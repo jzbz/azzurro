@@ -134,11 +134,22 @@ grouping is visible from a status poll without a second request.
 | `/Stop`, `/Skip`, `/Back` | none |
 | `/Volume` | `level=0..100`, or `db=`, or `mute=0|1` |
 | `/Shuffle` | `state=0|1` |
-| `/Repeat` | `state=0|1|2` — **0 is all, 1 is one, 2 is off** |
+| `/Repeat` | `state=0|1|2` — **0 is all, 1 is one, 2 is off**, confirmed below |
 | `/Clear` | none; empties the queue |
 | `/Preset` | `id=<n>` |
 | `/AddSlave`, `/RemoveSlave` | `slave=<host>&port=<port>`, called on the master |
 | `/Sleep` | none observed; cycles the sleep timer |
+
+The repeat numbering is worth stating twice, because the order is not the one
+anyone guesses and getting it backwards silently swaps "repeat everything" for
+"repeat nothing". The official controller renders `repeat === 0` as "Repeat
+All", `1` as "Repeat One" and `2` as "Off", and treats `repeat !== 2` as the
+condition for the button being lit.
+
+`/Status` also carries an `<actions>` list naming the transport actions the
+current source actually supports — the official controller reads it to decide
+whether skip and previous are live, and a `skip` action carries an `interval`
+for the seek-by-N-seconds buttons. Azzurro does not parse it yet.
 
 **Declared.** These appear in the request descriptions the player serves from
 `/Services`, with their parameters spelled out there: `/Add`, `/Info`,
@@ -212,7 +223,7 @@ without runtime widget-tree construction can still render it.
 
 ## Method
 
-The official Linux controller ships as an AppImage containing an unpacked
+The unofficial Linux controller ships as an AppImage containing an unpacked
 Electron app; its `package.json` says `UNLICENSED`. It was read to understand the
 wire format — in particular the LSDP decoder, which is the only complete
 description of that format that exists anywhere — and nothing was copied from

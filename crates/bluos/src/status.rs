@@ -111,7 +111,10 @@ pub struct ZoneOption {
 }
 
 /// `/Status` — what the player is doing right now.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Default` is here so that callers can build one field at a time in tests;
+/// a default `Status` describes a player that has said nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Status {
     /// Changes whenever anything below does. Hand it back to
     /// [`crate::StatusWatch`] to block until it does.

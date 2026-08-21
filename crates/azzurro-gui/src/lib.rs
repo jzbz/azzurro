@@ -4,38 +4,69 @@
 //! player, and a channel of commands going the other way. Nothing touches the
 //! UI except through `slint::invoke_from_event_loop`, and nothing in the
 //! backend knows what a widget is.
+//!
+//! The MPRIS bridge in [`mpris`] hangs off the same two things — it reads the
+//! statuses the pollers store and writes into the same command channel — so a
+//! media key and a click on a button are the same event by the time either
+//! reaches a player.
+
+mod mpris;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bluos::{Client, DeviceId, Discovery, discovery::DEFAULT_SWEEP};
+use bluos::{Client, DeviceId, Discovery, Repeat, Status, discovery::DEFAULT_SWEEP};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 
 slint::include_modules!();
 
-/// What the window can ask the backend to do.
-///
-/// Deliberately coarse: the UI names a player and an intent, and the backend
-/// owns every decision about how to reach it.
+/// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
-    Toggle(DeviceId),
-    Skip(DeviceId),
-    Back(DeviceId),
-    SetVolume(DeviceId, i32),
+    /// Broadcast for players again.
     Rescan,
+    /// Do something to one player.
+    Player(DeviceId, Action),
+}
+
+/// Deliberately coarse: a caller names an intent, and the backend owns every
+/// decision about how to reach the player.
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    Play,
+    Pause,
+    Toggle,
+    Stop,
+    Next,
+    Previous,
+    /// Absolute position, in seconds.
+    Seek(u32),
+    /// 0 to 100.
+    Volume(i32),
+    Shuffle(bool),
+    Repeat(Repeat),
 }
 
 /// One player as the backend tracks it.
 struct Entry {
     client: Client,
+    /// What the window shows.
     view: Device,
+    /// The last status the poller received, which is more than the window
+    /// needs but exactly what MPRIS asks for.
+    status: Option<Status>,
+    /// When that status arrived, so a position can be extrapolated from it.
+    status_at: Option<Instant>,
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
+
+/// Distinguishes the several MPRIS bus names one process claims.
+static NEXT_MPRIS_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 pub fn run_app() -> ExitCode {
     tracing_subscriber::fmt()
@@ -64,7 +95,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let (commands, command_rx) = mpsc::unbounded_channel();
-    runtime.spawn(backend(ui.as_weak(), command_rx));
+    runtime.spawn(backend(ui.as_weak(), command_rx, commands.clone()));
 
     wire(&ui, commands);
     ui.run()?;
@@ -77,44 +108,38 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
 /// is shutting down; there is nothing useful to do about it from a click
 /// handler, so it is dropped.
 fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
-    fn device(id: &slint::SharedString) -> Option<DeviceId> {
-        id.parse().ok()
+    fn dispatch(
+        commands: &mpsc::UnboundedSender<Command>,
+        id: &slint::SharedString,
+        action: Action,
+    ) {
+        if let Ok(id) = id.parse() {
+            let _ = commands.send(Command::Player(id, action));
+        }
     }
 
     let tx = commands.clone();
-    ui.on_toggle(move |id| {
-        if let Some(id) = device(&id) {
-            let _ = tx.send(Command::Toggle(id));
-        }
-    });
+    ui.on_toggle(move |id| dispatch(&tx, &id, Action::Toggle));
 
     let tx = commands.clone();
-    ui.on_skip(move |id| {
-        if let Some(id) = device(&id) {
-            let _ = tx.send(Command::Skip(id));
-        }
-    });
+    ui.on_skip(move |id| dispatch(&tx, &id, Action::Next));
 
     let tx = commands.clone();
-    ui.on_back(move |id| {
-        if let Some(id) = device(&id) {
-            let _ = tx.send(Command::Back(id));
-        }
-    });
+    ui.on_back(move |id| dispatch(&tx, &id, Action::Previous));
 
     let tx = commands.clone();
-    ui.on_set_volume(move |id, level| {
-        if let Some(id) = device(&id) {
-            let _ = tx.send(Command::SetVolume(id, level));
-        }
-    });
+    ui.on_set_volume(move |id, level| dispatch(&tx, &id, Action::Volume(level)));
 
     ui.on_rescan(move || {
         let _ = commands.send(Command::Rescan);
     });
 }
 
-async fn backend(ui: slint::Weak<AppWindow>, commands: mpsc::UnboundedReceiver<Command>) {
+async fn backend(
+    ui: slint::Weak<AppWindow>,
+    command_rx: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::UnboundedSender<Command>,
+) {
     // One HTTP client for every player: the connection pool and the resolver
     // are per client, and a controller holds a poll open to each of them.
     let http = match reqwest::Client::builder().build() {
@@ -135,7 +160,7 @@ async fn backend(ui: slint::Weak<AppWindow>, commands: mpsc::UnboundedReceiver<C
     let registry: Registry = Arc::new(Mutex::new(BTreeMap::new()));
 
     tokio::spawn(run_commands(
-        commands,
+        command_rx,
         registry.clone(),
         discovery.clone(),
         ui.clone(),
@@ -159,7 +184,7 @@ async fn backend(ui: slint::Weak<AppWindow>, commands: mpsc::UnboundedReceiver<C
     // player switched on an hour later still appears.
     if let Ok(found) = discovery.sweep(DEFAULT_SWEEP).await {
         for announce in found {
-            adopt(&announce, &http, &registry, &ui);
+            adopt(&announce, &http, &registry, &ui, &commands);
         }
     }
 
@@ -167,7 +192,7 @@ async fn backend(ui: slint::Weak<AppWindow>, commands: mpsc::UnboundedReceiver<C
         match discovery.recv().await {
             Ok(announces) => {
                 for announce in announces {
-                    adopt(&announce, &http, &registry, &ui);
+                    adopt(&announce, &http, &registry, &ui, &commands);
                 }
             }
             Err(e) => {
@@ -184,6 +209,7 @@ fn adopt(
     http: &reqwest::Client,
     registry: &Registry,
     ui: &slint::Weak<AppWindow>,
+    commands: &mpsc::UnboundedSender<Command>,
 ) {
     let Some(player) = announce.player() else {
         return;
@@ -208,27 +234,50 @@ fn adopt(
                     reachable: true,
                     ..Default::default()
                 },
+                status: None,
+                status_at: None,
             },
         );
     }
 
     tracing::info!(%id, "adopted a player");
     publish(registry, ui);
-    tokio::spawn(follow(id, registry.clone(), ui.clone()));
+    tokio::spawn(follow(
+        id,
+        registry.clone(),
+        ui.clone(),
+        commands.clone(),
+        NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+    ));
 }
 
-/// Keep one player's row current for as long as the app runs.
-async fn follow(id: DeviceId, registry: Registry, ui: slint::Weak<AppWindow>) {
+/// Keep one player's row, and its MPRIS object, current for as long as the app
+/// runs.
+async fn follow(
+    id: DeviceId,
+    registry: Registry,
+    ui: slint::Weak<AppWindow>,
+    commands: mpsc::UnboundedSender<Command>,
+    mpris_index: usize,
+) {
     let Some(client) = with_entry(&registry, id, |e| e.client.clone()) else {
         return;
     };
 
+    // The announcement already gave a name; /SyncStatus gives the authoritative
+    // one, and MPRIS wants it before the bus name is claimed so the desktop
+    // never shows a placeholder.
+    let mut name = with_entry(&registry, id, |e| e.view.name.to_string()).unwrap_or_default();
     if let Ok(sync) = client.sync_status().await {
+        name = sync.name.clone();
+        let model = sync.display_model().to_owned();
         update(&registry, id, &ui, |view| {
             view.name = sync.name.as_str().into();
-            view.model = sync.display_model().into();
+            view.model = model.as_str().into();
         });
     }
+
+    let mpris = mpris::Bridge::attach(mpris_index, id, name, registry.clone(), commands).await;
 
     let mut watch = client.watch();
     let mut backoff = Duration::from_secs(1);
@@ -237,6 +286,15 @@ async fn follow(id: DeviceId, registry: Registry, ui: slint::Weak<AppWindow>) {
         match watch.next().await {
             Ok(status) => {
                 backoff = Duration::from_secs(1);
+
+                {
+                    let mut guard = registry.lock().unwrap();
+                    if let Some(entry) = guard.get_mut(&id) {
+                        entry.status = Some(status.clone());
+                        entry.status_at = Some(Instant::now());
+                    }
+                }
+
                 update(&registry, id, &ui, |view| {
                     view.reachable = true;
                     view.playing = status.is_playing();
@@ -245,10 +303,21 @@ async fn follow(id: DeviceId, registry: Registry, ui: slint::Weak<AppWindow>) {
                     view.now_playing = status.now_playing().unwrap_or_default().into();
                     view.service = status.service.clone().unwrap_or_default().into();
                 });
+
+                if let Some(bridge) = &mpris {
+                    bridge.publish(&status).await;
+                }
             }
             Err(e) => {
                 tracing::debug!(%id, "poll failed, retrying in {backoff:?}: {e}");
                 update(&registry, id, &ui, |view| view.reachable = false);
+
+                // The last known track stays on the bus — a blip should not
+                // wipe the desktop's media widget — but it stops claiming to
+                // be playing something it can no longer see.
+                if let Some(bridge) = &mpris {
+                    bridge.publish_offline().await;
+                }
 
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -269,34 +338,37 @@ async fn run_commands(
     ui: slint::Weak<AppWindow>,
 ) {
     while let Some(command) = commands.recv().await {
-        if let Command::Rescan = command {
-            say(&ui, "rescanning");
-            let _ = discovery.query().await;
-            continue;
-        }
-
-        let id = match command {
-            Command::Toggle(id) | Command::Skip(id) | Command::Back(id) => id,
-            Command::SetVolume(id, _) => id,
-            Command::Rescan => unreachable!("handled above"),
+        let (id, action) = match command {
+            Command::Rescan => {
+                say(&ui, "rescanning");
+                let _ = discovery.query().await;
+                continue;
+            }
+            Command::Player(id, action) => (id, action),
         };
+
         let Some(client) = with_entry(&registry, id, |e| e.client.clone()) else {
             continue;
         };
 
-        // Fire and forget. The player's own long-poll is what tells the UI
+        // Fire and forget. The player's own long poll is what tells the UI
         // whether it worked, so waiting here would only add latency to the
         // next click.
         tokio::spawn(async move {
-            let result = match command {
-                Command::Toggle(_) => client.toggle().await,
-                Command::Skip(_) => client.skip().await,
-                Command::Back(_) => client.back().await,
-                Command::SetVolume(_, level) => client.set_volume(level).await,
-                Command::Rescan => unreachable!(),
+            let result = match action {
+                Action::Play => client.play().await,
+                Action::Pause => client.pause().await,
+                Action::Toggle => client.toggle().await,
+                Action::Stop => client.stop().await,
+                Action::Next => client.skip().await,
+                Action::Previous => client.back().await,
+                Action::Seek(secs) => client.seek(secs).await,
+                Action::Volume(level) => client.set_volume(level).await,
+                Action::Shuffle(on) => client.set_shuffle(on).await,
+                Action::Repeat(mode) => client.set_repeat(mode).await,
             };
             if let Err(e) = result {
-                tracing::warn!(%id, "command failed: {e}");
+                tracing::warn!(%id, ?action, "command failed: {e}");
             }
         });
     }

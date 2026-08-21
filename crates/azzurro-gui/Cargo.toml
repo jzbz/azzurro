@@ -37,5 +37,15 @@ slint = { version = "1.17", default-features = false, features = [
     "renderer-software",
 ] }
 
+# Emphatically NOT the "tokio" feature, however tempting it looks next to the
+# runtime this app already has. It sets `zbus/tokio`, and Cargo unifies
+# features across the graph onto one zbus — the same zbus that `accesskit_unix`
+# uses for AT-SPI. That feature switches zbus's executor to `tokio::spawn`,
+# which panics unless it is called inside a runtime, and AccessKit builds its
+# connection on the Slint event-loop thread, where there is none. Enabling it
+# trades working accessibility for nothing: zbus's default async-io reactor
+# drives the MPRIS server perfectly well from a tokio task.
+mpris-server = "0.10"
+
 [build-dependencies]
 slint-build = "1.17"

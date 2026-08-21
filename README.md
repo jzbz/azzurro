@@ -6,8 +6,9 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
 **Status: a working skeleton, and young.** Discovery, status, the long poll and
 the transport verbs are implemented and exercised against real hardware; the
-window lists the players it finds and drives them. Browsing, artwork, grouping
-and MPRIS are not written yet — see the roadmap.
+window lists the players it finds and drives them, and each one is exported
+over MPRIS so the desktop's own media controls work. Browsing, artwork and
+grouping are not written yet — see the roadmap.
 
 ## Layout
 
@@ -49,6 +50,12 @@ Discovery is a UDP broadcast on port 11430 that every player answers. The same
 socket keeps listening afterwards, because players announce themselves when they
 wake, so one switched on an hour later still appears without a rescan.
 
+Every player is also exported on D-Bus as its own MPRIS media player, named
+after the speaker rather than after the app — two speakers playing two
+different things are two things the desktop should be able to see and drive.
+Media keys, the GNOME shell menu, the KDE applet and a lock screen all reach a
+player through the same command channel the window's own buttons use.
+
 `docs/protocol.md` is the reference for all of it, including what has been
 confirmed against hardware and what has only been read out of the official
 client.
@@ -57,8 +64,7 @@ client.
 
 **v0.1 — a daily driver.** Discovery and manual addressing. Per-player volume
 and mute. Now playing with artwork, transport, seek, shuffle and repeat. The
-play queue. Presets. MPRIS, so the media keys and the desktop's own controls
-work.
+play queue. Presets. MPRIS is done.
 
 **v0.2 — browsing.** BluOS describes its own screens and menus in XML, and
 rendering those two grammars is what makes every music service work without
