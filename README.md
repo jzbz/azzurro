@@ -83,10 +83,11 @@ Presets. The play queue, cover art and MPRIS are done; seek and presets are not.
 **v0.2 — browsing.** The engine is in: the player describes each screen as XML,
 `/ui/BrowseObjects` reaches every service through one code path, and a service
 this app has never heard of browses and plays without a line of code about it.
-Still to come on top of it: search, favourites, and the per-item context menus
-(add to queue, favourite, go to artist) — which are also the only route to
-editing the queue, since removing and reordering exist solely as the device's
-own menus. Then grouping and saving a queue as a playlist.
+Search, favourites, presets and the per-item context menus all ride on it: the
+picker lists whatever screens the player reports, and a row's `⋯` opens the
+menu the player describes for it — favourite, add to playlist, go to artist.
+Still to come: grouping and zones, seek scrubbing, shuffle and repeat controls,
+alarms and the sleep timer.
 
 **v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
 

@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 
@@ -38,6 +39,14 @@ pub struct Screen {
     pub navigation_title: Option<String>,
     pub navigation_icon: Option<String>,
     pub id: Option<String>,
+    /// Second line, on the documents that have one — a context menu names the
+    /// track it was opened on.
+    pub subtitle: Option<String>,
+    /// Artwork for the thing the screen is about.
+    pub image: Option<String>,
+    /// Whether this arrived as a `<contextMenu>` rather than a `<screen>`.
+    /// Same vocabulary either way; only the framing differs.
+    pub is_context_menu: bool,
     /// Which service this screen belongs to, where it belongs to one.
     pub service: Option<String>,
     /// Redraw when the selected player changes.
@@ -180,6 +189,33 @@ impl Item {
         self.action.is_some() || self.play_action.is_some()
     }
 
+    /// Placeholder text for a search box — "Search..." — as distinct from its
+    /// label, which is what [`Item::label`] returns.
+    pub fn prompt(&self) -> Option<&str> {
+        self.extra.get("prompt").map(String::as_str)
+    }
+
+    /// Where a search box wants the user's text: the player names the query
+    /// parameter rather than fixing one.
+    pub fn search_parameter(&self) -> Option<&str> {
+        if self.kind != ItemKind::Search {
+            return None;
+        }
+        self.extra.get("parameterName").map(String::as_str)
+    }
+
+    /// The path to fetch to search for `query`.
+    ///
+    /// Returns `None` for anything that is not a search box, or for one the
+    /// player described without enough to act on.
+    pub fn search_url(&self, query: &str) -> Option<String> {
+        let parameter = self.search_parameter()?;
+        let uri = self.action.as_ref()?.uri.as_deref()?;
+        let separator = if uri.contains('?') { '&' } else { '?' };
+        let encoded = utf8_percent_encode(query, QUERY_VALUE);
+        Some(format!("{uri}{separator}{parameter}={encoded}"))
+    }
+
     /// Whether `status` says this is the item currently playing.
     pub fn is_playing(&self, status: &crate::Status) -> bool {
         let Some((key, value)) = &self.now_playing_match else {
@@ -229,6 +265,9 @@ pub struct Action {
     pub refresh_screen: bool,
     /// Close the current screen once this has been sent.
     pub close_screen: bool,
+    /// What to tell the user once it has been sent — "Added to favourites".
+    /// The player supplies the wording, so a client need not invent any.
+    pub notification: Option<String>,
     pub extra: BTreeMap<String, String>,
 }
 
@@ -265,6 +304,27 @@ pub struct MenuAction {
     pub kind: Option<String>,
     pub action: Option<Action>,
 }
+
+/// Everything that would otherwise be read as query-string structure, plus the
+/// characters a URL cannot carry raw. Deliberately narrow: over-encoding a
+/// search term works but makes the request unreadable when it needs debugging.
+const QUERY_VALUE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// Where the parser currently is, so that a nested `<action>` can be attached
 /// to whatever opened it.
@@ -395,9 +455,16 @@ fn start(
     let mut a = attributes(e);
 
     match name {
-        "screen" => {
+        // `contextMenu` is two different things depending on where it sits: a
+        // root element when a whole document is a menu, and an action on an
+        // item when a row has one to open. Only position tells them apart.
+        "screen" | "contextMenu" if stack.is_empty() => {
             *seen_screen = true;
-            screen.title = a.remove("screenTitle");
+            screen.is_context_menu = name == "contextMenu";
+            screen.subtitle = a.remove("subTitle");
+            screen.image = a.remove("image");
+            // A screen uses `screenTitle`; a context menu uses `title`.
+            screen.title = a.remove("screenTitle").or_else(|| a.remove("title"));
             screen.navigation_title = a.remove("navigationTitle");
             screen.navigation_icon = a.remove("navigationIcon");
             screen.id = a.remove("id");
@@ -500,10 +567,23 @@ fn start(
 
         _ => {
             if let Some((_, kind)) = ITEM_ELEMENTS.iter().find(|(n, _)| *n == name) {
+                // A search box is the one item whose action lives on the
+                // element itself, so it has to be lifted out before the rest of
+                // the attributes are swept into `extra`.
+                let own_action = (*kind == ItemKind::Search).then(|| {
+                    let mut owned = BTreeMap::new();
+                    for key in ["type", "URI", "href", "url", "resultType", "service"] {
+                        if let Some(value) = a.remove(key) {
+                            owned.insert(key.to_owned(), value);
+                        }
+                    }
+                    action("action", owned)
+                });
+
                 *item = Some(Item {
                     kind: *kind,
+                    action: own_action,
                     title: a.remove("title"),
-                    text: a.remove("text"),
                     subtitle: a.remove("subTitle"),
                     subsubtitle: a.remove("subSubTitle"),
                     body: a.remove("body"),
@@ -514,6 +594,7 @@ fn start(
                     service: a.remove("service"),
                     object_type: a.remove("objectType"),
                     selected: flag(a.remove("selected")),
+                    text: a.remove("text"),
                     extra: a,
                     ..Default::default()
                 });
@@ -600,6 +681,7 @@ fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
         service: a.remove("service"),
         refresh_screen: flag(a.remove("refreshScreen")),
         close_screen: flag(a.remove("closeScreen")),
+        notification: a.remove("notification"),
         extra: a,
     }
 }
@@ -893,6 +975,125 @@ mod tests {
             .unwrap();
         assert_eq!(action.kind, ActionKind::Unknown);
         assert!(!action.is_navigational());
+    }
+
+    /// `/ui/nowPlayingCM` from a real player, trimmed to three entries. A
+    /// context menu is a different root element carrying the same vocabulary.
+    const CONTEXT_MENU: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<contextMenu image="/Artwork?service=LocalMusic&amp;fn=%2Fmusic%2Ftrack.flac" subTitle="The Rolling Stones • Aftermath" title="Paint It, Black" version="1">
+  <item icon="/images/ui/cm_favourite_add.png" text="Favourite">
+    <action type="player-link" URI="/ui/prf?cgsc=1&amp;u=%2FAddFavourite%3Ffn%3D%252Fmusic%252Ftrack.flac" refreshScreen="true" notification="Added to favourites"></action>
+  </item>
+  <item icon="/images/ui/cm_gotoartist.png" text="Go to artist">
+    <action type="context-browse" URI="/library/v1/Artists?artist=The+Rolling+Stones&amp;service=LocalMusic" resultType="Artist" title="The Rolling Stones" service="LocalMusic"></action>
+  </item>
+  <item icon="/images/ui/cm_info.png" text="Info">
+    <action type="browse" URI="/Info?service=LocalMusic" resultType="Info" title="Info"></action>
+  </item>
+</contextMenu>"##;
+
+    /// `/ui/Search`, whose `<search>` element carries its action on itself
+    /// rather than in a child.
+    const SEARCH: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<screen version="1" screenTitle="Search" id="screen-LocalMusic-Search" service="LocalMusic">
+  <search prompt="Search..." parameterName="q" type="browse" URI="/ui/Search?forService=LocalMusic" resultType="screen" title="Search" service="LocalMusic"></search>
+</screen>"##;
+
+    #[test]
+    fn a_context_menu_is_a_screen_in_different_clothes() {
+        let menu = parse(CONTEXT_MENU).unwrap();
+
+        assert!(menu.is_context_menu);
+        assert_eq!(menu.heading(), Some("Paint It, Black"));
+        assert_eq!(
+            menu.subtitle.as_deref(),
+            Some("The Rolling Stones • Aftermath")
+        );
+        assert!(menu.image.is_some());
+
+        // Items sit straight under the root with no section around them, and
+        // still have to land somewhere.
+        let items: Vec<_> = menu.items().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].label(), Some("Favourite"));
+
+        // The player supplies the wording for the confirmation.
+        let favourite = items[0].action.as_ref().unwrap();
+        assert_eq!(favourite.kind, ActionKind::PlayerLink);
+        assert_eq!(
+            favourite.notification.as_deref(),
+            Some("Added to favourites")
+        );
+        assert!(favourite.refresh_screen);
+
+        // "Go to artist" navigates, so it can go on the same trail as any
+        // other browse.
+        assert_eq!(
+            items[1].action.as_ref().unwrap().kind,
+            ActionKind::ContextBrowse
+        );
+        assert!(items[1].action.as_ref().unwrap().is_navigational());
+    }
+
+    #[test]
+    fn a_nested_context_menu_is_an_action_not_a_root() {
+        // Queue and browse rows carry <contextMenu> as the way to open their
+        // menu. Reading one as a document root would throw away the screen.
+        let screen = parse(
+            r#"<screen screenTitle="Recently Played"><list>
+                 <item title="A Song" subTitle="An Artist">
+                   <action type="player-link" URI="/Play?id=1"></action>
+                   <contextMenu type="browse" URI="/ui/queueItemCM?id=0" resultType="contextMenu"></contextMenu>
+                 </item>
+               </list></screen>"#,
+        )
+        .unwrap();
+
+        assert!(!screen.is_context_menu);
+        assert_eq!(screen.heading(), Some("Recently Played"));
+
+        let item = screen.items().next().unwrap();
+        assert_eq!(item.label(), Some("A Song"));
+        assert_eq!(item.subtitle.as_deref(), Some("An Artist"));
+        // The row's own action is untouched by the menu beside it.
+        assert_eq!(item.action.as_ref().unwrap().kind, ActionKind::PlayerLink);
+
+        let menu = item.context_menu.as_ref().expect("the row has a menu");
+        assert_eq!(menu.kind, ActionKind::Browse);
+        assert_eq!(menu.uri.as_deref(), Some("/ui/queueItemCM?id=0"));
+    }
+
+    #[test]
+    fn a_search_box_names_its_own_query_parameter() {
+        let screen = parse(SEARCH).unwrap();
+        let search = screen.items().next().unwrap();
+
+        assert_eq!(search.kind, ItemKind::Search);
+        // The label and the placeholder are different strings.
+        assert_eq!(search.label(), Some("Search"));
+        assert_eq!(search.prompt(), Some("Search..."));
+        assert_eq!(search.search_parameter(), Some("q"));
+        assert_eq!(
+            search.action.as_ref().map(|a| a.kind),
+            Some(ActionKind::Browse)
+        );
+
+        // The URI already has a query, so the parameter is appended.
+        assert_eq!(
+            search.search_url("rolling stones").as_deref(),
+            Some("/ui/Search?forService=LocalMusic&q=rolling%20stones")
+        );
+        // Anything that would be read as query structure is encoded.
+        assert_eq!(
+            search.search_url("rock & roll?").as_deref(),
+            Some("/ui/Search?forService=LocalMusic&q=rock%20%26%20roll%3F")
+        );
+
+        // Nothing else is a search box.
+        let sources = parse(SOURCES).unwrap();
+        let input = &sources.sections[0].items[0];
+        assert_eq!(input.search_parameter(), None);
+        assert_eq!(input.search_url("anything"), None);
     }
 
     #[test]

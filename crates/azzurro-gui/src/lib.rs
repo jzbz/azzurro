@@ -60,6 +60,14 @@ enum Command {
     BrowseHome,
     /// Follow row `n` of the screen currently shown.
     BrowseActivate(usize),
+    /// Open row `n`'s context menu.
+    BrowseMenu(usize),
+    /// Open the context menu for a queue position.
+    QueueMenu(u32),
+    /// Jump to screen `n` of the ones the player offers.
+    BrowseScreen(usize),
+    /// Search the current screen for some text.
+    BrowseSearch(String),
     /// Back one screen.
     BrowseBack,
 }
@@ -70,9 +78,13 @@ struct Browsing {
     /// Which player's screens are being read. Browsing follows the selection,
     /// because a screen is only meaningful against the player that served it.
     device: Option<DeviceId>,
-    /// One entry per screen fetched, so Back is a pop. The root is the
-    /// player's own Sources screen.
+    /// One entry per screen fetched, so Back is a pop.
     trail: Vec<Crumb>,
+    /// The screens this player offers: `(label, uri)`, in the order it listed
+    /// them. Read once from `/ui/Configuration`.
+    screens: Vec<(String, String)>,
+    /// Where to ask for a queue item's context menu, also from the player.
+    queue_menu_uri: Option<String>,
 }
 
 struct Crumb {
@@ -151,6 +163,7 @@ struct BrowseData {
     heading: bool,
     actionable: bool,
     playing: bool,
+    has_menu: bool,
 }
 
 /// One queue row on its way to the window.
@@ -264,6 +277,26 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_browse_activate(move |index| {
         let _ = tx.send(Command::BrowseActivate(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_menu(move |index| {
+        let _ = tx.send(Command::BrowseMenu(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_menu(move |song| {
+        let _ = tx.send(Command::QueueMenu(song.max(0) as u32));
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_screen(move |index| {
+        let _ = tx.send(Command::BrowseScreen(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_search(move |query| {
+        let _ = tx.send(Command::BrowseSearch(query.to_string()));
     });
 
     ui.on_rescan(move || {
@@ -563,7 +596,7 @@ impl Backend {
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
     fn publish_browse(&self) {
-        let (rows, title, can_go_back) = {
+        let (rows, title, can_go_back, search) = {
             let browsing = self.browsing.lock().unwrap();
             let status = browsing
                 .device
@@ -574,7 +607,7 @@ impl Backend {
                 .and_then(|id| self.with_entry(id, |e| e.client.clone()));
 
             let Some(screen) = browsing.current() else {
-                return self.send_browse(Vec::new(), "Browse".into(), false);
+                return self.send_browse(Vec::new(), "Browse".into(), false, None);
             };
 
             let mut rows = Vec::new();
@@ -595,6 +628,7 @@ impl Backend {
                         heading: true,
                         actionable: false,
                         playing: false,
+                        has_menu: false,
                     });
                 }
 
@@ -611,7 +645,15 @@ impl Backend {
 
                     rows.push(BrowseData {
                         index,
-                        title: item.label().unwrap_or("—").to_owned(),
+                        // Some rows are an icon and nothing else — the "add a
+                        // preset" tile is one — so fall back to what the
+                        // action calls itself, and then to nothing rather than
+                        // to a placeholder dash.
+                        title: item
+                            .label()
+                            .or_else(|| item.action.as_ref().and_then(|a| a.title.as_deref()))
+                            .unwrap_or_default()
+                            .to_owned(),
                         subtitle: item
                             .subtitle
                             .clone()
@@ -621,19 +663,35 @@ impl Backend {
                         heading: false,
                         actionable: item.is_actionable(),
                         playing: status.as_ref().is_some_and(|s| item.is_playing(s)),
+                        has_menu: item.context_menu.is_some(),
                     });
                     index += 1;
                 }
             }
 
-            let title = screen.heading().unwrap_or("Browse").to_owned();
-            (rows, title, browsing.trail.len() > 1)
+            let title = match (screen.heading(), screen.subtitle.as_deref()) {
+                (Some(heading), Some(sub)) => format!("{heading} — {sub}"),
+                (Some(heading), None) => heading.to_owned(),
+                _ => "Browse".to_owned(),
+            };
+            let search = screen
+                .items()
+                .find(|i| i.search_parameter().is_some())
+                .map(|i| i.prompt().or(i.label()).unwrap_or("Search").to_owned());
+
+            (rows, title, browsing.trail.len() > 1, search)
         };
 
-        self.send_browse(rows, title, can_go_back);
+        self.send_browse(rows, title, can_go_back, search);
     }
 
-    fn send_browse(&self, rows: Vec<BrowseData>, title: String, can_go_back: bool) {
+    fn send_browse(
+        &self,
+        rows: Vec<BrowseData>,
+        title: String,
+        can_go_back: bool,
+        search: Option<String>,
+    ) {
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -648,12 +706,47 @@ impl Backend {
                     heading: row.heading,
                     actionable: row.actionable,
                     playing: row.playing,
+                    has_menu: row.has_menu,
                 })
                 .collect();
 
             ui.set_browse(ModelRc::new(VecModel::from(rows)));
             ui.set_browse_title(title.into());
             ui.set_browse_can_go_back(can_go_back);
+            ui.set_browse_has_search(search.is_some());
+            if let Some(prompt) = search {
+                ui.set_browse_search_prompt(prompt.into());
+            }
+        });
+    }
+
+    /// Hand the window the list of screens this player offers.
+    fn publish_screens(&self) {
+        let names: Vec<slint::SharedString> = self
+            .browsing
+            .lock()
+            .unwrap()
+            .screens
+            .iter()
+            .map(|(label, _)| label.as_str().into())
+            .collect();
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_screens(ModelRc::new(VecModel::from(names)));
+            }
+        });
+    }
+
+    /// Switch the right-hand panel. Used when opening a queue item's context
+    /// menu, which is a browse document and belongs in the browser.
+    fn show_pane(&self, pane: i32) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_pane(pane);
+            }
         });
     }
 
@@ -665,6 +758,48 @@ impl Backend {
                 ui.set_cover(pixels.map(slint::Image::from_rgba8).unwrap_or_default());
             }
         });
+    }
+}
+
+/// The screens worth offering, in the order the player listed them.
+///
+/// The two context-menu entries are addressed directly when a row is
+/// right-clicked rather than browsed to, the URL resolver is internal, and the
+/// queue has a pane of its own. Everything else goes in the picker — including
+/// anything a future firmware adds, which is why the fallback keeps the raw
+/// name rather than dropping it.
+fn user_screens(config: &bluos::Configuration) -> Vec<(String, String)> {
+    const NOT_BROWSABLE: &[&str] = &[
+        "nowPlayingContextMenu",
+        "queueItemContextMenu",
+        "resolveSoviURL",
+        "queue",
+    ];
+
+    config
+        .items
+        .iter()
+        .filter(|item| !NOT_BROWSABLE.contains(&item.id.as_str()))
+        .map(|item| (screen_label(&item.id), item.uri.clone()))
+        .collect()
+}
+
+fn screen_label(id: &str) -> String {
+    match id {
+        "home" => "Home".to_owned(),
+        "recentlyPlayed" => "Recently Played".to_owned(),
+        "news" => "News".to_owned(),
+        "favourites" => "Favourites".to_owned(),
+        "sources" => "Sources".to_owned(),
+        "search" => "Search".to_owned(),
+        "presets" => "Presets".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
     }
 }
 
@@ -733,10 +868,21 @@ async fn activate(backend: Backend, index: usize) {
         // The player handed over a complete request; sending it is the whole
         // job. Its own long poll reports the result.
         ActionKind::PlayerLink | ActionKind::Add => {
-            if let Some(uri) = uri
-                && let Err(e) = client.follow(&uri).await
-            {
-                tracing::warn!(%id, "{uri} failed: {e}");
+            let Some(uri) = uri else { return };
+            match client.follow(&uri).await {
+                Ok(()) => {
+                    // Even the wording of the confirmation comes from the
+                    // player — "Added to favourites" is its phrase, not ours.
+                    if let Some(text) = &action.notification {
+                        say(&backend.ui, text.clone());
+                    }
+                    // Favouriting changes what the menu should say next time,
+                    // and the player says so.
+                    if action.refresh_screen {
+                        refresh_current(backend).await;
+                    }
+                }
+                Err(e) => tracing::warn!(%id, "{uri} failed: {e}"),
             }
         }
 
@@ -768,6 +914,19 @@ async fn activate(backend: Backend, index: usize) {
             tracing::debug!(%id, "nothing to do for a {:?} action", action.kind);
         }
     }
+}
+
+/// Re-fetch the screen on show, keeping its place on the trail.
+async fn refresh_current(backend: Backend) {
+    let Some((id, uri)) = ({
+        let mut browsing = backend.browsing.lock().unwrap();
+        browsing
+            .device
+            .zip(browsing.trail.pop().map(|crumb| crumb.uri))
+    }) else {
+        return;
+    };
+    open_screen(backend, id, uri, true).await;
 }
 
 /// Fetch the icons and cover art for the screen on show.
@@ -1011,23 +1170,14 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // date. Re-fetch in place rather than dropping the trail.
                 let stale = {
                     let browsing = backend.browsing.lock().unwrap();
-                    (browsing.device == Some(id))
-                        .then(|| browsing.trail.last())
-                        .flatten()
-                        .filter(|crumb| crumb.screen.is_stale(&status))
-                        .map(|crumb| crumb.uri.clone())
+                    browsing.device == Some(id)
+                        && browsing
+                            .trail
+                            .last()
+                            .is_some_and(|crumb| crumb.screen.is_stale(&status))
                 };
-                if let Some(uri) = stale {
-                    let backend = backend.clone();
-                    tokio::spawn(async move {
-                        let popped = {
-                            let mut browsing = backend.browsing.lock().unwrap();
-                            browsing.trail.pop().is_some()
-                        };
-                        if popped {
-                            open_screen(backend, id, uri, true).await;
-                        }
-                    });
+                if stale {
+                    tokio::spawn(refresh_current(backend.clone()));
                 }
 
                 if backend.is_selected(id) {
@@ -1121,18 +1271,29 @@ async fn run_commands(
                         continue;
                     }
                 }
-                // Sources is the root of everything the player offers: inputs
-                // on one row, music services on the next.
-                let uri = match backend.with_entry(id, |e| e.client.clone()) {
-                    Some(client) => client
-                        .ui_configuration()
-                        .await
-                        .ok()
-                        .and_then(|c| c.uri("sources").map(str::to_owned))
-                        .unwrap_or_else(|| "/ui/Sources".to_owned()),
-                    None => continue,
+
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
                 };
-                tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                // The player says which screens it has; the app does not have a
+                // list of its own.
+                let config = client.ui_configuration().await.ok();
+                let screens = config.as_ref().map(user_screens).unwrap_or_default();
+                let root = screens
+                    .first()
+                    .map(|(_, uri)| uri.clone())
+                    .unwrap_or_else(|| "/ui/Sources".to_owned());
+
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.queue_menu_uri = config
+                        .as_ref()
+                        .and_then(|c| c.uri("queueItemContextMenu"))
+                        .map(str::to_owned);
+                    browsing.screens = screens;
+                }
+                backend.publish_screens();
+                tokio::spawn(open_screen(backend.clone(), id, root, false));
                 continue;
             }
 
@@ -1149,6 +1310,78 @@ async fn run_commands(
 
             Command::BrowseActivate(index) => {
                 tokio::spawn(activate(backend.clone(), index));
+                continue;
+            }
+
+            Command::BrowseMenu(index) => {
+                let opened = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.device.zip(
+                        browsing
+                            .current()
+                            .and_then(|screen| screen.items().nth(index))
+                            .and_then(|item| item.context_menu.as_ref())
+                            .and_then(|action| action.uri.clone()),
+                    )
+                };
+                if let Some((id, uri)) = opened {
+                    tokio::spawn(open_screen(backend.clone(), id, uri, true));
+                }
+                continue;
+            }
+
+            Command::QueueMenu(song) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // The player names the endpoint in /ui/Configuration; only the
+                // queue position is ours to add.
+                let base = backend
+                    .browsing
+                    .lock()
+                    .unwrap()
+                    .queue_menu_uri
+                    .clone()
+                    .unwrap_or_else(|| "/ui/queueItemCM".to_owned());
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    open_screen(backend.clone(), id, format!("{base}?id={song}"), true).await;
+                    backend.show_pane(1);
+                });
+                continue;
+            }
+
+            Command::BrowseScreen(index) => {
+                let chosen = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .device
+                        .zip(browsing.screens.get(index).map(|(_, uri)| uri.clone()))
+                };
+                if let Some((id, uri)) = chosen {
+                    tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                }
+                continue;
+            }
+
+            Command::BrowseSearch(query) => {
+                if query.trim().is_empty() {
+                    continue;
+                }
+                let searched = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.device.zip(
+                        browsing
+                            .current()
+                            .and_then(|screen| {
+                                screen.items().find(|i| i.search_parameter().is_some())
+                            })
+                            .and_then(|item| item.search_url(query.trim())),
+                    )
+                };
+                if let Some((id, uri)) = searched {
+                    tokio::spawn(open_screen(backend.clone(), id, uri, true));
+                }
                 continue;
             }
 

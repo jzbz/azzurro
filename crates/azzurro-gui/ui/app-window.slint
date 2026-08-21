@@ -1,4 +1,4 @@
-import { ListView, Slider, ScrollView } from "std-widgets.slint";
+import { ListView, Slider, ScrollView, ComboBox, LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 
 // One player, flattened for display. The backend owns the real state; this is
@@ -42,6 +42,8 @@ export struct BrowseRow {
     actionable: bool,
     // The player says this is what is playing.
     playing: bool,
+    // Whether there is a context menu to open on it.
+    has-menu: bool,
 }
 
 component TextButton inherits Rectangle {
@@ -77,6 +79,7 @@ component TextButton inherits Rectangle {
 component TrackRow inherits Rectangle {
     in property <Track> track;
     callback play();
+    callback open-menu();
 
     height: 46px;
     border-radius: 6px;
@@ -146,6 +149,25 @@ component TrackRow inherits Rectangle {
             }
         }
 
+        Rectangle {
+            width: 22px;
+            border-radius: 4px;
+            background: menu-touch.has-hover ? Theme.pressed : transparent;
+            opacity: touch.has-hover || menu-touch.has-hover ? 1.0 : 0.0;
+
+            Text {
+                text: "⋯";
+                font-size: Theme.body-size;
+                color: Theme.dim;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+
+            menu-touch := TouchArea {
+                clicked => { root.open-menu(); }
+            }
+        }
+
         Text {
             text: root.track.duration;
             font-size: Theme.small-size;
@@ -160,6 +182,7 @@ component TrackRow inherits Rectangle {
 component BrowseRowView inherits Rectangle {
     in property <BrowseRow> entry;
     callback activate();
+    callback open-menu();
 
     height: root.entry.heading ? 28px : 46px;
     border-radius: 6px;
@@ -221,6 +244,27 @@ component BrowseRowView inherits Rectangle {
                 font-size: Theme.small-size;
                 color: Theme.dim;
                 overflow: elide;
+            }
+        }
+
+        if !root.entry.heading && root.entry.has-menu: Rectangle {
+            width: 22px;
+            border-radius: 4px;
+            background: menu-touch.has-hover ? Theme.pressed : transparent;
+            // Kept out of the way until the row is under the pointer, so a
+            // list of forty rows is not forty pieces of furniture.
+            opacity: touch.has-hover || menu-touch.has-hover ? 1.0 : 0.0;
+
+            Text {
+                text: "⋯";
+                font-size: Theme.body-size;
+                color: Theme.dim;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+
+            menu-touch := TouchArea {
+                clicked => { root.open-menu(); }
             }
         }
 
@@ -317,6 +361,10 @@ export component AppWindow inherits Window {
     in property <[BrowseRow]> browse;
     in property <string> browse-title: "Browse";
     in property <bool> browse-can-go-back: false;
+    // The screens this player offers, by name, straight from the player.
+    in property <[string]> screens;
+    in property <bool> browse-has-search: false;
+    in property <string> browse-search-prompt: "Search";
     in-out property <int> selected: 0;
     // 0 shows the queue, 1 shows the browser.
     in-out property <int> pane: 0;
@@ -328,8 +376,12 @@ export component AppWindow inherits Window {
     callback select(string);
     callback play-track(string, int);
     callback browse-activate(int);
+    callback browse-menu(int);
     callback browse-back();
     callback browse-home();
+    callback browse-screen(int);
+    callback browse-search(string);
+    callback queue-menu(int);
     callback rescan();
 
     title: "Azzurro";
@@ -510,6 +562,11 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    if root.pane == 1 && root.screens.length > 0: ComboBox {
+                        model: root.screens;
+                        selected => { root.browse-screen(self.current-index); }
+                    }
+
                     Text {
                         text: root.pane == 0
                             ? (root.queue-line == "" ? "Queue" : root.queue-line)
@@ -520,10 +577,16 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
 
+                    if root.pane == 1 && root.browse-has-search: LineEdit {
+                        placeholder-text: root.browse-search-prompt;
+                        accepted(text) => { root.browse-search(text); }
+                    }
+
                     if root.pane == 0: ListView {
                         for track in root.queue: TrackRow {
                             track: track;
                             play => { root.play-track(root.current.id, track.id); }
+                            open-menu => { root.queue-menu(track.id); }
                         }
                     }
 
@@ -531,6 +594,7 @@ export component AppWindow inherits Window {
                         for entry in root.browse: BrowseRowView {
                             entry: entry;
                             activate => { root.browse-activate(entry.index); }
+                            open-menu => { root.browse-menu(entry.index); }
                         }
                     }
                 }

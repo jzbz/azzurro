@@ -703,6 +703,7 @@ name = "bluos"
 version = "0.1.0"
 dependencies = [
  "if-addrs",
+ "percent-encoding",
  "quick-xml 0.41.0",
  "reqwest",
  "rustls",
