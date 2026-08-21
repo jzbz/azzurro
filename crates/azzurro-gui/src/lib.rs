@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bluos::{Client, DeviceId, Discovery, Queue, Repeat, Status, discovery::DEFAULT_SWEEP};
+use bluos::{
+    ActionKind, Client, DeviceId, Discovery, Queue, Repeat, Screen, Status,
+    discovery::DEFAULT_SWEEP,
+};
 
 use crate::artwork::{Artwork, Pixels};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
@@ -39,7 +42,8 @@ const QUEUE_WINDOW: u32 = 500;
 /// screen. Fetched once at this size rather than per scale factor.
 const COVER_SIZE: u32 = 360;
 
-/// Queue thumbnails are drawn at 34px, likewise doubled.
+/// Queue thumbnails are drawn at 34px, likewise doubled. Browse rows use the
+/// same size, so the two panes share cache entries for the same art.
 const THUMB_SIZE: u32 = 72;
 
 /// What the window and the desktop can ask the backend to do.
@@ -52,6 +56,34 @@ enum Command {
     Select(DeviceId),
     /// Do something to one player.
     Player(DeviceId, Action),
+    /// Show the browser's starting screen.
+    BrowseHome,
+    /// Follow row `n` of the screen currently shown.
+    BrowseActivate(usize),
+    /// Back one screen.
+    BrowseBack,
+}
+
+/// Where the browser is, and how it got there.
+#[derive(Default)]
+struct Browsing {
+    /// Which player's screens are being read. Browsing follows the selection,
+    /// because a screen is only meaningful against the player that served it.
+    device: Option<DeviceId>,
+    /// One entry per screen fetched, so Back is a pop. The root is the
+    /// player's own Sources screen.
+    trail: Vec<Crumb>,
+}
+
+struct Crumb {
+    uri: String,
+    screen: Screen,
+}
+
+impl Browsing {
+    fn current(&self) -> Option<&Screen> {
+        self.trail.last().map(|c| &c.screen)
+    }
 }
 
 /// Deliberately coarse: a caller names an intent, and the backend owns every
@@ -106,6 +138,19 @@ struct Backend {
     commands: mpsc::UnboundedSender<Command>,
     ui: slint::Weak<AppWindow>,
     artwork: Arc<Artwork>,
+    browsing: Arc<Mutex<Browsing>>,
+}
+
+/// One browse row on its way to the window, for the same reason as
+/// [`TrackData`]: the pixels are `Send` and the `Image` is not.
+struct BrowseData {
+    index: i32,
+    title: String,
+    subtitle: String,
+    cover: Option<Pixels>,
+    heading: bool,
+    actionable: bool,
+    playing: bool,
 }
 
 /// One queue row on its way to the window.
@@ -206,6 +251,21 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
         }
     });
 
+    let tx = commands.clone();
+    ui.on_browse_home(move || {
+        let _ = tx.send(Command::BrowseHome);
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_back(move || {
+        let _ = tx.send(Command::BrowseBack);
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_activate(move |index| {
+        let _ = tx.send(Command::BrowseActivate(index.max(0) as usize));
+    });
+
     ui.on_rescan(move || {
         let _ = commands.send(Command::Rescan);
     });
@@ -239,6 +299,7 @@ async fn run(
         commands,
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(http.clone())),
+        browsing: Arc::new(Mutex::new(Browsing::default())),
     };
 
     tokio::spawn(run_commands(command_rx, backend.clone(), discovery.clone()));
@@ -331,6 +392,9 @@ impl Backend {
         self.publish();
         if first {
             tokio::spawn(fetch_queue(self.clone(), id));
+            // The window selects the first row for us, so the backend has to
+            // do everything selecting normally would.
+            let _ = self.commands.send(Command::BrowseHome);
         }
         tokio::spawn(follow(
             self.clone(),
@@ -492,6 +556,107 @@ impl Backend {
         });
     }
 
+    /// Push the current browse screen to the window.
+    ///
+    /// Sections become headings in a single flat list. The alternative — real
+    /// nested rows and shelves the way the official app draws them — is a
+    /// bigger UI job than the parsing was, and a list is legible in a 340px
+    /// column where a horizontal shelf is not.
+    fn publish_browse(&self) {
+        let (rows, title, can_go_back) = {
+            let browsing = self.browsing.lock().unwrap();
+            let status = browsing
+                .device
+                .and_then(|id| self.with_entry(id, |e| e.status.clone()))
+                .flatten();
+            let client = browsing
+                .device
+                .and_then(|id| self.with_entry(id, |e| e.client.clone()));
+
+            let Some(screen) = browsing.current() else {
+                return self.send_browse(Vec::new(), "Browse".into(), false);
+            };
+
+            let mut rows = Vec::new();
+            let mut index = 0i32;
+            let named_sections = screen.sections.iter().filter(|s| s.title.is_some()).count();
+
+            for section in &screen.sections {
+                // Only worth a heading when there is more than one to tell
+                // apart.
+                if named_sections > 1
+                    && let Some(title) = &section.title
+                {
+                    rows.push(BrowseData {
+                        index: -1,
+                        title: title.clone(),
+                        subtitle: String::new(),
+                        cover: None,
+                        heading: true,
+                        actionable: false,
+                        playing: false,
+                    });
+                }
+
+                for item in &section.items {
+                    let cover = item
+                        .image
+                        .as_deref()
+                        .or(item.icon.as_deref())
+                        .filter(|src| !src.is_empty())
+                        .zip(client.as_ref())
+                        .and_then(|(src, client)| {
+                            self.artwork.cached(&client.image_url(src), THUMB_SIZE)
+                        });
+
+                    rows.push(BrowseData {
+                        index,
+                        title: item.label().unwrap_or("—").to_owned(),
+                        subtitle: item
+                            .subtitle
+                            .clone()
+                            .or_else(|| item.body.clone())
+                            .unwrap_or_default(),
+                        cover,
+                        heading: false,
+                        actionable: item.is_actionable(),
+                        playing: status.as_ref().is_some_and(|s| item.is_playing(s)),
+                    });
+                    index += 1;
+                }
+            }
+
+            let title = screen.heading().unwrap_or("Browse").to_owned();
+            (rows, title, browsing.trail.len() > 1)
+        };
+
+        self.send_browse(rows, title, can_go_back);
+    }
+
+    fn send_browse(&self, rows: Vec<BrowseData>, title: String, can_go_back: bool) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+
+            let rows: Vec<BrowseRow> = rows
+                .into_iter()
+                .map(|row| BrowseRow {
+                    index: row.index,
+                    title: row.title.into(),
+                    subtitle: row.subtitle.into(),
+                    cover: row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
+                    heading: row.heading,
+                    actionable: row.actionable,
+                    playing: row.playing,
+                })
+                .collect();
+
+            ui.set_browse(ModelRc::new(VecModel::from(rows)));
+            ui.set_browse_title(title.into());
+            ui.set_browse_can_go_back(can_go_back);
+        });
+    }
+
     /// Put cover art in the now-playing panel, or clear it.
     fn set_cover(&self, pixels: Option<Pixels>) {
         let ui = self.ui.clone();
@@ -501,6 +666,155 @@ impl Backend {
             }
         });
     }
+}
+
+/// Fetch a screen and show it.
+///
+/// `push` distinguishes going deeper from starting over: Back pops the trail,
+/// so every screen that is arrived at by following a row has to be on it.
+async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+
+    match client.screen(&uri).await {
+        Ok(screen) => {
+            {
+                let mut browsing = backend.browsing.lock().unwrap();
+                // Browsing follows the selection: a screen only means anything
+                // against the player that served it.
+                if browsing.device != Some(id) {
+                    browsing.trail.clear();
+                }
+                browsing.device = Some(id);
+                if !push {
+                    browsing.trail.clear();
+                }
+                browsing.trail.push(Crumb { uri, screen });
+            }
+            backend.publish_browse();
+            tokio::spawn(load_browse_thumbnails(backend, id));
+        }
+        Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
+    }
+}
+
+/// Do whatever row `index` of the current screen says to do.
+///
+/// Every branch here is the player's instruction rather than this app's
+/// decision — which is the whole point of the server-driven screens, and why a
+/// music service nobody has heard of still browses and plays.
+async fn activate(backend: Backend, index: usize) {
+    let (id, action) = {
+        let browsing = backend.browsing.lock().unwrap();
+        let Some(id) = browsing.device else { return };
+        let Some(screen) = browsing.current() else {
+            return;
+        };
+        let Some(item) = screen.items().nth(index) else {
+            return;
+        };
+        (id, item.action.clone().or_else(|| item.play_action.clone()))
+    };
+
+    let Some(action) = action else { return };
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+    let uri = action.uri.clone().or_else(|| action.href.clone());
+
+    match action.kind {
+        ActionKind::Browse | ActionKind::ContextBrowse => {
+            if let Some(uri) = uri {
+                open_screen(backend, id, uri, true).await;
+            }
+        }
+
+        // The player handed over a complete request; sending it is the whole
+        // job. Its own long poll reports the result.
+        ActionKind::PlayerLink | ActionKind::Add => {
+            if let Some(uri) = uri
+                && let Err(e) = client.follow(&uri).await
+            {
+                tracing::warn!(%id, "{uri} failed: {e}");
+            }
+        }
+
+        // Not a path on the player: these are the official app's own routes.
+        // The library is the one that matters, and it has an equivalent that
+        // goes through the same browse endpoint as everything else.
+        ActionKind::DeepLink => match uri.as_deref() {
+            Some(route) if route.starts_with("/music-service/") => {
+                let service = route.trim_start_matches("/music-service/");
+                let uri =
+                    format!("/ui/BrowseObjects?service={service}&type=BrowseMenu&url=%2FBrowse");
+                open_screen(backend, id, uri, true).await;
+            }
+            Some(route) => tracing::debug!(%id, "no equivalent for the route {route}"),
+            None => {}
+        },
+
+        // Signing into a music service and the player's own settings pages are
+        // web pages. A controller can only point at them.
+        ActionKind::Webpage | ActionKind::Setting => {
+            if let Some(uri) = uri {
+                let url = client.image_url(&uri);
+                tracing::info!(%id, "opening {url} in a browser");
+                let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+            }
+        }
+
+        ActionKind::Reorder | ActionKind::Unknown => {
+            tracing::debug!(%id, "nothing to do for a {:?} action", action.kind);
+        }
+    }
+}
+
+/// Fetch the icons and cover art for the screen on show.
+async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
+    let urls: Vec<String> = {
+        let browsing = backend.browsing.lock().unwrap();
+        let Some(screen) = browsing.current() else {
+            return;
+        };
+        let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+            return;
+        };
+
+        let mut seen = std::collections::BTreeSet::new();
+        screen
+            .items()
+            .filter_map(|item| {
+                item.image
+                    .as_deref()
+                    .or(item.icon.as_deref())
+                    .filter(|src| !src.is_empty())
+            })
+            .map(|src| client.image_url(src))
+            .filter(|url| seen.insert(url.clone()))
+            .collect()
+    };
+
+    if urls.is_empty() {
+        return;
+    }
+
+    let mut fetches = tokio::task::JoinSet::new();
+    for url in urls {
+        let artwork = backend.artwork.clone();
+        fetches.spawn(async move {
+            artwork.get(&url, THUMB_SIZE).await;
+        });
+    }
+
+    let mut last_publish = Instant::now();
+    while fetches.join_next().await.is_some() {
+        if last_publish.elapsed() >= Duration::from_millis(150) {
+            backend.publish_browse();
+            last_publish = Instant::now();
+        }
+    }
+    backend.publish_browse();
 }
 
 /// Fetch the art for whatever the selected player is playing.
@@ -692,6 +1006,30 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     tokio::spawn(load_cover(backend.clone(), id));
                 }
 
+                // A screen carries the status values it was built against; when
+                // one of them moves the player is saying the drawing is out of
+                // date. Re-fetch in place rather than dropping the trail.
+                let stale = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    (browsing.device == Some(id))
+                        .then(|| browsing.trail.last())
+                        .flatten()
+                        .filter(|crumb| crumb.screen.is_stale(&status))
+                        .map(|crumb| crumb.uri.clone())
+                };
+                if let Some(uri) = stale {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        let popped = {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            browsing.trail.pop().is_some()
+                        };
+                        if popped {
+                            open_screen(backend, id, uri, true).await;
+                        }
+                    });
+                }
+
                 if backend.is_selected(id) {
                     if queue_replaced {
                         tokio::spawn(fetch_queue(backend.clone(), id));
@@ -752,6 +1090,14 @@ async fn run_commands(
                 // the network when this is a player whose queue is not held.
                 backend.publish_queue();
                 tokio::spawn(load_cover(backend.clone(), id));
+                // Warm the browser for this player, so the tab is not a wait.
+                let fresh = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.device != Some(id) || browsing.trail.is_empty()
+                };
+                if fresh {
+                    let _ = backend.commands.send(Command::BrowseHome);
+                }
                 if !already
                     || backend
                         .with_entry(id, |e| e.queue.is_none())
@@ -761,6 +1107,51 @@ async fn run_commands(
                 }
                 continue;
             }
+            Command::BrowseHome => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // Already showing this player's screens: leave the trail where
+                // the user left it rather than resetting to the root.
+                {
+                    let browsing = backend.browsing.lock().unwrap();
+                    if browsing.device == Some(id) && !browsing.trail.is_empty() {
+                        drop(browsing);
+                        backend.publish_browse();
+                        continue;
+                    }
+                }
+                // Sources is the root of everything the player offers: inputs
+                // on one row, music services on the next.
+                let uri = match backend.with_entry(id, |e| e.client.clone()) {
+                    Some(client) => client
+                        .ui_configuration()
+                        .await
+                        .ok()
+                        .and_then(|c| c.uri("sources").map(str::to_owned))
+                        .unwrap_or_else(|| "/ui/Sources".to_owned()),
+                    None => continue,
+                };
+                tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                continue;
+            }
+
+            Command::BrowseBack => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    if browsing.trail.len() > 1 {
+                        browsing.trail.pop();
+                    }
+                }
+                backend.publish_browse();
+                continue;
+            }
+
+            Command::BrowseActivate(index) => {
+                tokio::spawn(activate(backend.clone(), index));
+                continue;
+            }
+
             Command::Player(id, action) => (id, action),
         };
 

@@ -22,7 +22,9 @@ export global Theme {
     // Ink.
     out property <brush> text: dark ? #e9ebf0 : #14171d;
     out property <brush> dim: dark ? #98a1b2 : #5b6472;
-    out property <brush> faint: dark ? #69718200 : #8a919e00;
+    // Eight hex digits are RGBA here, not RGB: the trailing pair is alpha, and
+    // getting it wrong makes a colour invisible rather than merely wrong.
+    out property <brush> faint: dark ? #697182 : #8a919e;
 
     // Accent. Azzurro, which is the whole reason for the name.
     out property <brush> accent: dark ? #38bdf8 : #0284c7;

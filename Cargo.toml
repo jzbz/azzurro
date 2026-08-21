@@ -53,6 +53,10 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 lru = "0.18"
 dirs = "6"
+# Hands a URL to the desktop's own opener. Music-service sign-in and the
+# player's settings pages are web pages served by Lenbrook or by the player, and
+# a controller can only point at them.
+open = "5"
 
 # "serialize" turns on the serde deserializer, which is what reads /Status and
 # /SyncStatus. The server-driven `<screen>` documents are tree-shaped with

@@ -30,6 +30,9 @@ pub enum Error {
 
     #[error("{0} is not a host:port a player can live at")]
     BadDeviceId(String),
+
+    #[error("could not read a screen document: {0}")]
+    Screen(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

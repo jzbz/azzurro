@@ -18,3 +18,9 @@ socket2.workspace = true
 if-addrs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# Not a real dependency: this crate never opens a TLS connection. It is here so
+# the tests can install the provider that workspace feature unification makes
+# reqwest insist on. See the note on `Client::new`.
+[dev-dependencies]
+rustls.workspace = true

@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use crate::device::DeviceId;
 use crate::error::{Error, Result};
 use crate::queue::Queue;
+use crate::screen::{Configuration, Screen};
 use crate::status::{Status, SyncStatus};
 
 /// Ordinary requests are answered from memory, so this is generous already;
@@ -62,6 +63,22 @@ pub struct Client {
 }
 
 impl Client {
+    /// A client for one player.
+    ///
+    /// **Panics** if the `reqwest` in the build has a TLS backend enabled with
+    /// no crypto provider installed — reqwest panics rather than erroring when
+    /// its `rustls-no-provider` feature is on and nothing has called
+    /// `install_default`. This crate speaks plain HTTP and asks for no TLS
+    /// features itself, but Cargo unifies features across a build, so anything
+    /// else in the tree that wants https decides this for everyone. A binary in
+    /// that position should install a provider before the first client:
+    ///
+    /// ```no_run
+    /// let _ = rustls::crypto::ring::default_provider().install_default();
+    /// ```
+    ///
+    /// Use [`Client::with_http`] to supply a client built to your own taste
+    /// and side-step the question.
     pub fn new(id: DeviceId) -> Result<Self> {
         Ok(Self::with_http(id, reqwest::Client::builder().build()?))
     }
@@ -146,6 +163,35 @@ impl Client {
 
     pub async fn sync_status(&self) -> Result<SyncStatus> {
         self.get_xml("/SyncStatus", &[], REQUEST_TIMEOUT).await
+    }
+
+    /// Which screens this player offers.
+    ///
+    /// The starting point for browsing: everything else is reached by
+    /// following actions out of the screens named here.
+    pub async fn ui_configuration(&self) -> Result<Configuration> {
+        self.get_xml("/ui/Configuration", &[], REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Fetch and parse one server-driven screen.
+    ///
+    /// `path` comes from `/ui/Configuration` or from a `browse` action, and
+    /// already carries its own query string, so nothing is appended to it.
+    pub async fn screen(&self, path: &str) -> Result<Screen> {
+        let body = self.get_text(path, &[], REQUEST_TIMEOUT).await?;
+        crate::screen::parse(&body)
+    }
+
+    /// Send a path the player itself supplied, and discard the answer.
+    ///
+    /// This is how a `player-link` action is carried out: the screen document
+    /// gives a complete URL — `/Play?url=Capture%3Ahw%3A…` — and the client's
+    /// whole job is to fetch it. Deliberately generic, because the point of the
+    /// server-driven screens is that the client does not know what the player
+    /// will ask for next.
+    pub async fn follow(&self, path: &str) -> Result<()> {
+        self.get_text(path, &[], REQUEST_TIMEOUT).await.map(drop)
     }
 
     /// The whole play queue.
@@ -343,6 +389,11 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
+        // See the note on `Client::new`: another crate in this workspace wants
+        // https for cover art, and feature unification means reqwest here
+        // demands a provider too. Installing it repeatedly is harmless — the
+        // second call reports that one is already in place.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Client::new("192.0.2.155:11000".parse().unwrap()).unwrap()
     }
 

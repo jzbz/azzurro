@@ -152,10 +152,15 @@ is playing a URL directly rather than working through its queue: a radio stream,
 or `Capture:hw:...` for a physical input. Neither has a next track.
 
 That fallback is also the best available signal for "is this player working
-through its queue right now", which is how Azzurro uses it. It has been checked
-against an input and against a stream, but **not** against library playback — if
-a player turns out to set `streamUrl` while playing from its queue, this is the
-one inference in this document that would need revisiting.
+through its queue right now", which is how Azzurro uses it. **Confirmed on
+hardware**: a player working through its queue omits `<streamUrl>` entirely, and
+reports `canSeek` 1, a `totlen`, and separate `artist`/`album` fields that an
+input never has. The same player on HDMI ARC sets `streamUrl` to
+`Capture:hw:…`. So "no streamUrl" really does mean "playing the queue".
+
+Library playback also adds fields an input does not carry: `serviceName` and
+`serviceIcon` for display, `isFavourite`, `canMovePlayback`, `streamFormat`
+(`FLAC 24/44.1`), and `fn` for the file on disk.
 
 ### The play queue
 

@@ -161,6 +161,16 @@ pub struct Status {
     pub service: Option<String>,
     #[serde(rename = "serviceType")]
     pub service_type: Option<String>,
+    /// Display name and icon for the service, which the player supplies so a
+    /// client does not have to keep a table of them.
+    #[serde(rename = "serviceName")]
+    pub service_name: Option<String>,
+    #[serde(rename = "serviceIcon")]
+    pub service_icon: Option<String>,
+    /// Whether what is playing is already a favourite. Only present on the
+    /// services that have favourites.
+    #[serde(rename = "isFavourite")]
+    pub is_favourite: Option<u8>,
     #[serde(rename = "streamUrl")]
     pub stream_url: Option<String>,
     #[serde(rename = "streamFormat")]
@@ -313,6 +323,27 @@ impl Status {
 
     pub fn can_go_back(&self) -> bool {
         self.can("back")
+    }
+
+    /// Look a field up by the name the player uses for it in a screen's
+    /// `nowPlayingMatch` rule.
+    ///
+    /// The player names the field and the value it should hold, leaving the
+    /// client to compare them; this is the lookup half of that. Unknown keys
+    /// return `None`, which reads as "does not match" rather than as an error.
+    pub fn field(&self, key: &str) -> Option<String> {
+        match key {
+            "service" => self.service.clone(),
+            "serviceType" => self.service_type.clone(),
+            "inputId" => self.input_id.clone(),
+            "state" => self.state.clone(),
+            "streamUrl" => self.stream_url.clone(),
+            "song" => self.song.map(|v| v.to_string()),
+            "sid" => self.sid.map(|v| v.to_string()),
+            "pid" => self.pid.map(|v| v.to_string()),
+            "prid" => self.prid.map(|v| v.to_string()),
+            _ => None,
+        }
     }
 
     /// A single line for a notification or an MPRIS title.

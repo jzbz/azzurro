@@ -41,6 +41,18 @@ enum Command {
     Status {
         device: DeviceId,
     },
+    /// List the screens this player offers.
+    Screens {
+        device: DeviceId,
+    },
+    /// Render one server-driven screen, and show what each row leads to.
+    ///
+    /// With no path, starts at the Sources screen. Feed a printed `->` URI
+    /// back in to walk down the tree.
+    Browse {
+        device: DeviceId,
+        path: Option<String>,
+    },
     /// The play queue, with the playing track marked.
     Queue {
         device: DeviceId,
@@ -118,6 +130,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // reqwest is built with `rustls-no-provider` for the sake of the GUI's
+    // cover art, and panics on the first client unless something has chosen a
+    // backend. Nothing here speaks https, but the choice is per-process.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -133,6 +150,8 @@ async fn main() -> Result<()> {
         Command::Info { device } => info(device).await,
         Command::Status { device } => status(device).await,
         Command::Queue { device, limit } => queue(device, limit).await,
+        Command::Screens { device } => screens(device).await,
+        Command::Browse { device, path } => browse(device, path).await,
         Command::Watch { device, poll } => watch(device, poll).await,
         Command::Volume { device, level } => volume(device, level).await,
         Command::Mute { device, on } => client(device)?.set_mute(on).await.map_err(Into::into),
@@ -275,6 +294,105 @@ fn print_status(s: &bluos::Status) {
         if s.can_skip() { "skip" } else { "" }
     );
     println!("etag      {}", s.etag);
+}
+
+async fn screens(device: DeviceId) -> Result<()> {
+    let config = client(device)?.ui_configuration().await?;
+    for item in &config.items {
+        println!(
+            "{:<22} {}{}",
+            item.id,
+            item.uri,
+            item.result_type
+                .as_deref()
+                .map(|t| format!("  [{t}]"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+async fn browse(device: DeviceId, path: Option<String>) -> Result<()> {
+    let client = client(device)?;
+
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let config = client.ui_configuration().await?;
+            config
+                .uri("sources")
+                .or_else(|| config.uri("home"))
+                .unwrap_or("/ui/Sources")
+                .to_owned()
+        }
+    };
+
+    let screen = client.screen(&path).await?;
+    let status = client.status().await.ok();
+
+    println!("{}", screen.heading().unwrap_or("(untitled)"));
+    if let Some(service) = &screen.service {
+        println!("service: {service}");
+    }
+    for (key, value) in &screen.refresh_on {
+        println!("redraw when {key} = {value}");
+    }
+    for menu in &screen.menu_actions {
+        println!(
+            "menu: {} -> {}",
+            menu.text.as_deref().or(menu.kind.as_deref()).unwrap_or("?"),
+            target(menu.action.as_ref())
+        );
+    }
+
+    for section in &screen.sections {
+        println!();
+        println!(
+            "[{}{}]",
+            section.title.as_deref().unwrap_or("—"),
+            match section.kind {
+                bluos::screen::SectionKind::Row => " (row)",
+                bluos::screen::SectionKind::SelectorMenu => " (picker)",
+                bluos::screen::SectionKind::List => "",
+            }
+        );
+
+        for item in &section.items {
+            let playing = status.as_ref().is_some_and(|s| item.is_playing(s));
+            println!(
+                "  {} {:<38} {:<22} {}",
+                if playing { "\u{25b6}" } else { " " },
+                truncate(item.label().unwrap_or("—"), 38),
+                truncate(item.subtitle.as_deref().unwrap_or(""), 22),
+                target(item.action.as_ref()),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One line describing where an action leads, for the listing above.
+fn target(action: Option<&bluos::Action>) -> String {
+    use bluos::ActionKind::*;
+
+    let Some(action) = action else {
+        return String::new();
+    };
+    let where_to = action
+        .uri
+        .as_deref()
+        .or(action.href.as_deref())
+        .unwrap_or("");
+
+    match action.kind {
+        Browse | ContextBrowse => format!("-> {where_to}"),
+        PlayerLink => format!("play {where_to}"),
+        DeepLink => format!("(client route {where_to})"),
+        Webpage | Setting => format!("(browser {where_to})"),
+        Add => format!("add {where_to}"),
+        Reorder => "reorder".to_owned(),
+        Unknown => format!("(unknown action {where_to})"),
+    }
 }
 
 async fn queue(device: DeviceId, limit: Option<u32>) -> Result<()> {

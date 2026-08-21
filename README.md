@@ -7,9 +7,9 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 **Status: a working skeleton, and young.** Discovery, status, the long poll and
 the transport verbs are implemented and exercised against real hardware; the
 window lists the players it finds, shows the selected one's play queue with
-cover art, and drives both. Each player is exported over MPRIS so the desktop's
-own media controls work. Browsing and grouping are not written yet — see the
-roadmap.
+cover art, browses every source the player offers, and drives all of it. Each
+player is exported over MPRIS so the desktop's own media controls work. See the
+roadmap for what is still missing.
 
 ## Layout
 
@@ -57,6 +57,13 @@ different things are two things the desktop should be able to see and drive.
 Media keys, the GNOME shell menu, the KDE applet and a lock screen all reach a
 player through the same command channel the window's own buttons use.
 
+Browsing is server-driven. `/ui/Configuration` lists the screens a player
+offers, each one arrives as XML describing rows and items, and every `browse`
+action names the next document to fetch. The vocabulary is closed — about
+twenty-five elements and nine action types — so `crates/bluos/src/screen.rs`
+is a `match` rather than a general document renderer, and the app needs no
+knowledge of any particular music service.
+
 Cover art is the one place Slint costs more than a toolkit with a URL-loading
 image element: fetching, decoding, scaling and caching are all the app's job.
 That work is confined to `crates/azzurro-gui/src/artwork.rs` — an LRU of
@@ -73,11 +80,13 @@ client.
 and mute. Now playing with artwork, transport, seek, shuffle and repeat.
 Presets. The play queue, cover art and MPRIS are done; seek and presets are not.
 
-**v0.2 — browsing.** BluOS describes its own screens and menus in XML, and
-rendering those two grammars is what makes every music service work without
-per-service code. It is also the only route to editing the queue: removing and
-reordering tracks exist solely as the device's own context menus, not as plain
-endpoints. Then grouping, and saving a queue as a playlist.
+**v0.2 — browsing.** The engine is in: the player describes each screen as XML,
+`/ui/BrowseObjects` reaches every service through one code path, and a service
+this app has never heard of browses and plays without a line of code about it.
+Still to come on top of it: search, favourites, and the per-item context menus
+(add to queue, favourite, go to artist) — which are also the only route to
+editing the queue, since removing and reordering exist solely as the device's
+own menus. Then grouping and saving a queue as a playlist.
 
 **v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
 
