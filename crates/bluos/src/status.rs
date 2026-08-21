@@ -12,6 +12,8 @@
 
 use serde::Deserialize;
 
+use crate::device::DeviceId;
+
 /// `/SyncStatus` — the player itself, and its grouping.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncStatus {
@@ -20,6 +22,9 @@ pub struct SyncStatus {
     /// The player's own idea of its address, as `host:port`.
     #[serde(rename = "@id")]
     pub id: String,
+    /// Only present when `id` is a bare host rather than `host:port`.
+    #[serde(rename = "@port")]
+    pub port: Option<u16>,
     #[serde(rename = "@name")]
     pub name: String,
     /// Short model code, e.g. `N330`.
@@ -53,9 +58,9 @@ pub struct SyncStatus {
 
     /// Present when this player is a slave in a group: the master's address.
     ///
-    /// Not observed on the ungrouped player this crate was developed against —
-    /// the shape here follows the official controller. Absent fields decode as
-    /// `None` either way, so a wrong guess here is silent rather than fatal.
+    /// Shape confirmed against the official controller's own parser, which
+    /// reads the IP from the element's text and the port from an attribute.
+    /// Not exercised against hardware — only one player has been available.
     pub master: Option<Master>,
     /// Present when this player is a group master: one entry per slave.
     #[serde(default, rename = "slave")]
@@ -74,16 +79,81 @@ impl SyncStatus {
     pub fn is_grouped(&self) -> bool {
         self.master.is_some() || !self.slaves.is_empty()
     }
+
+    /// Whether this player is leading a group.
+    pub fn is_master(&self) -> bool {
+        !self.slaves.is_empty()
+    }
+
+    /// Whether this player is following another. A slave takes its transport
+    /// and its content from the master; only volume stays its own.
+    pub fn is_slave(&self) -> bool {
+        self.master.is_some()
+    }
+
+    /// Who this player is following, if anyone.
+    pub fn master_id(&self) -> Option<DeviceId> {
+        self.master.as_ref()?.device_id()
+    }
+
+    /// Everyone following this player.
+    pub fn slave_ids(&self) -> impl Iterator<Item = DeviceId> + '_ {
+        self.slaves.iter().filter_map(Slave::device_id)
+    }
+
+    /// The player's own idea of its address, corrected.
+    ///
+    /// Two wrinkles, both handled by the official controller and both
+    /// reproduced here: `id` is sometimes `host:port` and sometimes a bare host
+    /// with the port in its own attribute, and some players report `127.0.0.1`
+    /// — which is true from where they are standing and useless from here. In
+    /// that case the address it was actually reached on wins.
+    pub fn device_id(&self, reached_at: DeviceId) -> DeviceId {
+        let parsed = self.id.parse::<DeviceId>().ok().or_else(|| {
+            let host: std::net::IpAddr = self.id.parse().ok()?;
+            Some(DeviceId::new(
+                host,
+                self.port.unwrap_or(crate::DEFAULT_PORT),
+            ))
+        });
+
+        match parsed {
+            Some(id) if !id.host.is_loopback() => id,
+            _ => reached_at,
+        }
+    }
 }
 
+/// `<master port="11000" reconnecting="false">10.0.0.7</master>` — the address
+/// is the element's text, not an attribute.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Master {
     #[serde(rename = "@port")]
     pub port: Option<u16>,
+    /// True while the slave has lost its master and is trying to get it back.
+    /// Worth showing rather than pretending the group is healthy.
+    #[serde(rename = "@reconnecting")]
+    pub reconnecting: Option<bool>,
     #[serde(rename = "$text")]
     pub host: String,
 }
 
+impl Master {
+    pub fn device_id(&self) -> Option<DeviceId> {
+        let host: std::net::IpAddr = self.host.trim().parse().ok()?;
+        Some(DeviceId::new(
+            host,
+            self.port.unwrap_or(crate::DEFAULT_PORT),
+        ))
+    }
+
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnecting.unwrap_or(false)
+    }
+}
+
+/// `<slave id="10.0.0.9" port="11000"/>`. Note that `id` is a bare host here,
+/// unlike the `id` on `<SyncStatus>` itself, which may carry a port.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Slave {
     #[serde(rename = "@id")]
@@ -92,9 +162,22 @@ pub struct Slave {
     pub port: Option<u16>,
 }
 
+impl Slave {
+    pub fn device_id(&self) -> Option<DeviceId> {
+        let host: std::net::IpAddr = self.id.as_deref()?.trim().parse().ok()?;
+        Some(DeviceId::new(
+            host,
+            self.port.unwrap_or(crate::DEFAULT_PORT),
+        ))
+    }
+}
+
 /// Where this player can sit in a stereo or surround zone.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZoneOptions {
+    /// Whether more than one player can join the zone.
+    #[serde(rename = "@multi")]
+    pub multi: Option<bool>,
     #[serde(default, rename = "option")]
     pub options: Vec<ZoneOption>,
 }
@@ -410,6 +493,83 @@ mod tests {
         // Fields the player did not send stay absent rather than becoming "".
         assert_eq!(s.artist, None);
         assert_eq!(s.totlen, None);
+    }
+
+    /// A group master. Built from the shapes the official controller's own
+    /// parser reads — `<slave id port>` and `<master port reconnecting>ip` —
+    /// rather than captured, because only one player has been available. The
+    /// surrounding attributes are from a real capture.
+    const MASTER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<SyncStatus etag="109" syncStat="109" id="192.0.2.155:11000" volume="31" name="Powernode" model="N330" schemaVersion="34" mac="AA:BB:CC:DD:EE:FF"><slave id="192.0.2.9" port="11000"></slave><slave id="192.0.2.10" port="11000"></slave><zoneOptions multi="true"><option zoneMaster="true">front</option></zoneOptions></SyncStatus>"#;
+
+    /// A slave, and one that has lost its master.
+    const SLAVE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<SyncStatus etag="12" syncStat="12" id="192.0.2.9" port="11000" volume="20" name="Kitchen" model="N125" schemaVersion="34"><master port="11000" reconnecting="true">192.0.2.155</master></SyncStatus>"#;
+
+    #[test]
+    fn reads_a_group_from_the_master_side() {
+        let s: SyncStatus = quick_xml::de::from_str(MASTER).unwrap();
+
+        assert!(s.is_grouped());
+        assert!(s.is_master());
+        assert!(!s.is_slave());
+        assert_eq!(s.master_id(), None);
+
+        let slaves: Vec<_> = s.slave_ids().collect();
+        assert_eq!(slaves.len(), 2);
+        // `id` on a <slave> is a bare host, so the port comes from beside it.
+        assert_eq!(slaves[0].to_string(), "192.0.2.9:11000");
+        assert_eq!(slaves[1].to_string(), "192.0.2.10:11000");
+
+        assert_eq!(s.zone_options.unwrap().multi, Some(true));
+    }
+
+    #[test]
+    fn reads_a_group_from_the_slave_side() {
+        let s: SyncStatus = quick_xml::de::from_str(SLAVE).unwrap();
+
+        assert!(s.is_slave());
+        assert!(!s.is_master());
+        // The master's address is the element's text, not an attribute.
+        assert_eq!(
+            s.master_id().map(|m| m.to_string()).as_deref(),
+            Some("192.0.2.155:11000")
+        );
+        // ...and it is not currently reachable.
+        assert!(s.master.as_ref().unwrap().is_reconnecting());
+
+        // Here `id` is a bare host with the port beside it.
+        let reached_at = "192.0.2.9:11000".parse().unwrap();
+        assert_eq!(s.device_id(reached_at).to_string(), "192.0.2.9:11000");
+    }
+
+    #[test]
+    fn a_player_claiming_to_be_localhost_is_not_believed() {
+        // Some players report 127.0.0.1, which is true where they are standing
+        // and useless from here. The address it answered on wins.
+        let s: SyncStatus = quick_xml::de::from_str(
+            r#"<SyncStatus etag="1" id="127.0.0.1:11000" name="Odd" model="X"></SyncStatus>"#,
+        )
+        .unwrap();
+        let reached_at = "10.0.0.155:11000".parse().unwrap();
+        assert_eq!(s.device_id(reached_at), reached_at);
+
+        // A sensible address is taken at its word.
+        let ordinary: SyncStatus = quick_xml::de::from_str(
+            r#"<SyncStatus etag="1" id="10.0.0.7:11000" name="Fine" model="X"></SyncStatus>"#,
+        )
+        .unwrap();
+        assert_eq!(ordinary.device_id(reached_at).to_string(), "10.0.0.7:11000");
+    }
+
+    #[test]
+    fn an_ungrouped_player_is_neither_master_nor_slave() {
+        let s: SyncStatus = quick_xml::de::from_str(SYNC_STATUS).unwrap();
+        assert!(!s.is_grouped());
+        assert!(!s.is_master());
+        assert!(!s.is_slave());
+        assert_eq!(s.master_id(), None);
+        assert_eq!(s.slave_ids().count(), 0);
     }
 
     #[test]

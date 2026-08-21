@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bluos::{
-    ActionKind, Client, DeviceId, Discovery, Queue, Repeat, Screen, Status,
+    ActionKind, Client, DeviceId, Discovery, Queue, Repeat, Screen, Status, SyncStatus,
     discovery::DEFAULT_SWEEP,
 };
 
@@ -56,6 +56,8 @@ enum Command {
     Select(DeviceId),
     /// Do something to one player.
     Player(DeviceId, Action),
+    /// Put this player into the selected player's group, or take it out.
+    ToggleGroup(DeviceId),
     /// Show the browser's starting screen.
     BrowseHome,
     /// Follow row `n` of the screen currently shown.
@@ -131,6 +133,10 @@ struct Entry {
     /// Fetched on demand, and dropped when the player says the queue was
     /// replaced.
     queue: Option<Queue>,
+    /// The player as it describes itself, including who it is grouped with.
+    /// Re-read whenever `/Status` reports a new `syncStat`, which is the
+    /// player's way of saying its grouping changed.
+    sync: Option<SyncStatus>,
     /// The absolute URL of the art for whatever is playing, resolved against
     /// this player. Kept so that a status carrying the same art twice does not
     /// start the fetch again, and so a fetch that lands late can tell whether
@@ -299,6 +305,13 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
         let _ = tx.send(Command::BrowseSearch(query.to_string()));
     });
 
+    let tx = commands.clone();
+    ui.on_toggle_group(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::ToggleGroup(id));
+        }
+    });
+
     ui.on_rescan(move || {
         let _ = commands.send(Command::Rescan);
     });
@@ -403,6 +416,7 @@ impl Backend {
                     status: None,
                     status_at: None,
                     queue: None,
+                    sync: None,
                     cover_url: None,
                 },
             );
@@ -467,13 +481,56 @@ impl Backend {
     /// `VecModel` held across calls with `row_changed` on the one row that
     /// moved, so that a volume nudge does not re-upload every cover on screen.
     fn publish(&self) {
-        let rows: Vec<Device> = self
-            .registry
-            .lock()
-            .unwrap()
-            .values()
-            .map(|e| e.view.clone())
-            .collect();
+        // Selection first, then the registry: two locks, always in that order,
+        // everywhere.
+        let selected = *self.selected.lock().unwrap();
+
+        let rows: Vec<Device> = {
+            let guard = self.registry.lock().unwrap();
+
+            // A follower's row names its leader, so every row needs the others.
+            let names: BTreeMap<DeviceId, String> = guard
+                .iter()
+                .map(|(id, entry)| (*id, entry.view.name.to_string()))
+                .collect();
+
+            guard
+                .iter()
+                .map(|(id, entry)| {
+                    let mut view = entry.view.clone();
+                    let sync = entry.sync.as_ref();
+
+                    view.role = match sync {
+                        Some(sync) if sync.is_master() => {
+                            let n = sync.slaves.len();
+                            format!("Leading {n} player{}", if n == 1 { "" } else { "s" }).into()
+                        }
+                        Some(sync) if sync.is_slave() => {
+                            // A follower that has lost its leader is not
+                            // playing anything, and should not look as if it is.
+                            if sync.master.as_ref().is_some_and(|m| m.is_reconnecting()) {
+                                "Reconnecting…".into()
+                            } else {
+                                let master = sync.master_id();
+                                let who = master
+                                    .and_then(|m| names.get(&m).cloned())
+                                    .or_else(|| master.map(|m| m.host.to_string()))
+                                    .unwrap_or_default();
+                                format!("Following {who}").into()
+                            }
+                        }
+                        _ => Default::default(),
+                    };
+
+                    view.in_group =
+                        selected.is_some() && sync.and_then(|sync| sync.master_id()) == selected;
+                    // Grouping is something you do *to another* player, so the
+                    // selected row does not offer it against itself.
+                    view.groupable = selected.is_some_and(|sel| sel != *id);
+                    view
+                })
+                .collect()
+        };
 
         let line = match rows.len() {
             0 => "no players found yet".to_owned(),
@@ -916,6 +973,30 @@ async fn activate(backend: Backend, index: usize) {
     }
 }
 
+/// Read `/SyncStatus` and fold it into the player's row.
+///
+/// This is where grouping becomes visible: who is leading, who is following,
+/// and whether a follower has lost sight of its leader.
+async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<SyncStatus> {
+    let sync = client.sync_status().await.ok()?;
+
+    if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
+        entry.sync = Some(sync.clone());
+    }
+
+    let name = sync.name.clone();
+    let model = sync.display_model().to_owned();
+    backend.update(id, |view| {
+        view.name = name.as_str().into();
+        view.model = model.as_str().into();
+    });
+
+    // Every row's role can change when one player's grouping does — the leader
+    // gains a follower at the same moment the follower gains a leader.
+    backend.publish();
+    Some(sync)
+}
+
 /// Re-fetch the screen on show, keeping its place on the trail.
 async fn refresh_current(backend: Backend) {
     let Some((id, uri)) = ({
@@ -1087,13 +1168,8 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
     let mut name = backend
         .with_entry(id, |e| e.view.name.to_string())
         .unwrap_or_default();
-    if let Ok(sync) = client.sync_status().await {
+    if let Some(sync) = read_sync(&backend, id, &client).await {
         name = sync.name.clone();
-        let model = sync.display_model().to_owned();
-        backend.update(id, |view| {
-            view.name = sync.name.as_str().into();
-            view.model = model.as_str().into();
-        });
     }
 
     let mpris = mpris::Bridge::attach(
@@ -1146,6 +1222,23 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     view.now_playing = status.now_playing().unwrap_or_default().into();
                     view.service = status.service.clone().unwrap_or_default().into();
                 });
+
+                // `syncStat` mirrors /SyncStatus's own etag, so a change in it
+                // means the player's grouping moved — without a second request
+                // to find that out.
+                let regrouped = {
+                    let guard = backend.registry.lock().unwrap();
+                    guard.get(&id).is_some_and(|entry| {
+                        entry.sync.as_ref().map(|s| s.etag.as_str()) != status.sync_stat.as_deref()
+                    })
+                };
+                if regrouped {
+                    let backend = backend.clone();
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        read_sync(&backend, id, &client).await;
+                    });
+                }
 
                 // Resolved here rather than at draw time: the path is relative
                 // to *this* player unless the service handed back an absolute
@@ -1382,6 +1475,38 @@ async fn run_commands(
                 if let Some((id, uri)) = searched {
                     tokio::spawn(open_screen(backend.clone(), id, uri, true));
                 }
+                continue;
+            }
+
+            Command::ToggleGroup(target) => {
+                let Some(master) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                if master == target {
+                    continue;
+                }
+                let Some(client) = backend.with_entry(master, |e| e.client.clone()) else {
+                    continue;
+                };
+
+                // Both calls go to the master: it owns the group, and the
+                // slave only learns about it afterwards.
+                let joined = backend
+                    .with_entry(target, |e| {
+                        e.sync.as_ref().and_then(|s| s.master_id()) == Some(master)
+                    })
+                    .unwrap_or(false);
+
+                tokio::spawn(async move {
+                    let result = if joined {
+                        client.remove_slave(target).await
+                    } else {
+                        client.add_slave(target).await
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(%master, %target, "grouping failed: {e}");
+                    }
+                });
                 continue;
             }
 

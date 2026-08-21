@@ -231,6 +231,46 @@ condition for the button being lit.
 `/AddFavourite`, `/DeleteFavourite`, `/SetPreset`, `/AddToPlaylistOptions`,
 `/Action`, `/Delete`.
 
+### Grouping and zones
+
+**Shapes transcribed from the official controller's own parser; not exercised
+against hardware**, because only one player has ever been available here.
+
+BluOS has two distinct notions and they are easy to conflate:
+
+* **Groups** are ad-hoc multi-room sync. A master leads, slaves follow its
+  transport and content, and each keeps its own volume.
+* **Zones** are a persistent hardware pairing — a stereo pair, or a surround
+  set — described by `zoneMaster`, `zoneSlave`, `channelMode` and `channelName`,
+  and configured rather than assembled on the fly.
+
+Only groups are implemented. `/SyncStatus` reports them from both sides, and the
+two sides do not look alike:
+
+```xml
+<!-- on the master -->
+<slave id="10.0.0.9" port="11000"></slave>
+
+<!-- on the slave: the address is the element's TEXT, not an attribute -->
+<master port="11000" reconnecting="false">10.0.0.155</master>
+```
+
+Note that `id` on a `<slave>` is a bare host, whereas `id` on `<SyncStatus>`
+itself may be either `host:port` or a bare host with a separate `port`
+attribute. `reconnecting="true"` means the follower has lost its leader and is
+trying to get it back — worth showing rather than drawing a healthy group.
+
+Both `/AddSlave?slave=<host>&port=<port>` and `/RemoveSlave?…` are sent **to the
+master**: it owns the group, and the slave finds out afterwards.
+
+A player may report its own `id` as `127.0.0.1`, which is true where it is
+standing and useless from anywhere else. The official controller substitutes the
+address it actually reached the player on, and so does this crate.
+
+`syncStat` in `/Status` mirrors `/SyncStatus`'s own etag, so a controller
+already long-polling `/Status` learns that grouping changed without a second
+request.
+
 ### Artwork
 
 **Observed.** Art references come in two shapes in the same field, and a client

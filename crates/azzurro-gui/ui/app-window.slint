@@ -13,6 +13,12 @@ export struct Device {
     now-playing: string,
     service: string,
     reachable: bool,
+    // "Leading 2 players", "Following Kitchen", "Reconnecting…" or empty.
+    role: string,
+    // Whether this player is currently in the selected player's group.
+    in-group: bool,
+    // Whether grouping it with the selected player is even a question.
+    groupable: bool,
 }
 
 // One row of the play queue.
@@ -284,8 +290,9 @@ component DeviceRow inherits Rectangle {
     in property <bool> selected;
     callback picked();
     callback volume-changed(int);
+    callback toggle-group();
 
-    height: 74px;
+    height: root.device.role == "" ? 74px : 92px;
     border-radius: Theme.radius;
     background: root.selected
         ? Theme.selected
@@ -317,6 +324,25 @@ component DeviceRow inherits Rectangle {
                 font-size: Theme.small-size;
                 color: Theme.dim;
                 vertical-alignment: center;
+            }
+        }
+
+        if root.device.role != "" || root.device.groupable: HorizontalLayout {
+            spacing: Theme.gap;
+
+            Text {
+                text: root.device.role;
+                font-size: Theme.small-size;
+                color: Theme.accent;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if root.device.groupable: TextButton {
+                label: root.device.in-group ? "Ungroup" : "Group";
+                clicked => { root.toggle-group(); }
             }
         }
 
@@ -374,6 +400,7 @@ export component AppWindow inherits Window {
     callback back(string);
     callback set-volume(string, int);
     callback select(string);
+    callback toggle-group(string);
     callback play-track(string, int);
     callback browse-activate(int);
     callback browse-menu(int);
@@ -433,6 +460,7 @@ export component AppWindow inherits Window {
                                 root.select(device.id);
                             }
                             volume-changed(v) => { root.set-volume(device.id, v); }
+                            toggle-group => { root.toggle-group(device.id); }
                         }
                     }
                 }

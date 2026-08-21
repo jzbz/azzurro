@@ -86,8 +86,10 @@ this app has never heard of browses and plays without a line of code about it.
 Search, favourites, presets and the per-item context menus all ride on it: the
 picker lists whatever screens the player reports, and a row's `⋯` opens the
 menu the player describes for it — favourite, add to playlist, go to artist.
-Still to come: grouping and zones, seek scrubbing, shuffle and repeat controls,
-alarms and the sleep timer.
+Grouping is in but **untested against hardware** — only one player has been
+available, so the wire shapes come from the official controller's own parser
+rather than from a capture. Still to come: stereo and surround zones, seek
+scrubbing, shuffle and repeat controls, alarms and the sleep timer.
 
 **v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
 
