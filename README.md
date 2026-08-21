@@ -6,9 +6,10 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
 **Status: a working skeleton, and young.** Discovery, status, the long poll and
 the transport verbs are implemented and exercised against real hardware; the
-window lists the players it finds and drives them, and each one is exported
-over MPRIS so the desktop's own media controls work. Browsing, artwork and
-grouping are not written yet — see the roadmap.
+window lists the players it finds, shows the selected one's play queue, and
+drives both. Each player is exported over MPRIS so the desktop's own media
+controls work. Browsing, artwork and grouping are not written yet — see the
+roadmap.
 
 ## Layout
 
@@ -63,13 +64,14 @@ client.
 ## Roadmap
 
 **v0.1 — a daily driver.** Discovery and manual addressing. Per-player volume
-and mute. Now playing with artwork, transport, seek, shuffle and repeat. The
-play queue. Presets. MPRIS is done.
+and mute. Now playing with artwork, transport, seek, shuffle and repeat.
+Presets. The play queue and MPRIS are done; artwork, seek and presets are not.
 
 **v0.2 — browsing.** BluOS describes its own screens and menus in XML, and
 rendering those two grammars is what makes every music service work without
-per-service code. Then grouping, queue reordering, and saving a queue as a
-playlist.
+per-service code. It is also the only route to editing the queue: removing and
+reordering tracks exist solely as the device's own context menus, not as plain
+endpoints. Then grouping, and saving a queue as a playlist.
 
 **v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
 

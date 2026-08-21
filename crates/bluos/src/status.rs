@@ -188,6 +188,41 @@ pub struct Status {
     /// status poll without a second request.
     #[serde(rename = "syncStat")]
     pub sync_stat: Option<String>,
+
+    /// What the current source can actually do. See [`Status::can`].
+    pub actions: Option<Actions>,
+}
+
+/// The `<actions>` wrapper, which exists only to hold the list.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Actions {
+    #[serde(default, rename = "action")]
+    pub actions: Vec<Action>,
+}
+
+/// One thing the current source offers.
+///
+/// Beyond `skip` and `back` these cover the per-service extras: `love` and
+/// `ban` for thumbs up and down, `shop`, and skip/back variants carrying an
+/// `interval` for the fifteen-second nudges a podcast wants.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Action {
+    #[serde(rename = "@name")]
+    pub name: String,
+    /// Where to send the request. Its **absence is meaningful**: an action
+    /// listed without a URL is being declared unavailable, not merely
+    /// parameterless.
+    #[serde(rename = "@url")]
+    pub url: Option<String>,
+    /// For the toggles — `love` and `ban` — whether they are currently set.
+    /// Not an enabled flag.
+    #[serde(rename = "@state")]
+    pub state: Option<i32>,
+    /// Seconds, on the seek-by-a-bit variants of skip and back.
+    #[serde(rename = "@interval")]
+    pub interval: Option<i32>,
+    #[serde(rename = "@type")]
+    pub kind: Option<String>,
 }
 
 impl Status {
@@ -223,6 +258,61 @@ impl Status {
             .or(self.current_image.as_deref())
             .or(self.station_image.as_deref())
             .filter(|s| !s.is_empty())
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        self.actions.as_ref().map_or(&[], |a| a.actions.as_slice())
+    }
+
+    /// The named action, whether or not it is available.
+    pub fn action(&self, name: &str) -> Option<&Action> {
+        self.actions().iter().find(|a| a.name == name)
+    }
+
+    /// Whether the current source offers `name` — `skip`, `back`, `love`, and
+    /// so on.
+    ///
+    /// The rule is the official controller's, and it is not obvious. An action
+    /// counts as available only if it is listed *with a URL*; a listing without
+    /// one is a declaration that it is unavailable. When nothing matches, the
+    /// fallback is "anything that is not a stream can do it", because
+    /// `streamUrl` is set when the player is playing a URL directly rather
+    /// than working through its queue — a radio stream or a physical input,
+    /// neither of which has a next track.
+    ///
+    /// So a player on HDMI ARC lists `back` without a URL and sets `streamUrl`
+    /// to its capture device, and both branches say no.
+    pub fn can(&self, name: &str) -> bool {
+        if self
+            .actions()
+            .iter()
+            .any(|a| a.name == name && a.url.is_some())
+        {
+            return true;
+        }
+        self.is_queue_based()
+    }
+
+    /// Whether the player is working through its queue rather than playing a
+    /// URL or a physical input directly.
+    ///
+    /// `streamUrl` is the signal, and it is the same one the official
+    /// controller falls back on when deciding whether skip and back are live:
+    /// it is set for a radio stream (the stream's URL) and for an input
+    /// (`Capture:hw:...`), and those are exactly the sources with no next
+    /// track. Not directly confirmed for library playback — see
+    /// `docs/protocol.md` — but it is what the official client's own logic
+    /// implies.
+    pub fn is_queue_based(&self) -> bool {
+        self.stream_url.as_deref().unwrap_or_default().is_empty()
+    }
+
+    pub fn can_skip(&self) -> bool {
+        self.can("skip")
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.can("back")
     }
 
     /// A single line for a notification or an MPRIS title.
@@ -289,6 +379,46 @@ mod tests {
         // Fields the player did not send stay absent rather than becoming "".
         assert_eq!(s.artist, None);
         assert_eq!(s.totlen, None);
+    }
+
+    #[test]
+    fn an_input_can_neither_skip_nor_go_back() {
+        let s: Status = quick_xml::de::from_str(STATUS).unwrap();
+        // The player lists `back`, but without a URL, and sets streamUrl to its
+        // capture device. Both halves of the rule say no.
+        assert_eq!(s.actions().len(), 1);
+        assert_eq!(s.action("back").map(|a| a.name.as_str()), Some("back"));
+        assert!(s.action("back").unwrap().url.is_none());
+        assert!(!s.can_go_back());
+        assert!(!s.can_skip());
+    }
+
+    #[test]
+    fn a_queue_can_skip_and_a_listed_action_wins() {
+        // Playing from the queue: no streamUrl, so the fallback allows it.
+        let queued = Status {
+            stream_url: None,
+            ..Default::default()
+        };
+        assert!(queued.can_skip());
+        assert!(queued.can_go_back());
+
+        // A stream that explicitly offers skip with a URL can skip, despite
+        // having a streamUrl.
+        let stream = Status {
+            stream_url: Some("http://example.invalid/live".into()),
+            actions: Some(Actions {
+                actions: vec![Action {
+                    name: "skip".into(),
+                    url: Some("/Action?service=X&action=skip".into()),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(stream.can_skip());
+        // ...but nothing said it could go back.
+        assert!(!stream.can_go_back());
     }
 
     #[test]

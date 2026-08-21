@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 
 use crate::device::DeviceId;
 use crate::error::{Error, Result};
+use crate::queue::Queue;
 use crate::status::{Status, SyncStatus};
 
 /// Ordinary requests are answered from memory, so this is generous already;
@@ -145,6 +146,29 @@ impl Client {
 
     pub async fn sync_status(&self) -> Result<SyncStatus> {
         self.get_xml("/SyncStatus", &[], REQUEST_TIMEOUT).await
+    }
+
+    /// The whole play queue.
+    ///
+    /// One document however long the queue is. Worth re-reading whenever
+    /// [`Status::pid`] changes, which is the player saying the queue was
+    /// replaced.
+    pub async fn queue(&self) -> Result<Queue> {
+        self.get_xml("/Playlist", &[], REQUEST_TIMEOUT).await
+    }
+
+    /// A window onto the queue, by position, both ends included.
+    ///
+    /// For a queue long enough that pulling all of it to redraw a screenful
+    /// would be wasteful. `length` on the result is still the whole queue, not
+    /// the size of the window.
+    pub async fn queue_range(&self, start: u32, end: u32) -> Result<Queue> {
+        self.get_xml(
+            "/Playlist",
+            &[("start", &start.to_string()), ("end", &end.to_string())],
+            REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     /// A long-poll that yields a new [`Status`] whenever this player changes.

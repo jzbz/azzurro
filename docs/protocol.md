@@ -95,7 +95,8 @@ of its identity is `host:port`, which is what `/SyncStatus` reports as `id`.
 | `/Status` | Observed | What it is doing: transport state, volume, titles, artwork, service, queue position |
 | `/Volume` | Observed | Current volume, with `db`, `mute` and an etag of its own |
 | `/Presets` | Observed | Stored presets |
-| `/Playlists` | Observed | Saved playlists |
+| `/Playlist` | Observed | The play queue — see below. Note the singular |
+| `/Playlists` | Observed | Saved playlists. Note the plural |
 | `/Alarms` | Observed | Alarms |
 | `/Services` | Observed | The browse grammar — see below |
 | `/RadioBrowse` | Observed | TuneIn's menu, proxied through the player |
@@ -123,6 +124,80 @@ timeout so the player's deadline is always the one that fires.
 `/SyncStatus`'s etag also appears inside `/Status` as `syncStat`, so a change in
 grouping is visible from a status poll without a second request.
 
+### What the current source can do
+
+**Observed, and the rule transcribed.** `/Status` carries an `<actions>` list:
+
+```xml
+<actions><action name="back" state="0"></action></actions>
+```
+
+Beyond `skip` and `back` it covers the per-service extras — `love` and `ban` for
+thumbs up and down, `shop`, and skip/back variants carrying an `interval` for
+the fifteen-second nudges a podcast wants. `state` is the *toggle* state of
+`love` and `ban`, not an enabled flag.
+
+The rule the official controller uses to decide whether an action is live is not
+obvious, and reads:
+
+```js
+status.actions.some(a => a.name === wanted && a.url) ? true : !status.streamUrl
+```
+
+So an action counts only when it is listed **with a URL** — a listing without one
+is a declaration that it is *unavailable*, which is why the example above means
+"you cannot go back" rather than "back takes no parameters". When nothing
+matches, the fallback is `!streamUrl`, because `streamUrl` is set when the player
+is playing a URL directly rather than working through its queue: a radio stream,
+or `Capture:hw:...` for a physical input. Neither has a next track.
+
+That fallback is also the best available signal for "is this player working
+through its queue right now", which is how Azzurro uses it. It has been checked
+against an input and against a stream, but **not** against library playback — if
+a player turns out to set `streamUrl` while playing from its queue, this is the
+one inference in this document that would need revisiting.
+
+### The play queue
+
+**Observed.** Two endpoints describe the same thing, at different levels.
+
+`/Playlist` is the structured one, and the better base for a client:
+
+```xml
+<playlist length="42" id="692" shuffle="0" repeat="0">
+  <song service="LocalMusic" id="0">
+    <art>The Rolling Stones</art>          <!-- artist -->
+    <alb>Forty Licks CD2</alb>             <!-- album -->
+    <title>You Got Me Rocking</title>
+    <track>8</track>  <discno>2</discno>  <date>2002</date>
+    <time>214</time>                       <!-- seconds -->
+    <fn>/var/mnt/…/file.flac</fn>
+    <quality>cd</quality>
+    <image>/Artwork?service=LocalMusic&amp;artist=…</image>
+  </song>
+```
+
+The whole queue comes in one document. `start=` and `end=` take a window, both
+ends included — `?start=5&end=7` returns three songs. `length` is always the
+whole queue, not the size of the window. A song's `id` is its queue position and
+is what `/Play?id=` takes.
+
+`id` on the root is the queue's identity and matches `pid` in `/Status`; when it
+changes the player has replaced the queue. The device says as much itself, via
+`<refreshOnStatusChange key="pid" value="692"/>` on its own queue screen.
+
+`/ui/Queue` is the server-driven version: paginated twenty at a time via
+`?offset=`, durations pre-formatted as `3:58`, and each item carrying the
+device's own context menu plus a `<nowPlayingMatch key="song" value="0"/>`
+telling the client how to decide which row is playing. Its Save, Edit and Clear
+buttons and its per-item context menus (`/ui/queueItemCM?id=N`) are where
+removing and reordering live — there is no plain endpoint for either, so queue
+editing has to go through the server-driven UI.
+
+Note that the queue keeps its position while a player is on an input: `pid` and
+`song` both stay put. The right reading is "where playback would resume", not
+"what you are hearing".
+
 ### Changing state
 
 **Transcribed.** None of these were exercised against hardware.
@@ -145,11 +220,6 @@ anyone guesses and getting it backwards silently swaps "repeat everything" for
 "repeat nothing". The official controller renders `repeat === 0` as "Repeat
 All", `1` as "Repeat One" and `2` as "Off", and treats `repeat !== 2` as the
 condition for the button being lit.
-
-`/Status` also carries an `<actions>` list naming the transport actions the
-current source actually supports — the official controller reads it to decide
-whether skip and previous are live, and a `skip` action carries an `interval`
-for the seek-by-N-seconds buttons. Azzurro does not parse it yet.
 
 **Declared.** These appear in the request descriptions the player serves from
 `/Services`, with their parameters spelled out there: `/Add`, `/Info`,

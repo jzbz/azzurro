@@ -39,6 +39,8 @@ struct Announced {
     shuffle: bool,
     volume_percent: i32,
     can_seek: bool,
+    can_go_next: bool,
+    can_go_previous: bool,
     track: TrackKey,
     position_secs: i64,
 }
@@ -110,6 +112,8 @@ impl Bridge {
             shuffle: status.shuffle_on(),
             volume_percent: status.volume.unwrap_or(0),
             can_seek: status.seekable(),
+            can_go_next: status.can_skip(),
+            can_go_previous: status.can_go_back(),
             track: track_key(status, art.clone()),
             position_secs: status.secs.unwrap_or(0) as i64,
         };
@@ -182,6 +186,8 @@ fn diff(
                 Property::Shuffle(current.shuffle),
                 Property::Volume(volume(current.volume_percent)),
                 Property::CanSeek(current.can_seek),
+                Property::CanGoNext(current.can_go_next),
+                Property::CanGoPrevious(current.can_go_previous),
                 Property::Metadata(metadata()),
             ],
             None,
@@ -203,6 +209,12 @@ fn diff(
     }
     if previous.can_seek != current.can_seek {
         properties.push(Property::CanSeek(current.can_seek));
+    }
+    if previous.can_go_next != current.can_go_next {
+        properties.push(Property::CanGoNext(current.can_go_next));
+    }
+    if previous.can_go_previous != current.can_go_previous {
+        properties.push(Property::CanGoPrevious(current.can_go_previous));
     }
 
     let same_track = previous.track == current.track;
@@ -564,16 +576,18 @@ impl PlayerInterface for Exported {
         Ok(1.0)
     }
 
-    // BluOS accepts skip and back against every source; where they are
-    // meaningless — a physical input — it ignores them rather than erroring.
-    // `/Status` carries an `<actions>` list that says which are live, and
-    // reading it would let these two be honest.
+    // Both read the `<actions>` list the player publishes, so a desktop widget
+    // greys out the buttons on a source that has no next track — an HDMI input
+    // or a live stream — instead of offering them and doing nothing.
     async fn can_go_next(&self) -> fdo::Result<bool> {
-        Ok(true)
+        Ok(self.snapshot().map(|(s, _)| s.can_skip()).unwrap_or(false))
     }
 
     async fn can_go_previous(&self) -> fdo::Result<bool> {
-        Ok(true)
+        Ok(self
+            .snapshot()
+            .map(|(s, _)| s.can_go_back())
+            .unwrap_or(false))
     }
 
     async fn can_play(&self) -> fdo::Result<bool> {

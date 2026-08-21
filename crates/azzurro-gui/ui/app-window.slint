@@ -15,6 +15,18 @@ export struct Device {
     reachable: bool,
 }
 
+// One row of the play queue.
+export struct Track {
+    id: int,
+    title: string,
+    artist: string,
+    duration: string,
+    // Where the player sits in the queue.
+    cursor: bool,
+    // ...and whether that position is what you are actually hearing.
+    live: bool,
+}
+
 component TextButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
@@ -42,6 +54,63 @@ component TextButton inherits Rectangle {
     touch := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+component TrackRow inherits Rectangle {
+    in property <Track> track;
+    callback play();
+
+    height: 46px;
+    border-radius: 6px;
+    background: touch.has-hover
+        ? Theme.hover
+        : (root.track.cursor ? Theme.selected : transparent);
+
+    touch := TouchArea {
+        clicked => { root.play(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        Text {
+            // Playing, versus merely where playback would resume.
+            text: root.track.cursor ? (root.track.live ? "▶" : "◇") : "";
+            font-size: Theme.small-size;
+            color: root.track.live ? Theme.accent : Theme.dim;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            width: 14px;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+
+            Text {
+                text: root.track.title;
+                font-size: Theme.body-size;
+                color: Theme.text;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.track.artist;
+                font-size: Theme.small-size;
+                color: Theme.dim;
+                overflow: elide;
+            }
+        }
+
+        Text {
+            text: root.track.duration;
+            font-size: Theme.small-size;
+            color: Theme.dim;
+            vertical-alignment: center;
+        }
     }
 }
 
@@ -120,6 +189,8 @@ component DeviceRow inherits Rectangle {
 
 export component AppWindow inherits Window {
     in property <[Device]> devices;
+    in property <[Track]> queue;
+    in property <string> queue-line: "";
     in property <string> status-line: "starting";
     in-out property <int> selected: 0;
 
@@ -127,12 +198,14 @@ export component AppWindow inherits Window {
     callback skip(string);
     callback back(string);
     callback set-volume(string, int);
+    callback select(string);
+    callback play-track(string, int);
     callback rescan();
 
     title: "Azzurro";
-    preferred-width: 880px;
+    preferred-width: 1060px;
     preferred-height: 560px;
-    min-width: 520px;
+    min-width: 720px;
     min-height: 380px;
     background: Theme.bg;
 
@@ -173,7 +246,10 @@ export component AppWindow inherits Window {
                         for device[i] in root.devices: DeviceRow {
                             device: device;
                             selected: i == root.selected;
-                            picked => { root.selected = i; }
+                            picked => {
+                                root.selected = i;
+                                root.select(device.id);
+                            }
                             volume-changed(v) => { root.set-volume(device.id, v); }
                         }
                     }
@@ -250,6 +326,34 @@ export component AppWindow inherits Window {
                             label: "Next";
                             enabled: root.has-selection;
                             clicked => { root.skip(root.current.id); }
+                        }
+                    }
+                }
+            }
+
+            // Queue.
+            Rectangle {
+                width: 320px;
+                background: Theme.surface;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.gap;
+                    spacing: Theme.gap;
+
+                    Text {
+                        text: root.queue-line == "" ? "Queue" : root.queue-line;
+                        font-size: Theme.small-size;
+                        font-weight: 600;
+                        color: Theme.dim;
+                    }
+
+                    ListView {
+                        for track in root.queue: TrackRow {
+                            track: track;
+                            play => { root.play-track(root.current.id, track.id); }
                         }
                     }
                 }

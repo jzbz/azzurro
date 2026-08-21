@@ -41,6 +41,13 @@ enum Command {
     Status {
         device: DeviceId,
     },
+    /// The play queue, with the playing track marked.
+    Queue {
+        device: DeviceId,
+        /// Show only the first N tracks.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// Print a line every time a player changes, until interrupted.
     Watch {
         device: DeviceId,
@@ -125,6 +132,7 @@ async fn main() -> Result<()> {
         Command::Discover { seconds } => discover(seconds).await,
         Command::Info { device } => info(device).await,
         Command::Status { device } => status(device).await,
+        Command::Queue { device, limit } => queue(device, limit).await,
         Command::Watch { device, poll } => watch(device, poll).await,
         Command::Volume { device, level } => volume(device, level).await,
         Command::Mute { device, on } => client(device)?.set_mute(on).await.map_err(Into::into),
@@ -261,7 +269,66 @@ fn print_status(s: &bluos::Status) {
     if let Some(art) = s.artwork() {
         println!("artwork   {art}");
     }
+    println!(
+        "can       {}{}",
+        if s.can_go_back() { "back " } else { "" },
+        if s.can_skip() { "skip" } else { "" }
+    );
     println!("etag      {}", s.etag);
+}
+
+async fn queue(device: DeviceId, limit: Option<u32>) -> Result<()> {
+    let client = client(device)?;
+    // Both in one go: the status is what says which row is playing, and
+    // whether this queue is the thing playing at all.
+    let (queue, status) = tokio::try_join!(
+        async {
+            match limit {
+                Some(n) if n > 0 => client.queue_range(0, n - 1).await,
+                _ => client.queue().await,
+            }
+        },
+        client.status()
+    )?;
+
+    let cursor = queue.cursor(&status);
+    let live = queue.is_playing_from(&status);
+    println!("{} tracks in queue {}", queue.length, queue.id.unwrap_or(0));
+    if cursor.is_some() && !live {
+        println!(
+            "(playing {}, not the queue \u{2014} \u{25c7} marks where it would resume)",
+            status.service.as_deref().unwrap_or("something else")
+        );
+    }
+
+    for song in &queue.songs {
+        println!(
+            "{} {:>4}  {:<44}  {:<26}  {:>7}  {}",
+            match (Some(song.id) == cursor, live) {
+                (true, true) => "\u{25b6}",
+                (true, false) => "\u{25c7}",
+                _ => " ",
+            },
+            song.id,
+            truncate(song.title.as_deref().unwrap_or("—"), 44),
+            truncate(song.artist.as_deref().unwrap_or(""), 26),
+            song.duration().unwrap_or_default(),
+            song.quality.as_deref().unwrap_or(""),
+        );
+    }
+
+    if queue.songs.len() as u32 != queue.length {
+        println!("... {} not shown", queue.length - queue.songs.len() as u32);
+    }
+    Ok(())
+}
+
+/// Cut on a character boundary, not a byte one.
+fn truncate(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_owned();
+    }
+    s.chars().take(width.saturating_sub(1)).collect::<String>() + "\u{2026}"
 }
 
 async fn volume(device: DeviceId, level: Option<i32>) -> Result<()> {

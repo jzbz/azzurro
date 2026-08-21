@@ -18,17 +18,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bluos::{Client, DeviceId, Discovery, Repeat, Status, discovery::DEFAULT_SWEEP};
+use bluos::{Client, DeviceId, Discovery, Queue, Repeat, Status, discovery::DEFAULT_SWEEP};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 
 slint::include_modules!();
+
+/// How much of a queue to pull for the window.
+///
+/// Long enough that no ordinary queue is truncated, short enough that pointing
+/// the app at a player holding somebody's entire library does not drag a
+/// megabyte of XML across the network on every selection. The header says when
+/// the view is a window rather than the whole thing.
+const QUEUE_WINDOW: u32 = 500;
 
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
     /// Broadcast for players again.
     Rescan,
+    /// Show this player's queue. The window's selection is the backend's cue
+    /// to fetch one, since fetching every player's queue would be waste.
+    Select(DeviceId),
     /// Do something to one player.
     Player(DeviceId, Action),
 }
@@ -45,6 +56,8 @@ enum Action {
     Previous,
     /// Absolute position, in seconds.
     Seek(u32),
+    /// Jump to a position in the play queue.
+    PlayQueueIndex(u32),
     /// 0 to 100.
     Volume(i32),
     Shuffle(bool),
@@ -54,16 +67,30 @@ enum Action {
 /// One player as the backend tracks it.
 struct Entry {
     client: Client,
-    /// What the window shows.
+    /// What the window shows in the player list.
     view: Device,
-    /// The last status the poller received, which is more than the window
-    /// needs but exactly what MPRIS asks for.
+    /// The last status the poller received, which is more than the list needs
+    /// but exactly what MPRIS and the queue view ask for.
     status: Option<Status>,
     /// When that status arrived, so a position can be extrapolated from it.
     status_at: Option<Instant>,
+    /// Fetched on demand, and dropped when the player says the queue was
+    /// replaced.
+    queue: Option<Queue>,
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
+
+/// Everything the background tasks share. Cheap to clone; all of it is behind
+/// an `Arc` already.
+#[derive(Clone)]
+struct Backend {
+    registry: Registry,
+    /// Whose queue the window is showing.
+    selected: Arc<Mutex<Option<DeviceId>>>,
+    commands: mpsc::UnboundedSender<Command>,
+    ui: slint::Weak<AppWindow>,
+}
 
 /// Distinguishes the several MPRIS bus names one process claims.
 static NEXT_MPRIS_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -95,7 +122,7 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let (commands, command_rx) = mpsc::unbounded_channel();
-    runtime.spawn(backend(ui.as_weak(), command_rx, commands.clone()));
+    runtime.spawn(run(ui.as_weak(), command_rx, commands.clone()));
 
     wire(&ui, commands);
     ui.run()?;
@@ -130,12 +157,24 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_set_volume(move |id, level| dispatch(&tx, &id, Action::Volume(level)));
 
+    let tx = commands.clone();
+    ui.on_play_track(move |id, index| {
+        dispatch(&tx, &id, Action::PlayQueueIndex(index.max(0) as u32))
+    });
+
+    let tx = commands.clone();
+    ui.on_select(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::Select(id));
+        }
+    });
+
     ui.on_rescan(move || {
         let _ = commands.send(Command::Rescan);
     });
 }
 
-async fn backend(
+async fn run(
     ui: slint::Weak<AppWindow>,
     command_rx: mpsc::UnboundedReceiver<Command>,
     commands: mpsc::UnboundedSender<Command>,
@@ -157,14 +196,14 @@ async fn backend(
         }
     };
 
-    let registry: Registry = Arc::new(Mutex::new(BTreeMap::new()));
+    let backend = Backend {
+        registry: Arc::new(Mutex::new(BTreeMap::new())),
+        selected: Arc::new(Mutex::new(None)),
+        commands,
+        ui: ui.clone(),
+    };
 
-    tokio::spawn(run_commands(
-        command_rx,
-        registry.clone(),
-        discovery.clone(),
-        ui.clone(),
-    ));
+    tokio::spawn(run_commands(command_rx, backend.clone(), discovery.clone()));
 
     say(
         &ui,
@@ -184,7 +223,7 @@ async fn backend(
     // player switched on an hour later still appears.
     if let Ok(found) = discovery.sweep(DEFAULT_SWEEP).await {
         for announce in found {
-            adopt(&announce, &http, &registry, &ui, &commands);
+            backend.adopt(&announce, &http);
         }
     }
 
@@ -192,7 +231,7 @@ async fn backend(
         match discovery.recv().await {
             Ok(announces) => {
                 for announce in announces {
-                    adopt(&announce, &http, &registry, &ui, &commands);
+                    backend.adopt(&announce, &http);
                 }
             }
             Err(e) => {
@@ -203,81 +242,242 @@ async fn backend(
     }
 }
 
-/// Start tracking a player, unless it is already tracked.
-fn adopt(
-    announce: &bluos::Announce,
-    http: &reqwest::Client,
-    registry: &Registry,
-    ui: &slint::Weak<AppWindow>,
-    commands: &mpsc::UnboundedSender<Command>,
-) {
-    let Some(player) = announce.player() else {
-        return;
-    };
-    let id = DeviceId::new(announce.address, player.port());
-
-    {
-        let mut guard = registry.lock().unwrap();
-        if guard.contains_key(&id) {
+impl Backend {
+    /// Start tracking a player, unless it is already tracked.
+    fn adopt(&self, announce: &bluos::Announce, http: &reqwest::Client) {
+        let Some(player) = announce.player() else {
             return;
-        }
-        // Seed the row from the announcement so the player appears immediately,
-        // named, before the first HTTP round trip has finished.
-        guard.insert(
-            id,
-            Entry {
-                client: Client::with_http(id, http.clone()),
-                view: Device {
-                    id: id.to_string().into(),
-                    name: player.get("name").unwrap_or("BluOS player").into(),
-                    model: player.get("model").unwrap_or_default().into(),
-                    reachable: true,
-                    ..Default::default()
+        };
+        let id = DeviceId::new(announce.address, player.port());
+
+        {
+            let mut guard = self.registry.lock().unwrap();
+            if guard.contains_key(&id) {
+                return;
+            }
+            // Seed the row from the announcement so the player appears
+            // immediately, named, before the first HTTP round trip finishes.
+            guard.insert(
+                id,
+                Entry {
+                    client: Client::with_http(id, http.clone()),
+                    view: Device {
+                        id: id.to_string().into(),
+                        name: player.get("name").unwrap_or("BluOS player").into(),
+                        model: player.get("model").unwrap_or_default().into(),
+                        reachable: true,
+                        ..Default::default()
+                    },
+                    status: None,
+                    status_at: None,
+                    queue: None,
                 },
-                status: None,
-                status_at: None,
-            },
-        );
+            );
+        }
+
+        // The window starts with the first row selected, so the backend has to
+        // agree with it or the queue panel stays empty until something is
+        // clicked.
+        let first = {
+            let mut selected = self.selected.lock().unwrap();
+            if selected.is_none() {
+                *selected = Some(id);
+                true
+            } else {
+                false
+            }
+        };
+
+        tracing::info!(%id, "adopted a player");
+        self.publish();
+        if first {
+            tokio::spawn(fetch_queue(self.clone(), id));
+        }
+        tokio::spawn(follow(
+            self.clone(),
+            id,
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
     }
 
-    tracing::info!(%id, "adopted a player");
-    publish(registry, ui);
-    tokio::spawn(follow(
-        id,
-        registry.clone(),
-        ui.clone(),
-        commands.clone(),
-        NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
-    ));
+    fn with_entry<T>(&self, id: DeviceId, f: impl FnOnce(&Entry) -> T) -> Option<T> {
+        self.registry.lock().unwrap().get(&id).map(f)
+    }
+
+    fn is_selected(&self, id: DeviceId) -> bool {
+        *self.selected.lock().unwrap() == Some(id)
+    }
+
+    /// Edit one player's row and push the result to the window.
+    fn update(&self, id: DeviceId, f: impl FnOnce(&mut Device)) {
+        {
+            let mut guard = self.registry.lock().unwrap();
+            let Some(entry) = guard.get_mut(&id) else {
+                return;
+            };
+            let before = entry.view.clone();
+            f(&mut entry.view);
+            if entry.view == before {
+                return;
+            }
+        }
+        self.publish();
+    }
+
+    /// Replace the window's device model wholesale.
+    ///
+    /// Fine while a row is a dozen scalars and a household has a handful of
+    /// players. Once rows carry decoded artwork this wants to become a
+    /// `VecModel` held across calls with `row_changed` on the one row that
+    /// moved, so that a volume nudge does not re-upload every cover on screen.
+    fn publish(&self) {
+        let rows: Vec<Device> = self
+            .registry
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.view.clone())
+            .collect();
+
+        let line = match rows.len() {
+            0 => "no players found yet".to_owned(),
+            1 => "1 player".to_owned(),
+            n => format!("{n} players"),
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+
+            // Keep the selection on the same player rather than the same
+            // index: a player appearing above the selected one would otherwise
+            // silently move the selection to its neighbour.
+            let selected_id = ui
+                .get_devices()
+                .row_data(ui.get_selected() as usize)
+                .map(|d| d.id);
+            let restored = selected_id
+                .and_then(|id| rows.iter().position(|d| d.id == id))
+                .unwrap_or(0);
+
+            ui.set_devices(ModelRc::new(VecModel::from(rows)));
+            ui.set_selected(restored as i32);
+            ui.set_status_line(line.into());
+        });
+    }
+
+    /// Push the selected player's queue to the window.
+    fn publish_queue(&self) {
+        // Read the selection out before taking the registry lock, so the two
+        // are never held at once and there is no order to get wrong.
+        let selected = *self.selected.lock().unwrap();
+
+        let (rows, line) = {
+            let guard = self.registry.lock().unwrap();
+            match selected.and_then(|id| guard.get(&id)).and_then(|entry| {
+                entry
+                    .queue
+                    .as_ref()
+                    .map(|queue| (queue, entry.status.clone()))
+            }) {
+                Some((queue, status)) => {
+                    let status = status.unwrap_or_default();
+                    let cursor = queue.cursor(&status);
+                    // The cursor is where playback would resume; it is only a
+                    // now-playing marker if the queue is what is playing.
+                    let live = queue.is_playing_from(&status) && status.is_playing();
+
+                    let rows: Vec<Track> = queue
+                        .songs
+                        .iter()
+                        .map(|song| {
+                            let at_cursor = Some(song.id) == cursor;
+                            Track {
+                                id: song.id as i32,
+                                title: song.title.clone().unwrap_or_default().into(),
+                                artist: song.artist.clone().unwrap_or_default().into(),
+                                duration: song.duration().unwrap_or_default().into(),
+                                cursor: at_cursor,
+                                live: at_cursor && live,
+                            }
+                        })
+                        .collect();
+
+                    let shown = rows.len() as u32;
+                    let line = if shown == queue.length {
+                        format!("Queue · {shown} tracks")
+                    } else {
+                        format!("Queue · {shown} of {} tracks", queue.length)
+                    };
+                    (rows, line)
+                }
+                None => (Vec::new(), "Queue".to_owned()),
+            }
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_queue(ModelRc::new(VecModel::from(rows)));
+                ui.set_queue_line(line.into());
+            }
+        });
+    }
 }
 
-/// Keep one player's row, and its MPRIS object, current for as long as the app
-/// runs.
-async fn follow(
-    id: DeviceId,
-    registry: Registry,
-    ui: slint::Weak<AppWindow>,
-    commands: mpsc::UnboundedSender<Command>,
-    mpris_index: usize,
-) {
-    let Some(client) = with_entry(&registry, id, |e| e.client.clone()) else {
+/// Read the selected player's queue and show it.
+async fn fetch_queue(backend: Backend, id: DeviceId) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+
+    match client.queue_range(0, QUEUE_WINDOW - 1).await {
+        Ok(queue) => {
+            tracing::debug!(
+                %id,
+                tracks = queue.songs.len(),
+                total = queue.length,
+                "read the queue"
+            );
+            if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
+                entry.queue = Some(queue);
+            }
+            backend.publish_queue();
+        }
+        Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
+    }
+}
+
+/// Keep one player's row, its queue and its MPRIS object current for as long as
+/// the app runs.
+async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
 
     // The announcement already gave a name; /SyncStatus gives the authoritative
     // one, and MPRIS wants it before the bus name is claimed so the desktop
     // never shows a placeholder.
-    let mut name = with_entry(&registry, id, |e| e.view.name.to_string()).unwrap_or_default();
+    let mut name = backend
+        .with_entry(id, |e| e.view.name.to_string())
+        .unwrap_or_default();
     if let Ok(sync) = client.sync_status().await {
         name = sync.name.clone();
         let model = sync.display_model().to_owned();
-        update(&registry, id, &ui, |view| {
+        backend.update(id, |view| {
             view.name = sync.name.as_str().into();
             view.model = model.as_str().into();
         });
     }
 
-    let mpris = mpris::Bridge::attach(mpris_index, id, name, registry.clone(), commands).await;
+    let mpris = mpris::Bridge::attach(
+        mpris_index,
+        id,
+        name,
+        backend.registry.clone(),
+        backend.commands.clone(),
+    )
+    .await;
 
     let mut watch = client.watch();
     let mut backoff = Duration::from_secs(1);
@@ -287,15 +487,32 @@ async fn follow(
             Ok(status) => {
                 backoff = Duration::from_secs(1);
 
-                {
-                    let mut guard = registry.lock().unwrap();
-                    if let Some(entry) = guard.get_mut(&id) {
-                        entry.status = Some(status.clone());
-                        entry.status_at = Some(Instant::now());
+                // `pid` is the queue's identity. When it changes the player has
+                // replaced the queue, which is the cue the device itself gives
+                // through `refreshOnStatusChange` on its queue screen.
+                //
+                // The first status of all is not a replacement, however
+                // different it looks from the nothing that preceded it —
+                // treating it as one would throw away the queue the adoption
+                // just fetched and fetch it again.
+                let queue_replaced = {
+                    let mut guard = backend.registry.lock().unwrap();
+                    let Some(entry) = guard.get_mut(&id) else {
+                        return;
+                    };
+                    let replaced = match &entry.status {
+                        Some(previous) => previous.pid != status.pid,
+                        None => false,
+                    };
+                    if replaced {
+                        entry.queue = None;
                     }
-                }
+                    entry.status = Some(status.clone());
+                    entry.status_at = Some(Instant::now());
+                    replaced
+                };
 
-                update(&registry, id, &ui, |view| {
+                backend.update(id, |view| {
                     view.reachable = true;
                     view.playing = status.is_playing();
                     view.muted = status.is_muted();
@@ -304,13 +521,23 @@ async fn follow(
                     view.service = status.service.clone().unwrap_or_default().into();
                 });
 
+                if backend.is_selected(id) {
+                    if queue_replaced {
+                        tokio::spawn(fetch_queue(backend.clone(), id));
+                    } else {
+                        // Same queue, but the cursor may have moved to the next
+                        // track.
+                        backend.publish_queue();
+                    }
+                }
+
                 if let Some(bridge) = &mpris {
                     bridge.publish(&status).await;
                 }
             }
             Err(e) => {
                 tracing::debug!(%id, "poll failed, retrying in {backoff:?}: {e}");
-                update(&registry, id, &ui, |view| view.reachable = false);
+                backend.update(id, |view| view.reachable = false);
 
                 // The last known track stays on the bus — a blip should not
                 // wipe the desktop's media widget — but it stops claiming to
@@ -333,21 +560,39 @@ async fn follow(
 
 async fn run_commands(
     mut commands: mpsc::UnboundedReceiver<Command>,
-    registry: Registry,
+    backend: Backend,
     discovery: Arc<Discovery>,
-    ui: slint::Weak<AppWindow>,
 ) {
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
             Command::Rescan => {
-                say(&ui, "rescanning");
+                say(&backend.ui, "rescanning");
                 let _ = discovery.query().await;
+                continue;
+            }
+            Command::Select(id) => {
+                let already = {
+                    let mut selected = backend.selected.lock().unwrap();
+                    let already = *selected == Some(id);
+                    *selected = Some(id);
+                    already
+                };
+                // Show whatever is already known straight away, and only go to
+                // the network when this is a player whose queue is not held.
+                backend.publish_queue();
+                if !already
+                    || backend
+                        .with_entry(id, |e| e.queue.is_none())
+                        .unwrap_or(false)
+                {
+                    tokio::spawn(fetch_queue(backend.clone(), id));
+                }
                 continue;
             }
             Command::Player(id, action) => (id, action),
         };
 
-        let Some(client) = with_entry(&registry, id, |e| e.client.clone()) else {
+        let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
             continue;
         };
 
@@ -363,6 +608,7 @@ async fn run_commands(
                 Action::Next => client.skip().await,
                 Action::Previous => client.back().await,
                 Action::Seek(secs) => client.seek(secs).await,
+                Action::PlayQueueIndex(index) => client.play_queue_index(index).await,
                 Action::Volume(level) => client.set_volume(level).await,
                 Action::Shuffle(on) => client.set_shuffle(on).await,
                 Action::Repeat(mode) => client.set_repeat(mode).await,
@@ -372,72 +618,6 @@ async fn run_commands(
             }
         });
     }
-}
-
-fn with_entry<T>(registry: &Registry, id: DeviceId, f: impl FnOnce(&Entry) -> T) -> Option<T> {
-    registry.lock().unwrap().get(&id).map(f)
-}
-
-/// Edit one player's row and push the result to the window.
-fn update(
-    registry: &Registry,
-    id: DeviceId,
-    ui: &slint::Weak<AppWindow>,
-    f: impl FnOnce(&mut Device),
-) {
-    {
-        let mut guard = registry.lock().unwrap();
-        let Some(entry) = guard.get_mut(&id) else {
-            return;
-        };
-        let before = entry.view.clone();
-        f(&mut entry.view);
-        if entry.view == before {
-            return;
-        }
-    }
-    publish(registry, ui);
-}
-
-/// Replace the window's device model wholesale.
-///
-/// Fine while a row is a dozen scalars and a household has a handful of
-/// players. Once rows carry decoded artwork this wants to become a `VecModel`
-/// held across calls with `row_changed` on the one row that moved, so that a
-/// volume nudge does not re-upload every cover on screen.
-fn publish(registry: &Registry, ui: &slint::Weak<AppWindow>) {
-    let rows: Vec<Device> = registry
-        .lock()
-        .unwrap()
-        .values()
-        .map(|e| e.view.clone())
-        .collect();
-
-    let line = match rows.len() {
-        0 => "no players found yet".to_owned(),
-        1 => "1 player".to_owned(),
-        n => format!("{n} players"),
-    };
-
-    let ui = ui.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = ui.upgrade() else { return };
-
-        // Keep the selection on the same player rather than the same index:
-        // a player appearing above the selected one would otherwise silently
-        // move the selection to its neighbour.
-        let selected_id = ui
-            .get_devices()
-            .row_data(ui.get_selected() as usize)
-            .map(|d| d.id);
-        let restored = selected_id
-            .and_then(|id| rows.iter().position(|d| d.id == id))
-            .unwrap_or(0);
-
-        ui.set_devices(ModelRc::new(VecModel::from(rows)));
-        ui.set_selected(restored as i32);
-        ui.set_status_line(line.into());
-    });
 }
 
 fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {

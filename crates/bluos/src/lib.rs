@@ -33,6 +33,7 @@ pub mod device;
 pub mod discovery;
 pub mod error;
 pub mod lsdp;
+pub mod queue;
 pub mod status;
 
 pub use client::{Client, Repeat, StatusWatch};
@@ -40,7 +41,8 @@ pub use device::DeviceId;
 pub use discovery::Discovery;
 pub use error::{Error, Result};
 pub use lsdp::Announce;
-pub use status::{Status, SyncStatus};
+pub use queue::{Queue, QueueSong};
+pub use status::{Action, Status, SyncStatus};
 
 /// The control API's port. Players advertise it in their LSDP announcement and
 /// have never been seen to use another, but the announcement is authoritative.
