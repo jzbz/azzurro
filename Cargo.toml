@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/bluos", "crates/bluos-cli", "crates/azzurro-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/jzbz/azzurro"
+
+[workspace.dependencies]
+# Versioned as well as pathed so `bluos` can be published on its own: the
+# protocol is the part other people need, and it should outlive this GUI.
+bluos = { path = "crates/bluos", version = "0.1.0" }
+
+# net for UDP and TCP, time for the long-poll backoff, sync for the channels
+# that carry player events to the UI thread. "macros" only for #[tokio::main]
+# in the CLI.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+] }
+
+# No TLS features, deliberately. Players speak plain HTTP on the LAN, so the
+# protocol crate never needs a certificate store or a crypto provider — which
+# keeps aws-lc-rs, and the C toolchain it wants, out of the graph. Cover art
+# hosted at a service CDN does need https, but that fetch belongs to whichever
+# crate decodes images, and it can turn on `rustls` there; Cargo unifies
+# features across the workspace, so enabling it in one place is enough.
+# `query` gates RequestBuilder::query, which every control verb uses.
+reqwest = { version = "0.13", default-features = false, features = [
+    "charset",
+    "http2",
+    "query",
+] }
+
+# "serialize" turns on the serde deserializer, which is what reads /Status and
+# /SyncStatus. The server-driven `<screen>` documents are tree-shaped with
+# heterogeneous children and will want the pull parser instead; see
+# docs/protocol.md.
+quick-xml = { version = "0.41", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+
+# SO_REUSEADDR and SO_REUSEPORT on the LSDP socket, which tokio's UdpSocket
+# cannot set on its own: it only wraps an already-configured socket.
+socket2 = { version = "0.6", features = ["all"] }
+# Interface addresses *with netmasks*, which is what the per-interface
+# broadcast address is derived from. getifaddrs, no C dependency.
+if-addrs = "0.15"
+
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"

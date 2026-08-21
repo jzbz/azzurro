@@ -1,0 +1,20 @@
+[package]
+name = "bluos-cli"
+description = "Command line control for BluOS players"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bluosctl"
+path = "src/main.rs"
+
+[dependencies]
+bluos.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,11 @@
+/target
+target/
+Cargo.lock.orig
+*.rs.bk
+
+# flatpak-builder, when run from the repository rather than pointed at a
+# directory under artifacts/.
+.flatpak-builder/
+/builddir/
+/repo/
+*.flatpak

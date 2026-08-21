@@ -1,0 +1,20 @@
+[package]
+name = "bluos"
+description = "Discovery and control for BluOS players (Bluesound, NAD, PSB)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["bluos", "bluesound", "multiroom", "audio", "lsdp"]
+categories = ["multimedia::audio", "network-programming"]
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+socket2.workspace = true
+if-addrs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

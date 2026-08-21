@@ -1,0 +1,277 @@
+import { ListView, Slider, ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// One player, flattened for display. The backend owns the real state; this is
+// only what has to cross into the UI thread.
+export struct Device {
+    id: string,
+    name: string,
+    model: string,
+    volume: int,
+    muted: bool,
+    playing: bool,
+    now-playing: string,
+    service: string,
+    reachable: bool,
+}
+
+component TextButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 30px;
+    width: text.preferred-width + 24px;
+    border-radius: Theme.radius;
+    background: root.primary
+        ? Theme.accent
+        : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent));
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.border;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    text := Text {
+        text: root.label;
+        font-size: Theme.body-size;
+        color: root.primary ? Theme.accent-ink : Theme.text;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component DeviceRow inherits Rectangle {
+    in property <Device> device;
+    in property <bool> selected;
+    callback picked();
+    callback volume-changed(int);
+
+    height: 74px;
+    border-radius: Theme.radius;
+    background: root.selected
+        ? Theme.selected
+        : (touch.has-hover ? Theme.hover : transparent);
+
+    touch := TouchArea {
+        clicked => { root.picked(); }
+    }
+
+    VerticalLayout {
+        padding: Theme.gap;
+        spacing: 2px;
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Text {
+                text: root.device.name;
+                font-size: Theme.title-size;
+                font-weight: 600;
+                color: Theme.text;
+                overflow: elide;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: root.device.reachable ? root.device.model : "unreachable";
+                font-size: Theme.small-size;
+                color: Theme.dim;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: root.device.now-playing == "" ? "—" : root.device.now-playing;
+            font-size: Theme.small-size;
+            color: Theme.dim;
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Slider {
+                minimum: 0;
+                maximum: 100;
+                value: root.device.volume;
+                // `released`, not `changed`: a drag fires continuously, and
+                // every intermediate value would be one HTTP request to the
+                // player and one long-poll wakeup on every other controller.
+                released(v) => { root.volume-changed(Math.round(v)); }
+            }
+
+            Text {
+                text: root.device.muted ? "muted" : root.device.volume;
+                font-size: Theme.small-size;
+                color: Theme.dim;
+                vertical-alignment: center;
+                width: 40px;
+                horizontal-alignment: right;
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    in property <[Device]> devices;
+    in property <string> status-line: "starting";
+    in-out property <int> selected: 0;
+
+    callback toggle(string);
+    callback skip(string);
+    callback back(string);
+    callback set-volume(string, int);
+    callback rescan();
+
+    title: "Azzurro";
+    preferred-width: 880px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 380px;
+    background: Theme.bg;
+
+    property <bool> has-selection: root.devices.length > 0
+        && root.selected >= 0
+        && root.selected < root.devices.length;
+    property <Device> current: root.has-selection
+        ? root.devices[root.selected]
+        : { name: "", now-playing: "", service: "" };
+
+    VerticalLayout {
+        padding: Theme.pad;
+        spacing: Theme.pad;
+
+        HorizontalLayout {
+            spacing: Theme.pad;
+
+            // Players.
+            Rectangle {
+                width: 320px;
+                background: Theme.surface;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.gap;
+                    spacing: Theme.gap;
+
+                    Text {
+                        text: "Players";
+                        font-size: Theme.small-size;
+                        font-weight: 600;
+                        color: Theme.dim;
+                    }
+
+                    ListView {
+                        for device[i] in root.devices: DeviceRow {
+                            device: device;
+                            selected: i == root.selected;
+                            picked => { root.selected = i; }
+                            volume-changed(v) => { root.set-volume(device.id, v); }
+                        }
+                    }
+                }
+            }
+
+            // Now playing.
+            Rectangle {
+                background: Theme.surface;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                VerticalLayout {
+                    padding: Theme.pad * 2;
+                    spacing: Theme.pad;
+                    alignment: center;
+
+                    // Artwork goes here once the image pipeline lands: fetch,
+                    // decode, downscale and cache, all of which this crate has
+                    // to do itself because Slint has no URL-loading image.
+                    HorizontalLayout {
+                        alignment: center;
+
+                        Rectangle {
+                            height: 180px;
+                            width: 180px;
+                            background: Theme.sunken;
+                            border-radius: Theme.radius;
+
+                            Text {
+                                text: root.current.service == "" ? "—" : root.current.service;
+                                font-size: Theme.small-size;
+                                color: Theme.dim;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.has-selection ? root.current.name : "No player selected";
+                        font-size: Theme.title-size + 3px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        horizontal-alignment: center;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: root.current.now-playing == "" ? "Nothing playing" : root.current.now-playing;
+                        font-size: Theme.body-size;
+                        color: Theme.dim;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+                        alignment: center;
+
+                        TextButton {
+                            label: "Previous";
+                            enabled: root.has-selection;
+                            clicked => { root.back(root.current.id); }
+                        }
+
+                        TextButton {
+                            label: root.current.playing ? "Pause" : "Play";
+                            primary: true;
+                            enabled: root.has-selection;
+                            clicked => { root.toggle(root.current.id); }
+                        }
+
+                        TextButton {
+                            label: "Next";
+                            enabled: root.has-selection;
+                            clicked => { root.skip(root.current.id); }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Text {
+                text: root.status-line;
+                font-size: Theme.small-size;
+                color: Theme.dim;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            TextButton {
+                label: "Rescan";
+                clicked => { root.rescan(); }
+            }
+        }
+    }
+}

@@ -1,0 +1,41 @@
+[package]
+name = "azzurro-gui"
+description = "Slint front end for Azzurro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "azzurro_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "azzurro"
+path = "src/main.rs"
+
+[dependencies]
+bluos.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# default-features = false keeps two C/C++ dependencies out of the build:
+# `backend-qt`, which the selector compiles in whenever qmake is on PATH and
+# then prefers over winit at runtime, and `renderer-skia`.
+# renderer-femtovg-wgpu draws through wgpu — Vulkan on Linux — instead of
+# femtovg's OpenGL path. renderer-software stays enabled as a fallback for
+# machines without a usable GPU: SLINT_BACKEND=winit-software.
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "accessibility",
+    "backend-winit",
+    "renderer-femtovg-wgpu",
+    "renderer-software",
+] }
+
+[build-dependencies]
+slint-build = "1.17"

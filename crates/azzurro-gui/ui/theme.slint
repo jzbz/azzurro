@@ -1,0 +1,38 @@
+import { Palette } from "std-widgets.slint";
+
+// One source of truth for colour, spacing and type.
+//
+// The app follows the system light/dark setting but draws its own controls, so
+// it looks like itself on any desktop and picks up platform character only
+// where it should — the window frame, the font, and the scrollbars. A music
+// controller is one of the few app classes where that is the expectation rather
+// than a compromise.
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Surfaces, back to front.
+    out property <brush> bg: dark ? #101216 : #f4f5f8;
+    out property <brush> surface: dark ? #181b21 : #ffffff;
+    out property <brush> sunken: dark ? #14161b : #eaecf1;
+    out property <brush> hover: dark ? #ffffff0f : #0000000a;
+    out property <brush> pressed: dark ? #ffffff1f : #00000016;
+    out property <brush> selected: dark ? #38bdf826 : #0284c714;
+    out property <brush> border: dark ? #262a32 : #e2e5ec;
+
+    // Ink.
+    out property <brush> text: dark ? #e9ebf0 : #14171d;
+    out property <brush> dim: dark ? #98a1b2 : #5b6472;
+    out property <brush> faint: dark ? #69718200 : #8a919e00;
+
+    // Accent. Azzurro, which is the whole reason for the name.
+    out property <brush> accent: dark ? #38bdf8 : #0284c7;
+    out property <brush> accent-ink: dark ? #06212e : #ffffff;
+
+    out property <length> gap: 8px;
+    out property <length> pad: 14px;
+    out property <length> radius: 10px;
+
+    out property <length> title-size: 15px;
+    out property <length> body-size: 13px;
+    out property <length> small-size: 11px;
+}
