@@ -25,18 +25,34 @@ tokio = { version = "1", features = [
     "macros",
 ] }
 
-# No TLS features, deliberately. Players speak plain HTTP on the LAN, so the
-# protocol crate never needs a certificate store or a crypto provider — which
-# keeps aws-lc-rs, and the C toolchain it wants, out of the graph. Cover art
-# hosted at a service CDN does need https, but that fetch belongs to whichever
-# crate decodes images, and it can turn on `rustls` there; Cargo unifies
-# features across the workspace, so enabling it in one place is enough.
+# Players speak plain HTTP on the LAN, but cover art comes from the streaming
+# services' own CDNs over https, so TLS cannot be avoided — only chosen
+# carefully. `rustls-no-provider` rather than plain `rustls`, because `rustls`
+# means aws-lc-rs, which wants cmake and a C toolchain at build time; the
+# provider is installed explicitly in azzurro-gui, and it is ring. Certificate
+# verification goes through rustls-platform-verifier, so the system trust store
+# is used rather than a bundled root list.
 # `query` gates RequestBuilder::query, which every control verb uses.
 reqwest = { version = "0.13", default-features = false, features = [
     "charset",
     "http2",
     "query",
+    "rustls-no-provider",
 ] }
+# Named here only so the ring provider can be installed by hand; nothing else
+# in the workspace touches rustls directly.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# Album art is JPEG, PNG or WebP in practice. default-features would compile a
+# decoder for every format the crate knows, which is most of the build time and
+# none of the benefit.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+] }
+lru = "0.18"
+dirs = "6"
 
 # "serialize" turns on the serde deserializer, which is what reads /Status and
 # /SyncStatus. The server-driven `<screen>` documents are tree-shaped with

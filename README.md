@@ -6,9 +6,9 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
 **Status: a working skeleton, and young.** Discovery, status, the long poll and
 the transport verbs are implemented and exercised against real hardware; the
-window lists the players it finds, shows the selected one's play queue, and
-drives both. Each player is exported over MPRIS so the desktop's own media
-controls work. Browsing, artwork and grouping are not written yet — see the
+window lists the players it finds, shows the selected one's play queue with
+cover art, and drives both. Each player is exported over MPRIS so the desktop's
+own media controls work. Browsing and grouping are not written yet — see the
 roadmap.
 
 ## Layout
@@ -57,6 +57,12 @@ different things are two things the desktop should be able to see and drive.
 Media keys, the GNOME shell menu, the KDE applet and a lock screen all reach a
 player through the same command channel the window's own buttons use.
 
+Cover art is the one place Slint costs more than a toolkit with a URL-loading
+image element: fetching, decoding, scaling and caching are all the app's job.
+That work is confined to `crates/azzurro-gui/src/artwork.rs` — an LRU of
+decoded pixels in front of a cache of fetched bytes on disk, deduplicated by
+URL and bounded to four fetches at once.
+
 `docs/protocol.md` is the reference for all of it, including what has been
 confirmed against hardware and what has only been read out of the official
 client.
@@ -65,7 +71,7 @@ client.
 
 **v0.1 — a daily driver.** Discovery and manual addressing. Per-player volume
 and mute. Now playing with artwork, transport, seek, shuffle and repeat.
-Presets. The play queue and MPRIS are done; artwork, seek and presets are not.
+Presets. The play queue, cover art and MPRIS are done; seek and presets are not.
 
 **v0.2 — browsing.** BluOS describes its own screens and menus in XML, and
 rendering those two grammars is what makes every music service work without

@@ -10,6 +10,7 @@
 //! media key and a click on a button are the same event by the time either
 //! reaches a player.
 
+mod artwork;
 mod mpris;
 
 use std::collections::BTreeMap;
@@ -19,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bluos::{Client, DeviceId, Discovery, Queue, Repeat, Status, discovery::DEFAULT_SWEEP};
+
+use crate::artwork::{Artwork, Pixels};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 
@@ -31,6 +34,13 @@ slint::include_modules!();
 /// megabyte of XML across the network on every selection. The header says when
 /// the view is a window rather than the whole thing.
 const QUEUE_WINDOW: u32 = 500;
+
+/// Cover art is drawn into a 180px box, doubled so it stays sharp on a HiDPI
+/// screen. Fetched once at this size rather than per scale factor.
+const COVER_SIZE: u32 = 360;
+
+/// Queue thumbnails are drawn at 34px, likewise doubled.
+const THUMB_SIZE: u32 = 72;
 
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
@@ -77,6 +87,11 @@ struct Entry {
     /// Fetched on demand, and dropped when the player says the queue was
     /// replaced.
     queue: Option<Queue>,
+    /// The absolute URL of the art for whatever is playing, resolved against
+    /// this player. Kept so that a status carrying the same art twice does not
+    /// start the fetch again, and so a fetch that lands late can tell whether
+    /// it is still wanted.
+    cover_url: Option<String>,
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
@@ -90,6 +105,22 @@ struct Backend {
     selected: Arc<Mutex<Option<DeviceId>>>,
     commands: mpsc::UnboundedSender<Command>,
     ui: slint::Weak<AppWindow>,
+    artwork: Arc<Artwork>,
+}
+
+/// One queue row on its way to the window.
+///
+/// This exists because [`slint::Image`] is not `Send` and the rows are built on
+/// a worker thread: the pixels travel, and the `Image` is assembled inside the
+/// event loop.
+struct TrackData {
+    id: i32,
+    title: String,
+    artist: String,
+    duration: String,
+    cursor: bool,
+    live: bool,
+    cover: Option<Pixels>,
 }
 
 /// Distinguishes the several MPRIS bus names one process claims.
@@ -103,6 +134,12 @@ pub fn run_app() -> ExitCode {
         )
         .without_time()
         .init();
+
+    // reqwest is built with `rustls-no-provider`, which leaves choosing the
+    // crypto backend to the application. ring rather than aws-lc-rs: it is what
+    // the rest of this author's Rust already uses, and it does not want cmake.
+    // An error here means something else installed one first, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     match start() {
         Ok(()) => ExitCode::SUCCESS,
@@ -201,6 +238,7 @@ async fn run(
         selected: Arc::new(Mutex::new(None)),
         commands,
         ui: ui.clone(),
+        artwork: Arc::new(Artwork::new(http.clone())),
     };
 
     tokio::spawn(run_commands(command_rx, backend.clone(), discovery.clone()));
@@ -271,6 +309,7 @@ impl Backend {
                     status: None,
                     status_at: None,
                     queue: None,
+                    cover_url: None,
                 },
             );
         }
@@ -387,18 +426,34 @@ impl Backend {
                     // now-playing marker if the queue is what is playing.
                     let live = queue.is_playing_from(&status) && status.is_playing();
 
-                    let rows: Vec<Track> = queue
+                    let client = selected
+                        .and_then(|id| guard.get(&id))
+                        .map(|e| e.client.clone());
+
+                    let rows: Vec<TrackData> = queue
                         .songs
                         .iter()
                         .map(|song| {
                             let at_cursor = Some(song.id) == cursor;
-                            Track {
+                            // Only what is already decoded. Anything missing
+                            // is being fetched, and lands on a later republish.
+                            let cover = song
+                                .image
+                                .as_deref()
+                                .filter(|src| !src.is_empty())
+                                .zip(client.as_ref())
+                                .and_then(|(src, client)| {
+                                    self.artwork.cached(&client.image_url(src), THUMB_SIZE)
+                                });
+
+                            TrackData {
                                 id: song.id as i32,
-                                title: song.title.clone().unwrap_or_default().into(),
-                                artist: song.artist.clone().unwrap_or_default().into(),
-                                duration: song.duration().unwrap_or_default().into(),
+                                title: song.title.clone().unwrap_or_default(),
+                                artist: song.artist.clone().unwrap_or_default(),
+                                duration: song.duration().unwrap_or_default(),
                                 cursor: at_cursor,
                                 live: at_cursor && live,
+                                cover,
                             }
                         })
                         .collect();
@@ -417,12 +472,109 @@ impl Backend {
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+
+            let rows: Vec<Track> = rows
+                .into_iter()
+                .map(|row| Track {
+                    id: row.id,
+                    title: row.title.into(),
+                    artist: row.artist.into(),
+                    duration: row.duration.into(),
+                    cursor: row.cursor,
+                    live: row.live,
+                    cover: row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
+                })
+                .collect();
+
+            ui.set_queue(ModelRc::new(VecModel::from(rows)));
+            ui.set_queue_line(line.into());
+        });
+    }
+
+    /// Put cover art in the now-playing panel, or clear it.
+    fn set_cover(&self, pixels: Option<Pixels>) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui.upgrade() {
-                ui.set_queue(ModelRc::new(VecModel::from(rows)));
-                ui.set_queue_line(line.into());
+                ui.set_cover(pixels.map(slint::Image::from_rgba8).unwrap_or_default());
             }
         });
     }
+}
+
+/// Fetch the art for whatever the selected player is playing.
+///
+/// Late arrivals are discarded rather than drawn: by the time a fetch returns,
+/// the selection may have moved to another player, or the track may have
+/// changed under it. Both are checked before anything reaches the window.
+async fn load_cover(backend: Backend, id: DeviceId) {
+    let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
+
+    let pixels = match &wanted {
+        Some(url) => backend.artwork.get(url, COVER_SIZE).await,
+        None => None,
+    };
+
+    if !backend.is_selected(id) {
+        return;
+    }
+    if backend.with_entry(id, |e| e.cover_url.clone()).flatten() != wanted {
+        return;
+    }
+    backend.set_cover(pixels);
+}
+
+/// Fetch thumbnails for the queue on screen.
+///
+/// Deduplicated by URL first, which is what makes this cheap: a queue is
+/// usually a handful of albums however many tracks it holds, and BluOS gives
+/// every track from one album the same artwork URL. The republishes are
+/// coalesced, so a queue filling in redraws a few times rather than once per
+/// image.
+async fn load_thumbnails(backend: Backend, id: DeviceId) {
+    let urls: Vec<String> = {
+        let guard = backend.registry.lock().unwrap();
+        let Some(entry) = guard.get(&id) else { return };
+        let Some(queue) = &entry.queue else { return };
+
+        let mut seen = std::collections::BTreeSet::new();
+        queue
+            .songs
+            .iter()
+            .filter_map(|song| song.image.as_deref().filter(|src| !src.is_empty()))
+            .map(|src| entry.client.image_url(src))
+            .filter(|url| seen.insert(url.clone()))
+            .collect()
+    };
+
+    if urls.is_empty() {
+        return;
+    }
+    tracing::debug!(%id, covers = urls.len(), "fetching queue thumbnails");
+
+    let mut fetches = tokio::task::JoinSet::new();
+    for url in urls {
+        let artwork = backend.artwork.clone();
+        fetches.spawn(async move {
+            artwork.get(&url, THUMB_SIZE).await;
+        });
+    }
+
+    let mut last_publish = Instant::now();
+    while fetches.join_next().await.is_some() {
+        // The user moved on; the rest of these covers are for a queue nobody
+        // is looking at.
+        if !backend.is_selected(id) {
+            fetches.abort_all();
+            return;
+        }
+        if last_publish.elapsed() >= Duration::from_millis(150) {
+            backend.publish_queue();
+            last_publish = Instant::now();
+        }
+    }
+    backend.publish_queue();
 }
 
 /// Read the selected player's queue and show it.
@@ -443,6 +595,7 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
                 entry.queue = Some(queue);
             }
             backend.publish_queue();
+            tokio::spawn(load_thumbnails(backend, id));
         }
         Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
     }
@@ -521,6 +674,24 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     view.service = status.service.clone().unwrap_or_default().into();
                 });
 
+                // Resolved here rather than at draw time: the path is relative
+                // to *this* player unless the service handed back an absolute
+                // URL, and only the client knows which.
+                let art = status.artwork().map(|src| client.image_url(src));
+                let art_changed = {
+                    let mut guard = backend.registry.lock().unwrap();
+                    match guard.get_mut(&id) {
+                        Some(entry) if entry.cover_url != art => {
+                            entry.cover_url = art;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if art_changed && backend.is_selected(id) {
+                    tokio::spawn(load_cover(backend.clone(), id));
+                }
+
                 if backend.is_selected(id) {
                     if queue_replaced {
                         tokio::spawn(fetch_queue(backend.clone(), id));
@@ -580,6 +751,7 @@ async fn run_commands(
                 // Show whatever is already known straight away, and only go to
                 // the network when this is a player whose queue is not held.
                 backend.publish_queue();
+                tokio::spawn(load_cover(backend.clone(), id));
                 if !already
                     || backend
                         .with_entry(id, |e| e.queue.is_none())

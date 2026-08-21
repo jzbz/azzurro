@@ -228,10 +228,32 @@ condition for the button being lit.
 
 ### Artwork
 
-Paths in a status document are relative to the player (`/images/capture/...`)
-for anything the player owns, and absolute `https://` URLs when the art comes
-from a streaming service's CDN. Both forms turn up in the same field, so a
-client has to handle both.
+**Observed.** Art references come in two shapes in the same field, and a client
+has to handle both:
+
+* a path relative to the player — `/images/capture/ic_tvNP.png` for the icon of
+  a physical input, or `/Artwork?service=…&artist=…&album=…` for a library
+  cover;
+* an absolute `https://` URL at a streaming service's CDN, which is the only
+  reason a controller needs a TLS stack at all.
+
+`/Artwork` on port 11000 does not serve the image itself. It answers **301** to
+a second service on the same host at **port 11004**:
+
+```
+GET  http://player:11000/Artwork?service=LocalMusic&artist=…&album=…
+301  http://player:11004/library/v1/Artwork?album=…&artist=…&service=LocalMusic
+200  image/jpeg, 600×600
+```
+
+So any client has to follow redirects, and port 11000 is not the only one worth
+allowing through a firewall. The `<image>` on a queue song and the `image`
+attribute on a `/ui/Queue` item are the same URL.
+
+Covers are per *album*, not per track: every track from one album shares an
+artwork URL. A 42-track queue on the test player needed 22 fetches, so
+deduplicating by URL before fetching roughly halves the work on a queue built
+from albums and does far better on one built from a single record.
 
 ## The server-driven UI
 

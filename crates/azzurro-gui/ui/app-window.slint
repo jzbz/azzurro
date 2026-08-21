@@ -25,6 +25,9 @@ export struct Track {
     cursor: bool,
     // ...and whether that position is what you are actually hearing.
     live: bool,
+    // Empty until the art has been fetched and decoded; `cover.width == 0`
+    // is what distinguishes "not loaded" from "loaded".
+    cover: image,
 }
 
 component TextButton inherits Rectangle {
@@ -76,6 +79,8 @@ component TrackRow inherits Rectangle {
         padding-right: 8px;
         spacing: 6px;
 
+        // The marker leads, so every thumbnail below it lines up whether or
+        // not its row is the one the player is sitting on.
         Text {
             // Playing, versus merely where playback would resume.
             text: root.track.cursor ? (root.track.live ? "▶" : "◇") : "";
@@ -83,12 +88,34 @@ component TrackRow inherits Rectangle {
             color: root.track.live ? Theme.accent : Theme.dim;
             vertical-alignment: center;
             horizontal-alignment: center;
-            width: 14px;
+            width: 12px;
+        }
+
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 4px;
+                background: Theme.sunken;
+                clip: true;
+
+                Image {
+                    source: root.track.cover;
+                    image-fit: cover;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
         }
 
         VerticalLayout {
             alignment: center;
             spacing: 1px;
+            // Takes the slack, so the duration column below stays put instead
+            // of drifting with the length of each title.
+            horizontal-stretch: 1;
 
             Text {
                 text: root.track.title;
@@ -110,6 +137,8 @@ component TrackRow inherits Rectangle {
             font-size: Theme.small-size;
             color: Theme.dim;
             vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 38px;
         }
     }
 }
@@ -190,6 +219,7 @@ component DeviceRow inherits Rectangle {
 export component AppWindow inherits Window {
     in property <[Device]> devices;
     in property <[Track]> queue;
+    in property <image> cover;
     in property <string> queue-line: "";
     in property <string> status-line: "starting";
     in-out property <int> selected: 0;
@@ -279,8 +309,19 @@ export component AppWindow inherits Window {
                             width: 180px;
                             background: Theme.sunken;
                             border-radius: Theme.radius;
+                            clip: true;
 
+                            Image {
+                                source: root.cover;
+                                image-fit: contain;
+                                width: 100%;
+                                height: 100%;
+                            }
+
+                            // Stands in until there is art, and stays for the
+                            // sources that never have any.
                             Text {
+                                visible: root.cover.width == 0;
                                 text: root.current.service == "" ? "—" : root.current.service;
                                 font-size: Theme.small-size;
                                 color: Theme.dim;
