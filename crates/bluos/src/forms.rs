@@ -355,7 +355,18 @@ fn pieces(html: &str) -> impl Iterator<Item = Piece<'_>> {
         }
         match rest.find('<') {
             Some(0) => {
-                let end = rest.find('>').unwrap_or(rest.len() - 1);
+                // `rest.len()` and not `len() - 1`: a tag the page never
+                // closed runs to the end of the input, and on a page whose
+                // last byte is a bare `<` the subtraction made this `0`, so
+                // `&rest[1..0]` sliced backwards and panicked. The player's own
+                // web UI is the input here, so a page truncated mid-tag took
+                // the scrape down instead of degrading to "no form here" the
+                // way this module promises to.
+                //
+                // `end` cannot be below 1: this arm only runs when `rest`
+                // starts with `<`, so any `>` is at index 1 or later, and the
+                // fallback is a length that is at least 1 for the same reason.
+                let end = rest.find('>').unwrap_or(rest.len());
                 let raw = &rest[1..end];
                 rest = &rest[(end + 1).min(rest.len())..];
 
@@ -567,4 +578,17 @@ mod tests {
         assert!(parse("<html><body><p>Nothing here</p></body></html>").is_empty());
         assert!(parse("").is_empty());
     }
+    #[test]
+    fn a_page_truncated_mid_tag_degrades_instead_of_panicking() {
+        // Every one of these ends inside a tag the page never closed. The
+        // contract is "no form here", not a panic.
+        for page in ["<", "x<", "<form></form>x<", "<form><input name=\"a\"", "<<<"] {
+            let forms = parse(page);
+            assert!(
+                forms.iter().all(|f| f.fields.is_empty()),
+                "{page:?} produced a form with fields"
+            );
+        }
+    }
+
 }
