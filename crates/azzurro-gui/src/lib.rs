@@ -933,8 +933,18 @@ async fn run(
 ) {
     // One HTTP client for every player: the connection pool and the resolver
     // are per client, and a controller holds a poll open to each of them.
-    let http = match reqwest::Client::builder().build() {
+    // Two clients on purpose. `http` talks to players and will not follow a
+    // redirect off one; `art` fetches covers, which legitimately come from a
+    // streaming service's CDN on another host. reqwest fixes the redirect
+    // policy per client rather than per request, so telling the two apart
+    // means having two. The cost is one extra TCP connection per host the
+    // second one talks to, and those are hosts the first never touches.
+    let http = match bluos::client::http_client() {
         Ok(http) => http,
+        Err(e) => return say(&ui, format!("could not start HTTP: {e}")),
+    };
+    let art = match reqwest::Client::builder().build() {
+        Ok(art) => art,
         Err(e) => return say(&ui, format!("could not start HTTP: {e}")),
     };
 
@@ -953,7 +963,7 @@ async fn run(
         selected: Arc::new(Mutex::new(None)),
         commands,
         ui: ui.clone(),
-        artwork: Arc::new(Artwork::new(http.clone())),
+        artwork: Arc::new(Artwork::new(art)),
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(BTreeSet::new())),
         searches: Arc::new(AtomicU64::new(0)),
@@ -4361,9 +4371,21 @@ async fn run_commands(
                         // leave the placeholder behind.
                         backend.browsing.lock().unwrap().pane = Pane::Browse;
                         backend.publish_pane();
-                        let url = client.web_url(&path);
-                        tracing::info!(%id, "opening {url} in a browser");
-                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        match client.web_url(&path) {
+                            Ok(url) => {
+                                tracing::info!(%id, "opening {url} in a browser");
+                                let _ =
+                                    tokio::task::spawn_blocking(move || open::that_detached(url))
+                                        .await;
+                            }
+                            // The player named somewhere that is not the
+                            // player. Handing that to the desktop's browser is
+                            // the one thing this app must not do on its say-so.
+                            Err(e) => {
+                                tracing::warn!(%id, "refusing to open {path}: {e}");
+                                say(&backend.ui, "That page is not on this player");
+                            }
+                        }
                     }
                 }
                 continue;
@@ -4695,8 +4717,11 @@ async fn run_commands(
                         if let Err(e) = other {
                             tracing::debug!(%id, "could not read the services page: {e}");
                         }
-                        let url = client.web_url("/services?noheader=1");
-                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        // A constant, so this cannot be off-player.
+                        if let Ok(url) = client.web_url("/services?noheader=1") {
+                            let _ =
+                                tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        }
                     }
                 }
                 continue;
@@ -4720,8 +4745,11 @@ async fn run_commands(
                     }
                     Err(e) => {
                         tracing::debug!(%id, "could not read the shares page: {e}");
-                        let url = client.web_url("/sharecfg?noheader=1");
-                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        // A constant, so this cannot be off-player.
+                        if let Ok(url) = client.web_url("/sharecfg?noheader=1") {
+                            let _ =
+                                tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        }
                     }
                 }
                 continue;

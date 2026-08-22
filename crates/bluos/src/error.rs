@@ -38,6 +38,12 @@ pub enum Error {
     #[error("could not read a screen document: {0}")]
     Screen(String),
 
+    #[error("{device} asked for {url}, which is not on that player")]
+    OffPlayer {
+        device: crate::DeviceId,
+        url: String,
+    },
+
     #[error("{device} sent more than {limit} bytes in reply to one request")]
     Oversized {
         device: crate::DeviceId,

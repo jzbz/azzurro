@@ -108,6 +108,58 @@ pub struct Client {
     http: reqwest::Client,
 }
 
+/// How far a redirect chain may run before it is a loop.
+///
+/// A custom policy replaces reqwest's own limit rather than adding to it, so
+/// without this there is none at all.
+const MAX_HOPS: usize = 5;
+
+/// A `reqwest::Client` for talking to players, and only to players.
+///
+/// Checking the paths this crate builds is half the job. The other half is
+/// that a player can move a request off itself simply by answering with a
+/// 302 — no odd path required, and it works on `/Status` as readily as
+/// anywhere. So the client that talks to players will not change host,
+/// whoever asks.
+///
+/// A port change is allowed, because that is a thing real players do: on a
+/// Powernode running BluOS 4.16.6, `/Settings` answers 301 to port 11001 and
+/// `/redirectToCp` answers 301 to port 80, both on the player's own address.
+/// Those are the only two redirects it performs at all.
+///
+/// Cover art does not use this client. Artwork legitimately comes from a
+/// streaming service's CDN on another host entirely, and reqwest cannot vary
+/// the policy per request — `Request::extensions` is private, so there is no
+/// way to tag one — which is exactly why the two want separate clients.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // Never empty: the URL being redirected away from is pushed before
+            // the policy is consulted, so at the first hop this holds one.
+            let from = attempt.previous().last().and_then(|url| url.host_str());
+            let to = attempt.url().host_str();
+            let hops = attempt.previous().len();
+
+            // Both messages are built before anything is decided: `error` and
+            // `follow` consume the attempt, and `previous()` borrows it.
+            let leaving = (from != to).then(|| {
+                format!(
+                    "refusing a redirect off the player, to {}",
+                    to.unwrap_or("nowhere")
+                )
+            });
+
+            match leaving {
+                // `error` and not `stop`: stopping hands the 302 back as a
+                // successful response, which is not what refusing means.
+                Some(why) => attempt.error(why),
+                None if hops > MAX_HOPS => attempt.error("too many redirects"),
+                None => attempt.follow(),
+            }
+        }))
+        .build()
+}
+
 impl Client {
     /// A client for one player.
     ///
@@ -126,7 +178,7 @@ impl Client {
     /// Use [`Client::with_http`] to supply a client built to your own taste
     /// and side-step the question.
     pub fn new(id: DeviceId) -> Result<Self> {
-        Ok(Self::with_http(id, reqwest::Client::builder().build()?))
+        Ok(Self::with_http(id, http_client()?))
     }
 
     /// Share one `reqwest::Client` across every player.
@@ -143,6 +195,41 @@ impl Client {
 
     pub fn id(&self) -> DeviceId {
         self.id
+    }
+
+    /// Build a URL for `path`, refusing one that would leave this player.
+    ///
+    /// Every path here comes out of a document the player wrote — a screen's
+    /// action URI, a setting's target, a form's `action` — and concatenating
+    /// it onto a base is not the same as resolving it. `@evil.example/x`
+    /// concatenated gives `http://10.0.0.155:11000@evil.example/x`, which
+    /// parses with `10.0.0.155:11000` as *userinfo* and `evil.example` as the
+    /// host: the request leaves for a machine of the player's choosing, from
+    /// this desktop's position on the network, which is somewhere the player
+    /// itself may not be able to reach. `//evil.example/x` and an outright
+    /// absolute URL do the same thing by other spellings.
+    ///
+    /// So the check is on the host of the *resolved* URL rather than on the
+    /// shape of the path. There is one rule instead of a list of hostile
+    /// syntaxes to keep up with, and it holds for spellings nobody has thought
+    /// of yet.
+    fn resolve(&self, base: &str, path: &str) -> Result<reqwest::Url> {
+        let base = reqwest::Url::parse(base).map_err(|_| Error::OffPlayer {
+            device: self.id,
+            url: base.to_owned(),
+        })?;
+        let url = base.join(path).map_err(|_| Error::OffPlayer {
+            device: self.id,
+            url: path.to_owned(),
+        })?;
+
+        if url.host_str() != base.host_str() {
+            return Err(Error::OffPlayer {
+                device: self.id,
+                url: url.to_string(),
+            });
+        }
+        Ok(url)
     }
 
     /// Turn an artwork path from a status document into something fetchable.
@@ -208,7 +295,7 @@ impl Client {
     ) -> Result<String> {
         let response = self
             .http
-            .get(format!("{}{path}", self.base))
+            .get(self.resolve(&self.base, path)?)
             .query(query)
             .header("x-sovi-schema-version", SCHEMA_VERSION)
             .header("x-sovi-ui-schema-version", UI_SCHEMA_VERSION)
@@ -284,7 +371,7 @@ impl Client {
 
         let response = self
             .http
-            .get(format!("{}{path}", self.base))
+            .get(self.resolve(&self.base, &path)?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
@@ -329,7 +416,7 @@ impl Client {
         let body = format!("{{{}:{}}}", json_string(name), json_string(value));
 
         self.http
-            .post(format!("{}{url}", self.base))
+            .post(self.resolve(&self.base, url)?)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(REQUEST_TIMEOUT)
             .body(body)
@@ -366,14 +453,22 @@ impl Client {
     /// separate web UI on port 80. Some of them are reachable through
     /// `/redirectToCp` on the control port and some — the share configuration
     /// among them — answer 404 there and only exist on 80.
-    pub fn web_url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.id.host)
+    /// Checked the same way as [`Self::resolve`], and for a sharper reason:
+    /// one caller hands the result to the desktop's browser, so an unchecked
+    /// path here would let a player choose a page for someone else's browser
+    /// to open.
+    pub fn web_url(&self, path: &str) -> Result<String> {
+        let base = match self.id.host {
+            std::net::IpAddr::V4(v4) => format!("http://{v4}"),
+            std::net::IpAddr::V6(v6) => format!("http://[{v6}]"),
+        };
+        Ok(self.resolve(&base, path)?.to_string())
     }
 
     async fn get_web(&self, path: &str) -> Result<String> {
         let response = self
             .http
-            .get(self.web_url(path))
+            .get(self.web_url(path)?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
@@ -437,7 +532,7 @@ impl Client {
             body.push_str(&percent_encoding::utf8_percent_encode(value, FORM_FIELD).to_string());
         }
 
-        let url = self.web_url(&form.action);
+        let url = self.web_url(&form.action)?;
         let request = if form.post {
             self.http.post(url).header(
                 reqwest::header::CONTENT_TYPE,
@@ -446,7 +541,7 @@ impl Client {
         } else {
             self.http.get(format!(
                 "{}{}{body}",
-                self.web_url(&form.action),
+                self.web_url(&form.action)?,
                 if form.action.contains('?') { "&" } else { "?" }
             ))
         };
@@ -510,7 +605,7 @@ impl Client {
         }
 
         self.http
-            .post(self.web_url(action))
+            .post(self.web_url(action)?)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
@@ -939,6 +1034,107 @@ mod tests {
             c.get_text("/Status", &[], REQUEST_TIMEOUT).await,
             Err(Error::Oversized { .. })
         ));
+    }
+
+    #[test]
+    fn a_path_may_not_move_the_request_off_the_player() {
+        let c = client();
+
+        // Refused: each of these resolves to a host that is not the player.
+        for path in [
+            "//evil.example/x",
+            "\\\\evil.example/x",
+            "http://evil.example/x",
+            "https://evil.example/x",
+        ] {
+            assert!(
+                matches!(c.resolve(&c.base, path), Err(Error::OffPlayer { .. })),
+                "{path:?} was allowed off the player"
+            );
+            assert!(
+                matches!(c.web_url(path), Err(Error::OffPlayer { .. })),
+                "{path:?} was allowed off the player's web UI"
+            );
+        }
+
+        // Allowed, and this is the interesting half. Concatenating `@…` onto
+        // the base was the original hole: `http://192.0.2.155:11000` followed
+        // by `@evil.example/x` parses with the player as *userinfo* and
+        // `evil.example` as the host. Resolving instead of concatenating makes
+        // it what it looks like — a path segment on the player — so the host
+        // check never has to see it. Both halves are load-bearing: resolution
+        // handles this one, the host check handles the four above.
+        for path in ["@evil.example/x", "@127.0.0.1:1/x"] {
+            let url = c.resolve(&c.base, path).expect(path);
+            assert_eq!(url.host_str(), Some("192.0.2.155"), "{path}");
+            assert_eq!(url.path(), format!("/{path}"));
+        }
+    }
+
+    #[test]
+    fn the_paths_players_actually_send_still_work() {
+        let c = client();
+        for path in [
+            "/Status",
+            "/ui/BrowseObjects?service=LocalMusic&url=%2Flibrary%2Fv1%2FSongs",
+            "/Play?url=Capture%3Abluez%3Abluetooth&title=Bluetooth",
+            "/Info?category=technical&filename=%2Fvar%2Fmnt%2Fx.flac",
+            "/Move?new=10&old=12",
+        ] {
+            let url = c.resolve(&c.base, path).expect(path);
+            assert_eq!(url.host_str(), Some("192.0.2.155"), "{path}");
+            assert_eq!(
+                url.as_str(),
+                format!("{}{path}", c.base),
+                "{path} was rewritten rather than resolved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_port_is_followed_and_another_host_is_not() {
+        use tokio::io::AsyncWriteExt;
+
+        // Stands in for the player's `/Settings`, which really does answer 301
+        // to port 11001 on its own address.
+        async fn redirector(to: String) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let to = to.clone();
+                    tokio::spawn(async move {
+                        let head = format!(
+                            "HTTP/1.1 301 Moved Permanently\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n"
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                    });
+                }
+            });
+            addr
+        }
+
+        let target = serve("<settings/>", 0).await;
+
+        // Same host, different port: what a real player does.
+        let hop = redirector(format!("http://127.0.0.1:{}/Settings", target.port())).await;
+        let c = client_at(hop);
+        assert_eq!(
+            c.get_text("/Settings", &[], REQUEST_TIMEOUT).await.unwrap(),
+            "<settings/>"
+        );
+
+        // Same address by another name is still a host change, and refused.
+        let away = redirector(format!("http://localhost:{}/Settings", target.port())).await;
+        let c = client_at(away);
+        let err = c
+            .get_text("/Settings", &[], REQUEST_TIMEOUT)
+            .await
+            .expect_err("a host change was followed");
+        assert!(
+            matches!(&err, Error::Http { source, .. } if source.is_redirect()),
+            "wrong error: {err:?}"
+        );
     }
 
     #[test]
