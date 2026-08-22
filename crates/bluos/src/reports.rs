@@ -15,6 +15,27 @@
 //! degrades to "nothing found" rather than to an error, and the caller can
 //! still offer the page itself.
 
+/// What a configuration page says to the reader, if anything.
+///
+/// These pages carry a sentence above their form — what the service wants, or
+/// what went wrong with the last attempt — in a `bs-header-text` block. Shown
+/// as-is: the player is better placed than this app to explain its own pages,
+/// and a wrong password is reported in the service's own words.
+pub fn message(html: &str) -> String {
+    // Only a visible one. The page keeps hidden blocks in the same class for
+    // errors it is not reporting yet.
+    for block in html.split("class=\"bs-header-text\"").skip(1) {
+        let Some(text) = block.split_once('>').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let text = strip_tags(text.split("</div>").next().unwrap_or_default());
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// One music service the player can be signed into.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Service {

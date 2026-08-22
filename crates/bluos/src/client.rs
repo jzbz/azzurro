@@ -335,6 +335,94 @@ impl Client {
             })
     }
 
+    /// Read the form off one of the player's own configuration pages.
+    ///
+    /// The first form on the page, which is the only one on all of these.
+    /// `None` where the page has none — a firmware that changed its shape, or a
+    /// page that is only a message.
+    pub async fn web_form(&self, path: &str) -> Result<Option<crate::forms::Form>> {
+        let body = self.get_web(path).await?;
+        Ok(crate::forms::parse(&body).into_iter().next())
+    }
+
+    /// Send a form back, and return the page that comes of it.
+    ///
+    /// The answer is another page rather than a status: signing in wrong comes
+    /// back as the same form with a message on it, and asking to add a share
+    /// comes back as the next step's form. Handing the body to the caller is
+    /// what lets one screen follow another without knowing which pages exist.
+    ///
+    /// `pressed` is the name of the button, which is how these pages tell one
+    /// action from another: Login and Logout post the same fields and differ
+    /// only in which name arrives with them.
+    pub async fn submit_form(
+        &self,
+        form: &crate::forms::Form,
+        values: &std::collections::BTreeMap<String, String>,
+        pressed: &crate::forms::Submit,
+    ) -> Result<String> {
+        let mut body = String::new();
+        // Hidden first, then what was filled in, then the button. The player
+        // reads the last of a repeated name, and nothing here repeats, but the
+        // order is the page's own and worth keeping.
+        let pairs = form
+            .hidden
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(values.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            // A nameless button contributes nothing to the body; it is the only
+            // thing its form does, so pressing it is the whole message.
+            .chain(
+                (!pressed.name.is_empty())
+                    .then_some((pressed.name.as_str(), pressed.label.as_str())),
+            );
+
+        for (key, value) in pairs {
+            if !body.is_empty() {
+                body.push('&');
+            }
+            body.push_str(&percent_encoding::utf8_percent_encode(key, FORM_FIELD).to_string());
+            body.push('=');
+            body.push_str(&percent_encoding::utf8_percent_encode(value, FORM_FIELD).to_string());
+        }
+
+        let url = self.web_url(&form.action);
+        let request = if form.post {
+            self.http.post(url).header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+        } else {
+            self.http.get(format!(
+                "{}{}{body}",
+                self.web_url(&form.action),
+                if form.action.contains('?') { "&" } else { "?" }
+            ))
+        };
+
+        let request = if form.post {
+            request.body(body)
+        } else {
+            request
+        };
+
+        request
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })?
+            .text()
+            .await
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })
+    }
+
     /// Every music service the player offers to sign into.
     ///
     /// A list worth drawing. What each row leads to is not: signing in asks for

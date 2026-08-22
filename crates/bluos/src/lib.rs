@@ -32,6 +32,7 @@ pub mod client;
 pub mod device;
 pub mod discovery;
 pub mod error;
+pub mod forms;
 pub mod lsdp;
 pub mod queue;
 pub mod reports;
