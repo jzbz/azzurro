@@ -1,17 +1,112 @@
-//! The two pages a player serves that are worth reading rather than opening.
+//! The pages a player serves that are worth reading rather than opening.
 //!
-//! Most of what the official controller reaches for outside its own screens is
-//! an interactive web page — signing into a service, submitting logs — and
-//! those belong in a browser. Two are not: the upgrade check answers one line
-//! of text, and diagnostics is a table of facts. Both are read-only, so they
-//! can be shown in the app instead of handing the user off to a browser to
-//! read five values.
+//! Some of what the official controller reaches for outside its own screens is
+//! an interactive web page — signing into a music service asks for a password
+//! and sometimes a captcha — and that belongs in a browser. The rest is a list:
+//! the upgrade check answers one line of text, diagnostics is a table of facts,
+//! the services page is twenty-five names each linking to its own sign-in form,
+//! and the shares page is whatever is currently mounted. Those can be drawn in
+//! the app instead of handing the user off to read five values or pick a name
+//! from a list.
 //!
-//! This is scraping, and it is the only scraping in the crate. Both pages are
-//! hand-written HTML from the player's own web UI rather than an API, so a
-//! firmware update could change them; everything here therefore degrades to
-//! "nothing found" rather than to an error, and the caller can still offer the
-//! page itself.
+//! This is scraping, and it is the only scraping in the crate. Every one of
+//! these is hand-written HTML from the player's own web UI rather than an API,
+//! so a firmware update could change any of them; everything here therefore
+//! degrades to "nothing found" rather than to an error, and the caller can
+//! still offer the page itself.
+
+/// One music service the player can be signed into.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Service {
+    /// The player's own name for it — `AmazonAlexa`, `TuneIn`.
+    pub id: String,
+    /// What to call it on screen: "Amazon Music", not `Amazon`.
+    pub name: String,
+    /// Where signing in happens. A form with a password on it, so this is a
+    /// page to open rather than one to draw.
+    pub href: String,
+}
+
+/// One network share the player is indexing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Share {
+    /// The checkbox's name, which is the UNC path and what the remove form
+    /// wants back.
+    pub field: String,
+    /// The sentence the player writes for it.
+    pub label: String,
+}
+
+/// Every music service the player offers to sign into.
+///
+/// The page is a jQuery Mobile listview of `<li id=Service><a href=…>Name<span
+/// class="bs-list-logo">…`. The id is the player's name for the service and the
+/// text before the logo is the human one; they differ often enough to matter
+/// — `Amazon` is "Amazon Music".
+pub fn services(html: &str) -> Vec<Service> {
+    let mut out = Vec::new();
+    for row in html.split("<li id=").skip(1) {
+        let Some(id) = row.split(['>', ' ']).next().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let Some(href) = between(row, "href=\"", "\"") else {
+            continue;
+        };
+        // Everything between the anchor opening and the logo that follows it.
+        let after = match row.find('>').map(|at| &row[at + 1..]) {
+            Some(after) => after,
+            None => continue,
+        };
+        let name = strip_tags(after.split("<span").next().unwrap_or_default());
+        if name.is_empty() {
+            continue;
+        }
+        out.push(Service {
+            id: id.trim_matches('"').to_owned(),
+            name,
+            href: href.to_owned(),
+        });
+    }
+    out
+}
+
+/// The shares the player is indexing, and where to post a change to them.
+///
+/// One checkbox per share, named for its UNC path, inside a form whose action
+/// is where a removal goes. The label is the player's own sentence about it.
+pub fn shares(html: &str) -> (Option<String>, Vec<Share>) {
+    let action = between(html, "<form id=\"configshareform\"", ">")
+        .and_then(|form| between(form, "action=\"", "\""))
+        .map(str::to_owned);
+
+    let mut out = Vec::new();
+    for field in html.split("<input name=\"").skip(1) {
+        let Some(name) = field.split('"').next().filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        // Only the checkboxes are shares; the submits carry a value instead.
+        if !field
+            .split('>')
+            .next()
+            .unwrap_or_default()
+            .contains("checkbox")
+        {
+            continue;
+        }
+        let label = between(field, "<label", "</label>")
+            .map(|label| strip_tags(label.split_once('>').map(|(_, t)| t).unwrap_or(label)))
+            .unwrap_or_default();
+        out.push(Share {
+            field: name.to_owned(),
+            label: if label.is_empty() {
+                name.to_owned()
+            } else {
+                label
+            },
+        });
+    }
+    (action, out)
+}
 
 /// The result of an upgrade check, as one line.
 ///
@@ -103,6 +198,64 @@ fn strip_tags(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/services?noheader=1` from a real player, trimmed to two of its
+    /// twenty-five rows. Note that the id and the name differ — `Amazon` is
+    /// "Amazon Music" — which is why both are kept.
+    const SERVICES: &str = r#"<ul data-role="listview">
+        <li id=AmazonAlexa><a href="/credentials?service=AmazonAlexa&noheader=1&schemaVersion=35" data-transition="slide">Amazon Alexa <span class="bs-list-logo" data-inline="true"><img src="/Sources/images/AmazonAlexaIcon.png" class="bs-list-img"></span></a></li>
+        <li id=Amazon><a href="/credentials?service=Amazon&noheader=1&schemaVersion=35" data-transition="slide">Amazon Music <span class="bs-list-logo" data-inline="true"><img src="/Sources/images/AmazonMusicIcon.png" class="bs-list-img"></span></a></li>
+    </ul>"#;
+
+    /// `/sharecfg?noheader=1` from a real player with one share mounted. The
+    /// checkbox's name is the UNC path, backslashes and all.
+    const SHARES: &str = r#"<form id="configshareform" method="POST" action="/findremoveshares?noheader=1" data-ajax="false">
+        <fieldset data-role="controlgroup" data-type="vertical">
+            <legend>Current music shares:</legend>
+            <input name="\\10.0.0.100\media\music" id="checkbox1" type="checkbox" />
+            <label for="checkbox1">media\music on 10.0.0.100 (\\10.0.0.100\media\music)</label>
+        </fieldset>
+        <input type="submit" value="Remove selected shares" name="remove">
+        <input type="submit" value="Add shares" name="doaddshares" data-inline="true">
+    </form>"#;
+
+    #[test]
+    fn reads_the_services_a_player_offers() {
+        let found = services(SERVICES);
+        assert_eq!(found.len(), 2);
+
+        assert_eq!(found[0].id, "AmazonAlexa");
+        assert_eq!(found[0].name, "Amazon Alexa");
+        assert_eq!(
+            found[0].href,
+            "/credentials?service=AmazonAlexa&noheader=1&schemaVersion=35"
+        );
+
+        // The player's name for it and the one to show are not the same word.
+        assert_eq!(found[1].id, "Amazon");
+        assert_eq!(found[1].name, "Amazon Music");
+    }
+
+    #[test]
+    fn reads_the_shares_a_player_is_indexing() {
+        let (action, found) = shares(SHARES);
+
+        assert_eq!(action.as_deref(), Some("/findremoveshares?noheader=1"));
+        assert_eq!(found.len(), 1, "the submit buttons are not shares");
+        assert_eq!(found[0].field, r"\\10.0.0.100\media\music");
+        assert_eq!(
+            found[0].label,
+            r"media\music on 10.0.0.100 (\\10.0.0.100\media\music)"
+        );
+    }
+
+    #[test]
+    fn a_page_that_changed_shape_finds_nothing_rather_than_erroring() {
+        assert!(services("<html><body>Not that page any more</body></html>").is_empty());
+        let (action, found) = shares("<html><body></body></html>");
+        assert!(action.is_none());
+        assert!(found.is_empty());
+    }
 
     /// `/upgrade?noheader=1` from a real player, with nothing to install.
     const UPGRADE: &str = r#"<html><body>

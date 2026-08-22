@@ -39,6 +39,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The two numbers are what the official controller declares. Raising them
 /// past what it sends would be claiming to understand documents nobody has
 /// seen.
+/// Everything a form field may not carry raw. A share's name is a UNC path —
+/// `\\10.0.0.100\media\music` — so the backslashes matter as much as the
+/// ampersands.
+const FORM_FIELD: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 const SCHEMA_VERSION: &str = "35";
 const UI_SCHEMA_VERSION: &str = "7";
 
@@ -295,6 +304,92 @@ impl Client {
             crate::reports::upgrade_status(&body),
             crate::reports::upgrade_action(&body),
         ))
+    }
+
+    /// A page of the player's own web UI, which is a different server.
+    ///
+    /// The control port serves XML on 11000; the configuration pages are a
+    /// separate web UI on port 80. Some of them are reachable through
+    /// `/redirectToCp` on the control port and some — the share configuration
+    /// among them — answer 404 there and only exist on 80.
+    pub fn web_url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.id.host)
+    }
+
+    async fn get_web(&self, path: &str) -> Result<String> {
+        self.http
+            .get(self.web_url(path))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })?
+            .text()
+            .await
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })
+    }
+
+    /// Every music service the player offers to sign into.
+    ///
+    /// A list worth drawing. What each row leads to is not: signing in asks for
+    /// a password and sometimes a captcha, so [`reports::Service::href`] is a
+    /// page to open rather than a form to rebuild.
+    pub async fn services(&self) -> Result<Vec<crate::reports::Service>> {
+        let body = self
+            .get_text(
+                "/redirectToCp?href=%2Fservices%3Fnoheader%3D1",
+                &[],
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        Ok(crate::reports::services(&body))
+    }
+
+    /// The network shares the player is indexing, and where a change to them
+    /// goes.
+    pub async fn shares(&self) -> Result<(Option<String>, Vec<crate::reports::Share>)> {
+        let body = self.get_web("/sharecfg?noheader=1").await?;
+        Ok(crate::reports::shares(&body))
+    }
+
+    /// Unmount shares, by the field names the page gave for them.
+    ///
+    /// A form post rather than an API call, because that is all the player
+    /// offers: the checkbox's name is the UNC path and its presence is the
+    /// whole of the request.
+    pub async fn remove_shares(&self, action: &str, fields: &[String]) -> Result<()> {
+        // Encoded by hand: reqwest is built here with default features off,
+        // and turning one on for a single form post is a heavier change than
+        // the two lines it saves.
+        let mut body = String::from("remove=Remove+selected+shares");
+        for field in fields {
+            body.push('&');
+            body.push_str(&percent_encoding::utf8_percent_encode(field, FORM_FIELD).to_string());
+            body.push_str("=on");
+        }
+
+        self.http
+            .post(self.web_url(action))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .timeout(REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })
+            .map(drop)
     }
 
     /// The player's diagnostics, as label and value.

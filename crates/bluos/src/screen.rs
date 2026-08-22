@@ -124,6 +124,13 @@ pub struct Section {
     pub replace_screen: bool,
     pub menu_actions: Vec<MenuAction>,
     pub buttons: Vec<Button>,
+    /// What the section itself leads to, where it leads anywhere.
+    ///
+    /// A library's front page is nine of these: `<row title="Artists">` with an
+    /// action and nothing inside it. The player is describing a heading that is
+    /// also a way in, and the official controller draws those as plain rows
+    /// with a chevron rather than as empty shelves.
+    pub action: Option<Action>,
     pub items: Vec<Item>,
 }
 
@@ -301,6 +308,21 @@ impl Action {
     /// Whether following this means fetching another document to render.
     pub fn is_navigational(&self) -> bool {
         matches!(self.kind, ActionKind::Browse | ActionKind::ContextBrowse)
+    }
+
+    /// Whether following this leads to a menu of categories rather than to
+    /// things to play.
+    ///
+    /// The player says so in the request it hands over: a browse into a
+    /// service's own menu carries `type=BrowseMenu`, where a browse into its
+    /// content carries the kind of object instead — `type=Artist` on a search
+    /// screen's Artists row. It is worth telling apart because the picture on a
+    /// menu row is the service's branding for a category, and the picture on a
+    /// content row is the thing itself.
+    pub fn is_browse_menu(&self) -> bool {
+        self.uri
+            .as_deref()
+            .is_some_and(|uri| uri.contains("type=BrowseMenu"))
     }
 }
 
@@ -631,6 +653,10 @@ fn start(
                             "contextMenu" => item.context_menu = Some(built),
                             _ => item.action = Some(built),
                         }
+                    // No item open, so it belongs to the section: an empty row
+                    // whose action is the whole of its content.
+                    } else if let Some(section) = section {
+                        section.action = Some(built);
                     }
                 }
             }
