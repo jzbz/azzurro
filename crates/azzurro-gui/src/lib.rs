@@ -3331,8 +3331,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // A page about the music on somebody else's site.
                 Some("Info") => {
                     let url = client.image_url(&uri);
-                    tracing::info!(%id, "opening {url} in a browser");
-                    let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    open_in_browser(&backend.ui, url).await;
                 }
                 _ => open_screen(backend, id, uri, arrive).await,
             }
@@ -3465,8 +3464,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                     return;
                 }
                 let url = client.image_url(&uri);
-                tracing::info!(%id, "opening {url} in a browser");
-                let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                open_in_browser(&backend.ui, url).await;
             }
         }
 
@@ -4357,8 +4355,7 @@ async fn run_commands(
                             });
                             continue;
                         }
-                        tracing::info!("opening {url} in a browser");
-                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                        open_in_browser(&backend.ui, url).await;
                     }
                     Some(Chosen::Write(setting, value)) => {
                         let page = backend.browsing.lock().unwrap().pane.settings().cloned();
@@ -4423,13 +4420,7 @@ async fn run_commands(
                             Some(client) => client.image_url(target),
                             None => (*target).to_owned(),
                         };
-                        tracing::info!("opening {url} in a browser");
-                        let _ =
-                            tokio::task::spawn_blocking(move || match open::that_detached(&url) {
-                                Ok(()) => tracing::info!("browser launched"),
-                                Err(e) => tracing::warn!("could not open a browser: {e}"),
-                            })
-                            .await;
+                        open_in_browser(&backend.ui, url).await;
                     }
                     HelpKind::Diagnostics => {
                         let Some(client) = client else { continue };
@@ -4443,10 +4434,7 @@ async fn run_commands(
                             // change under us; offer it rather than nothing.
                             _ => {
                                 let url = client.image_url("/redirectToCp?href=/diagnostics");
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    let _ = open::that_detached(&url);
-                                })
-                                .await;
+                                open_in_browser(&backend.ui, url).await;
                             }
                         }
                     }
@@ -4518,10 +4506,7 @@ async fn run_commands(
                         backend.publish_pane();
                         match client.web_url(&path) {
                             Ok(url) => {
-                                tracing::info!(%id, "opening {url} in a browser");
-                                let _ =
-                                    tokio::task::spawn_blocking(move || open::that_detached(url))
-                                        .await;
+                                open_in_browser(&backend.ui, url).await;
                             }
                             // The player named somewhere that is not the
                             // player. Handing that to the desktop's browser is
@@ -4864,8 +4849,7 @@ async fn run_commands(
                         }
                         // A constant, so this cannot be off-player.
                         if let Ok(url) = client.web_url("/services?noheader=1") {
-                            let _ =
-                                tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                            open_in_browser(&backend.ui, url).await;
                         }
                     }
                 }
@@ -4892,8 +4876,7 @@ async fn run_commands(
                         tracing::debug!(%id, "could not read the shares page: {e}");
                         // A constant, so this cannot be off-player.
                         if let Ok(url) = client.web_url("/sharecfg?noheader=1") {
-                            let _ =
-                                tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                            open_in_browser(&backend.ui, url).await;
                         }
                     }
                 }
@@ -5308,6 +5291,29 @@ async fn run_commands(
                 tracing::warn!(%id, ?action, "command failed: {e}");
             }
         });
+    }
+}
+
+/// Hand a URL to the desktop's browser, and tell the window it happened.
+///
+/// Worth saying out loud. The browser opens behind the app as often as in
+/// front of it, and this app does not change at all when it does — so without
+/// a word the press reads as having done nothing, which is exactly the
+/// complaint the queue menu used to draw.
+async fn open_in_browser(ui: &slint::Weak<AppWindow>, url: String) {
+    tracing::info!("opening {url} in a browser");
+    match tokio::task::spawn_blocking(move || open::that_detached(url)).await {
+        Ok(Ok(())) => say(ui, "Opened in your browser"),
+        Ok(Err(e)) => {
+            tracing::warn!("could not open a browser: {e}");
+            say(ui, "Could not open your browser");
+        }
+        // The blocking pool itself gave up, which is not something the person
+        // reading the screen can do anything about beyond knowing.
+        Err(e) => {
+            tracing::warn!("browser launch did not finish: {e}");
+            say(ui, "Could not open your browser");
+        }
     }
 }
 
