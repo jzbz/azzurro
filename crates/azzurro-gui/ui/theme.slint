@@ -5,36 +5,104 @@ import { Palette } from "std-widgets.slint";
 // The app follows the system light/dark setting but draws its own controls, so
 // it looks like itself on any desktop and picks up platform character only
 // where it should — the window frame, the font, and the scrollbars. A music
-// controller is one of the few app classes where that is the expectation rather
-// than a compromise.
+// controller is one of the few app classes where that is the expectation
+// rather than a compromise: nobody wants Spotify to look like a file manager.
+//
+// The dark palette is the one designed first and the one to judge the app by.
+// Light is a faithful inversion, not an afterthought, but this is an app for
+// looking at album art in.
 export global Theme {
     out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
 
-    // Surfaces, back to front.
-    out property <brush> bg: dark ? #101216 : #f4f5f8;
-    out property <brush> surface: dark ? #181b21 : #ffffff;
-    out property <brush> sunken: dark ? #14161b : #eaecf1;
-    out property <brush> hover: dark ? #ffffff0f : #0000000a;
-    out property <brush> pressed: dark ? #ffffff1f : #00000016;
-    out property <brush> selected: dark ? #38bdf826 : #0284c714;
-    out property <brush> border: dark ? #262a32 : #e2e5ec;
+    // Surfaces, back to front. Four levels rather than two: the difference
+    // between a panel and a row inside it has to be visible without a border
+    // on every row, or a list of forty becomes a grid.
+    out property <brush> bg: dark ? #0b0d10 : #f4f6f8;
+    out property <brush> surface: dark ? #14171c : #ffffff;
+    out property <brush> raised: dark ? #1b1f26 : #f1f4f7;
+    out property <brush> sunken: dark ? #0e1116 : #e8ecf1;
 
-    // Ink.
-    out property <brush> text: dark ? #e9ebf0 : #14171d;
-    out property <brush> dim: dark ? #98a1b2 : #5b6472;
-    // Eight hex digits are RGBA here, not RGB: the trailing pair is alpha, and
-    // getting it wrong makes a colour invisible rather than merely wrong.
-    out property <brush> faint: dark ? #697182 : #8a919e;
+    // Interaction, as overlays rather than fixed colours, so they compose over
+    // whichever surface they land on.
+    out property <brush> hover: dark ? #ffffff0d : #0000000a;
+    out property <brush> pressed: dark ? #ffffff17 : #00000014;
+    out property <brush> selected: dark ? #38bdf81f : #0284c714;
 
-    // Accent. Azzurro, which is the whole reason for the name.
+    out property <brush> border: dark ? #23282f : #e3e7ed;
+    out property <brush> border-strong: dark ? #2f3640 : #ccd3dc;
+
+    // Ink. Three weights: what you read, what you glance at, and what is only
+    // there to be found when looked for.
+    out property <brush> text: dark ? #eef1f5 : #12161c;
+    out property <brush> dim: dark ? #9aa4b2 : #5b6572;
+    out property <brush> faint: dark ? #5d6673 : #8d97a5;
+
+    // Azzurro, which is the whole reason for the name.
     out property <brush> accent: dark ? #38bdf8 : #0284c7;
-    out property <brush> accent-ink: dark ? #06212e : #ffffff;
+    out property <brush> accent-hover: dark ? #7dd3fc : #0369a1;
+    out property <brush> accent-ink: dark ? #04212e : #ffffff;
+    out property <brush> accent-soft: dark ? #38bdf826 : #0284c714;
 
+    // Spacing, on a 4px grid. Named for what they separate rather than by
+    // size, so a change of mind is one edit here.
+    out property <length> tight: 4px;
     out property <length> gap: 8px;
-    out property <length> pad: 14px;
-    out property <length> radius: 10px;
+    out property <length> pad: 12px;
+    out property <length> room: 18px;
 
+    out property <length> radius: 12px;
+    out property <length> radius-small: 8px;
+
+    // Type. The display size is for the one line that matters — what is
+    // playing — and everything else steps down from the body size.
+    out property <length> display-size: 21px;
     out property <length> title-size: 15px;
     out property <length> body-size: 13px;
-    out property <length> small-size: 11px;
+    out property <length> small-size: 11.5px;
+    out property <length> micro-size: 10.5px;
+}
+
+// Lucide, ISC licensed — see icons/LICENSE. Every glyph is 24x24 on a 2px
+// round-cap stroke, and `Icon` recolours it through the alpha channel, so the
+// set follows the theme without a second copy per colour.
+//
+// The names here are the app's, not Lucide's: `previous`/`next` because that
+// is what the buttons do, `sleep` because `moon` describes the picture and not
+// the function, and `menu` because the call sites should not have to know that
+// three dots is called `ellipsis`.
+export global Icons {
+    out property <image> play: @image-url("icons/play.svg");
+    out property <image> pause: @image-url("icons/pause.svg");
+    out property <image> next: @image-url("icons/skip-forward.svg");
+    out property <image> previous: @image-url("icons/skip-back.svg");
+    out property <image> shuffle: @image-url("icons/shuffle.svg");
+    out property <image> repeat: @image-url("icons/repeat.svg");
+    out property <image> repeat-one: @image-url("icons/repeat-1.svg");
+    out property <image> sleep: @image-url("icons/moon.svg");
+
+    out property <image> volume: @image-url("icons/volume-2.svg");
+    out property <image> muted: @image-url("icons/volume-x.svg");
+
+    out property <image> queue: @image-url("icons/list-music.svg");
+    out property <image> browse: @image-url("icons/library-big.svg");
+    out property <image> search: @image-url("icons/search.svg");
+    out property <image> forward: @image-url("icons/chevron-right.svg");
+    out property <image> back: @image-url("icons/chevron-left.svg");
+    out property <image> menu: @image-url("icons/ellipsis.svg");
+
+    out property <image> player: @image-url("icons/speaker.svg");
+    out property <image> radio: @image-url("icons/radio.svg");
+    out property <image> track: @image-url("icons/music-4.svg");
+    out property <image> group: @image-url("icons/link-2.svg");
+    out property <image> ungroup: @image-url("icons/unlink-2.svg");
+    out property <image> grouped: @image-url("icons/cast.svg");
+    out property <image> add: @image-url("icons/plus.svg");
+    out property <image> rescan: @image-url("icons/refresh-cw.svg");
+
+    // Not drawn anywhere in the window. `audio-lines` is the glyph the
+    // application icon is built from, and it is kept here so that the icon in
+    // the launcher and the icons in the window are traceably the same set —
+    // and so the next person to touch desktop/*.svg can find the original
+    // rather than reverse-engineering the paths out of it.
+    out property <image> brand: @image-url("icons/audio-lines.svg");
 }

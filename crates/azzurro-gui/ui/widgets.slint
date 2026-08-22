@@ -1,0 +1,336 @@
+import { Theme, Icons } from "theme.slint";
+
+// The pieces the window is built from. Everything here draws itself rather
+// than wrapping a std-widget, so that hover, press and disabled states behave
+// the same way in every corner of the app.
+
+// A Lucide glyph, recoloured.
+export component Icon inherits Image {
+    in property <image> glyph;
+    in property <brush> tint: Theme.text;
+
+    source: root.glyph;
+    // colorize treats the SVG as an alpha mask and paints it in `tint`, so one
+    // copy of each glyph serves every colour the theme has.
+    colorize: root.tint;
+    image-fit: contain;
+    width: 18px;
+    height: 18px;
+}
+
+// A round button with a glyph in it. The transport controls, and every small
+// affordance that would otherwise need a word.
+export component IconButton inherits Rectangle {
+    in property <image> glyph;
+    in property <bool> enabled: true;
+    // Filled with the accent rather than drawn on the surface. One per screen:
+    // the thing you press without looking.
+    in property <bool> primary: false;
+    in property <bool> active: false;
+    in property <length> size: 34px;
+    in property <length> glyph-size: 17px;
+    in property <brush> tint: Theme.dim;
+    callback clicked();
+
+    width: root.size;
+    height: root.size;
+    border-radius: self.height / 2;
+
+    background: !root.enabled
+        ? transparent
+        : (root.primary
+            ? (touch.pressed ? Theme.accent-hover : Theme.accent)
+            : (root.active
+                ? Theme.accent-soft
+                : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent))));
+
+    // Short enough not to lag the pointer, long enough not to flicker on a
+    // list where the pointer crosses several rows at once.
+    animate background { duration: 120ms; easing: ease-out; }
+
+    opacity: root.enabled ? 1.0 : 0.35;
+    animate opacity { duration: 120ms; }
+
+    Icon {
+        glyph: root.glyph;
+        width: root.glyph-size;
+        height: root.glyph-size;
+        tint: root.primary
+            ? Theme.accent-ink
+            : (root.active ? Theme.accent : (touch.has-hover ? Theme.text : root.tint));
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A text button, optionally with a glyph before the label.
+export component PillButton inherits Rectangle {
+    in property <string> label;
+    in property <image> glyph;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    callback clicked();
+
+    height: 30px;
+    width: content.preferred-width + 26px;
+    border-radius: self.height / 2;
+
+    background: root.primary
+        ? (touch.pressed ? Theme.accent-hover : Theme.accent)
+        : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent));
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.border;
+    animate background { duration: 120ms; easing: ease-out; }
+    opacity: root.enabled ? 1.0 : 0.35;
+
+    content := HorizontalLayout {
+        alignment: center;
+        spacing: 6px;
+        padding-left: 13px;
+        padding-right: 13px;
+
+        if root.glyph.width > 0: Icon {
+            glyph: root.glyph;
+            width: 14px;
+            height: 14px;
+            tint: root.primary ? Theme.accent-ink : Theme.dim;
+        }
+
+        Text {
+            text: root.label;
+            font-size: Theme.body-size;
+            color: root.primary ? Theme.accent-ink : Theme.text;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Two mutually exclusive views sharing one panel. A pair of buttons would say
+// "two actions"; this says "one thing, seen two ways".
+export component Segmented inherits Rectangle {
+    in property <string> first;
+    in property <string> second;
+    in property <image> first-glyph;
+    in property <image> second-glyph;
+    in-out property <int> index: 0;
+    callback changed(int);
+
+    height: 30px;
+    border-radius: self.height / 2;
+    background: Theme.sunken;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+
+        for entry[i] in [
+            { label: root.first, glyph: root.first-glyph },
+            { label: root.second, glyph: root.second-glyph },
+        ]: Rectangle {
+            border-radius: self.height / 2;
+            background: root.index == i
+                ? Theme.raised
+                : (segment.has-hover ? Theme.hover : transparent);
+            animate background { duration: 120ms; easing: ease-out; }
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 6px;
+                padding-left: 12px;
+                padding-right: 12px;
+
+                Icon {
+                    glyph: entry.glyph;
+                    width: 14px;
+                    height: 14px;
+                    tint: root.index == i ? Theme.accent : Theme.faint;
+                }
+
+                Text {
+                    text: entry.label;
+                    font-size: Theme.small-size;
+                    font-weight: root.index == i ? 600 : 400;
+                    color: root.index == i ? Theme.text : Theme.dim;
+                    vertical-alignment: center;
+                }
+            }
+
+            segment := TouchArea {
+                clicked => {
+                    root.index = i;
+                    root.changed(i);
+                }
+            }
+        }
+    }
+}
+
+// A seek bar. Drawn rather than borrowed from std-widgets, because a slider
+// with a knob on it looks like a setting, and this is a position.
+export component Scrubber inherits Rectangle {
+    // 0 to 1.
+    in property <float> value;
+    in property <bool> enabled: true;
+    callback seek(float);
+
+    height: 18px;
+    // While a drag is in progress the bar follows the pointer, not the player:
+    // the player is a second behind and would drag the handle back.
+    property <bool> dragging: false;
+    property <float> preview: 0;
+    property <float> shown: root.dragging ? root.preview : Math.clamp(root.value, 0, 1);
+
+    track := Rectangle {
+        y: (parent.height - 4px) / 2;
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.sunken;
+
+        Rectangle {
+            x: 0;
+            width: parent.width * root.shown;
+            height: parent.height;
+            border-radius: 2px;
+            background: root.enabled ? Theme.accent : Theme.faint;
+        }
+    }
+
+    // The handle appears on hover or while dragging. At rest the bar is a
+    // line, which is all it needs to be.
+    Rectangle {
+        x: track.width * root.shown - self.width / 2;
+        y: (parent.height - self.height) / 2;
+        width: 11px;
+        height: 11px;
+        border-radius: self.height / 2;
+        background: Theme.accent;
+        opacity: root.enabled && (touch.has-hover || root.dragging) ? 1.0 : 0.0;
+        animate opacity { duration: 100ms; }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        moved => {
+            if (self.pressed) {
+                root.dragging = true;
+                root.preview = Math.clamp(self.mouse-x / root.width, 0, 1);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up) {
+                root.seek(Math.clamp(self.mouse-x / root.width, 0, 1));
+                root.dragging = false;
+            }
+        }
+    }
+}
+
+// Volume: an icon that doubles as the mute button, and a level.
+export component Level inherits HorizontalLayout {
+    in property <int> value;
+    in property <bool> muted: false;
+    callback changed(int);
+    callback toggle-mute();
+
+    spacing: Theme.gap;
+
+    IconButton {
+        glyph: root.muted ? Icons.muted : Icons.volume;
+        size: 26px;
+        glyph-size: 15px;
+        tint: root.muted ? Theme.faint : Theme.dim;
+        clicked => { root.toggle-mute(); }
+    }
+
+    bar := Scrubber {
+        enabled: !root.muted;
+        value: root.value / 100;
+        vertical-stretch: 1;
+        seek(fraction) => { root.changed(Math.round(fraction * 100)); }
+    }
+
+    Text {
+        text: root.muted ? "—" : root.value;
+        font-size: Theme.small-size;
+        color: Theme.faint;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        width: 22px;
+    }
+}
+
+// A card. The one place the panel treatment is decided.
+export component Panel inherits Rectangle {
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+}
+
+// Cover art, with something to show before it arrives.
+export component Artwork inherits Rectangle {
+    in property <image> source;
+    in property <image> fallback: Icons.track;
+    in property <length> corner: Theme.radius;
+
+    border-radius: root.corner;
+    background: Theme.sunken;
+    clip: true;
+
+    Icon {
+        glyph: root.fallback;
+        tint: Theme.faint;
+        width: Math.min(parent.width, parent.height) * 0.32;
+        height: self.width;
+        visible: root.source.width == 0;
+    }
+
+    Image {
+        source: root.source;
+        image-fit: cover;
+        width: 100%;
+        height: 100%;
+    }
+}
+
+// A small label that carries state — "Leading 2 players", "unreachable".
+export component Badge inherits Rectangle {
+    in property <string> label;
+    in property <brush> tint: Theme.dim;
+    in property <image> glyph;
+
+    height: 18px;
+    width: row.preferred-width + 14px;
+    border-radius: self.height / 2;
+    background: Theme.raised;
+
+    row := HorizontalLayout {
+        alignment: center;
+        spacing: 4px;
+        padding-left: 7px;
+        padding-right: 7px;
+
+        if root.glyph.width > 0: Icon {
+            glyph: root.glyph;
+            width: 11px;
+            height: 11px;
+            tint: root.tint;
+        }
+
+        Text {
+            text: root.label;
+            font-size: Theme.micro-size;
+            color: root.tint;
+            vertical-alignment: center;
+        }
+    }
+}

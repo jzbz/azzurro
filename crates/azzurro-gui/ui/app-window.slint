@@ -1,5 +1,6 @@
-import { ListView, Slider, ScrollView, ComboBox, LineEdit } from "std-widgets.slint";
-import { Theme } from "theme.slint";
+import { ListView, ComboBox, LineEdit } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge } from "widgets.slint";
 
 // One player, flattened for display. The backend owns the real state; this is
 // only what has to cross into the UI thread.
@@ -11,13 +12,13 @@ export struct Device {
     muted: bool,
     playing: bool,
     now-playing: string,
+    title: string,
+    artist: string,
     service: string,
     reachable: bool,
     // "Leading 2 players", "Following Kitchen", "Reconnecting…" or empty.
     role: string,
-    // Whether this player is currently in the selected player's group.
     in-group: bool,
-    // Whether grouping it with the selected player is even a question.
     groupable: bool,
 }
 
@@ -31,8 +32,6 @@ export struct Track {
     cursor: bool,
     // ...and whether that position is what you are actually hearing.
     live: bool,
-    // Empty until the art has been fetched and decoded; `cover.width == 0`
-    // is what distinguishes "not loaded" from "loaded".
     cover: image,
 }
 
@@ -42,43 +41,128 @@ export struct BrowseRow {
     title: string,
     subtitle: string,
     cover: image,
-    // A section heading rather than something to click.
     heading: bool,
-    // Whether activating it does anything.
     actionable: bool,
-    // The player says this is what is playing.
     playing: bool,
-    // Whether there is a context menu to open on it.
     has-menu: bool,
 }
 
-component TextButton inherits Rectangle {
-    in property <string> label;
-    in property <bool> primary: false;
-    in property <bool> enabled: true;
-    callback clicked();
+component SectionLabel inherits Text {
+    font-size: Theme.micro-size;
+    font-weight: 700;
+    color: Theme.faint;
+    // Small caps are not available, so the spacing does the work of saying
+    // "this is a label, not content".
+    letter-spacing: 0.8px;
+}
 
-    height: 30px;
-    width: text.preferred-width + 24px;
-    border-radius: Theme.radius;
-    background: root.primary
-        ? Theme.accent
-        : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent));
-    border-width: root.primary ? 0px : 1px;
-    border-color: Theme.border;
-    opacity: root.enabled ? 1.0 : 0.4;
+component DeviceCard inherits Rectangle {
+    in property <Device> device;
+    in property <bool> selected;
+    callback picked();
+    callback volume-changed(int);
+    callback toggle-mute();
+    callback toggle-group();
 
-    text := Text {
-        text: root.label;
-        font-size: Theme.body-size;
-        color: root.primary ? Theme.accent-ink : Theme.text;
-        vertical-alignment: center;
-        horizontal-alignment: center;
-    }
+    border-radius: Theme.radius-small;
+    background: root.selected
+        ? Theme.selected
+        : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: 140ms; easing: ease-out; }
 
     touch := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
+        clicked => { root.picked(); }
+    }
+
+    // A rule down the left edge rather than a heavier fill: the selected card
+    // has to be obvious at a glance without becoming the loudest thing on the
+    // screen, which is the artwork's job.
+    Rectangle {
+        x: 0;
+        width: 3px;
+        height: parent.height - 16px;
+        y: 8px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+        opacity: root.selected ? 1.0 : 0.0;
+        animate opacity { duration: 140ms; }
+    }
+
+    VerticalLayout {
+        padding: Theme.pad;
+        padding-left: Theme.pad + 4px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Icon {
+                glyph: root.device.in-group ? Icons.grouped : Icons.player;
+                tint: root.selected ? Theme.accent : Theme.faint;
+                width: 17px;
+                height: 17px;
+                y: 2px;
+            }
+
+            VerticalLayout {
+                spacing: 1px;
+                horizontal-stretch: 1;
+                min-width: 0px;
+
+                Text {
+                    text: root.device.name;
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.device.reachable
+                        ? (root.device.now-playing == "" ? root.device.model : root.device.now-playing)
+                        : "Not responding";
+                    font-size: Theme.small-size;
+                    color: root.device.reachable ? Theme.dim : Theme.faint;
+                    overflow: elide;
+                }
+            }
+
+            if root.device.playing: Icon {
+                glyph: Icons.play;
+                tint: Theme.accent;
+                width: 13px;
+                height: 13px;
+                y: 4px;
+            }
+        }
+
+        Level {
+            value: root.device.volume;
+            muted: root.device.muted;
+            changed(v) => { root.volume-changed(v); }
+            toggle-mute => { root.toggle-mute(); }
+        }
+
+        if root.device.role != "" || root.device.groupable: HorizontalLayout {
+            spacing: Theme.gap;
+            padding-top: 2px;
+
+            if root.device.role != "": Badge {
+                label: root.device.role;
+                tint: Theme.accent;
+                glyph: Icons.grouped;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if root.device.groupable: IconButton {
+                glyph: root.device.in-group ? Icons.ungroup : Icons.group;
+                size: 26px;
+                glyph-size: 14px;
+                active: root.device.in-group;
+                clicked => { root.toggle-group(); }
+            }
+        }
     }
 }
 
@@ -87,63 +171,46 @@ component TrackRow inherits Rectangle {
     callback play();
     callback open-menu();
 
-    height: 46px;
-    border-radius: 6px;
-    background: touch.has-hover
-        ? Theme.hover
-        : (root.track.cursor ? Theme.selected : transparent);
+    height: 52px;
+    border-radius: Theme.radius-small;
+    background: root.track.live
+        ? Theme.selected
+        : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: 120ms; easing: ease-out; }
 
     touch := TouchArea {
         clicked => { root.play(); }
     }
 
     HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 8px;
-        spacing: 6px;
-
-        // The marker leads, so every thumbnail below it lines up whether or
-        // not its row is the one the player is sitting on.
-        Text {
-            // Playing, versus merely where playback would resume.
-            text: root.track.cursor ? (root.track.live ? "▶" : "◇") : "";
-            font-size: Theme.small-size;
-            color: root.track.live ? Theme.accent : Theme.dim;
-            vertical-alignment: center;
-            horizontal-alignment: center;
-            width: 12px;
-        }
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.gap;
 
         VerticalLayout {
             alignment: center;
 
-            Rectangle {
-                width: 34px;
-                height: 34px;
-                border-radius: 4px;
-                background: Theme.sunken;
-                clip: true;
-
-                Image {
-                    source: root.track.cover;
-                    image-fit: cover;
-                    width: 100%;
-                    height: 100%;
-                }
+            Artwork {
+                source: root.track.cover;
+                corner: 5px;
+                width: 36px;
+                height: 36px;
             }
         }
 
         VerticalLayout {
             alignment: center;
             spacing: 1px;
-            // Takes the slack, so the duration column below stays put instead
-            // of drifting with the length of each title.
             horizontal-stretch: 1;
+            // Without this the row's minimum width is the full untruncated
+            // title, and a fixed-width panel gets painted straight through.
+            min-width: 0px;
 
             Text {
                 text: root.track.title;
                 font-size: Theme.body-size;
-                color: Theme.text;
+                font-weight: root.track.cursor ? 600 : 400;
+                color: root.track.cursor ? Theme.accent : Theme.text;
                 overflow: elide;
             }
 
@@ -155,32 +222,23 @@ component TrackRow inherits Rectangle {
             }
         }
 
-        Rectangle {
-            width: 22px;
-            border-radius: 4px;
-            background: menu-touch.has-hover ? Theme.pressed : transparent;
-            opacity: touch.has-hover || menu-touch.has-hover ? 1.0 : 0.0;
-
-            Text {
-                text: "⋯";
-                font-size: Theme.body-size;
-                color: Theme.dim;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-            }
-
-            menu-touch := TouchArea {
-                clicked => { root.open-menu(); }
-            }
+        // Only where the pointer is: forty of these at rest is furniture.
+        IconButton {
+            glyph: Icons.menu;
+            size: 26px;
+            glyph-size: 15px;
+            opacity: touch.has-hover ? 1.0 : 0.0;
+            animate opacity { duration: 120ms; }
+            clicked => { root.open-menu(); }
         }
 
         Text {
             text: root.track.duration;
             font-size: Theme.small-size;
-            color: Theme.dim;
+            color: Theme.faint;
             vertical-alignment: center;
             horizontal-alignment: right;
-            width: 38px;
+            width: 36px;
         }
     }
 }
@@ -190,53 +248,50 @@ component BrowseRowView inherits Rectangle {
     callback activate();
     callback open-menu();
 
-    height: root.entry.heading ? 28px : 46px;
-    border-radius: 6px;
+    height: root.entry.heading ? 30px : 52px;
+    border-radius: Theme.radius-small;
     background: (root.entry.heading || !root.entry.actionable)
         ? transparent
         : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: 120ms; easing: ease-out; }
 
     touch := TouchArea {
         enabled: root.entry.actionable && !root.entry.heading;
         clicked => { root.activate(); }
     }
 
-    HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 8px;
-        spacing: 6px;
+    if root.entry.heading: HorizontalLayout {
+        padding-left: Theme.gap;
+        alignment: start;
 
-        if root.entry.heading: Text {
+        SectionLabel {
             text: root.entry.title;
-            font-size: Theme.small-size;
-            font-weight: 600;
-            color: Theme.dim;
             vertical-alignment: bottom;
         }
+    }
 
-        if !root.entry.heading: VerticalLayout {
+    if !root.entry.heading: HorizontalLayout {
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.gap;
+
+        VerticalLayout {
             alignment: center;
 
-            Rectangle {
-                width: 34px;
-                height: 34px;
-                border-radius: 4px;
-                background: Theme.sunken;
-                clip: true;
-
-                Image {
-                    source: root.entry.cover;
-                    image-fit: contain;
-                    width: 100%;
-                    height: 100%;
-                }
+            Artwork {
+                source: root.entry.cover;
+                fallback: Icons.radio;
+                corner: 5px;
+                width: 36px;
+                height: 36px;
             }
         }
 
-        if !root.entry.heading: VerticalLayout {
+        VerticalLayout {
             alignment: center;
             spacing: 1px;
             horizontal-stretch: 1;
+            min-width: 0px;
 
             Text {
                 text: root.entry.title;
@@ -253,126 +308,24 @@ component BrowseRowView inherits Rectangle {
             }
         }
 
-        if !root.entry.heading && root.entry.has-menu: Rectangle {
-            width: 22px;
-            border-radius: 4px;
-            background: menu-touch.has-hover ? Theme.pressed : transparent;
-            // Kept out of the way until the row is under the pointer, so a
-            // list of forty rows is not forty pieces of furniture.
-            opacity: touch.has-hover || menu-touch.has-hover ? 1.0 : 0.0;
-
-            Text {
-                text: "⋯";
-                font-size: Theme.body-size;
-                color: Theme.dim;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-            }
-
-            menu-touch := TouchArea {
-                clicked => { root.open-menu(); }
-            }
+        if root.entry.has-menu: IconButton {
+            glyph: Icons.menu;
+            size: 26px;
+            glyph-size: 15px;
+            opacity: touch.has-hover ? 1.0 : 0.0;
+            animate opacity { duration: 120ms; }
+            clicked => { root.open-menu(); }
         }
 
-        if !root.entry.heading: Text {
-            text: root.entry.playing ? "▶" : (root.entry.actionable ? "›" : "");
-            font-size: Theme.body-size;
-            color: root.entry.playing ? Theme.accent : Theme.faint;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            width: 14px;
-        }
-    }
-}
+        VerticalLayout {
+            alignment: center;
 
-component DeviceRow inherits Rectangle {
-    in property <Device> device;
-    in property <bool> selected;
-    callback picked();
-    callback volume-changed(int);
-    callback toggle-group();
-
-    height: root.device.role == "" ? 74px : 92px;
-    border-radius: Theme.radius;
-    background: root.selected
-        ? Theme.selected
-        : (touch.has-hover ? Theme.hover : transparent);
-
-    touch := TouchArea {
-        clicked => { root.picked(); }
-    }
-
-    VerticalLayout {
-        padding: Theme.gap;
-        spacing: 2px;
-
-        HorizontalLayout {
-            spacing: Theme.gap;
-
-            Text {
-                text: root.device.name;
-                font-size: Theme.title-size;
-                font-weight: 600;
-                color: Theme.text;
-                overflow: elide;
-            }
-
-            Rectangle { horizontal-stretch: 1; }
-
-            Text {
-                text: root.device.reachable ? root.device.model : "unreachable";
-                font-size: Theme.small-size;
-                color: Theme.dim;
-                vertical-alignment: center;
-            }
-        }
-
-        if root.device.role != "" || root.device.groupable: HorizontalLayout {
-            spacing: Theme.gap;
-
-            Text {
-                text: root.device.role;
-                font-size: Theme.small-size;
-                color: Theme.accent;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-
-            Rectangle { horizontal-stretch: 1; }
-
-            if root.device.groupable: TextButton {
-                label: root.device.in-group ? "Ungroup" : "Group";
-                clicked => { root.toggle-group(); }
-            }
-        }
-
-        Text {
-            text: root.device.now-playing == "" ? "—" : root.device.now-playing;
-            font-size: Theme.small-size;
-            color: Theme.dim;
-            overflow: elide;
-        }
-
-        HorizontalLayout {
-            spacing: Theme.gap;
-
-            Slider {
-                minimum: 0;
-                maximum: 100;
-                value: root.device.volume;
-                // `released`, not `changed`: a drag fires continuously, and
-                // every intermediate value would be one HTTP request to the
-                // player and one long-poll wakeup on every other controller.
-                released(v) => { root.volume-changed(Math.round(v)); }
-            }
-
-            Text {
-                text: root.device.muted ? "muted" : root.device.volume;
-                font-size: Theme.small-size;
-                color: Theme.dim;
-                vertical-alignment: center;
-                width: 40px;
-                horizontal-alignment: right;
+            Icon {
+                glyph: root.entry.playing ? Icons.play : Icons.forward;
+                tint: root.entry.playing ? Theme.accent : Theme.faint;
+                width: 15px;
+                height: 15px;
+                visible: root.entry.playing || root.entry.actionable;
             }
         }
     }
@@ -382,15 +335,27 @@ export component AppWindow inherits Window {
     in property <[Device]> devices;
     in property <[Track]> queue;
     in property <image> cover;
+    // A colour taken from the artwork, washed behind the now-playing panel.
+    in property <color> cover-tint;
+    in property <bool> has-tint: false;
     in property <string> queue-line: "";
     in property <string> status-line: "starting";
     in property <[BrowseRow]> browse;
     in property <string> browse-title: "Browse";
     in property <bool> browse-can-go-back: false;
-    // The screens this player offers, by name, straight from the player.
     in property <[string]> screens;
     in property <bool> browse-has-search: false;
     in property <string> browse-search-prompt: "Search";
+    in property <int> position;
+    in property <int> duration;
+    in property <string> position-text;
+    in property <string> duration-text;
+    in property <bool> seekable: false;
+    in property <bool> shuffle: false;
+    // 0 all, 1 one, 2 off — BluOS's numbering, not a guess.
+    in property <int> repeat: 2;
+    in property <string> sleep-label: "Sleep";
+    in property <bool> sleep-on: false;
     in-out property <int> selected: 0;
     // 0 shows the queue, 1 shows the browser.
     in-out property <int> pane: 0;
@@ -399,6 +364,7 @@ export component AppWindow inherits Window {
     callback skip(string);
     callback back(string);
     callback set-volume(string, int);
+    callback toggle-mute(string);
     callback select(string);
     callback toggle-group(string);
     callback play-track(string, int);
@@ -409,13 +375,18 @@ export component AppWindow inherits Window {
     callback browse-screen(int);
     callback browse-search(string);
     callback queue-menu(int);
+    callback seek(string, int);
+    callback toggle-shuffle(string);
+    callback cycle-repeat(string);
+    callback cycle-sleep(string);
     callback rescan();
+    callback add-player(string);
 
     title: "Azzurro";
-    preferred-width: 1060px;
-    preferred-height: 560px;
-    min-width: 720px;
-    min-height: 380px;
+    preferred-width: 1100px;
+    preferred-height: 660px;
+    min-width: 860px;
+    min-height: 520px;
     background: Theme.bg;
 
     property <bool> has-selection: root.devices.length > 0
@@ -433,26 +404,37 @@ export component AppWindow inherits Window {
             spacing: Theme.pad;
 
             // Players.
-            Rectangle {
-                width: 320px;
-                background: Theme.surface;
-                border-radius: Theme.radius;
-                border-width: 1px;
-                border-color: Theme.border;
+            Panel {
+                width: 296px;
 
                 VerticalLayout {
                     padding: Theme.gap;
                     spacing: Theme.gap;
 
-                    Text {
-                        text: "Players";
-                        font-size: Theme.small-size;
-                        font-weight: 600;
-                        color: Theme.dim;
+                    HorizontalLayout {
+                        padding-left: Theme.gap;
+                        padding-right: 2px;
+                        spacing: Theme.gap;
+
+                        SectionLabel {
+                            text: "PLAYERS";
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        IconButton {
+                            glyph: Icons.rescan;
+                            size: 26px;
+                            glyph-size: 14px;
+                            clicked => { root.rescan(); }
+                        }
                     }
 
                     ListView {
-                        for device[i] in root.devices: DeviceRow {
+                        vertical-stretch: 1;
+
+                        for device[i] in root.devices: DeviceCard {
                             device: device;
                             selected: i == root.selected;
                             picked => {
@@ -460,153 +442,259 @@ export component AppWindow inherits Window {
                                 root.select(device.id);
                             }
                             volume-changed(v) => { root.set-volume(device.id, v); }
+                            toggle-mute => { root.toggle-mute(device.id); }
                             toggle-group => { root.toggle-group(device.id); }
+                        }
+                    }
+
+                    // For a player discovery cannot reach: asleep at startup,
+                    // on another subnet, or behind something that eats
+                    // broadcast traffic.
+                    LineEdit {
+                        placeholder-text: "Add a player by address";
+                        font-size: Theme.small-size;
+                        accepted(text) => {
+                            root.add-player(text);
+                            self.text = "";
                         }
                     }
                 }
             }
 
             // Now playing.
-            Rectangle {
-                background: Theme.surface;
-                border-radius: Theme.radius;
-                border-width: 1px;
-                border-color: Theme.border;
+            Panel {
+                // The record's own colour, behind everything and barely there.
+                // Strong enough that a red sleeve and a green one feel
+                // different across the room; weak enough that text on top of
+                // it is still text on a dark panel.
+                Rectangle {
+                    background: @linear-gradient(180deg,
+                        root.cover-tint.with-alpha(0.20) 0%,
+                        root.cover-tint.with-alpha(0.05) 45%,
+                        transparent 85%);
+                    opacity: root.has-tint ? 1.0 : 0.0;
+                    animate opacity { duration: 400ms; easing: ease-out; }
+                }
 
                 VerticalLayout {
-                    padding: Theme.pad * 2;
-                    spacing: Theme.pad;
-                    alignment: center;
+                    padding: Theme.gap;
 
-                    // Artwork goes here once the image pipeline lands: fetch,
-                    // decode, downscale and cache, all of which this crate has
-                    // to do itself because Slint has no URL-loading image.
+                    // The sleep timer is a setting, not a transport control —
+                    // the official app keeps it in the player's settings pages
+                    // rather than beside the play button, and it is something
+                    // set once at bedtime. It sits up here out of the way, and
+                    // says how long it has left only while it is running.
                     HorizontalLayout {
-                        alignment: center;
+                        spacing: Theme.tight;
+                        alignment: end;
 
-                        Rectangle {
-                            height: 180px;
-                            width: 180px;
-                            background: Theme.sunken;
-                            border-radius: Theme.radius;
-                            clip: true;
+                        if root.sleep-on: Badge {
+                            label: root.sleep-label;
+                            tint: Theme.accent;
+                            glyph: Icons.sleep;
+                        }
 
-                            Image {
-                                source: root.cover;
-                                image-fit: contain;
-                                width: 100%;
-                                height: 100%;
-                            }
-
-                            // Stands in until there is art, and stays for the
-                            // sources that never have any.
-                            Text {
-                                visible: root.cover.width == 0;
-                                text: root.current.service == "" ? "—" : root.current.service;
-                                font-size: Theme.small-size;
-                                color: Theme.dim;
-                            }
+                        IconButton {
+                            glyph: Icons.sleep;
+                            size: 28px;
+                            glyph-size: 15px;
+                            active: root.sleep-on;
+                            enabled: root.has-selection;
+                            clicked => { root.cycle-sleep(root.current.id); }
                         }
                     }
 
-                    Text {
-                        text: root.has-selection ? root.current.name : "No player selected";
-                        font-size: Theme.title-size + 3px;
-                        font-weight: 600;
-                        color: Theme.text;
-                        horizontal-alignment: center;
-                        overflow: elide;
+                    VerticalLayout {
+                        padding-left: Theme.room;
+                        padding-right: Theme.room;
+                        padding-bottom: Theme.room;
+                        spacing: Theme.pad;
+                        alignment: center;
+                        vertical-stretch: 1;
+
+                    HorizontalLayout {
+                        alignment: center;
+
+                        Artwork {
+                            source: root.cover;
+                            width: 236px;
+                            height: 236px;
+                        }
                     }
 
-                    Text {
-                        text: root.current.now-playing == "" ? "Nothing playing" : root.current.now-playing;
-                        font-size: Theme.body-size;
-                        color: Theme.dim;
-                        horizontal-alignment: center;
-                        wrap: word-wrap;
+                    VerticalLayout {
+                        spacing: 3px;
+                        padding-top: Theme.gap;
+
+                        Text {
+                            text: !root.has-selection
+                                ? "No player selected"
+                                : (root.current.title == "" ? "Nothing playing" : root.current.title);
+                            font-size: Theme.display-size;
+                            font-weight: 600;
+                            color: Theme.text;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.current.artist;
+                            font-size: Theme.body-size;
+                            color: Theme.dim;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                            visible: root.current.artist != "";
+                        }
                     }
 
                     HorizontalLayout {
-                        spacing: Theme.gap;
                         alignment: center;
+                        spacing: Theme.tight;
 
-                        TextButton {
-                            label: "Previous";
+                        if root.has-selection: Badge {
+                            label: root.current.name;
+                            glyph: Icons.player;
+                        }
+
+                        if root.has-selection && root.current.service != "": Badge {
+                            label: root.current.service;
+                            glyph: Icons.radio;
+                        }
+                    }
+
+                    // Progress. Only interactive where the source can be
+                    // seeked: a live stream reports no length and no seek.
+                    if root.has-selection && root.duration > 0: HorizontalLayout {
+                        spacing: Theme.gap;
+                        padding-top: Theme.tight;
+
+                        Text {
+                            text: root.position-text;
+                            font-size: Theme.small-size;
+                            color: Theme.faint;
+                            vertical-alignment: center;
+                            width: 44px;
+                            horizontal-alignment: right;
+                        }
+
+                        Scrubber {
+                            enabled: root.seekable;
+                            value: root.position / Math.max(root.duration, 1);
+                            seek(fraction) => {
+                                root.seek(root.current.id, Math.round(fraction * root.duration));
+                            }
+                        }
+
+                        Text {
+                            text: root.duration-text;
+                            font-size: Theme.small-size;
+                            color: Theme.faint;
+                            vertical-alignment: center;
+                            width: 44px;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: Theme.gap;
+                        padding-top: Theme.tight;
+
+                        IconButton {
+                            glyph: Icons.shuffle;
+                            active: root.shuffle;
+                            enabled: root.has-selection;
+                            clicked => { root.toggle-shuffle(root.current.id); }
+                        }
+
+                        IconButton {
+                            glyph: Icons.previous;
                             enabled: root.has-selection;
                             clicked => { root.back(root.current.id); }
                         }
 
-                        TextButton {
-                            label: root.current.playing ? "Pause" : "Play";
+                        IconButton {
+                            glyph: root.current.playing ? Icons.pause : Icons.play;
                             primary: true;
+                            size: 52px;
+                            glyph-size: 22px;
                             enabled: root.has-selection;
                             clicked => { root.toggle(root.current.id); }
                         }
 
-                        TextButton {
-                            label: "Next";
+                        IconButton {
+                            glyph: Icons.next;
                             enabled: root.has-selection;
                             clicked => { root.skip(root.current.id); }
                         }
+
+                        IconButton {
+                            glyph: root.repeat == 1 ? Icons.repeat-one : Icons.repeat;
+                            active: root.repeat != 2;
+                            enabled: root.has-selection;
+                            clicked => { root.cycle-repeat(root.current.id); }
+                        }
+                    }
+
                     }
                 }
             }
 
             // Queue and browser share the right-hand panel.
-            Rectangle {
-                width: 340px;
-                background: Theme.surface;
-                border-radius: Theme.radius;
-                border-width: 1px;
-                border-color: Theme.border;
+            Panel {
+                width: 344px;
 
                 VerticalLayout {
                     padding: Theme.gap;
                     spacing: Theme.gap;
 
-                    HorizontalLayout {
-                        spacing: 4px;
-
-                        TextButton {
-                            label: "Queue";
-                            primary: root.pane == 0;
-                            clicked => { root.pane = 0; }
+                    Segmented {
+                        first: "Queue";
+                        second: "Browse";
+                        first-glyph: Icons.queue;
+                        second-glyph: Icons.browse;
+                        // One-way in, callback out: root.pane is the single
+                        // source of truth, and the backend can set it too — a
+                        // queue item's context menu is a browse document and
+                        // has to bring the pane with it.
+                        index: root.pane;
+                        changed(i) => {
+                            root.pane = i;
+                            if (i == 1) { root.browse-home(); }
                         }
+                    }
 
-                        TextButton {
-                            label: "Browse";
-                            primary: root.pane == 1;
-                            clicked => {
-                                root.pane = 1;
-                                root.browse-home();
-                            }
-                        }
+                    if root.pane == 0: SectionLabel {
+                        text: root.queue-line == "" ? "QUEUE" : root.queue-line;
+                    }
 
-                        Rectangle { horizontal-stretch: 1; }
+                    if root.pane == 1: HorizontalLayout {
+                        spacing: Theme.gap;
 
-                        if root.pane == 1 && root.browse-can-go-back: TextButton {
-                            label: "Back";
+                        if root.browse-can-go-back: IconButton {
+                            glyph: Icons.back;
+                            size: 26px;
+                            glyph-size: 15px;
                             clicked => { root.browse-back(); }
                         }
+
+                        // Without a height it takes whatever the row will give
+                        // it, which in a stretching column is all of it.
+                        ComboBox {
+                            model: root.screens;
+                            height: 30px;
+                            horizontal-stretch: 1;
+                            selected => { root.browse-screen(self.current-index); }
+                        }
                     }
 
-                    if root.pane == 1 && root.screens.length > 0: ComboBox {
-                        model: root.screens;
-                        selected => { root.browse-screen(self.current-index); }
-                    }
-
-                    Text {
-                        text: root.pane == 0
-                            ? (root.queue-line == "" ? "Queue" : root.queue-line)
-                            : root.browse-title;
-                        font-size: Theme.small-size;
-                        font-weight: 600;
-                        color: Theme.dim;
+                    if root.pane == 1: SectionLabel {
+                        text: root.browse-title;
                         overflow: elide;
                     }
 
                     if root.pane == 1 && root.browse-has-search: LineEdit {
                         placeholder-text: root.browse-search-prompt;
+                        font-size: Theme.small-size;
                         accepted(text) => { root.browse-search(text); }
                     }
 
@@ -631,20 +719,18 @@ export component AppWindow inherits Window {
 
         HorizontalLayout {
             spacing: Theme.gap;
+            padding-left: Theme.tight;
+            padding-right: Theme.tight;
 
             Text {
                 text: root.status-line;
                 font-size: Theme.small-size;
-                color: Theme.dim;
+                color: Theme.faint;
                 vertical-alignment: center;
+                overflow: elide;
             }
 
             Rectangle { horizontal-stretch: 1; }
-
-            TextButton {
-                label: "Rescan";
-                clicked => { root.rescan(); }
-            }
         }
     }
 }

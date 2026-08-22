@@ -51,6 +51,11 @@ Discovery is a UDP broadcast on port 11430 that every player answers. The same
 socket keeps listening afterwards, because players announce themselves when they
 wake, so one switched on an hour later still appears without a rescan.
 
+Neither of those helps a player that was asleep at startup or sits behind
+something that eats broadcast traffic, so addresses that have answered are
+remembered in `~/.config/azzurro/players` and tried again next time. One can be
+pinned there by hand, or typed into the box under the player list.
+
 Every player is also exported on D-Bus as its own MPRIS media player, named
 after the speaker rather than after the app — two speakers playing two
 different things are two things the desktop should be able to see and drive.
@@ -64,6 +69,19 @@ twenty-five elements and nine action types — so `crates/bluos/src/screen.rs`
 is a `match` rather than a general document renderer, and the app needs no
 knowledge of any particular music service.
 
+The interface draws its own controls rather than using the platform's — a
+music controller is one of the few app classes where looking like itself is
+the expectation. `ui/theme.slint` holds the palette, spacing and type in one
+place; `ui/widgets.slint` holds the pieces built from them. Icons are
+[Lucide](https://lucide.dev), recoloured through their alpha channel so one
+copy of each glyph serves every colour the theme has.
+
+The now-playing panel takes a colour from the cover art and washes it behind
+everything at low opacity, so a red sleeve and a green one feel different from
+across the room. Greys and near-blacks are discarded before averaging, because
+the mean of a whole sleeve is always a muddy brown; a cover with no colour in
+it gets no tint rather than a dirty one.
+
 Cover art is the one place Slint costs more than a toolkit with a URL-loading
 image element: fetching, decoding, scaling and caching are all the app's job.
 That work is confined to `crates/azzurro-gui/src/artwork.rs` — an LRU of
@@ -74,11 +92,37 @@ URL and bounded to four fetches at once.
 confirmed against hardware and what has only been read out of the official
 client.
 
+## Installing
+
+There is no packaged build yet. To put it in your desktop's menu from a
+checkout:
+
+```bash
+cargo build --release -p azzurro-gui
+install -Dm755 "$CARGO_TARGET_DIR/release/azzurro" ~/.local/bin/azzurro
+install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro.desktop \
+    ~/.local/share/applications/io.github.jzbz.azzurro.desktop
+install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro-256.png \
+    ~/.local/share/icons/hicolor/256x256/apps/io.github.jzbz.azzurro.png
+```
+
+`packaging/io.github.jzbz.azzurro.yml` is a Flatpak manifest for the same
+thing. It needs `packaging/cargo-sources.json`, which is generated from
+`Cargo.lock` because Flathub builds offline:
+
+```bash
+python3 packaging/cargo-sources.py > packaging/cargo-sources.json
+```
+
+The sandbox takes no filesystem permissions. It does need `--share=network`,
+and not only for HTTP: discovery is a UDP broadcast, which needs the host's
+network namespace rather than a proxied socket.
+
 ## Roadmap
 
-**v0.1 — a daily driver.** Discovery and manual addressing. Per-player volume
-and mute. Now playing with artwork, transport, seek, shuffle and repeat.
-Presets. The play queue, cover art and MPRIS are done; seek and presets are not.
+**v0.1 — a daily driver.** Done: discovery, per-player volume and mute, now
+playing with cover art, transport, seek, shuffle and repeat, the play queue,
+and MPRIS. Adding a player by address by hand is not wired up yet.
 
 **v0.2 — browsing.** The engine is in: the player describes each screen as XML,
 `/ui/BrowseObjects` reaches every service through one code path, and a service
@@ -88,8 +132,8 @@ picker lists whatever screens the player reports, and a row's `⋯` opens the
 menu the player describes for it — favourite, add to playlist, go to artist.
 Grouping is in but **untested against hardware** — only one player has been
 available, so the wire shapes come from the official controller's own parser
-rather than from a capture. Still to come: stereo and surround zones, seek
-scrubbing, shuffle and repeat controls, alarms and the sleep timer.
+rather than from a capture. Still to come: stereo and surround
+zones, alarms, and drag-to-reorder in the queue.
 
 **v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
 
