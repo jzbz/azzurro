@@ -3143,7 +3143,19 @@ export component AppWindow inherits Window {
     //
     // Anchored to the row that opened it and then clamped, so a menu opened
     // against the last row in a full queue still sits on screen.
-    if root.queue-menu-open: Rectangle {
+    // The same two-element shape as Now Playing, for the same two reasons: the
+    // outer carries the fade and is always here, the contents stay behind an
+    // `if` so a closed menu holds neither rows nor a hit target.
+    menu-fade := Rectangle {
+        opacity: root.queue-menu-open ? 1.0 : 0.0;
+        visible: self.opacity > 0.0;
+
+        animate opacity {
+            duration: 140ms;
+            easing: ease-out;
+        }
+
+        if menu-fade.visible: Rectangle {
         // Anything outside the panel dismisses it.
         TouchArea {
             clicked => { root.queue-menu-open = false; }
@@ -3151,9 +3163,17 @@ export component AppWindow inherits Window {
 
         Rectangle {
             x: parent.width - self.width - Theme.room;
+            // Rises the last few pixels into place rather than appearing at
+            // rest, which is what makes it read as coming from the row.
             y: Math.clamp(root.queue-menu-y + 34px,
                 Theme.room,
-                Math.max(Theme.room, parent.height - self.height - 96px));
+                Math.max(Theme.room, parent.height - self.height - 96px))
+                + (root.queue-menu-open ? 0px : 10px);
+
+            animate y {
+                duration: 140ms;
+                easing: ease-out;
+            }
             width: 320px;
             height: header.preferred-height + rows.preferred-height + 2 * Theme.gap;
             border-radius: Theme.radius;
@@ -3247,6 +3267,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
         }
     }
 
