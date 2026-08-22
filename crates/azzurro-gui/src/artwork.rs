@@ -19,6 +19,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::sync::Mutex;
 
 use lru::LruCache;
@@ -44,6 +45,15 @@ const DISK_CACHE_FILES: usize = 512;
 /// Refuse anything implausible for a piece of cover art rather than decoding
 /// it. Guards against a redirect to something that is not an image at all.
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long one cover may take to arrive.
+///
+/// Without it a CDN that accepts the connection and then says nothing holds
+/// one of the [`CONCURRENT_FETCHES`] permits forever, and four such covers
+/// stop artwork loading altogether for the rest of the session. Generous,
+/// because this is a picture over someone else's network and not something
+/// the interface waits on.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A decoded image is identified by where it came from and how big it was
 /// wanted, since the same cover is drawn at two sizes.
@@ -167,7 +177,7 @@ impl Artwork {
         // connections, and a permit kept through decoding would idle it.
         let _permit = self.limit.acquire().await.ok()?;
 
-        let response = match self.http.get(url).send().await {
+        let mut response = match self.http.get(url).timeout(FETCH_TIMEOUT).send().await {
             Ok(response) => response.error_for_status().ok()?,
             Err(e) => {
                 tracing::debug!(url, "artwork fetch failed: {e}");
@@ -175,8 +185,8 @@ impl Artwork {
             }
         };
 
-        // Trust the declared length where there is one, and check the real
-        // length either way — a chunked response declares nothing.
+        // Trust the declared length where there is one, so an implausible
+        // cover costs nothing to refuse.
         if response
             .content_length()
             .is_some_and(|n| n as usize > MAX_BYTES)
@@ -184,12 +194,29 @@ impl Artwork {
             tracing::debug!(url, "artwork is implausibly large; skipping");
             return None;
         }
-        let bytes = response.bytes().await.ok()?;
-        if bytes.len() > MAX_BYTES {
-            return None;
-        }
 
-        let bytes = bytes.to_vec();
+        // Then read it a chunk at a time, checking as it goes. A chunked
+        // response declares no length at all, so this is the check that
+        // actually holds: asking for the whole body first and measuring it
+        // afterwards means the oversized body is already in memory, which is
+        // the thing being guarded against.
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > MAX_BYTES {
+                        tracing::debug!(url, "artwork kept growing past the limit; dropping it");
+                        return None;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::debug!(url, "artwork fetch stopped short: {e}");
+                    return None;
+                }
+            }
+        }
         if let Some(path) = path {
             let copy = bytes.clone();
             tokio::spawn(async move {

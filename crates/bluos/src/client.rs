@@ -26,6 +26,22 @@ use crate::status::{Status, SyncStatus};
 /// the long-poll below sets its own.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The largest reply worth reading from a player.
+///
+/// The timeout above bounds how *long* a body may take to arrive, not how
+/// large it may grow, and `Response::text()` buffers whatever turns up. Those
+/// are different limits: a body that never ends still costs a gigabyte before
+/// a ten-second timeout fires on a fast link, and the status poll — which
+/// waits up to 115 seconds by design — costs proportionally more, on repeat,
+/// for every player adopted.
+///
+/// A hundredfold headroom over anything a real player sends. Measured on an
+/// NAD Powernode at schema 35: `/Status` 1.2 KB, `/ui/Home` 15.4 KB, the
+/// library's Albums page 30.8 KB, and its Songs page — the largest document
+/// observed anywhere — 39.9 KB. Long lists page rather than growing, so the
+/// ceiling is a property of the document rather than of the library behind it.
+const MAX_BODY: usize = 4 * 1024 * 1024;
+
 /// What this client tells the player it understands.
 ///
 /// The player serves different documents to different numbers, and it is not a
@@ -140,13 +156,51 @@ impl Client {
         }
     }
 
+    /// Read a response body, giving up if it grows past [`MAX_BODY`].
+    ///
+    /// Replaces `Response::text()` on every read path. The declared length is
+    /// checked first so an oversized reply costs nothing at all, but it is
+    /// only a hint — a chunked response carries none and a hostile one can
+    /// lie, so the running total is what actually enforces the limit.
+    ///
+    /// Decoded as UTF-8, which every one of these documents declares: the XML
+    /// says so in its prologue and the player's web pages in a `<meta>`. A
+    /// byte that is not UTF-8 is replaced rather than refused, because a
+    /// mangled character in one label is a smaller failure than a screen that
+    /// will not open.
+    async fn body(&self, mut response: reqwest::Response) -> Result<String> {
+        let oversized = || Error::Oversized {
+            device: self.id,
+            limit: MAX_BODY,
+        };
+
+        if response.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+            return Err(oversized());
+        }
+
+        let mut buffer = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|source| Error::Http {
+            device: self.id,
+            source,
+        })? {
+            if buffer.len() + chunk.len() > MAX_BODY {
+                return Err(oversized());
+            }
+            buffer.extend_from_slice(&chunk);
+        }
+
+        Ok(String::from_utf8(buffer)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+    }
+
     async fn get_text(
         &self,
         path: &str,
         query: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<String> {
-        self.http
+        let response = self
+            .http
             .get(format!("{}{path}", self.base))
             .query(query)
             .header("x-sovi-schema-version", SCHEMA_VERSION)
@@ -158,13 +212,9 @@ impl Client {
             .map_err(|source| Error::Http {
                 device: self.id,
                 source,
-            })?
-            .text()
-            .await
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
+            })?;
+
+        self.body(response).await
     }
 
     async fn get_xml<T: DeserializeOwned>(
@@ -239,10 +289,7 @@ impl Client {
 
         let landed = response.url().clone();
         let base = format!("{}://{}", landed.scheme(), landed.authority());
-        let body = response.text().await.map_err(|source| Error::Http {
-            device: self.id,
-            source,
-        })?;
+        let body = self.body(response).await?;
 
         crate::settings::parse(&body, &base)
     }
@@ -317,7 +364,8 @@ impl Client {
     }
 
     async fn get_web(&self, path: &str) -> Result<String> {
-        self.http
+        let response = self
+            .http
             .get(self.web_url(path))
             .timeout(REQUEST_TIMEOUT)
             .send()
@@ -326,13 +374,9 @@ impl Client {
             .map_err(|source| Error::Http {
                 device: self.id,
                 source,
-            })?
-            .text()
-            .await
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
+            })?;
+
+        self.body(response).await
     }
 
     /// Read the form off one of the player's own configuration pages.
@@ -406,7 +450,7 @@ impl Client {
             request
         };
 
-        request
+        let response = request
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
@@ -414,13 +458,9 @@ impl Client {
             .map_err(|source| Error::Http {
                 device: self.id,
                 source,
-            })?
-            .text()
-            .await
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
+            })?;
+
+        self.body(response).await
     }
 
     /// Every music service the player offers to sign into.
@@ -798,6 +838,100 @@ mod tests {
         // second call reports that one is already in place.
         let _ = rustls::crypto::ring::default_provider().install_default();
         Client::new("192.0.2.155:11000".parse().unwrap()).unwrap()
+    }
+
+    fn client_at(addr: std::net::SocketAddr) -> Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Client::new(format!("{addr}").parse().unwrap()).unwrap()
+    }
+
+    /// A listener that answers every request with `body`, then a chunked run
+    /// of `flood` filler chunks. Returns the address to point a client at.
+    ///
+    /// Hand-rolled rather than pulled from a crate: one endpoint answering one
+    /// shape of request is less code than wiring a server in, and this needs
+    /// to speak a *deliberately* malformed conversation — an endless body —
+    /// which a well-behaved server would not offer to produce.
+    async fn serve(body: &'static str, flood: usize) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+
+            let head = if flood == 0 {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_owned()
+            };
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+
+            // 64 KiB a chunk, never terminated. A client that buffers whatever
+            // arrives keeps every one of them.
+            let chunk = format!("{:x}\r\n{}\r\n", 65536, "x".repeat(65536));
+            for _ in 0..flood {
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_reply_is_read_whole() {
+        let addr = serve("<status><volume>21</volume></status>", 0).await;
+        let c = client_at(addr);
+        assert_eq!(
+            c.get_text("/Status", &[], REQUEST_TIMEOUT).await.unwrap(),
+            "<status><volume>21</volume></status>"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_never_ends_is_refused_rather_than_buffered() {
+        // Twice the cap in chunks, with no terminating chunk: without a limit
+        // this is bounded only by the timeout and the speed of the link.
+        let addr = serve("", 2 * MAX_BODY / 65536).await;
+        let c = client_at(addr);
+
+        match c.get_text("/Status", &[], REQUEST_TIMEOUT).await {
+            Err(Error::Oversized { limit, .. }) => assert_eq!(limit, MAX_BODY),
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_over_the_cap_is_refused_before_reading() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Claims a gigabyte and sends almost none of it.
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nxxxx",
+                1024 * 1024 * 1024
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+        });
+
+        let c = client_at(addr);
+        assert!(matches!(
+            c.get_text("/Status", &[], REQUEST_TIMEOUT).await,
+            Err(Error::Oversized { .. })
+        ));
     }
 
     #[test]

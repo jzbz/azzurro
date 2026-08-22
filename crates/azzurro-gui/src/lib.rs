@@ -74,6 +74,15 @@ const SEARCH_SETTLE: Duration = Duration::from_millis(280);
 /// own list, and it lasts as long as the app is running.
 const RECENT_SEARCHES: usize = 8;
 
+/// How many players discovery may adopt on its own.
+///
+/// Not a limit anyone can reach by owning speakers: a large BluOS install is a
+/// few dozen zones, and this is an order of magnitude above that. It bounds
+/// what a forged announcement can cost, since each adopted player is a
+/// permanent poller and another O(n) rebuild of the list the window draws.
+/// Adding a player by hand ignores it — that is a decision, not a broadcast.
+const MAX_TRACKED: usize = 256;
+
 /// The longest label that shares a line with the others under the queue.
 ///
 /// Which buttons the player sends varies — Edit only appears once there is
@@ -1024,8 +1033,44 @@ impl Backend {
         let Some(player) = announce.player() else {
             return;
         };
+
+        // The address is what the packet *says*, not where it came from: the
+        // datagram's source is discarded before this, and LSDP is an
+        // unauthenticated broadcast anyone on the network can send. So the
+        // announcement is treated as a claim rather than a fact.
+        //
+        // The same test the remembered players get at startup, for the same
+        // reason and with the same helper. No genuine player can fail it — its
+        // announcement reached this machine over its own broadcast domain, so
+        // it is on one of these interfaces by construction — while a forged
+        // one naming 127.0.0.1, a metadata endpoint, or a host across the
+        // internet is refused. An address typed in by hand is not gated: that
+        // is someone deciding, which is a different thing entirely.
+        if !bluos::discovery::is_local(announce.address.into()) {
+            tracing::debug!(
+                address = %announce.address,
+                "ignoring an announcement for an address on no local network"
+            );
+            return;
+        }
+
+        // A cap on top, because a subnet is not itself small: one datagram can
+        // carry dozens of identities and a wide netmask leaves room for
+        // thousands. Every one of them would be a permanent poller and another
+        // O(n) rebuild of the player list. Far above any real system — the
+        // largest BluOS install is a few dozen zones — so the only thing this
+        // can turn away is a flood.
+        let id = DeviceId::new(announce.address, player.port());
+        {
+            let registry = self.registry.lock().unwrap();
+            if registry.len() >= MAX_TRACKED && !registry.contains_key(&id) {
+                tracing::warn!("ignoring an announcement: already tracking {MAX_TRACKED} players");
+                return;
+            }
+        }
+
         self.track(
-            DeviceId::new(announce.address, player.port()),
+            id,
             http,
             player.get("name"),
             player.get("model"),
