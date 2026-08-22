@@ -15,6 +15,41 @@
 //! degrades to "nothing found" rather than to an error, and the caller can
 //! still offer the page itself.
 
+/// A track's technical details, as the label and value pairs the player prints.
+///
+/// `/Info?category=technical` answers an HTML table rather than a document with
+/// a grammar: `<tr><td>Format:</td><td><small>FLAC 24/96</small></td></tr>`.
+/// Five facts about a file, so it is worth reading rather than opening.
+///
+/// Note that plain `/Info` is a different thing entirely — a redirect out to
+/// last.fm — and belongs in a browser.
+pub fn technical_info(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for row in html.split("<tr>").skip(1) {
+        let mut cells = row.split("<td").skip(1).map(|cell| {
+            strip_tags(cell.split_once('>').map(|(_, text)| text).unwrap_or(cell))
+                .trim_end_matches(':')
+                .trim()
+                .to_owned()
+        });
+        match (cells.next(), cells.next()) {
+            // Two cells is a fact. One is the file name, which the player
+            // writes across the whole width and which the row above already
+            // names.
+            (Some(label), Some(value)) if !label.is_empty() && !value.is_empty() => {
+                out.push((label, value));
+            }
+            (Some(only), None) if !only.is_empty() => {
+                if let Some((label, value)) = only.split_once(':') {
+                    out.push((label.trim().to_owned(), value.trim().to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// What a configuration page says to the reader, if anything.
 ///
 /// These pages carry a sentence above their form — what the service wants, or
@@ -268,6 +303,22 @@ mod tests {
             found[0].label,
             r"media\music on 10.0.0.100 (\\10.0.0.100\media\music)"
         );
+    }
+
+    /// `/Info?category=technical` for one FLAC, trimmed of its stylesheet.
+    const TECHNICAL: &str = r#"<br><table><head></head>
+<tr><td valign="top" colspan="2">File: <small>/var/mnt/media/Prince - 1999.flac</small></td></tr>
+<tr><td valign="top">Format:</td><td valign="bottom"><small>FLAC 24/96</small></td></tr>
+<tr><td valign="top">Sample&nbsp;rate:</td><td valign="bottom"><small>96000</small></td></tr>
+<tr><td valign="top">Channels:</td><td valign="bottom"><small>2</small></td></tr></table>"#;
+
+    #[test]
+    fn reads_a_track_technical_info() {
+        let facts = technical_info(TECHNICAL);
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0].0, "File");
+        assert_eq!(facts[1], ("Format".to_owned(), "FLAC 24/96".to_owned()));
+        assert_eq!(facts[3], ("Channels".to_owned(), "2".to_owned()));
     }
 
     #[test]

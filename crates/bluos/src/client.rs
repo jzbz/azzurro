@@ -480,6 +480,12 @@ impl Client {
             .map(drop)
     }
 
+    /// One track's technical details, as label and value.
+    pub async fn technical_info(&self, uri: &str) -> Result<Vec<(String, String)>> {
+        let body = self.get_text(uri, &[], REQUEST_TIMEOUT).await?;
+        Ok(crate::reports::technical_info(&body))
+    }
+
     /// The player's diagnostics, as label and value.
     pub async fn diagnostics(&self) -> Result<Vec<(String, String)>> {
         let body = self

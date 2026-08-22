@@ -68,6 +68,9 @@ pub struct Screen {
     /// The player's own "you are in a mode" bar, served on every screen for as
     /// long as the mode lasts.
     pub mode_indicator: Option<ModeIndicator>,
+    /// What a screen about one thing says about it. An album's page opens with
+    /// its cover, who made it, when, and what can be done with the whole of it.
+    pub header: Option<Header>,
     pub sections: Vec<Section>,
 }
 
@@ -342,6 +345,21 @@ pub struct QueuePage {
     pub name: Option<String>,
 }
 
+/// The block at the top of a screen that is about one thing.
+///
+/// An album, an artist, a playlist: the player sends the artwork, the three
+/// lines it wants shown, and the buttons for acting on the whole of it — "Play
+/// all" and "Shuffle" on an album.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Header {
+    pub image: Option<String>,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    /// The third line: "1982 • 1 Tracks".
+    pub subsubtitle: Option<String>,
+    pub buttons: Vec<Button>,
+}
+
 /// A bar the player puts on every screen while a mode is on.
 ///
 /// Queue Builder Mode is the one that uses it. What matters is that the way out
@@ -404,6 +422,11 @@ enum Ctx {
     MenuAction,
     Button,
     Action,
+    /// The alphabet down the side of a long list. Its children look exactly
+    /// like content and are not.
+    Index,
+    /// The block at the top of a screen about one thing, which has buttons.
+    Header,
     /// Anything unrecognised, so its end tag pops the right thing.
     Other,
 }
@@ -576,6 +599,26 @@ fn start(
             stack.push(Ctx::Other);
         }
 
+        // A jump index: `<index><item key="A" offset="6" length="22"/>…`, which
+        // a library's Artists page puts at the top of four hundred names. Its
+        // items carry no title and no action — they are somewhere to scroll to,
+        // not something to open — so drawing them gave a screenful of blank
+        // rows before the first artist.
+        "index" => {
+            stack.push(Ctx::Index);
+        }
+
+        "header" => {
+            screen.header = Some(Header {
+                image: a.remove("image"),
+                title: a.remove("title"),
+                subtitle: a.remove("subTitle"),
+                subsubtitle: a.remove("subSubTitle"),
+                buttons: Vec::new(),
+            });
+            stack.push(Ctx::Header);
+        }
+
         "row" | "selectorMenu" => {
             *section = Some(Section {
                 kind: if name == "row" {
@@ -673,7 +716,9 @@ fn start(
         }
 
         _ => {
-            if let Some((_, kind)) = ITEM_ELEMENTS.iter().find(|(n, _)| *n == name) {
+            if stack.last() == Some(&Ctx::Index) {
+                stack.push(Ctx::Other);
+            } else if let Some((_, kind)) = ITEM_ELEMENTS.iter().find(|(n, _)| *n == name) {
                 // A search box is the one item whose action lives on the
                 // element itself, so it has to be lifted out before the rest of
                 // the attributes are swept into `extra`.
@@ -758,6 +803,13 @@ fn end(
                     (Some(item), _, _) => item.buttons.push(done),
                     (None, Some(section), _) => section.buttons.push(done),
                     (None, None, Some(mode)) => mode.buttons.push(done),
+                    // "Play all" and "Shuffle" belong to the thing the screen
+                    // is about rather than to the screen.
+                    (None, None, None) if screen.header.is_some() => {
+                        if let Some(header) = screen.header.as_mut() {
+                            header.buttons.push(done);
+                        }
+                    }
                     // Nothing else open, so it belongs to the document: the
                     // play queue's button row sits directly under its root.
                     (None, None, None) => screen.buttons.push(done),
@@ -1132,6 +1184,34 @@ mod tests {
         assert_eq!(
             tracks[1].now_playing_match,
             Some(("song".to_owned(), "1".to_owned()))
+        );
+    }
+
+    /// A library's Artists page: an alphabet to jump by, then the names. Both
+    /// are `<item>`, and only the second kind is content.
+    const INDEXED: &str = r##"<screen version="1" service="LocalMusic">
+  <list offset="0" total="448">
+    <index revision="191">
+      <item key="#" offset="0" length="6"></item>
+      <item key="A" offset="6" length="22"></item>
+    </index>
+    <item title="10cm">
+      <action type="browse" URI="/ui/browseContext?title=10cm" resultType="screen"></action>
+    </item>
+    <item title="21 Savage">
+      <action type="browse" URI="/ui/browseContext?title=21+Savage" resultType="screen"></action>
+    </item>
+  </list>
+</screen>"##;
+
+    #[test]
+    fn a_jump_index_is_not_content() {
+        let screen = parse(INDEXED).unwrap();
+        let titles: Vec<_> = screen.items().filter_map(|item| item.label()).collect();
+        assert_eq!(
+            titles,
+            vec!["10cm", "21 Savage"],
+            "the alphabet is somewhere to scroll to, not something to draw"
         );
     }
 
