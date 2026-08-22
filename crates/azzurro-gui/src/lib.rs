@@ -1322,7 +1322,11 @@ impl Backend {
                 .items()
                 .enumerate()
                 .filter_map(|(at, item)| {
-                    let label = item.title.clone()?;
+                    // `label`, not `title`: a context menu writes its rows as
+                    // `<item text="Favourite">` and leaves `title` empty, so
+                    // reading `title` here dropped every line and the menu
+                    // reported that the player had offered nothing.
+                    let label = item.label()?.to_owned();
                     let glyph = glyphs::menu_glyph(&label);
                     Some((at as i32, label, glyph))
                 })

@@ -1434,4 +1434,50 @@ mod tests {
         assert_eq!(config.uri("queue"), Some("/ui/Queue"));
         assert_eq!(config.uri("nonesuch"), None);
     }
+    /// `/ui/queueItemCM?id=0` from a real NAD Powernode. Every row labels
+    /// itself with `text` and none of them carry a `title`, which is the whole
+    /// point of this fixture.
+    const QUEUE_ITEM_MENU: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<contextMenu image="/Artwork?service=LocalMusic&amp;artist=21+Savage&amp;album=Gang+Shit" subTitle="21 Savage • Gang Shit" title="Gang Shit" version="1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="screen.xsd">
+  <item icon="/images/ui/cm_favourite_add.png" text="Favourite">
+    <action type="player-link" URI="/ui/prf?cgsc=1&amp;u=%2FAddFavourite%3Ffn%3D%252Fvar%252Fmnt%252F10.0.0.100-mediamusic%252Fplaylist%252F21%2BSavage%2B-%2BGang%2BShit.flac%26service%3DLocalMusic" refreshScreen="true" haptic="true" notification="Added to favourites" notificationIcon="/images/ui/cm_favourite_add.png"></action>
+  </item>
+  <item icon="/images/ui/cm_addtoplaylist.png" text="Add to playlist…">
+    <action type="browse" URI="/AddToPlaylistOptions?service=LocalMusic&amp;songid=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac" resultType="AddToPlaylistOptions" title="Add to playlist…" service="LocalMusic"></action>
+  </item>
+  <item icon="/images/ui/cm_info.png" text="Info">
+    <action type="browse" URI="/Info?album=Gang+Shit&amp;artist=21+Savage&amp;service=LocalMusic&amp;title=Gang+Shit" resultType="Info" title="Info" service="LocalMusic"></action>
+  </item>
+  <item icon="/images/ui/cm_info.png" text="Technical info">
+    <action type="browse" URI="/Info?category=technical&amp;filename=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac&amp;service=LocalMusic" resultType="BriefInfo" title="Technical info" service="LocalMusic"></action>
+  </item>
+  <item icon="/images/ui/cm_delete.png" text="Delete from play queue">
+    <action type="player-link" URI="/Delete?id=0" refreshScreen="true" haptic="true" notification="Deleted &#34;Gang Shit&#34;"></action>
+  </item>
+</contextMenu>"##;
+
+    #[test]
+    fn a_queue_item_menu_labels_its_rows_with_text() {
+        let menu = parse(QUEUE_ITEM_MENU).expect("parses");
+        assert!(menu.is_context_menu);
+        assert_eq!(menu.title.as_deref(), Some("Gang Shit"));
+
+        let labels: Vec<&str> = menu.items().filter_map(|item| item.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Favourite",
+                "Add to playlist…",
+                "Info",
+                "Technical info",
+                "Delete from play queue"
+            ]
+        );
+
+        // The trap this fixture exists for: `title` is empty on every one of
+        // them, so anything reading it instead of `label()` sees an empty menu
+        // and reports that the player offered nothing.
+        assert!(menu.items().all(|item| item.title.is_none()));
+        assert!(menu.items().all(|item| item.action.is_some()));
+    }
 }
