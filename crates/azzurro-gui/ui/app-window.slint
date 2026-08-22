@@ -1405,6 +1405,7 @@ export component AppWindow inherits Window {
     callback browse-header(int);
     callback toggle-now-playing();
     callback browse-more();
+    callback clear-recent();
     callback queue-reorder(int, int);
     callback queue-remove(int);
     callback queue-save(string);
@@ -1748,7 +1749,44 @@ export component AppWindow inherits Window {
                             padding-top: Theme.tight;
                             padding-bottom: Theme.tight;
 
-                            SectionLabel { text: "RECENT SEARCHES"; }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+
+                                SectionLabel { text: "RECENT SEARCHES"; }
+                            }
+
+                            // The same shape the player's own section buttons
+                            // have, because it does the same kind of thing.
+                            VerticalLayout {
+                                alignment: center;
+
+                                Rectangle {
+                                    height: 22px;
+                                    width: wipe.preferred-width + 20px;
+                                    border-radius: self.height / 2;
+                                    background: forget.pressed
+                                        ? Theme.pressed
+                                        : (forget.has-hover ? Theme.hover : transparent);
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    animate background { duration: 120ms; easing: ease-out; }
+
+                                    wipe := Text {
+                                        text: "CLEAR";
+                                        font-size: Theme.micro-size;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                        color: forget.has-hover ? Theme.text : Theme.dim;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+
+                                    forget := TouchArea {
+                                        clicked => { root.clear-recent(); }
+                                    }
+                                }
+                            }
                         }
 
                         for entry in root.browse-recent: Rectangle {

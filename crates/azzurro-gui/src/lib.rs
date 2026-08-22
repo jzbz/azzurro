@@ -134,6 +134,8 @@ enum Command {
     ToggleNowPlaying,
     /// Fetch the next page of the list on show and add it to the end.
     BrowseMore,
+    /// Forget every search made this session.
+    ClearRecent,
     /// Read one of the player's web configuration pages and draw it.
     OpenServices,
     OpenShares,
@@ -766,6 +768,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
         if index >= 0 {
             let _ = tx.send(Command::QueueButton(index as usize));
         }
+    });
+
+    let tx = commands.clone();
+    ui.on_clear_recent(move || {
+        let _ = tx.send(Command::ClearRecent);
     });
 
     let tx = commands.clone();
@@ -4546,6 +4553,12 @@ async fn run_commands(
                     }
                     None => {}
                 }
+                continue;
+            }
+
+            Command::ClearRecent => {
+                backend.browsing.lock().unwrap().recent.clear();
+                backend.publish_browse();
                 continue;
             }
 
