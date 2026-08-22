@@ -66,6 +66,15 @@ pub enum Glyph {
     Tone,
     Gauge,
     Edit,
+    // A radio service writes its own menu, and the words are always much the
+    // same: somewhere to start, somewhere near you, and the usual shelves.
+    ForYou,
+    Sport,
+    Podcast,
+    Trending,
+    Language,
+    Local,
+    Place,
     /// A music service with no glyph of its own — the long tail of them, from
     /// Deezer to whatever the next firmware adds.
     Service,
@@ -83,6 +92,22 @@ fn is_content(source: &str) -> bool {
         || source.contains("/Artwork")
         || source.contains("/Sources/images/")
         || source.contains("/images/ui/Source/")
+}
+
+/// The glyph for a row in a service's own menu.
+///
+/// Unlike [`glyph_for`], this never defers to the player's picture and always
+/// returns something. A menu row's image is the service's branding for a
+/// category — TuneIn ships a coloured logo for "Sports" and another for
+/// "Trending" — and beside a column of Lucide strokes those read as somebody
+/// else's icons pasted in. The rows that carry real artwork are the ones that
+/// play something, and they go through [`glyph_for`] as before.
+///
+/// The fallback is a station, because a category in a radio service leads to
+/// stations however it is named — and some of them, like the listener's own
+/// country, cannot be recognised from the word alone.
+pub fn menu_glyph(title: &str) -> Glyph {
+    glyph_for(title, None).unwrap_or(Glyph::Station)
 }
 
 /// The glyph for a music service, whatever it is called.
@@ -133,7 +158,14 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Usb)
     // Context-menu verbs, checked before the nouns inside them: "Add to
     // playlist…" is an add rather than a playlist, and "Play now" is neither.
-    } else if has("add to") || has("add next") || has("add last") || has("add all") {
+    // "Queue builder" is the mode where following a row adds it to the queue
+    // instead of playing it, so it belongs with the other ways of adding.
+    } else if has("add to")
+        || has("add next")
+        || has("add last")
+        || has("add all")
+        || has("queue builder")
+    {
         Some(Glyph::Enqueue)
     } else if has("play now") || has("play all") {
         Some(Glyph::Play)
@@ -202,6 +234,26 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::News)
     } else if title == "sources" || has("music source") {
         Some(Glyph::Sources)
+    // A radio service's own menu, checked before the content words below,
+    // because every row in it also mentions radio or stations: "Local Radio" is
+    // somewhere to look rather than a radio, and "Most popular stations" is a
+    // chart before it is a station.
+    } else if has("for you") || has("recommend") {
+        Some(Glyph::ForYou)
+    } else if has("sport") {
+        Some(Glyph::Sport)
+    } else if has("podcast") {
+        Some(Glyph::Podcast)
+    } else if has("trending") || has("popular") || has("chart") {
+        Some(Glyph::Trending)
+    } else if has("language") {
+        Some(Glyph::Language)
+    } else if word("local") || has("near me") || has("nearby") {
+        Some(Glyph::Local)
+    } else if has("location") || has("region") || has("countr") || word("places") || word("place") {
+        Some(Glyph::Place)
+    } else if word("music") {
+        Some(Glyph::Track)
     } else if has("album") {
         Some(Glyph::Album)
     } else if has("artist") || has("composer") {

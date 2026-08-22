@@ -73,14 +73,6 @@ const SEARCH_SETTLE: Duration = Duration::from_millis(280);
 /// own list, and it lasts as long as the app is running.
 const RECENT_SEARCHES: usize = 8;
 
-/// How often the sweep bar redraws. Fine enough to read as movement, coarse
-/// enough that twelve seconds is a hundred repaints rather than a thousand.
-const SWEEP_TICK: Duration = Duration::from_millis(120);
-
-/// How long a finished sweep stays on screen before the bar goes away. Long
-/// enough to read the count, short enough not to become furniture.
-const SWEEP_LINGER: Duration = Duration::from_secs(3);
-
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
@@ -126,6 +118,13 @@ enum Command {
     /// Search the current screen for some text.
     BrowseSearch(String),
     BrowseSearchDone(String),
+    /// The button on a section's heading, by the section's place on the screen.
+    BrowseSection(usize),
+    /// Read one of the player's web configuration pages and draw it.
+    OpenServices,
+    OpenShares,
+    /// A row of whichever of those is showing.
+    WebAction(usize),
     /// Move a track from one place in the queue to another, both as positions
     /// in the queue rather than rows on screen.
     QueueReorder(u32, u32),
@@ -153,6 +152,10 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
+    /// A page of the player's own web configuration, read and drawn here
+    /// rather than opened in a browser. Alternative to the panes above, the
+    /// same way Settings and Help are.
+    web: Option<WebPage>,
     /// The play queue's own document, kept for the row of buttons under it.
     ///
     /// The rows come from `/Playlist`, which is smaller and pages cleanly. The
@@ -291,10 +294,6 @@ struct Backend {
     /// takes a number on the way in and checks it is still the highest on the
     /// way out.
     searches: Arc<AtomicU64>,
-    /// How many sweeps for players have been asked for, so that pressing
-    /// rescan again takes the bar over from the sweep already running instead
-    /// of the two of them fighting for it.
-    sweeps: Arc<AtomicU64>,
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -321,11 +320,30 @@ struct BrowseData {
     has_menu: bool,
 }
 
+/// A page of the player's web UI that is worth drawing rather than opening.
+///
+/// Both are lists. What sits behind a row of either is not: signing into a
+/// music service asks for a password and sometimes a captcha, and adding a
+/// share asks for a server and credentials, so those stay pages to open.
+enum WebPage {
+    Services(Vec<bluos::reports::Service>),
+    Shares {
+        /// Where a removal is posted, as the page's own form gives it.
+        action: Option<String>,
+        shares: Vec<bluos::reports::Share>,
+    },
+}
+
 /// One section of a screen, ready for the window.
 struct BlockData {
     /// 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips.
     kind: i32,
     title: String,
+    /// The caption on this section's own button, empty where it has none.
+    action: String,
+    /// Which section of the screen this came from. Not the block's position:
+    /// empty sections and the service picker never become blocks.
+    section: i32,
     rows: Vec<BrowseData>,
 }
 
@@ -378,6 +396,13 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Gauge => icons.get_gauge(),
         Glyph::Service => icons.get_service(),
         Glyph::Edit => icons.get_edit(),
+        Glyph::ForYou => icons.get_for_you(),
+        Glyph::Sport => icons.get_sport(),
+        Glyph::Podcast => icons.get_podcast(),
+        Glyph::Trending => icons.get_trending(),
+        Glyph::Language => icons.get_language(),
+        Glyph::Local => icons.get_local(),
+        Glyph::Place => icons.get_place(),
         Glyph::Help => icons.get_help(),
         Glyph::Rescan => icons.get_rescan(),
     }
@@ -611,6 +636,13 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_browse_section(move |section| {
+        if section >= 0 {
+            let _ = tx.send(Command::BrowseSection(section as usize));
+        }
+    });
+
+    let tx = commands.clone();
     ui.on_browse_search_done(move |query| {
         let _ = tx.send(Command::BrowseSearchDone(query.to_string()));
     });
@@ -687,7 +719,6 @@ async fn run(
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(BTreeSet::new())),
         searches: Arc::new(AtomicU64::new(0)),
-        sweeps: Arc::new(AtomicU64::new(0)),
     };
 
     tokio::spawn(run_commands(
@@ -1310,6 +1341,76 @@ impl Backend {
         self.send_settings(rows, "Help".to_owned());
     }
 
+    /// Put one of the player's web configuration pages in the middle pane.
+    ///
+    /// Drawn with the settings pane's own rows, because that is what these are:
+    /// a label, something to say about it, and one thing to do.
+    fn publish_web(&self) {
+        let page = self
+            .browsing
+            .lock()
+            .unwrap()
+            .web
+            .as_ref()
+            .map(|page| match page {
+                WebPage::Services(services) => (
+                    "Music Services".to_owned(),
+                    services
+                        .iter()
+                        .map(|service| SettingData {
+                            index: -1,
+                            glyph: Some(glyphs::service_glyph(&service.name)),
+                            label: service.name.clone(),
+                            // Signing in is a form with a password on it. Naming
+                            // where it goes is the honest way to say that pressing
+                            // this leaves the app.
+                            detail: "Sign in on the player".to_owned(),
+                            control: "link",
+                            available: true,
+                            ..SettingData::blank()
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                WebPage::Shares { shares, .. } => (
+                    "Network shares".to_owned(),
+                    shares
+                        .iter()
+                        .map(|share| SettingData {
+                            index: -1,
+                            glyph: Some(Glyph::Network),
+                            label: share.label.clone(),
+                            detail: String::new(),
+                            control: "button",
+                            // The pill says what pressing it does; the row says
+                            // which share it would do it to.
+                            value: "Remove".to_owned(),
+                            available: true,
+                            ..SettingData::blank()
+                        })
+                        .chain(std::iter::once(SettingData {
+                            index: -1,
+                            glyph: Some(Glyph::Add),
+                            label: "Add a share".to_owned(),
+                            detail: "Asks for a server and a password".to_owned(),
+                            control: "link",
+                            available: true,
+                            ..SettingData::blank()
+                        }))
+                        .collect::<Vec<_>>(),
+                ),
+            });
+
+        let Some((title, mut rows)) = page else {
+            return;
+        };
+        // Numbered in the order they are drawn, so a press finds its way back
+        // to the row it came from.
+        for (at, row) in rows.iter_mut().enumerate() {
+            row.index = at as i32;
+        }
+        self.send_settings(rows, title);
+    }
+
     /// Turn a settings page into rows for the middle pane.
     fn publish_settings(&self) {
         let Some(page) = self.browsing.lock().unwrap().settings.clone() else {
@@ -1410,7 +1511,7 @@ impl Backend {
         // here would fight them for the title.
         {
             let browsing = self.browsing.lock().unwrap();
-            if browsing.settings.is_some() || browsing.help {
+            if browsing.settings.is_some() || browsing.help || browsing.web.is_some() {
                 return;
             }
         }
@@ -1441,7 +1542,7 @@ impl Backend {
                 .filter(|s| s.kind == SectionKind::List && s.title.is_some())
                 .count();
 
-            for section in &screen.sections {
+            for (ordinal, section) in screen.sections.iter().enumerate() {
                 let kind = match section.kind {
                     SectionKind::Row => 1,
                     SectionKind::SelectorMenu => 2,
@@ -1493,6 +1594,12 @@ impl Backend {
                     // the player's picture wins when it is content.
                     let glyph = if kind == 2 {
                         Some(glyphs::service_glyph(item.label().unwrap_or_default()))
+                    } else if item
+                        .action
+                        .as_ref()
+                        .is_some_and(bluos::Action::is_browse_menu)
+                    {
+                        Some(glyphs::menu_glyph(item.label().unwrap_or_default()))
                     } else {
                         glyphs::glyph_for(item.label().unwrap_or_default(), source)
                     };
@@ -1534,7 +1641,20 @@ impl Backend {
                     });
                 }
 
+                // A section with a title, an action and nothing inside it is a
+                // heading that is also a way in: a library's front page is nine
+                // of them — Artists, Albums, Songs — and dropping them for
+                // being empty left only the one shelf that had content.
                 if rows.is_empty() {
+                    if let (Some(title), true) = (&section.title, section.action.is_some()) {
+                        blocks.push(BlockData {
+                            kind: 3,
+                            title: title.clone(),
+                            action: String::new(),
+                            section: ordinal as i32,
+                            rows: Vec::new(),
+                        });
+                    }
                     continue;
                 }
                 // The service picker belongs beside the title, where the
@@ -1546,6 +1666,15 @@ impl Backend {
                     blocks.push(BlockData {
                         kind,
                         title: heading,
+                        // "View All" beside a shelf showing ten of a hundred,
+                        // "Clear" beside the recents. The player writes both
+                        // the wording and what they do.
+                        action: section
+                            .menu_actions
+                            .first()
+                            .and_then(|menu| menu.text.clone())
+                            .unwrap_or_default(),
+                        section: ordinal as i32,
                         rows,
                     });
                 }
@@ -1601,6 +1730,8 @@ impl Backend {
                 .map(|block| BrowseBlock {
                     kind: block.kind,
                     title: block.title.into(),
+                    action: block.action.into(),
+                    section: block.section,
                     rows: ModelRc::new(VecModel::from(
                         block
                             .rows
@@ -1703,17 +1834,6 @@ impl Backend {
     /// Kept out of the device model on purpose: the position advances once a
     /// second, and rebuilding every row for it would re-upload every cover on
     /// screen along the way.
-    fn set_sweep(&self, scanning: bool, label: String, left: String, progress: f32) {
-        let ui = self.ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = ui.upgrade() else { return };
-            ui.set_scanning(scanning);
-            ui.set_scan_label(label.into());
-            ui.set_scan_left(left.into());
-            ui.set_scan_progress(progress);
-        });
-    }
-
     fn publish_transport(&self) {
         let selected = *self.selected.lock().unwrap();
         let snapshot = selected
@@ -1930,7 +2050,11 @@ fn walk_settings(
                         Kind::Text => "text",
                         Kind::Button => "button",
                         Kind::Sleep => "cycle",
-                        Kind::Alarms => "link",
+                        // Not a link: the alarms editor is the official
+                        // controller's own page, and there is nothing here for
+                        // one to open. The row says how many there are instead
+                        // of pretending to lead somewhere.
+                        Kind::Alarms => "none",
                         // Including dual-range, which needs a control of its
                         // own and gets its value shown instead.
                         _ => "none",
@@ -1948,14 +2072,20 @@ fn walk_settings(
                     // Falls back rather than leaving a hole; see Icons.tweak.
                     glyph: glyphs::glyph_for(setting.label(), None).or(Some(Glyph::Tweak)),
                     label: setting.label().to_owned(),
-                    detail: if available {
-                        setting.description.clone().unwrap_or_default()
-                    } else {
+                    detail: if !available {
                         setting
                             .depends_on
                             .as_ref()
                             .map(|(n, v)| format!("Needs {n} set to {v}"))
                             .unwrap_or_default()
+                    } else if matches!(setting.kind, Kind::Alarms) {
+                        match setting.count.unwrap_or(0) {
+                            0 => "None set".to_owned(),
+                            1 => "1 alarm".to_owned(),
+                            n => format!("{n} alarms"),
+                        }
+                    } else {
+                        setting.description.clone().unwrap_or_default()
                     },
                     heading: false,
                     control,
@@ -2167,74 +2297,15 @@ fn settings_page(uri: &str) -> Option<Option<String>> {
     }))
 }
 
-/// Broadcast for players, and show how the search is going.
+/// Broadcast for players and adopt whatever answers.
 ///
-/// The bar under the wordmark is the sweep window itself rather than a guess at
-/// it. A sweep is a schedule of broadcasts spread over twelve seconds, because
-/// one UDP query is dropped often enough to matter and a player that was asleep
-/// takes a moment to answer at all; without something on screen the button
-/// looks inert for all twelve of them.
+/// A sweep is a schedule of broadcasts spread over twelve seconds rather than
+/// one query and an answer, because a single UDP broadcast is dropped often
+/// enough to matter and a player that was asleep takes a moment to reply at
+/// all.
 async fn sweep(backend: Backend, discovery: Arc<Discovery>, http: reqwest::Client) {
-    let generation = backend.sweeps.fetch_add(1, Ordering::Relaxed) + 1;
-    let reporter = tokio::spawn(report_sweep(backend.clone(), generation));
-
-    let found = discovery.sweep(DEFAULT_SWEEP).await.unwrap_or_default();
-    for announce in &found {
-        backend.adopt(announce, &http);
-    }
-
-    // Stopped and waited for, so that a tick already on its way to the window
-    // cannot land after the result and put "looking" back on the bar.
-    reporter.abort();
-    let _ = reporter.await;
-
-    if backend.sweeps.load(Ordering::Relaxed) != generation {
-        return;
-    }
-
-    let known = backend.registry.lock().unwrap().len();
-    backend.set_sweep(
-        false,
-        match known {
-            0 => "No players answered".to_owned(),
-            1 => "1 player found".to_owned(),
-            n => format!("{n} players found"),
-        },
-        String::new(),
-        1.0,
-    );
-
-    tokio::time::sleep(SWEEP_LINGER).await;
-    if backend.sweeps.load(Ordering::Relaxed) == generation {
-        backend.set_sweep(false, String::new(), String::new(), 0.0);
-    }
-}
-
-/// Move the bar for as long as one sweep lasts.
-async fn report_sweep(backend: Backend, generation: u64) {
-    let started = Instant::now();
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= DEFAULT_SWEEP || backend.sweeps.load(Ordering::Relaxed) != generation {
-            return;
-        }
-
-        // Counted from the registry rather than from what this sweep has
-        // received, because a player that answers the broadcast and a player
-        // remembered from last time are both there to be played.
-        let known = backend.registry.lock().unwrap().len();
-        backend.set_sweep(
-            true,
-            match known {
-                0 => "Looking for players…".to_owned(),
-                1 => "Looking for players — 1 so far".to_owned(),
-                n => format!("Looking for players — {n} so far"),
-            },
-            format!("{}s", (DEFAULT_SWEEP - elapsed).as_secs() + 1),
-            elapsed.as_secs_f32() / DEFAULT_SWEEP.as_secs_f32(),
-        );
-
-        tokio::time::sleep(SWEEP_TICK).await;
+    for announce in discovery.sweep(DEFAULT_SWEEP).await.unwrap_or_default() {
+        backend.adopt(&announce, &http);
     }
 }
 
@@ -2257,6 +2328,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 browsing.help = false;
                 browsing.help_detail = None;
                 browsing.settings = None;
+                browsing.web = None;
                 // Browsing follows the selection: a screen only means anything
                 // against the player that served it.
                 if browsing.device != Some(id) {
@@ -2446,7 +2518,23 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                     format!("/ui/BrowseObjects?service={service}&type=BrowseMenu&url=%2FBrowse");
                 open_screen(backend, id, uri, Arrive::Deeper).await;
             }
-            Some(route) => tracing::debug!(%id, "no equivalent for the route {route}"),
+            // A route into the official controller's own pages, which this app
+            // has not built. Saying so is the whole fix available here: the
+            // alternative is a control that swallows the press, which reads as
+            // the app being broken rather than unfinished.
+            Some(route) => {
+                tracing::debug!(%id, "no equivalent for the route {route}");
+                say(
+                    &backend.ui,
+                    match route {
+                        "/add-preset" => "Saving presets is not built yet".to_owned(),
+                        _ => format!(
+                            "{} is not built yet",
+                            action.title.as_deref().unwrap_or(route)
+                        ),
+                    },
+                );
+            }
             None => {}
         },
 
@@ -2461,6 +2549,13 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // handing back a page it can draw itself.
                 if let Some(page) = settings_page(&uri) {
                     let _ = backend.commands.send(Command::OpenSettings(page));
+                    return;
+                }
+                // The Manage button on Music Services. What it opens is a list
+                // of the services this player can be signed into, which is
+                // worth drawing; the sign-in form behind each one is not.
+                if uri.contains("%2Fservices") || uri.contains("/services") {
+                    let _ = backend.commands.send(Command::OpenServices);
                     return;
                 }
                 let url = client.image_url(&uri);
@@ -2565,6 +2660,16 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
                 section.items.iter().map(move |item| (item, size))
             })
             .filter_map(|(item, size)| {
+                // A menu row is drawn as a glyph whatever picture came with it,
+                // so fetching TuneIn's logo for "Sports" would be a request for
+                // something that never reaches the screen.
+                if item
+                    .action
+                    .as_ref()
+                    .is_some_and(bluos::Action::is_browse_menu)
+                {
+                    return None;
+                }
                 let source = item
                     .image
                     .as_deref()
@@ -3079,7 +3184,7 @@ async fn run_commands(
                 // One step at a time: out of a Help page, then out of Help.
                 let stepped_back = {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.help_detail.take().is_some()
+                    browsing.web.take().is_some() || browsing.help_detail.take().is_some()
                 };
                 if stepped_back {
                     backend.publish_help();
@@ -3188,8 +3293,14 @@ async fn run_commands(
             }
 
             Command::SettingAction(index) => {
+                // Three panes share these rows, so the press goes wherever the
+                // rows came from.
                 if backend.browsing.lock().unwrap().help {
                     let _ = backend.commands.send(Command::HelpAction(index));
+                    continue;
+                }
+                if backend.browsing.lock().unwrap().web.is_some() {
+                    let _ = backend.commands.send(Command::WebAction(index));
                     continue;
                 }
 
@@ -3217,6 +3328,14 @@ async fn run_commands(
                         let _ = backend.commands.send(Command::Player(id, Action::Sleep));
                     }
                     Some(Chosen::Web(url)) => {
+                        // Except the share configuration, which is a list of
+                        // what is mounted and a button to unmount it. That is
+                        // worth drawing; the page that adds one asks for a
+                        // password and is not.
+                        if url.contains("/sharecfg") {
+                            let _ = backend.commands.send(Command::OpenShares);
+                            continue;
+                        }
                         tracing::info!("opening {url} in a browser");
                         let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
                     }
@@ -3531,6 +3650,146 @@ async fn run_commands(
                         // screen looks like.
                         fetch_queue(backend, id).await;
                     });
+                }
+                continue;
+            }
+
+            Command::OpenServices => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.services().await {
+                    Ok(services) if !services.is_empty() => {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.help = false;
+                        browsing.settings = None;
+                        browsing.web = Some(WebPage::Services(services));
+                        browsing.highlighted = None;
+                        drop(browsing);
+                        backend.publish_sidebar();
+                        backend.publish_web();
+                    }
+                    // The page is the player's own HTML and a firmware update
+                    // could change its shape. Falling back to opening it beats
+                    // showing an empty list and claiming there are no services.
+                    other => {
+                        if let Err(e) = other {
+                            tracing::debug!(%id, "could not read the services page: {e}");
+                        }
+                        let url = client.web_url("/services?noheader=1");
+                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    }
+                }
+                continue;
+            }
+
+            Command::OpenShares => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.shares().await {
+                    Ok((action, shares)) => {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.help = false;
+                        browsing.settings = None;
+                        browsing.web = Some(WebPage::Shares { action, shares });
+                        browsing.highlighted = None;
+                        drop(browsing);
+                        backend.publish_sidebar();
+                        backend.publish_web();
+                    }
+                    Err(e) => {
+                        tracing::debug!(%id, "could not read the shares page: {e}");
+                        let url = client.web_url("/sharecfg?noheader=1");
+                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    }
+                }
+                continue;
+            }
+
+            Command::WebAction(at) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+
+                enum Press {
+                    Open(String),
+                    Remove(String, String),
+                }
+
+                let press = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    match browsing.web.as_ref() {
+                        Some(WebPage::Services(services)) => services
+                            .get(at)
+                            .map(|service| Press::Open(client.web_url(&service.href))),
+                        Some(WebPage::Shares { action, shares }) => match shares.get(at) {
+                            // A share, and the form that unmounts it.
+                            Some(share) => action
+                                .clone()
+                                .map(|action| Press::Remove(action, share.field.clone())),
+                            // Past the last share is the row that adds one,
+                            // which asks for a server and a password.
+                            None => Some(Press::Open(client.web_url("/sharecfg?noheader=1"))),
+                        },
+                        None => None,
+                    }
+                };
+
+                match press {
+                    Some(Press::Open(url)) => {
+                        tracing::info!(%id, "opening {url} in a browser");
+                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    }
+                    Some(Press::Remove(action, field)) => {
+                        match client
+                            .remove_shares(&action, std::slice::from_ref(&field))
+                            .await
+                        {
+                            Ok(()) => {
+                                say(&backend.ui, "Share removed");
+                                let _ = backend.commands.send(Command::OpenShares);
+                            }
+                            Err(e) => say(&backend.ui, format!("could not remove {field}: {e}")),
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
+
+            Command::BrowseSection(at) => {
+                let found = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.device.zip(
+                        browsing
+                            .current()
+                            .and_then(|screen| screen.sections.get(at))
+                            .and_then(|section| {
+                                // An empty section is its own action; a shelf
+                                // with content puts one on its heading instead.
+                                if section.items.is_empty() {
+                                    section.action.clone()
+                                } else {
+                                    section
+                                        .menu_actions
+                                        .first()
+                                        .and_then(|menu| menu.action.clone())
+                                }
+                            }),
+                    )
+                };
+                if let Some((id, action)) = found {
+                    tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                 }
                 continue;
             }

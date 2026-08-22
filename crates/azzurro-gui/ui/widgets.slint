@@ -92,11 +92,18 @@ export component PillButton inherits Rectangle {
         padding-left: 13px;
         padding-right: 13px;
 
-        if root.glyph.width > 0: Icon {
-            glyph: root.glyph;
-            width: 14px;
-            height: 14px;
-            tint: root.primary ? Theme.accent-ink : Theme.dim;
+        // Centred by its own layout: a fixed-size child of a row is not
+        // centred against the taller text beside it, which left every glyph on
+        // the queue's buttons riding above its label.
+        if root.glyph.width > 0: VerticalLayout {
+            alignment: center;
+
+            Icon {
+                glyph: root.glyph;
+                width: 14px;
+                height: 14px;
+                tint: root.primary ? Theme.accent-ink : Theme.dim;
+            }
         }
 
         Text {

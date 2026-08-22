@@ -160,6 +160,17 @@ export global Icons {
     out property <image> edit: @image-url("icons/pencil.svg");
     out property <image> grip: @image-url("icons/grip-vertical.svg");
 
+    // The vocabulary a radio service's own menu is written in.
+    out property <image> for-you: @image-url("icons/sparkles.svg");
+    out property <image> sport: @image-url("icons/trophy.svg");
+    // Lucide has no podcast glyph. RSS is the conventional stand-in, and a
+    // podcast is an RSS feed; the microphone is already the artist.
+    out property <image> podcast: @image-url("icons/rss.svg");
+    out property <image> trending: @image-url("icons/trending-up.svg");
+    out property <image> language: @image-url("icons/languages.svg");
+    out property <image> local: @image-url("icons/map-pin.svg");
+    out property <image> place: @image-url("icons/globe.svg");
+
     // Not drawn anywhere in the window. `audio-lines` is the glyph the
     // application icon is built from, and it is kept here so that the icon in
     // the launcher and the icons in the window are traceably the same set —

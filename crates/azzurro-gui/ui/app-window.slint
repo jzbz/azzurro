@@ -101,9 +101,17 @@ export struct BrowseRow {
 // service chips at the top of Favourites, a plain list for an album. A flat
 // list of everything is legible but it is not what the player asked for.
 export struct BrowseBlock {
-    // 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips.
+    // 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips,
+    // 3 = a heading that is a way in and holds nothing itself.
     kind: int,
     title: string,
+    // The button the player puts on this section's heading — "View All" beside
+    // a shelf that is showing ten of a hundred, "Clear" beside the recents.
+    // Empty when the section has none.
+    action: string,
+    // Which section of the screen it belongs to, which is not the block's own
+    // position: empty sections and the service picker never become blocks.
+    section: int,
     rows: [BrowseRow],
 }
 
@@ -299,7 +307,10 @@ component SettingRow inherits Rectangle {
             alignment: center;
 
             PillButton {
-                label: root.item.label;
+                // A settings button says the same as its row — "Reindex music
+                // collection" — but a row that lists something and offers one
+                // thing to do with it needs the two to differ.
+                label: root.item.value != "" ? root.item.value : root.item.label;
                 enabled: root.item.available;
                 clicked => { root.opened(); }
             }
@@ -1101,6 +1112,7 @@ component BrowseBlockView inherits VerticalLayout {
     in property <BrowseBlock> block;
     callback activate(int);
     callback open-menu(int);
+    callback section-action(int);
 
     if root.block.kind == 2: HorizontalLayout {
         padding-left: Theme.pad;
@@ -1115,12 +1127,86 @@ component BrowseBlockView inherits VerticalLayout {
         }
     }
 
-    if root.block.kind != 2 && root.block.title != "": HorizontalLayout {
+    // A section that leads somewhere and holds nothing. Drawn as a row rather
+    // than as an empty shelf with a caption over it.
+    if root.block.kind == 3: Rectangle {
+        height: 52px;
+        border-radius: Theme.radius-small;
+        background: into.has-hover ? Theme.hover : transparent;
+        animate background { duration: 120ms; easing: ease-out; }
+
+        HorizontalLayout {
+            padding-left: Theme.pad;
+            padding-right: Theme.pad;
+
+            Text {
+                text: root.block.title;
+                font-size: Theme.body-size;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+
+            VerticalLayout {
+                alignment: center;
+
+                Icon {
+                    glyph: Icons.forward;
+                    tint: Theme.faint;
+                    width: 15px;
+                    height: 15px;
+                }
+            }
+        }
+
+        into := TouchArea {
+            clicked => { root.section-action(root.block.section); }
+        }
+    }
+
+    if root.block.kind != 2 && root.block.kind != 3 && root.block.title != "": HorizontalLayout {
         padding-left: Theme.pad;
+        padding-right: Theme.pad;
         padding-top: Theme.tight;
         padding-bottom: Theme.tight;
 
-        SectionLabel { text: root.block.title; }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+
+            SectionLabel { text: root.block.title; }
+        }
+
+        if root.block.action != "": VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                height: 22px;
+                width: more.preferred-width + 20px;
+                border-radius: self.height / 2;
+                background: shelf.pressed
+                    ? Theme.pressed
+                    : (shelf.has-hover ? Theme.hover : transparent);
+                border-width: 1px;
+                border-color: Theme.border;
+                animate background { duration: 120ms; easing: ease-out; }
+
+                more := Text {
+                    text: root.block.action;
+                    font-size: Theme.micro-size;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    color: shelf.has-hover ? Theme.text : Theme.dim;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                shelf := TouchArea {
+                    clicked => { root.section-action(root.block.section); }
+                }
+            }
+        }
     }
 
     // A shelf runs off the side of the pane, as it does in the official
@@ -1169,12 +1255,6 @@ export component AppWindow inherits Window {
     // the toast that shows it. In-out because the clearing happens in the
     // window rather than back in the backend.
     in-out property <string> status-line: "";
-    // The sweep for players: what it is doing, how far through it is, and how
-    // much of the window is left. Empty label means no sweep worth reporting.
-    in property <bool> scanning: false;
-    in property <string> scan-label: "";
-    in property <string> scan-left: "";
-    in property <float> scan-progress: 0;
     // "Indexing — 1204 songs processed", or empty when it is not.
     in property <string> indexing: "";
     in property <[BrowseBlock]> browse-blocks;
@@ -1226,6 +1306,7 @@ export component AppWindow inherits Window {
     callback browse-home();
     callback browse-search(string);
     callback browse-search-done(string);
+    callback browse-section(int);
     callback queue-reorder(int, int);
     callback queue-remove(int);
     callback queue-save(string);
@@ -1338,73 +1419,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        VerticalLayout {
-                            alignment: center;
-
-                            IconButton {
-                                glyph: Icons.rescan;
-                                size: 28px;
-                                glyph-size: 15px;
-                                active: root.scanning;
-                                clicked => { root.rescan(); }
-                            }
-                        }
-                    }
-
-                    // How the search for players is going.
-                    //
-                    // A sweep is not one broadcast and an answer: it is a
-                    // schedule of broadcasts over twelve seconds, because a
-                    // single UDP query is lost often enough to matter and a
-                    // sleeping player takes a moment to answer at all. Without
-                    // this the button looks like it did nothing for those
-                    // twelve seconds.
-                    if root.scan-label != "": VerticalLayout {
-                        // Takes only its own height. The list below it is what
-                        // the sidebar's spare room belongs to, and without this
-                        // the bar shares it and pushes the list off the bottom.
-                        vertical-stretch: 0;
-                        padding-left: Theme.room;
-                        padding-right: Theme.pad;
-                        padding-bottom: Theme.gap;
-                        spacing: 5px;
-
-                        HorizontalLayout {
-                            Text {
-                                text: root.scan-label;
-                                font-size: Theme.micro-size;
-                                color: Theme.dim;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                            }
-
-                            if root.scanning: Text {
-                                text: root.scan-left;
-                                font-size: Theme.micro-size;
-                                color: Theme.faint;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            height: 3px;
-                            border-radius: 1.5px;
-                            background: Theme.sunken;
-                            clip: true;
-
-                            Rectangle {
-                                x: 0;
-                                width: parent.width * Math.clamp(root.scan-progress, 0, 1);
-                                height: parent.height;
-                                border-radius: parent.border-radius;
-                                background: root.scanning ? Theme.accent : Theme.accent-hover;
-                                // The step between ticks is small and regular,
-                                // so a short ease reads as a bar filling rather
-                                // than a bar jumping.
-                                animate width { duration: 160ms; easing: ease-out; }
-                            }
-                        }
                     }
 
                     ListView {
@@ -1728,6 +1742,7 @@ export component AppWindow inherits Window {
                             block: block;
                             activate(i) => { root.browse-activate(i); }
                             open-menu(i) => { root.browse-menu(i); }
+                            section-action(i) => { root.browse-section(i); }
                         }
                     }
 
