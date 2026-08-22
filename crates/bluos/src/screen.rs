@@ -57,6 +57,17 @@ pub struct Screen {
     pub refresh_on: Vec<(String, String)>,
     /// Screen-level actions, shown by the official app in a menu.
     pub menu_actions: Vec<MenuAction>,
+    /// The row of buttons a document puts under everything else. The play queue
+    /// is the one that has them: Save, Edit, Clear, and — to a client that says
+    /// it understands a new enough schema — Queue Builder Mode.
+    pub buttons: Vec<Button>,
+    /// Present only on the play queue, and the way to tell it from a browse
+    /// screen. Its own struct rather than four more fields here, because paging
+    /// is the queue's business and no other screen has any.
+    pub queue: Option<QueuePage>,
+    /// The player's own "you are in a mode" bar, served on every screen for as
+    /// long as the mode lasts.
+    pub mode_indicator: Option<ModeIndicator>,
     pub sections: Vec<Section>,
 }
 
@@ -225,7 +236,7 @@ impl Item {
     }
 }
 
-/// What an action does. The nine the player emits, plus a catch-all so an
+/// What an action does. The ten the player emits, plus a catch-all so an
 /// unknown type is inert rather than fatal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActionKind {
@@ -246,6 +257,9 @@ pub enum ActionKind {
     Add,
     /// Reorder the queue.
     Reorder,
+    /// A player-link the player wants confirmed before it is sent. `title`
+    /// carries the question to ask.
+    Confirmation,
     #[default]
     Unknown,
 }
@@ -290,10 +304,40 @@ impl Action {
     }
 }
 
+/// What the `<queue>` root says about itself.
+///
+/// `/ui/Queue` is a window onto the queue rather than the whole of it: `offset`
+/// is where this document starts and `total` is how many tracks there are
+/// altogether.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueuePage {
+    pub offset: u32,
+    pub total: u32,
+    /// The queue has been changed away from the playlist that filled it, which
+    /// is the only thing that makes saving it worth offering.
+    pub modified: bool,
+    /// The playlist it was filled from, when it came from one.
+    pub name: Option<String>,
+}
+
+/// A bar the player puts on every screen while a mode is on.
+///
+/// Queue Builder Mode is the one that uses it. What matters is that the way out
+/// arrives with it: the buttons here carry the action that leaves the mode, so a
+/// client never has to guess the request that turns it off.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModeIndicator {
+    pub text: Option<String>,
+    pub icon: Option<String>,
+    pub buttons: Vec<Button>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Button {
     pub text: Option<String>,
     pub icon: Option<String>,
+    /// The player's own recommendation of which button matters right now.
+    pub highlight: bool,
     pub action: Option<Action>,
 }
 
@@ -413,7 +457,9 @@ pub fn parse(xml: &str) -> Result<Screen> {
     }
 
     if !seen_screen {
-        return Err(Error::Screen("no <screen> element".into()));
+        return Err(Error::Screen(
+            "no <screen>, <contextMenu> or <queue> element".into(),
+        ));
     }
 
     // A document whose items sit straight under <screen> still needs somewhere
@@ -458,9 +504,25 @@ fn start(
         // `contextMenu` is two different things depending on where it sits: a
         // root element when a whole document is a menu, and an action on an
         // item when a row has one to open. Only position tells them apart.
-        "screen" | "contextMenu" if stack.is_empty() => {
+        // `queue` is the third root the player serves. Everything inside it is
+        // ordinary screen furniture — items with actions, context menus and
+        // now-playing matches, and a row of buttons — so it parses as a screen
+        // and only its own attributes need lifting.
+        "screen" | "contextMenu" | "queue" if stack.is_empty() => {
             *seen_screen = true;
             screen.is_context_menu = name == "contextMenu";
+            if name == "queue" {
+                screen.queue = Some(QueuePage {
+                    offset: a.remove("offset").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    total: a.remove("total").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    // The queue differs from the playlist that filled it. The
+                    // player acts on this itself, putting `highlight` on the
+                    // Save button rather than leaving a client to work out when
+                    // saving is worth offering.
+                    modified: flag(a.remove("modified")),
+                    name: a.remove("name"),
+                });
+            }
             screen.subtitle = a.remove("subTitle");
             screen.image = a.remove("image");
             // A screen uses `screenTitle`; a context menu uses `title`.
@@ -471,6 +533,18 @@ fn start(
             screen.service = a.remove("service");
             screen.refresh_on_player_change = flag(a.remove("refreshOnPlayerChange"));
             stack.push(Ctx::Screen);
+        }
+
+        // The bar that says a mode is on. Parsed mainly so its buttons do not
+        // end up in the document's own button row — they close with no item and
+        // no section open, which is where the queue's Save and Clear live.
+        "modeIndicator" => {
+            screen.mode_indicator = Some(ModeIndicator {
+                text: a.remove("text"),
+                icon: a.remove("icon"),
+                buttons: Vec::new(),
+            });
+            stack.push(Ctx::Other);
         }
 
         "refreshOnStatusChange" => {
@@ -524,6 +598,13 @@ fn start(
             *button = Some(Button {
                 text: a.remove("text"),
                 icon: a.remove("icon"),
+                // `backgroundColor` and `textColor` are dropped on purpose:
+                // this app draws the player's furniture in its own theme, the
+                // same decision `glyphs` records for the player's icons. But
+                // `highlight` is not decoration — it is the player saying which
+                // button is the one to press, which is how Save lights up once
+                // the queue has been changed.
+                highlight: flag(a.remove("highlight")),
                 action: None,
             });
             stack.push(Ctx::Button);
@@ -642,10 +723,18 @@ fn end(
         }
         Some(Ctx::Button) => {
             if let Some(done) = button.take() {
-                match (item.as_mut(), section.as_mut()) {
-                    (Some(item), _) => item.buttons.push(done),
-                    (None, Some(section)) => section.buttons.push(done),
-                    (None, None) => {}
+                // Innermost open context wins, the same rule `<action>` follows.
+                match (
+                    item.as_mut(),
+                    section.as_mut(),
+                    screen.mode_indicator.as_mut(),
+                ) {
+                    (Some(item), _, _) => item.buttons.push(done),
+                    (None, Some(section), _) => section.buttons.push(done),
+                    (None, None, Some(mode)) => mode.buttons.push(done),
+                    // Nothing else open, so it belongs to the document: the
+                    // play queue's button row sits directly under its root.
+                    (None, None, None) => screen.buttons.push(done),
                 }
             }
         }
@@ -666,6 +755,10 @@ fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
         "setting" | "settings" => ActionKind::Setting,
         "add" => ActionKind::Add,
         "reorder" => ActionKind::Reorder,
+        // Everything a player-link is, plus the player's own instruction to ask
+        // first. Clearing the queue arrives this way once a client declares a
+        // new enough schema, with the question to put to the user in `title`.
+        "confirmation" => ActionKind::Confirmation,
         // A <contextMenu> with no type is still a context browse.
         "" if element == "contextMenu" => ActionKind::ContextBrowse,
         _ => ActionKind::Unknown,
@@ -931,6 +1024,88 @@ mod tests {
         assert_eq!(
             panel.label(),
             Some("You don't have any Favourites on Library")
+        );
+    }
+
+    /// Captured from a Powernode on BluOS 4.16.6 with the schema headers this
+    /// crate sends. Trimmed to two of thirteen tracks; nothing else is edited.
+    ///
+    /// Two things here appear nowhere else: buttons directly under the root,
+    /// and `type="confirmation"`. A client that declares no schema version is
+    /// served three buttons and a plain `player-link` on Clear.
+    const QUEUE: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<queue offset="0" total="13" id="723" modified="true">
+  <refreshOnStatusChange key="pid" value="723"></refreshOnStatusChange>
+  <button text="Save" backgroundColor="#363d3f" icon="/images/ui/btn_save_queue.png" highlight="true">
+    <action type="browse" URI="/AddToPlaylistOptions?saveQueue=1" resultType="SaveQueueOptions" title="Save playlist"></action>
+  </button>
+  <button text="Edit" icon="/images/ui/btn_edit_queue.png">
+    <action type="deep-link" URI="/edit-queue"></action>
+  </button>
+  <button text="Clear" icon="/images/ui/btn_clear_queue.png">
+    <action type="confirmation" URI="/Clear" title="Clear queue?" refreshScreen="true" notification="Play Queue cleared"></action>
+  </button>
+  <button text="Queue builder mode" icon="/images/ui/btn_qbm.png">
+    <action type="player-link" URI="/ui/action?CBQ=true" refreshScreen="true"></action>
+  </button>
+  <item image="/Artwork?service=LocalMusic&amp;artist=50+Cent" title="Many Men (Wish Death)" subTitle="50 Cent" subSubTitle="Get Rich or Die Tryin" quality="cd" duration="4:16">
+    <action type="player-link" URI="/Play?id=0"></action>
+    <contextMenu type="browse" URI="/ui/queueItemCM?id=0" resultType="contextMenu"></contextMenu>
+    <nowPlayingMatch key="song" value="0"></nowPlayingMatch>
+  </item>
+  <item image="/Artwork?service=LocalMusic&amp;artist=50+Cent" title="In da Club" subTitle="50 Cent" subSubTitle="Get Rich or Die Tryin" quality="cd" duration="3:13">
+    <action type="player-link" URI="/Play?id=1"></action>
+    <contextMenu type="browse" URI="/ui/queueItemCM?id=1" resultType="contextMenu"></contextMenu>
+    <nowPlayingMatch key="song" value="1"></nowPlayingMatch>
+  </item>
+</queue>"##;
+
+    #[test]
+    fn reads_the_play_queue() {
+        let queue = parse(QUEUE).unwrap();
+
+        let page = queue.queue.clone().expect("a queue document says so");
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total, 13);
+        assert!(page.modified);
+        assert!(!queue.is_context_menu);
+        assert_eq!(queue.id.as_deref(), Some("723"));
+        // The queue asks to be re-read when it is replaced, and says so with
+        // the same mechanism every other screen uses.
+        assert_eq!(queue.refresh_on, vec![("pid".to_owned(), "723".to_owned())]);
+
+        // Buttons under the root belong to the document, not to a section.
+        assert_eq!(queue.buttons.len(), 4);
+        assert!(queue.sections.iter().all(|s| s.buttons.is_empty()));
+
+        let save = &queue.buttons[0];
+        assert_eq!(save.text.as_deref(), Some("Save"));
+        assert!(save.highlight, "a changed queue lights its own Save button");
+
+        let clear = &queue.buttons[2];
+        assert_eq!(
+            clear.action.as_ref().map(|a| a.kind),
+            Some(ActionKind::Confirmation)
+        );
+        assert_eq!(
+            clear.action.as_ref().and_then(|a| a.title.as_deref()),
+            Some("Clear queue?")
+        );
+
+        // Only offered to a client that declares a new enough schema.
+        assert_eq!(queue.buttons[3].text.as_deref(), Some("Queue builder mode"));
+
+        // The tracks are ordinary items, so everything that draws a browse row
+        // draws a queue row.
+        let tracks: Vec<_> = queue.items().collect();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].label(), Some("Many Men (Wish Death)"));
+        assert_eq!(tracks[0].duration.as_deref(), Some("4:16"));
+        assert_eq!(tracks[0].quality.as_deref(), Some("cd"));
+        assert!(tracks[0].context_menu.is_some());
+        assert_eq!(
+            tracks[1].now_playing_match,
+            Some(("song".to_owned(), "1".to_owned()))
         );
     }
 

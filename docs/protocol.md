@@ -194,10 +194,35 @@ changes the player has replaced the queue. The device says as much itself, via
 `/ui/Queue` is the server-driven version: paginated twenty at a time via
 `?offset=`, durations pre-formatted as `3:58`, and each item carrying the
 device's own context menu plus a `<nowPlayingMatch key="song" value="0"/>`
-telling the client how to decide which row is playing. Its Save, Edit and Clear
-buttons and its per-item context menus (`/ui/queueItemCM?id=N`) are where
-removing and reordering live — there is no plain endpoint for either, so queue
-editing has to go through the server-driven UI.
+telling the client how to decide which row is playing. Unlike every other
+server-driven document its root is `<queue>` rather than `<screen>`, and it
+carries `offset`, `total` and `modified` — the last of which is the player
+saying the queue has been changed away from the playlist that filled it.
+
+Its `<button>` children are the row under the list. They sit directly under the
+root with no section around them, which is the only place in any of these
+documents that happens.
+
+Editing the queue does **not** have to go through the server-driven UI, despite
+appearances. Both verbs are plain endpoints, and the official controller uses
+them directly:
+
+| Endpoint | Parameters |
+| --- | --- |
+| `/Move` | `new=<destination>&old=<source>`, both absolute queue positions |
+| `/Delete` | `id=<queue position>` |
+| `/Clear` | none, or `nextlist=1` to drop only the autofill tail |
+| `/Save` | `name=<playlist name>` |
+
+`/Move` reads backwards and the player gives no hint which way round it is, so
+it was settled on hardware: with a thirteen-track queue, `Move?new=10&old=12`
+put the last track at position ten and left the rest in order. Everything after
+a `/Delete` shifts down, so removing several means working from the end or
+re-reading in between.
+
+Neither is announced. The queue's `id` does not change for a reorder or a
+delete, so `/Status` looks identical and a client has to re-read the queue
+itself.
 
 Note that the queue keeps its position while a player is on an input: `pid` and
 `song` both stay put. The right reading is "where playback would resume", not
@@ -215,7 +240,10 @@ Note that the queue keeps its position while a player is on an input: `pid` and
 | `/Volume` | `level=0..100`, or `db=`, or `mute=0|1` |
 | `/Shuffle` | `state=0|1` |
 | `/Repeat` | `state=0|1|2` — **0 is all, 1 is one, 2 is off**, confirmed below |
-| `/Clear` | none; empties the queue |
+| `/Clear` | none; empties the queue. `nextlist=1` drops only the autofill tail |
+| `/Move` | `new=<destination>&old=<source>` — see the queue section |
+| `/Delete` | `id=<queue position>` |
+| `/Save` | `name=<playlist name>`; saves the queue as a playlist |
 | `/Preset` | `id=<n>` |
 | `/AddSlave`, `/RemoveSlave` | `slave=<host>&port=<port>`, called on the master |
 | `/Sleep` | none observed; cycles the sleep timer |
@@ -229,7 +257,41 @@ condition for the button being lit.
 **Declared.** These appear in the request descriptions the player serves from
 `/Services`, with their parameters spelled out there: `/Add`, `/Info`,
 `/AddFavourite`, `/DeleteFavourite`, `/SetPreset`, `/AddToPlaylistOptions`,
-`/Action`, `/Delete`.
+`/Action`.
+
+### Saying which schema you understand
+
+The player serves different documents to clients that declare different schema
+versions, and the difference is not cosmetic. Two request headers do it:
+
+```
+x-sovi-schema-version: 35
+x-sovi-ui-schema-version: 7
+```
+
+Those are the numbers the official controller sends. Fetching every screen with
+and without them, against a Powernode on BluOS 4.16.6:
+
+- The play queue gains a fourth button, **Queue builder mode**, whose action is
+  `player-link` to `/ui/action?CBQ=true`. A client that declares nothing is
+  never offered it.
+- The queue's Clear button changes from `type="player-link"` to
+  `type="confirmation"`, carrying `title="Clear queue?"` — the player asking to
+  be asked.
+- The Sources screen hands out plain `browse` actions to
+  `/ui/browseMenuGroup?service=<name>` for the music services, where an older
+  client is given a `deep-link` to `/music-service/<name>` that it has to know
+  how to translate for itself.
+- Home gains a `<fetch url="/ui/myPlaylistsRow?service=LocalMusic"
+  itemType="largeThumbnail"/>` — a shelf whose contents are fetched separately —
+  along with another row, teaser and menu action.
+
+Toggling Queue Builder Mode with `/ui/action?CBQ=true` returns 200 with an empty
+body, but on this firmware nothing observable follows: no `<modeIndicator>`
+appears on any screen and no `<addAction>` replaces a `<playAction>`. The button
+is served; whatever it drives is not. Since the button and its action both come
+from the player, a client that simply draws the buttons it is given gets the
+feature for free on firmware where it does work.
 
 ### Grouping and zones
 

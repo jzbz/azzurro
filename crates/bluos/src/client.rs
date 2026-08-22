@@ -26,6 +26,22 @@ use crate::status::{Status, SyncStatus};
 /// the long-poll below sets its own.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What this client tells the player it understands.
+///
+/// The player serves different documents to different numbers, and it is not a
+/// small difference: at 35 the Sources screen hands out plain `browse` actions
+/// for the music services where an older client is given a `deep-link` it has
+/// to know how to translate, Home gains a lazily-fetched shelf, and the play
+/// queue offers a fourth button — Queue Builder Mode — that a client declaring
+/// nothing never sees at all. Verified against a Powernode on BluOS 4.16.6 by
+/// fetching every screen with and without the headers and diffing them.
+///
+/// The two numbers are what the official controller declares. Raising them
+/// past what it sends would be claiming to understand documents nobody has
+/// seen.
+const SCHEMA_VERSION: &str = "35";
+const UI_SCHEMA_VERSION: &str = "7";
+
 /// How long `/Status` is asked to hold a poll open.
 ///
 /// The player honours this exactly: a poll with an unchanged etag returns after
@@ -124,6 +140,8 @@ impl Client {
         self.http
             .get(format!("{}{path}", self.base))
             .query(query)
+            .header("x-sovi-schema-version", SCHEMA_VERSION)
+            .header("x-sovi-ui-schema-version", UI_SCHEMA_VERSION)
             .timeout(timeout)
             .send()
             .await
@@ -401,6 +419,51 @@ impl Client {
 
     pub async fn clear_queue(&self) -> Result<()> {
         self.command("/Clear", &[]).await
+    }
+
+    /// Drop only the tail the player added by itself.
+    ///
+    /// Autofill appends tracks the player picked when the queue would otherwise
+    /// have run out. This removes those and leaves what was put there on
+    /// purpose.
+    pub async fn clear_autofill(&self) -> Result<()> {
+        self.command("/Clear", &[("nextlist", "1")]).await
+    }
+
+    /// Take the track at `from` out of the queue and put it back at `to`.
+    ///
+    /// The parameter names read backwards — the destination is `new` and the
+    /// source is `old` — and the player gives no hint which is which, so the
+    /// order was settled on hardware: with a thirteen-track queue,
+    /// `Move?new=10&old=12` moved the last track up to position ten and left
+    /// everything else in order.
+    ///
+    /// Positions are absolute queue indices, the same ones `/Play?id=` and
+    /// `/Delete?id=` use, and the same one `/Status` reports as `song`.
+    pub async fn move_queue_item(&self, from: u32, to: u32) -> Result<()> {
+        self.command(
+            "/Move",
+            &[("new", &to.to_string()), ("old", &from.to_string())],
+        )
+        .await
+    }
+
+    /// Take one track out of the queue.
+    ///
+    /// Everything after it shifts down, so a caller removing several has to
+    /// work from the end or re-read in between.
+    pub async fn delete_queue_item(&self, index: u32) -> Result<()> {
+        self.command("/Delete", &[("id", &index.to_string())]).await
+    }
+
+    /// Save the queue as a playlist under `name`.
+    ///
+    /// The older of the two ways the player offers. The other is a round trip
+    /// through `/AddToPlaylistOptions?saveQueue=1`, which returns a document
+    /// naming the services that will accept a playlist and the ones that will
+    /// not; this one skips the choosing and saves to the player's own list.
+    pub async fn save_queue(&self, name: &str) -> Result<()> {
+        self.command("/Save", &[("name", name)]).await
     }
 
     /// Load one of the player's stored presets, the numbers the hardware

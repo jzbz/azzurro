@@ -475,6 +475,7 @@ fn target(action: Option<&bluos::Action>) -> String {
         Webpage | Setting => format!("(browser {where_to})"),
         Add => format!("add {where_to}"),
         Reorder => "reorder".to_owned(),
+        Confirmation => format!("play {where_to} (after asking)"),
         Unknown => format!("(unknown action {where_to})"),
     }
 }
