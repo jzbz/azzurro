@@ -36,13 +36,13 @@ use tokio::sync::mpsc;
 slint::include_modules!();
 
 /// The application id, which has to agree with
-/// `desktop/io.github.jzbz.azzurro.desktop`.
+/// `desktop/blue.azzurro.Azzurro.desktop`.
 ///
 /// On Wayland an application cannot set its own taskbar icon. The compositor
 /// matches this id against an installed .desktop file and takes the `Icon=`
 /// from there, so a mismatch between the two shows a generic placeholder
 /// rather than the icon beside it in this directory.
-const APP_ID: &str = "io.github.jzbz.azzurro";
+const APP_ID: &str = "blue.azzurro.Azzurro";
 
 /// How much of a queue to pull for the window.
 ///

@@ -4,12 +4,16 @@ An open-source Linux controller for BluOS players — Bluesound, NAD and PSB.
 
 Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
-**Status: a working skeleton, and young.** Discovery, status, the long poll and
-the transport verbs are implemented and exercised against real hardware; the
-window lists the players it finds, shows the selected one's play queue with
-cover art, browses every source the player offers, and drives all of it. Each
-player is exported over MPRIS so the desktop's own media controls work. See the
-roadmap for what is still missing.
+**Status: young, and exercised against real hardware.** Discovery, status, the
+long poll and the transport verbs all run against a player rather than a
+fixture. The window lists the players it finds, shows the selected one's play
+queue with cover art, browses and searches every source the player offers, and
+drives all of it. Each player is exported over MPRIS so the desktop's own media
+controls work.
+
+Two things are not reimplementable and are out of scope: linking a new music
+service, which happens on Lenbrook's cloud control panel, and anything else
+behind a BluOS account.
 
 ## Layout
 
@@ -100,13 +104,13 @@ checkout:
 ```bash
 cargo build --release -p azzurro-gui
 install -Dm755 "$CARGO_TARGET_DIR/release/azzurro" ~/.local/bin/azzurro
-install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro.desktop \
-    ~/.local/share/applications/io.github.jzbz.azzurro.desktop
-install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro-256.png \
-    ~/.local/share/icons/hicolor/256x256/apps/io.github.jzbz.azzurro.png
+install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro.desktop \
+    ~/.local/share/applications/blue.azzurro.Azzurro.desktop
+install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-256.png \
+    ~/.local/share/icons/hicolor/256x256/apps/blue.azzurro.Azzurro.png
 ```
 
-`packaging/io.github.jzbz.azzurro.yml` is a Flatpak manifest for the same
+`packaging/blue.azzurro.Azzurro.yml` is a Flatpak manifest for the same
 thing. It needs `packaging/cargo-sources.json`, which is generated from
 `Cargo.lock` because Flathub builds offline:
 
@@ -117,29 +121,6 @@ python3 packaging/cargo-sources.py > packaging/cargo-sources.json
 The sandbox takes no filesystem permissions. It does need `--share=network`,
 and not only for HTTP: discovery is a UDP broadcast, which needs the host's
 network namespace rather than a proxied socket.
-
-## Roadmap
-
-**v0.1 — a daily driver.** Done: discovery, per-player volume and mute, now
-playing with cover art, transport, seek, shuffle and repeat, the play queue,
-and MPRIS. Adding a player by address by hand is not wired up yet.
-
-**v0.2 — browsing.** The engine is in: the player describes each screen as XML,
-`/ui/BrowseObjects` reaches every service through one code path, and a service
-this app has never heard of browses and plays without a line of code about it.
-Search, favourites, presets and the per-item context menus all ride on it: the
-picker lists whatever screens the player reports, and a row's `⋯` opens the
-menu the player describes for it — favourite, add to playlist, go to artist.
-Grouping is in but **untested against hardware** — only one player has been
-available, so the wire shapes come from the official controller's own parser
-rather than from a capture. Still to come: stereo and surround
-zones, alarms, and drag-to-reorder in the queue.
-
-**v1.0.** Alarms, sleep timer, inputs. Tray icon and notifications. Flatpak.
-
-Out of scope, because they are not reimplementable: linking a new music service,
-which happens on Lenbrook's cloud control panel, and anything else behind a
-BluOS account.
 
 ## Licence
 

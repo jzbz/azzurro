@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Copyright 2026 Jonathan Zeppettini -->
 <component type="desktop-application">
-  <id>io.github.jzbz.azzurro</id>
+  <id>blue.azzurro.Azzurro</id>
 
   <name>Azzurro</name>
   <summary>Control BluOS players</summary>
@@ -9,7 +9,7 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
 
-  <developer id="io.github.jzbz">
+  <developer id="blue.azzurro">
     <name>Jonathan Zeppettini</name>
   </developer>
 
@@ -49,7 +49,7 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.jzbz.azzurro.desktop</launchable>
+  <launchable type="desktop-id">blue.azzurro.Azzurro.desktop</launchable>
 
   <!--
     No <screenshots> yet. Flathub requires at least one, and every screenshot
@@ -59,7 +59,7 @@
     This must be added before submitting to Flathub.
   -->
 
-  <url type="homepage">https://github.com/jzbz/azzurro</url>
+  <url type="homepage">https://azzurro.blue/</url>
   <url type="bugtracker">https://github.com/jzbz/azzurro/issues</url>
   <url type="vcs-browser">https://github.com/jzbz/azzurro</url>
 

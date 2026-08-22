@@ -7,7 +7,7 @@
 set -eu
 cd "$(dirname "$0")/../crates/azzurro-gui/desktop"
 for size in 64 128 256; do
-    rsvg-convert -w "$size" -h "$size" io.github.jzbz.azzurro.svg \
-        -o "io.github.jzbz.azzurro-$size.png"
+    rsvg-convert -w "$size" -h "$size" blue.azzurro.Azzurro.svg \
+        -o "blue.azzurro.Azzurro-$size.png"
 done
-echo "rendered 64, 128 and 256 px icons from io.github.jzbz.azzurro.svg"
+echo "rendered 64, 128 and 256 px icons from blue.azzurro.Azzurro.svg"

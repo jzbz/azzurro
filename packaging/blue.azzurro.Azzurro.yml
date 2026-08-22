@@ -3,7 +3,7 @@
 # Flathub builds with no network access, so every crate is declared up front in
 # cargo-sources.json (generated from Cargo.lock by packaging/cargo-sources.py)
 # and cargo runs --offline against a vendored registry.
-app-id: io.github.jzbz.azzurro
+app-id: blue.azzurro.Azzurro
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
@@ -38,7 +38,7 @@ finish-args:
 
   # Note what is *not* here: no --filesystem grants at all. The remembered
   # player list and the cover-art cache both live in the app's own directories
-  # under ~/.var/app/io.github.jzbz.azzurro, and nothing else is read or
+  # under ~/.var/app/blue.azzurro.Azzurro, and nothing else is read or
   # written. Signing into a music service and the players' own settings pages
   # are web pages, opened through the desktop's OpenURI portal rather than by
   # this app.
@@ -53,22 +53,22 @@ modules:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose -p azzurro-gui
       - install -Dm755 target/release/azzurro /app/bin/azzurro
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro.desktop
-        /app/share/applications/io.github.jzbz.azzurro.desktop
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro.metainfo.xml
-        /app/share/metainfo/io.github.jzbz.azzurro.metainfo.xml
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro.desktop
+        /app/share/applications/blue.azzurro.Azzurro.desktop
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro.metainfo.xml
+        /app/share/metainfo/blue.azzurro.Azzurro.metainfo.xml
       # PNG as well as the SVG. AppStream's catalogue generator rasterises the
       # icon itself and the freedesktop SDK's copy has no SVG loader, so an
       # SVG-only install fails the build with icon-file-read-error. The PNGs
       # are rendered from that same SVG by packaging/icons.sh.
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro-64.png
-        /app/share/icons/hicolor/64x64/apps/io.github.jzbz.azzurro.png
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro-128.png
-        /app/share/icons/hicolor/128x128/apps/io.github.jzbz.azzurro.png
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro-256.png
-        /app/share/icons/hicolor/256x256/apps/io.github.jzbz.azzurro.png
-      - install -Dm644 crates/azzurro-gui/desktop/io.github.jzbz.azzurro.svg
-        /app/share/icons/hicolor/scalable/apps/io.github.jzbz.azzurro.svg
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-64.png
+        /app/share/icons/hicolor/64x64/apps/blue.azzurro.Azzurro.png
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-128.png
+        /app/share/icons/hicolor/128x128/apps/blue.azzurro.Azzurro.png
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-256.png
+        /app/share/icons/hicolor/256x256/apps/blue.azzurro.Azzurro.png
+      - install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro.svg
+        /app/share/icons/hicolor/scalable/apps/blue.azzurro.Azzurro.svg
     sources:
       - type: git
         url: https://github.com/jzbz/azzurro.git
