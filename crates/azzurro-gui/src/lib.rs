@@ -17,10 +17,11 @@ mod mpris;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bluos::screen::{ItemKind, SectionKind};
 use bluos::settings::{Entry as SettingEntry, Kind, Settings as SettingsPage};
 use bluos::{
     ActionKind, Client, DeviceId, Discovery, Queue, Repeat, Screen, Status, SyncStatus,
@@ -58,6 +59,19 @@ const COVER_SIZE: u32 = 360;
 /// Queue thumbnails are drawn at 34px, likewise doubled. Browse rows use the
 /// same size, so the two panes share cache entries for the same art.
 const THUMB_SIZE: u32 = 72;
+
+/// A cover on a shelf is drawn at 116px, and at 72 it would be a smear. The
+/// cache is keyed by size, so a screen with both shapes on it fetches both.
+const TILE_SIZE: u32 = 232;
+
+/// How long the typing has to stop before a search goes out. Short enough that
+/// results feel like they follow the keys, long enough that a typed word is one
+/// request rather than eight.
+const SEARCH_SETTLE: Duration = Duration::from_millis(280);
+
+/// How many past searches to keep. The player keeps none — this is the app's
+/// own list, and it lasts as long as the app is running.
+const RECENT_SEARCHES: usize = 8;
 
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
@@ -103,6 +117,7 @@ enum Command {
     Sidebar(i32, i32),
     /// Search the current screen for some text.
     BrowseSearch(String),
+    BrowseSearchDone(String),
     /// Back one screen.
     BrowseBack,
 }
@@ -123,6 +138,13 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
+    /// What has been searched for this session, most recent first.
+    ///
+    /// The player does not keep this — the official controller keeps its own,
+    /// which is why the list is empty on a player you have used for years.
+    /// Recorded when a search is committed rather than on every keystroke, or
+    /// every prefix of every word would be on it.
+    recent: Vec<String>,
     /// When set, the middle pane is showing the Help menu.
     help: bool,
     /// A page reached from the Help menu: its title and the facts on it.
@@ -139,6 +161,29 @@ struct Browsing {
 struct Crumb {
     uri: String,
     screen: Screen,
+    /// What was typed to reach this screen, when it is a set of search results.
+    ///
+    /// Typing runs a search on every keystroke, and each one would otherwise be
+    /// a step on the trail: Back out of "van halen" and you would land in "van
+    /// hale". Results replace results instead, so Back returns to where the
+    /// searching started — and the query is kept because that is what goes on
+    /// the recent list once the search turns out to have been worth making.
+    query: Option<String>,
+}
+
+/// How a newly fetched screen joins the trail.
+#[derive(Debug, Clone, PartialEq)]
+enum Arrive {
+    /// A top-level screen off the sidebar: everything before it is gone.
+    Root,
+    /// A step deeper, which Back undoes.
+    Deeper,
+    /// A set of search results: pushed the first time, and thereafter in place
+    /// of the last set.
+    Found(String),
+    /// In place of the screen it came from, which is what a service picker
+    /// marked `replaceScreen` asks for.
+    Replace(Option<String>),
 }
 
 impl Browsing {
@@ -217,6 +262,11 @@ struct Backend {
     browsing: Arc<Mutex<Browsing>>,
     /// Addresses that have answered, remembered between runs.
     known: Arc<Mutex<BTreeSet<DeviceId>>>,
+    /// How many searches have been asked for. Typing asks for one per
+    /// keystroke and only the last of them should reach the player, so each
+    /// takes a number on the way in and checks it is still the highest on the
+    /// way out.
+    searches: Arc<AtomicU64>,
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -225,6 +275,10 @@ struct BrowseData {
     index: i32,
     title: String,
     subtitle: String,
+    /// The caption on a section heading's button — "Customise" on the Inputs
+    /// row, "Manage" on Music Services. Empty everywhere else, which is most
+    /// places: only the sidebar draws these, and only on headings.
+    action: String,
     cover: Option<Pixels>,
     /// Drawn instead of `cover` where the player's own picture is interface
     /// furniture rather than content. See [`glyphs`].
@@ -232,7 +286,19 @@ struct BrowseData {
     heading: bool,
     actionable: bool,
     playing: bool,
+    /// Which service a selector menu is currently showing. Not the same thing
+    /// as `playing`: you can be looking at TuneIn's favourites while the
+    /// library is what is coming out of the speakers.
+    selected: bool,
     has_menu: bool,
+}
+
+/// One section of a screen, ready for the window.
+struct BlockData {
+    /// 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips.
+    kind: i32,
+    title: String,
+    rows: Vec<BrowseData>,
 }
 
 /// The Lucide glyph for a [`Glyph`], out of the set the .slint file holds.
@@ -269,6 +335,20 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Save => icons.get_save(),
         Glyph::Settings => icons.get_settings(),
         Glyph::Tweak => icons.get_tweak(),
+        Glyph::Alarm => icons.get_alarm(),
+        Glyph::Sleep => icons.get_sleep(),
+        Glyph::Speaker => icons.get_player(),
+        Glyph::Volume => icons.get_volume(),
+        Glyph::Wifi => icons.get_wifi(),
+        Glyph::Network => icons.get_network(),
+        Glyph::Artwork => icons.get_artwork(),
+        Glyph::Power => icons.get_power(),
+        Glyph::Brightness => icons.get_brightness(),
+        Glyph::Reset => icons.get_reset(),
+        Glyph::Server => icons.get_server(),
+        Glyph::Tone => icons.get_tone(),
+        Glyph::Gauge => icons.get_gauge(),
+        Glyph::Service => icons.get_service(),
         Glyph::Help => icons.get_help(),
         Glyph::Rescan => icons.get_rescan(),
     }
@@ -464,6 +544,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_browse_search_done(move |query| {
+        let _ = tx.send(Command::BrowseSearchDone(query.to_string()));
+    });
+
+    let tx = commands.clone();
     ui.on_seek(move |id, secs| dispatch(&tx, &id, Action::Seek(secs.max(0) as u32)));
 
     let tx = commands.clone();
@@ -537,6 +622,7 @@ async fn run(
         artwork: Arc::new(Artwork::new(http.clone())),
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(BTreeSet::new())),
+        searches: Arc::new(AtomicU64::new(0)),
     };
 
     tokio::spawn(run_commands(
@@ -898,28 +984,40 @@ impl Backend {
                     index: index as i32,
                     title: label.clone(),
                     subtitle: String::new(),
+                    action: String::new(),
                     cover: None,
                     glyph: glyphs::glyph_for(label, None),
                     heading: false,
                     actionable: true,
                     playing: lit == Some((0, index as i32)),
+                    selected: false,
                     has_menu: false,
                 });
             }
 
             if let Some(sources) = &browsing.sources {
                 let mut index = 0i32;
-                for section in &sources.sections {
+                for (ordinal, section) in sources.sections.iter().enumerate() {
                     if let Some(title) = &section.title {
+                        // The button beside the heading is the section's own
+                        // menu action: "Customise" opens the inputs settings
+                        // page, "Manage" opens the music-services page. The
+                        // player supplies both the wording and the target.
                         rows.push(BrowseData {
-                            index: -1,
+                            index: ordinal as i32,
                             title: title.clone(),
                             subtitle: String::new(),
+                            action: section
+                                .menu_actions
+                                .first()
+                                .and_then(|menu| menu.text.clone())
+                                .unwrap_or_default(),
                             cover: None,
                             glyph: None,
                             heading: true,
                             actionable: false,
                             playing: false,
+                            selected: false,
                             has_menu: false,
                         });
                     }
@@ -929,14 +1027,23 @@ impl Backend {
                             index,
                             title: label.clone(),
                             subtitle: String::new(),
+                            action: String::new(),
                             cover: None,
-                            glyph: glyphs::glyph_for(
-                                &label,
-                                item.icon.as_deref().or(item.image.as_deref()),
-                            ),
+                            // A service in the sidebar always gets a glyph;
+                            // an input keeps the usual rule, which already
+                            // replaces the player's own chrome.
+                            glyph: Some(match item.kind {
+                                ItemKind::Service => glyphs::service_glyph(&label),
+                                _ => glyphs::glyph_for(
+                                    &label,
+                                    item.icon.as_deref().or(item.image.as_deref()),
+                                )
+                                .unwrap_or(Glyph::Service),
+                            }),
                             heading: false,
                             actionable: item.is_actionable(),
                             playing: lit == Some((1, index)),
+                            selected: false,
                             has_menu: false,
                         });
                         index += 1;
@@ -960,7 +1067,9 @@ impl Backend {
             let rows: Vec<SidebarRow> = rows
                 .into_iter()
                 .map(|row| {
-                    let kind = if !row.heading && seen < screens {
+                    let kind = if row.heading {
+                        2
+                    } else if seen < screens {
                         seen += 1;
                         0
                     } else {
@@ -968,6 +1077,7 @@ impl Backend {
                     };
                     SidebarRow {
                         label: row.title.into(),
+                        action: row.action.into(),
                         cover: match row.glyph {
                             Some(glyph) => glyph_image(&icons, glyph),
                             None => Default::default(),
@@ -1071,9 +1181,18 @@ impl Backend {
         let mut index = 0i32;
         walk_settings(&page.entries, &page, &mut rows, &mut index);
 
-        let title = match &page.page_id {
-            Some(id) => format!("Settings · {id}"),
-            None => "Settings".to_owned(),
+        // A page fetched by id has one group on it and that group names
+        // itself — "Customize sources", "Music library". Its own name beats
+        // the id it was fetched by, which is a word like `capture` that means
+        // nothing to anyone outside the firmware.
+        let named = match page.entries.as_slice() {
+            [SettingEntry::Group(group)] => group.display_name.clone(),
+            _ => None,
+        };
+        let title = match (named, &page.page_id) {
+            (Some(name), _) => name,
+            (None, Some(id)) => format!("Settings · {id}"),
+            (None, None) => "Settings".to_owned(),
         };
 
         self.send_settings(rows, title);
@@ -1143,44 +1262,87 @@ impl Backend {
             }
         }
 
-        let (rows, title, can_go_back, search) = {
+        let (blocks, selector, recent, empty, title, can_go_back, search) = {
             let browsing = self.browsing.lock().unwrap();
 
             let Some(screen) = browsing.current() else {
-                return self.send_browse(Vec::new(), "Browse".into(), false, None);
+                return self.send_browse(
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    "Browse".into(),
+                    false,
+                    None,
+                );
             };
 
-            let mut rows = Vec::new();
+            let mut blocks: Vec<BlockData> = Vec::new();
+            let mut selector: Vec<BrowseData> = Vec::new();
+            let mut empty: Option<(String, String, Option<Glyph>)> = None;
             let mut index = 0i32;
-            let named_sections = screen.sections.iter().filter(|s| s.title.is_some()).count();
+            // Only worth a heading when there is more than one to tell apart.
+            let listed = screen
+                .sections
+                .iter()
+                .filter(|s| s.kind == SectionKind::List && s.title.is_some())
+                .count();
 
             for section in &screen.sections {
-                // Only worth a heading when there is more than one to tell
-                // apart.
-                if named_sections > 1
-                    && let Some(title) = &section.title
-                {
-                    rows.push(BrowseData {
-                        index: -1,
-                        title: title.clone(),
-                        subtitle: String::new(),
-                        cover: None,
-                        glyph: None,
-                        heading: true,
-                        actionable: false,
-                        playing: false,
-                        has_menu: false,
-                    });
-                }
+                let kind = match section.kind {
+                    SectionKind::Row => 1,
+                    SectionKind::SelectorMenu => 2,
+                    SectionKind::List => 0,
+                };
+                // A shelf always names itself — that is the only way to tell
+                // "Presets" from "Recently Played" when both are a line of
+                // covers. Chips need no heading; they are self-evident.
+                let heading = match (kind, &section.title) {
+                    (1, Some(title)) => title.clone(),
+                    (0, Some(title)) if listed > 1 => title.clone(),
+                    _ => String::new(),
+                };
+                let size = if kind == 1 { TILE_SIZE } else { THUMB_SIZE };
 
+                let mut rows = Vec::new();
                 for item in &section.items {
+                    // The index counts every item the screen holds, including
+                    // the two below that never become rows: it is what an
+                    // activation is looked up by, and `Screen::items` counts
+                    // them too.
+                    let at = index;
+                    index += 1;
+
+                    match item.kind {
+                        // It has its own field above the list.
+                        ItemKind::Search => continue,
+                        // Not something to put on the screen — something to
+                        // draw instead of the screen.
+                        ItemKind::InfoPanel => {
+                            empty = Some((
+                                item.label().unwrap_or_default().to_owned(),
+                                item.extra.get("subText").cloned().unwrap_or_default(),
+                                glyphs::glyph_for(screen.heading().unwrap_or_default(), None),
+                            ));
+                            continue;
+                        }
+                        _ => {}
+                    }
+
                     let source = item
                         .image
                         .as_deref()
                         .or(item.icon.as_deref())
                         .filter(|src| !src.is_empty());
 
-                    let glyph = glyphs::glyph_for(item.label().unwrap_or_default(), source);
+                    // A service picker is a row of names in the app's own
+                    // chrome, so it gets the app's own icons; everywhere else
+                    // the player's picture wins when it is content.
+                    let glyph = if kind == 2 {
+                        Some(glyphs::service_glyph(item.label().unwrap_or_default()))
+                    } else {
+                        glyphs::glyph_for(item.label().unwrap_or_default(), source)
+                    };
                     // A glyph makes the picture beside it redundant, and not
                     // fetching it saves a request the player would have served.
                     let cover = glyph
@@ -1189,11 +1351,12 @@ impl Backend {
                         .flatten()
                         .zip(client.as_ref())
                         .and_then(|(src, client)| {
-                            self.artwork.cached(&client.image_url(src), THUMB_SIZE)
+                            self.artwork.cached(&client.image_url(src), size)
                         });
 
                     rows.push(BrowseData {
-                        index,
+                        index: at,
+                        action: String::new(),
                         // Some rows are an icon and nothing else — the "add a
                         // preset" tile is one — so fall back to what the
                         // action calls itself, and then to nothing rather than
@@ -1213,9 +1376,25 @@ impl Backend {
                         heading: false,
                         actionable: item.is_actionable(),
                         playing: status.as_ref().is_some_and(|s| item.is_playing(s)),
+                        selected: item.selected,
                         has_menu: item.context_menu.is_some(),
                     });
-                    index += 1;
+                }
+
+                if rows.is_empty() {
+                    continue;
+                }
+                // The service picker belongs beside the title, where the
+                // official controller keeps it, rather than as a row of chips
+                // above content it is not part of.
+                if kind == 2 {
+                    selector = rows;
+                } else {
+                    blocks.push(BlockData {
+                        kind,
+                        title: heading,
+                        rows,
+                    });
                 }
             }
 
@@ -1229,15 +1408,32 @@ impl Backend {
                 .find(|i| i.search_parameter().is_some())
                 .map(|i| i.prompt().or(i.label()).unwrap_or("Search").to_owned());
 
-            (rows, title, browsing.trail.len() > 1, search)
+            // The panel is what to draw when there is nothing else; a screen
+            // that has both is showing content, so the content wins.
+            let empty = empty.filter(|_| blocks.is_empty());
+            let recent = browsing.recent.clone();
+
+            (
+                blocks,
+                selector,
+                recent,
+                empty,
+                title,
+                browsing.trail.len() > 1,
+                search,
+            )
         };
 
-        self.send_browse(rows, title, can_go_back, search);
+        self.send_browse(blocks, selector, recent, empty, title, can_go_back, search);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_browse(
         &self,
-        rows: Vec<BrowseData>,
+        blocks: Vec<BlockData>,
+        selector: Vec<BrowseData>,
+        recent: Vec<String>,
+        empty: Option<(String, String, Option<Glyph>)>,
         title: String,
         can_go_back: bool,
         search: Option<String>,
@@ -1247,28 +1443,99 @@ impl Backend {
             let Some(ui) = ui.upgrade() else { return };
             let icons = Icons::get(&ui);
 
-            let rows: Vec<BrowseRow> = rows
+            let blocks: Vec<BrowseBlock> = blocks
                 .into_iter()
-                .map(|row| BrowseRow {
-                    index: row.index,
-                    title: row.title.into(),
-                    subtitle: row.subtitle.into(),
-                    // The glyphs live in the .slint file, so they can only be
-                    // reached from inside the event loop — which is also the
-                    // only place a slint::Image may be built.
-                    cover: match row.glyph {
-                        Some(glyph) => glyph_image(&icons, glyph),
-                        None => row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
-                    },
-                    is_glyph: row.glyph.is_some(),
-                    heading: row.heading,
-                    actionable: row.actionable,
-                    playing: row.playing,
-                    has_menu: row.has_menu,
+                .map(|block| BrowseBlock {
+                    kind: block.kind,
+                    title: block.title.into(),
+                    rows: ModelRc::new(VecModel::from(
+                        block
+                            .rows
+                            .into_iter()
+                            .map(|row| BrowseRow {
+                                index: row.index,
+                                title: row.title.into(),
+                                subtitle: row.subtitle.into(),
+                                // The glyphs live in the .slint file, so they
+                                // can only be reached from inside the event
+                                // loop — which is also the only place a
+                                // slint::Image may be built.
+                                cover: match row.glyph {
+                                    Some(glyph) => glyph_image(&icons, glyph),
+                                    None => {
+                                        row.cover.map(slint::Image::from_rgba8).unwrap_or_default()
+                                    }
+                                },
+                                is_glyph: row.glyph.is_some(),
+                                heading: row.heading,
+                                actionable: row.actionable,
+                                playing: row.playing,
+                                selected: row.selected,
+                                has_menu: row.has_menu,
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
                 })
                 .collect();
 
-            ui.set_browse(ModelRc::new(VecModel::from(rows)));
+            // Which service the picker is showing, said once here rather
+            // than searched for in the .slint file every time it draws.
+            let chosen = selector.iter().find(|row| row.selected);
+            ui.set_browse_service(
+                chosen
+                    .map(|row| row.title.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_service_icon(match chosen.and_then(|row| row.glyph) {
+                Some(glyph) => glyph_image(&icons, glyph),
+                None => Default::default(),
+            });
+            ui.set_browse_selector(ModelRc::new(VecModel::from(
+                selector
+                    .into_iter()
+                    .map(|row| BrowseRow {
+                        index: row.index,
+                        title: row.title.into(),
+                        subtitle: Default::default(),
+                        cover: match row.glyph {
+                            Some(glyph) => glyph_image(&icons, glyph),
+                            None => Default::default(),
+                        },
+                        is_glyph: row.glyph.is_some(),
+                        heading: false,
+                        actionable: true,
+                        playing: false,
+                        selected: row.selected,
+                        has_menu: false,
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            ui.set_browse_recent(ModelRc::new(VecModel::from(
+                recent
+                    .into_iter()
+                    .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            )));
+            ui.set_browse_blocks(ModelRc::new(VecModel::from(blocks)));
+            ui.set_browse_empty(
+                empty
+                    .as_ref()
+                    .map(|(t, _, _)| t.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_empty_detail(
+                empty
+                    .as_ref()
+                    .map(|(_, d, _)| d.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_empty_icon(match empty.and_then(|(_, _, glyph)| glyph) {
+                Some(glyph) => glyph_image(&icons, glyph),
+                None => icons.get_info(),
+            });
             ui.set_browse_title(title.into());
             ui.set_browse_can_go_back(can_go_back);
             ui.set_browse_has_search(search.is_some());
@@ -1288,6 +1555,17 @@ impl Backend {
         let snapshot = selected
             .and_then(|id| self.with_entry(id, |e| (e.status.clone(), e.status_at)))
             .and_then(|(status, at)| Some((status?, at)));
+
+        // Reindexing a library takes minutes and the player counts as it goes.
+        // It never says how many there are in total, so there is no percentage
+        // to report — the count and a bar that says "still working" is the
+        // whole of what the player knows.
+        let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
+            Some(songs) if songs > 0 => {
+                format!("Indexing the music library — {songs} songs so far")
+            }
+            _ => String::new(),
+        };
 
         let sleep = snapshot
             .as_ref()
@@ -1333,6 +1611,7 @@ impl Backend {
             ui.set_shuffle(shuffle);
             ui.set_repeat(repeat);
             ui.set_sleep_label(sleep.as_str().into());
+            ui.set_indexing(indexing.as_str().into());
             ui.set_sleep_on(sleep != "Sleep");
         });
     }
@@ -1692,11 +1971,27 @@ fn screen_label(id: &str) -> String {
     }
 }
 
+/// The settings page an action points at, if that is what it points at.
+///
+/// `/Settings?id=capture` names one page; a bare `/Settings` means the top of
+/// the settings menu, which is `None` rather than "not a settings page" — hence
+/// the two layers of `Option`.
+fn settings_page(uri: &str) -> Option<Option<String>> {
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    if !path.eq_ignore_ascii_case("/Settings") {
+        return None;
+    }
+    Some(query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "id").then(|| value.to_owned())
+    }))
+}
+
 /// Fetch a screen and show it.
 ///
 /// `push` distinguishes going deeper from starting over: Back pops the trail,
 /// so every screen that is arrived at by following a row has to be on it.
-async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
+async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive) {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
@@ -1717,10 +2012,27 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
                     browsing.trail.clear();
                 }
                 browsing.device = Some(id);
-                if !push {
-                    browsing.trail.clear();
-                }
-                browsing.trail.push(Crumb { uri, screen });
+                let query = match &arrive {
+                    Arrive::Root => {
+                        browsing.trail.clear();
+                        None
+                    }
+                    Arrive::Deeper => None,
+                    Arrive::Found(query) => {
+                        // Results stand in for results. Deciding that here,
+                        // with the trail locked, is what keeps two keystrokes
+                        // landing at once from stacking two screens.
+                        if browsing.trail.last().is_some_and(|c| c.query.is_some()) {
+                            browsing.trail.pop();
+                        }
+                        Some(query.clone())
+                    }
+                    Arrive::Replace(query) => {
+                        browsing.trail.pop();
+                        query.clone()
+                    }
+                };
+                browsing.trail.push(Crumb { uri, screen, query });
             }
             backend.publish_browse();
             tokio::spawn(load_browse_thumbnails(backend, id));
@@ -1731,20 +2043,107 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
 
 /// Do whatever row `index` of the current screen says to do.
 async fn activate(backend: Backend, index: usize) {
-    let (id, action) = {
+    let (id, action, arrive, worth_keeping) = {
         let browsing = backend.browsing.lock().unwrap();
         let Some(id) = browsing.device else { return };
-        let Some(screen) = browsing.current() else {
+        let Some(crumb) = browsing.trail.last() else {
             return;
         };
-        let Some(item) = screen.items().nth(index) else {
+
+        // Which section the row came from decides how its screen arrives. A
+        // service picker asks to replace the screen it sits on — switching
+        // from Library to TuneIn is the same screen about a different service,
+        // not a step into one.
+        let mut at = 0usize;
+        let mut found = None;
+        'sections: for section in &crumb.screen.sections {
+            for item in &section.items {
+                if at == index {
+                    let replaces =
+                        section.kind == SectionKind::SelectorMenu && section.replace_screen;
+                    found = Some((item, replaces));
+                    break 'sections;
+                }
+                at += 1;
+            }
+        }
+        let Some((item, replaces)) = found else {
             return;
         };
-        (id, item.action.clone().or_else(|| item.play_action.clone()))
+
+        let arrive = if replaces {
+            Arrive::Replace(crumb.query.clone())
+        } else {
+            Arrive::Deeper
+        };
+        // Following a result is what makes a search worth remembering: it
+        // found something. Switching service is not — the same query is still
+        // on screen.
+        let worth_keeping = if replaces { None } else { crumb.query.clone() };
+
+        (
+            id,
+            item.action.clone().or_else(|| item.play_action.clone()),
+            arrive,
+            worth_keeping,
+        )
     };
 
+    if let Some(query) = worth_keeping {
+        remember_search(&backend, query);
+    }
     let Some(action) = action else { return };
-    run_action(backend, id, action).await;
+    run_action(backend, id, action, arrive).await;
+}
+
+/// Put a query at the top of the recent list.
+fn remember_search(backend: &Backend, query: String) {
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        browsing.recent.retain(|seen| seen != &query);
+        browsing.recent.insert(0, query);
+        browsing.recent.truncate(RECENT_SEARCHES);
+    }
+    backend.publish_browse();
+}
+
+/// Search for what has been typed so far.
+///
+/// Called once the typing has settled rather than on the keystroke itself, and
+/// then only if nothing has been typed since.
+async fn run_search(backend: Backend, query: String) {
+    let query = query.trim().to_owned();
+
+    let plan = {
+        let browsing = backend.browsing.lock().unwrap();
+        let Some(id) = browsing.device else { return };
+        let Some(crumb) = browsing.trail.last() else {
+            return;
+        };
+        // An empty box is not a search for nothing: it is being back where the
+        // searching started.
+        if query.is_empty() {
+            crumb.query.is_some().then_some((id, None))
+        } else {
+            crumb
+                .screen
+                .items()
+                .find(|item| item.search_parameter().is_some())
+                .and_then(|item| item.search_url(&query))
+                .map(|uri| (id, Some(uri)))
+        }
+    };
+
+    match plan {
+        Some((id, Some(uri))) => {
+            open_screen(backend, id, uri, Arrive::Found(query)).await;
+        }
+        Some((_, None)) => {
+            backend.browsing.lock().unwrap().trail.pop();
+            backend.publish_browse();
+        }
+        None => {}
+    }
 }
 
 /// Carry out one action from a screen.
@@ -1752,7 +2151,7 @@ async fn activate(backend: Backend, index: usize) {
 /// Every branch is the player's instruction rather than this app's decision —
 /// which is the whole point of the server-driven screens, and why a music
 /// service nobody has heard of still browses and plays.
-async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action) {
+async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arrive: Arrive) {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
@@ -1761,7 +2160,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action) {
     match action.kind {
         ActionKind::Browse | ActionKind::ContextBrowse => {
             if let Some(uri) = uri {
-                open_screen(backend, id, uri, true).await;
+                open_screen(backend, id, uri, arrive).await;
             }
         }
 
@@ -1794,7 +2193,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action) {
                 let service = route.trim_start_matches("/music-service/");
                 let uri =
                     format!("/ui/BrowseObjects?service={service}&type=BrowseMenu&url=%2FBrowse");
-                open_screen(backend, id, uri, true).await;
+                open_screen(backend, id, uri, Arrive::Deeper).await;
             }
             Some(route) => tracing::debug!(%id, "no equivalent for the route {route}"),
             None => {}
@@ -1804,6 +2203,15 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action) {
         // web pages. A controller can only point at them.
         ActionKind::Webpage | ActionKind::Setting => {
             if let Some(uri) = uri {
+                // Except this one, which only looks like a web page. The
+                // Customise button on the Inputs row leads to
+                // `/Settings?id=capture`, and that is a settings document this
+                // app already renders — sending it to a browser would be
+                // handing back a page it can draw itself.
+                if let Some(page) = settings_page(&uri) {
+                    let _ = backend.commands.send(Command::OpenSettings(page));
+                    return;
+                }
                 let url = client.image_url(&uri);
                 tracing::info!(%id, "opening {url} in a browser");
                 let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
@@ -1874,7 +2282,7 @@ async fn refresh_current(backend: Backend) {
     }) else {
         return;
     };
-    open_screen(backend, id, uri, true).await;
+    open_screen(backend, id, uri, Arrive::Deeper).await;
 }
 
 /// Fetch the icons and cover art for the screen on show.
@@ -1884,7 +2292,7 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
         return;
     };
 
-    let urls: Vec<String> = {
+    let urls: Vec<(String, u32)> = {
         let browsing = backend.browsing.lock().unwrap();
         let Some(screen) = browsing.current() else {
             return;
@@ -1892,8 +2300,20 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
 
         let mut seen = std::collections::BTreeSet::new();
         screen
-            .items()
-            .filter_map(|item| {
+            .sections
+            .iter()
+            // A cover on a shelf is drawn four times the size of one on a row,
+            // so the two want different fetches. Walking sections rather than
+            // items is what makes that distinction available here.
+            .flat_map(|section| {
+                let size = if section.kind == SectionKind::Row {
+                    TILE_SIZE
+                } else {
+                    THUMB_SIZE
+                };
+                section.items.iter().map(move |item| (item, size))
+            })
+            .filter_map(|(item, size)| {
                 let source = item
                     .image
                     .as_deref()
@@ -1902,10 +2322,10 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
                 // Drawn as a glyph, so there is nothing to fetch.
                 glyphs::glyph_for(item.label().unwrap_or_default(), Some(source))
                     .is_none()
-                    .then_some(source)
+                    .then_some((source, size))
             })
-            .map(|src| client.image_url(src))
-            .filter(|url| seen.insert(url.clone()))
+            .map(|(src, size)| (client.image_url(src), size))
+            .filter(|entry| seen.insert(entry.clone()))
             .collect()
     };
 
@@ -1914,10 +2334,10 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
     }
 
     let mut fetches = tokio::task::JoinSet::new();
-    for url in urls {
+    for (url, size) in urls {
         let artwork = backend.artwork.clone();
         fetches.spawn(async move {
-            artwork.get(&url, THUMB_SIZE).await;
+            artwork.get(&url, size).await;
         });
     }
 
@@ -2055,11 +2475,13 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
 
     let mut watch = client.watch();
     let mut backoff = Duration::from_secs(1);
+    let mut unreadable = 0u32;
 
     loop {
         match watch.next().await {
             Ok(status) => {
                 backoff = Duration::from_secs(1);
+                unreadable = 0;
 
                 // `pid` is the queue's identity. When it changes the player has
                 // replaced the queue, which is the cue the device itself gives
@@ -2069,7 +2491,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // different it looks from the nothing that preceded it —
                 // treating it as one would throw away the queue the adoption
                 // just fetched and fetch it again.
-                let queue_replaced = {
+                let (queue_replaced, indexed) = {
                     let mut guard = backend.registry.lock().unwrap();
                     let Some(entry) = guard.get_mut(&id) else {
                         return;
@@ -2078,13 +2500,26 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                         Some(previous) => previous.pid != status.pid,
                         None => false,
                     };
+                    // The banner says nothing once the count stops, so the one
+                    // moment worth a word is the moment it stops: the count was
+                    // climbing and now it is not.
+                    let indexed = match &entry.status {
+                        Some(previous) => {
+                            previous.indexing.unwrap_or(0) > 0 && status.indexing.unwrap_or(0) == 0
+                        }
+                        None => false,
+                    };
                     if replaced {
                         entry.queue = None;
                     }
                     entry.status = Some(status.clone());
                     entry.status_at = Some(Instant::now());
-                    replaced
+                    (replaced, indexed)
                 };
+
+                if indexed && backend.is_selected(id) {
+                    say(&backend.ui, "Music library index complete");
+                }
 
                 backend.update(id, |view| {
                     view.reachable = true;
@@ -2193,18 +2628,43 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 }
             }
             Err(e) => {
-                tracing::debug!(%id, "poll failed, retrying in {backoff:?}: {e}");
-                backend.update(id, |view| view.reachable = false);
+                // Two different failures wearing one shape. A player that
+                // cannot be reached is offline and the app should say so; a
+                // player that answered with a document this crate cannot read
+                // is perfectly alive, and it does emit one on occasion while
+                // it changes input. Taking the whole app offline over that —
+                // greying the transport and writing "Not responding" under
+                // the name — is what makes switching inputs look like a
+                // freeze, and it lasted as long as the backoff.
+                let answered = matches!(e, bluos::Error::Xml { .. });
+                let wait = if answered {
+                    unreadable += 1;
+                    // A run of them is a real disagreement about the format
+                    // rather than a blip, and then it is worth slowing down
+                    // instead of hammering the player.
+                    if unreadable > 3 {
+                        backoff
+                    } else {
+                        Duration::from_millis(200)
+                    }
+                } else {
+                    unreadable = 0;
+                    backend.update(id, |view| view.reachable = false);
 
-                // The last known track stays on the bus — a blip should not
-                // wipe the desktop's media widget — but it stops claiming to
-                // be playing something it can no longer see.
-                if let Some(bridge) = &mpris {
-                    bridge.publish_offline().await;
+                    // The last known track stays on the bus — a blip should
+                    // not wipe the desktop's media widget — but it stops
+                    // claiming to be playing something it can no longer see.
+                    if let Some(bridge) = &mpris {
+                        bridge.publish_offline().await;
+                    }
+                    backoff
+                };
+
+                tracing::debug!(%id, "poll failed, retrying in {wait:?}: {e}");
+                tokio::time::sleep(wait).await;
+                if wait == backoff {
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
-
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
 
                 // The etag names a state the player may no longer remember
                 // after an outage; drop it so the next poll returns at once
@@ -2317,7 +2777,7 @@ async fn run_commands(
                     browsing.highlighted = Some((0, 0));
                 }
                 backend.publish_sidebar();
-                tokio::spawn(open_screen(backend.clone(), id, root, false));
+                tokio::spawn(open_screen(backend.clone(), id, root, Arrive::Root));
                 continue;
             }
 
@@ -2377,7 +2837,7 @@ async fn run_commands(
                     )
                 };
                 if let Some((id, uri)) = opened {
-                    tokio::spawn(open_screen(backend.clone(), id, uri, true));
+                    tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Deeper));
                 }
                 continue;
             }
@@ -2400,7 +2860,7 @@ async fn run_commands(
                     backend.clone(),
                     id,
                     format!("{base}?id={song}"),
-                    true,
+                    Arrive::Deeper,
                 ));
                 continue;
             }
@@ -2417,7 +2877,13 @@ async fn run_commands(
                         let mut browsing = backend.browsing.lock().unwrap();
                         browsing.help = false;
                         browsing.settings = Some(page);
+                        // Settings and Help are rows of their own below the
+                        // list, so nothing in the list is where you are any
+                        // more. Leaving the last screen lit says you are on a
+                        // screen you are not looking at.
+                        browsing.highlighted = None;
                         drop(browsing);
+                        backend.publish_sidebar();
                         backend.publish_settings();
                     }
                     Err(e) => {
@@ -2463,6 +2929,15 @@ async fn run_commands(
                         if let Some(page) = page {
                             match client.write_setting(&page, &setting, &value).await {
                                 Ok(()) => {
+                                    // A button leaves nothing behind on the
+                                    // page it was pressed on — no toggle moves,
+                                    // no value changes — so without a word it
+                                    // is indistinguishable from a dead control.
+                                    // Reindexing takes minutes before the
+                                    // player admits it started.
+                                    if setting.kind == Kind::Button {
+                                        say(&backend.ui, format!("{}…", setting.label()));
+                                    }
                                     // Re-read rather than guess: a write can
                                     // change more than the one value, and the
                                     // player is the only one who knows.
@@ -2485,8 +2960,10 @@ async fn run_commands(
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
                     browsing.help = true;
+                    browsing.highlighted = None;
                     browsing.settings = None;
                 }
+                backend.publish_sidebar();
                 backend.publish_help();
                 continue;
             }
@@ -2608,10 +3085,29 @@ async fn run_commands(
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
-                backend.browsing.lock().unwrap().highlighted = Some((kind, index));
-                backend.publish_sidebar();
+                if kind != 2 {
+                    backend.browsing.lock().unwrap().highlighted = Some((kind, index));
+                    backend.publish_sidebar();
+                }
 
-                if kind == 0 {
+                if kind == 2 {
+                    // The button on a section heading. Whatever it does is the
+                    // section's own menu action — a settings page for Inputs,
+                    // the services page for Music Services.
+                    let action = {
+                        let browsing = backend.browsing.lock().unwrap();
+                        browsing.sources.as_ref().and_then(|screen| {
+                            screen
+                                .sections
+                                .get(index.max(0) as usize)
+                                .and_then(|section| section.menu_actions.first())
+                                .and_then(|menu| menu.action.clone())
+                        })
+                    };
+                    if let Some(action) = action {
+                        tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
+                    }
+                } else if kind == 0 {
                     let uri = backend
                         .browsing
                         .lock()
@@ -2620,7 +3116,7 @@ async fn run_commands(
                         .get(index.max(0) as usize)
                         .map(|(_, uri)| uri.clone());
                     if let Some(uri) = uri {
-                        tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                        tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Root));
                     }
                 } else {
                     // An entry off the Sources screen: run whatever that item
@@ -2635,29 +3131,34 @@ async fn run_commands(
                         })
                     };
                     if let Some(action) = action {
-                        tokio::spawn(run_action(backend.clone(), id, action));
+                        tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                     }
                 }
                 continue;
             }
 
             Command::BrowseSearch(query) => {
-                if query.trim().is_empty() {
-                    continue;
-                }
-                let searched = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    browsing.device.zip(
-                        browsing
-                            .current()
-                            .and_then(|screen| {
-                                screen.items().find(|i| i.search_parameter().is_some())
-                            })
-                            .and_then(|item| item.search_url(query.trim())),
-                    )
-                };
-                if let Some((id, uri)) = searched {
-                    tokio::spawn(open_screen(backend.clone(), id, uri, true));
+                // Typing is the search; there is no Enter to wait for. Held
+                // back until the typing settles so a word costs one request,
+                // and numbered so that only the last one asked for lands.
+                let generation = backend.searches.fetch_add(1, Ordering::Relaxed) + 1;
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(SEARCH_SETTLE).await;
+                    if backend.searches.load(Ordering::Relaxed) != generation {
+                        return;
+                    }
+                    run_search(backend, query).await;
+                });
+                continue;
+            }
+
+            // Enter, which is not needed to search but does say the search was
+            // the one that mattered.
+            Command::BrowseSearchDone(query) => {
+                let query = query.trim().to_owned();
+                if !query.is_empty() {
+                    remember_search(&backend, query);
                 }
                 continue;
             }

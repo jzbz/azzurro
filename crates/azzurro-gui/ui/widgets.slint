@@ -237,33 +237,76 @@ export component Scrubber inherits Rectangle {
 export component Level inherits HorizontalLayout {
     in property <int> value;
     in property <bool> muted: false;
+    // What one press of the buttons is worth. Volume is 0-100 on every BluOS
+    // player, and single steps are too fine to hear.
+    in property <int> step: 2;
     callback changed(int);
     callback toggle-mute();
 
-    spacing: Theme.gap;
+    spacing: Theme.tight;
 
-    IconButton {
-        glyph: root.muted ? Icons.muted : Icons.volume;
-        size: 26px;
-        glyph-size: 15px;
-        tint: root.muted ? Theme.faint : Theme.dim;
-        clicked => { root.toggle-mute(); }
+    // Every child here is a different height, and a row does not centre what
+    // it does not have to. Each one carries its own centring layout.
+    VerticalLayout {
+        alignment: center;
+
+        IconButton {
+            glyph: root.muted ? Icons.muted : Icons.volume;
+            size: 26px;
+            glyph-size: 15px;
+            tint: root.muted ? Theme.faint : Theme.dim;
+            clicked => { root.toggle-mute(); }
+        }
     }
 
-    bar := Scrubber {
-        enabled: !root.muted;
-        value: root.value / 100;
-        vertical-stretch: 1;
-        seek(fraction) => { root.changed(Math.round(fraction * 100)); }
+    // A step either side of the bar. Dragging is quick but imprecise, and the
+    // one adjustment anyone makes twice in a row is "slightly quieter".
+    VerticalLayout {
+        alignment: center;
+
+        IconButton {
+            glyph: Icons.less;
+            size: 22px;
+            glyph-size: 12px;
+            enabled: !root.muted;
+            clicked => { root.changed(Math.max(0, root.value - root.step)); }
+        }
     }
 
-    Text {
-        text: root.muted ? "—" : root.value;
-        font-size: Theme.small-size;
-        color: Theme.faint;
-        vertical-alignment: center;
-        horizontal-alignment: right;
-        width: 22px;
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+
+        bar := Scrubber {
+            enabled: !root.muted;
+            value: root.value / 100;
+            seek(fraction) => { root.changed(Math.round(fraction * 100)); }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+
+        IconButton {
+            glyph: Icons.add;
+            size: 22px;
+            glyph-size: 12px;
+            enabled: !root.muted;
+            clicked => { root.changed(Math.min(100, root.value + root.step)); }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+
+        Text {
+            text: root.muted ? "—" : root.value;
+            font-size: Theme.small-size;
+            color: Theme.faint;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 22px;
+        }
     }
 }
 

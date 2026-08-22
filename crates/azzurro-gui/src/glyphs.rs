@@ -48,6 +48,26 @@ pub enum Glyph {
     Settings,
     /// The generic stand-in for a setting with no icon of its own.
     Tweak,
+    // The settings vocabulary. These names come off the player's own pages —
+    // "Amplifier Standby", "Indicator brightness", "Reindex music collection"
+    // — and without them every row on every settings page draws the same
+    // generic slider, which tells the reader nothing.
+    Alarm,
+    Sleep,
+    Speaker,
+    Volume,
+    Wifi,
+    Network,
+    Artwork,
+    Power,
+    Brightness,
+    Reset,
+    Server,
+    Tone,
+    Gauge,
+    /// A music service with no glyph of its own — the long tail of them, from
+    /// Deezer to whatever the next firmware adds.
+    Service,
     /// Only used by the Help menu, which names its own icons.
     Help,
     Rescan,
@@ -62,6 +82,17 @@ fn is_content(source: &str) -> bool {
         || source.contains("/Artwork")
         || source.contains("/Sources/images/")
         || source.contains("/images/ui/Source/")
+}
+
+/// The glyph for a music service, whatever it is called.
+///
+/// Unlike [`glyph_for`], this never defers to the player's own picture. The
+/// sidebar draws the services as a list of names, and the brand marks beside
+/// them are PNGs of somebody else's logo; in a column of Lucide strokes they
+/// read as a rip in the page. Names it recognises get something apt, and the
+/// rest get a note.
+pub fn service_glyph(title: &str) -> Glyph {
+    glyph_for(title, None).unwrap_or(Glyph::Service)
 }
 
 /// The glyph to draw for a row, or `None` to use whatever the player sent.
@@ -115,6 +146,37 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Info)
     } else if has("customise") || has("customize") || has("manage") || has("setting") {
         Some(Glyph::Settings)
+    // The settings pages, before the content vocabulary below: "Music library"
+    // is a settings row about the library, not a row of albums, and "Optimize
+    // Artwork" is neither an album nor a track.
+    } else if has("alarm") {
+        Some(Glyph::Alarm)
+    } else if has("sleep") {
+        Some(Glyph::Sleep)
+    } else if has("reindex") || has("re-index") {
+        Some(Glyph::Rescan)
+    } else if has("artwork") {
+        Some(Glyph::Artwork)
+    } else if has("wifi") || has("wi-fi") || has("wireless") {
+        Some(Glyph::Wifi)
+    } else if has("network") || has("share") || has("ethernet") {
+        Some(Glyph::Network)
+    } else if has("server") {
+        Some(Glyph::Server)
+    } else if has("standby") || has("power") {
+        Some(Glyph::Power)
+    } else if has("brightness") || has("indicator") || word("dim") {
+        Some(Glyph::Brightness)
+    } else if has("reset") {
+        Some(Glyph::Reset)
+    } else if has("tone") || has("treble") || has("bass") || has("crossover") || has("equali") {
+        Some(Glyph::Tone)
+    } else if has("balance") || has("replay-gain") || has("replay gain") {
+        Some(Glyph::Gauge)
+    } else if has("volume") || has("subwoofer") || has("output mode") {
+        Some(Glyph::Volume)
+    } else if has("audio") || has("amplifier") || title == "player" || has("room name") {
+        Some(Glyph::Speaker)
     } else if word("clear") {
         Some(Glyph::Clear)
     } else if word("save") {
@@ -149,7 +211,7 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Track)
     } else if has("station") {
         Some(Glyph::Station)
-    } else if has("radio") {
+    } else if has("radio") || has("tunein") || has("tune in") {
         Some(Glyph::Radio)
     } else {
         None
