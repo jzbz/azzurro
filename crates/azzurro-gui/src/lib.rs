@@ -4469,9 +4469,8 @@ async fn run_commands(
                                     .into_iter()
                                     .flat_map(|section| section.items)
                                     .collect();
-                                match crumb.screen.sections.last_mut() {
-                                    Some(section) => section.items.extend(arriving),
-                                    None => {}
+                                if let Some(section) = crumb.screen.sections.last_mut() {
+                                    section.items.extend(arriving);
                                 }
                                 crumb.screen.next = more.next;
                             }

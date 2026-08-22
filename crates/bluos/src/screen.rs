@@ -71,6 +71,12 @@ pub struct Screen {
     /// What a screen about one thing says about it. An album's page opens with
     /// its cover, who made it, when, and what can be done with the whole of it.
     pub header: Option<Header>,
+    /// Where the rest of a long list is.
+    ///
+    /// A library's Artists page answers thirty names of four hundred and
+    /// forty-eight and hands over the request for the next thirty. Without
+    /// following it there is no way to reach the four hundred and eighteen.
+    pub next: Option<String>,
     pub sections: Vec<Section>,
 }
 
@@ -427,6 +433,8 @@ enum Ctx {
     Index,
     /// The block at the top of a screen about one thing, which has buttons.
     Header,
+    /// The request for the next page of a long list, whose text is the uri.
+    NextLink,
     /// Anything unrecognised, so its end tag pops the right thing.
     Other,
 }
@@ -496,9 +504,43 @@ pub fn parse(xml: &str) -> Result<Screen> {
                     &mut button,
                 );
             }
+            // The only element whose text matters: the request for the next
+            // page of a long list is written between its tags rather than as
+            // an attribute.
+            Ok(Event::Text(text)) if stack.last() == Some(&Ctx::NextLink) => {
+                if let Some(next) = screen.next.as_mut()
+                    && let Ok(raw) = text.decode()
+                {
+                    next.push_str(&raw);
+                }
+            }
+
+            // An entity arrives as an event of its own, so a continuation's
+            // `&amp;` would otherwise fall out from between its parameters and
+            // leave a request the player cannot read.
+            Ok(Event::GeneralRef(entity)) if stack.last() == Some(&Ctx::NextLink) => {
+                if let Some(next) = screen.next.as_mut()
+                    && let Ok(name) = entity.decode()
+                {
+                    next.push_str(match name.as_ref() {
+                        "amp" => "&",
+                        "lt" => "<",
+                        "gt" => ">",
+                        "quot" => "\"",
+                        "apos" => "'",
+                        _ => "",
+                    });
+                }
+            }
             Ok(_) => {}
             Err(e) => return Err(Error::Screen(format!("malformed XML: {e}"))),
         }
+    }
+
+    // Trimmed once at the end rather than per fragment, for the same reason.
+    if let Some(next) = screen.next.as_mut() {
+        let trimmed = next.trim().to_owned();
+        screen.next = (!trimmed.is_empty()).then_some(trimmed);
     }
 
     if !seen_screen {
@@ -606,6 +648,11 @@ fn start(
         // rows before the first artist.
         "index" => {
             stack.push(Ctx::Index);
+        }
+
+        "nextLink" => {
+            screen.next = Some(String::new());
+            stack.push(Ctx::NextLink);
         }
 
         "header" => {
@@ -1203,6 +1250,26 @@ mod tests {
     </item>
   </list>
 </screen>"##;
+
+    #[test]
+    fn a_long_list_says_where_the_rest_is() {
+        let screen = parse(
+            r#"<screen version="1"><list offset="0" total="448">
+                 <item title="10cm"></item>
+               </list>
+               <nextLink>/ui/browseGrouped?listContinuation=30&amp;type=Artist</nextLink>
+             </screen>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            screen.next.as_deref(),
+            Some("/ui/browseGrouped?listContinuation=30&type=Artist")
+        );
+        // And a screen that is all there says nothing.
+        let whole =
+            parse(r#"<screen version="1"><list><item title="x"></item></list></screen>"#).unwrap();
+        assert!(whole.next.is_none());
+    }
 
     #[test]
     fn a_jump_index_is_not_content() {
