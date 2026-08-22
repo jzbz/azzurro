@@ -11,9 +11,10 @@
 //! reaches a player.
 
 mod artwork;
+mod known;
 mod mpris;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,15 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 
 slint::include_modules!();
+
+/// The application id, which has to agree with
+/// `desktop/io.github.jzbz.azzurro.desktop`.
+///
+/// On Wayland an application cannot set its own taskbar icon. The compositor
+/// matches this id against an installed .desktop file and takes the `Icon=`
+/// from there, so a mismatch between the two shows a generic placeholder
+/// rather than the icon beside it in this directory.
+const APP_ID: &str = "io.github.jzbz.azzurro";
 
 /// How much of a queue to pull for the window.
 ///
@@ -51,6 +61,8 @@ const THUMB_SIZE: u32 = 72;
 enum Command {
     /// Broadcast for players again.
     Rescan,
+    /// Track a player at an address typed in by hand.
+    AddPlayer(String),
     /// Show this player's queue. The window's selection is the backend's cue
     /// to fetch one, since fetching every player's queue would be waste.
     Select(DeviceId),
@@ -58,6 +70,13 @@ enum Command {
     Player(DeviceId, Action),
     /// Put this player into the selected player's group, or take it out.
     ToggleGroup(DeviceId),
+    /// Flip shuffle, reading the current state from the last status rather
+    /// than tracking it separately.
+    ToggleShuffle(DeviceId),
+    /// Flip mute, likewise.
+    ToggleMute(DeviceId),
+    /// All -> one -> off -> all, the order the official controller cycles in.
+    CycleRepeat(DeviceId),
     /// Show the browser's starting screen.
     BrowseHome,
     /// Follow row `n` of the screen currently shown.
@@ -118,6 +137,9 @@ enum Action {
     Volume(i32),
     Shuffle(bool),
     Repeat(Repeat),
+    Mute(bool),
+    /// Advance the sleep timer one step along the player's own ladder.
+    Sleep,
 }
 
 /// One player as the backend tracks it.
@@ -148,6 +170,14 @@ type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
 
 /// Everything the background tasks share. Cheap to clone; all of it is behind
 /// an `Arc` already.
+///
+/// **Locking rule: never hold two of these at once.** Each of `registry`,
+/// `selected` and `browsing` is taken, used, and released before the next is
+/// touched — usually by copying the one value needed out first, which is why
+/// several functions here read a `DeviceId` in its own statement before doing
+/// anything else. Held singly there is no order to get wrong and nothing to
+/// deadlock; the moment two are nested, every future caller has to know which
+/// way round, and one that gets it backwards hangs the whole app.
 #[derive(Clone)]
 struct Backend {
     registry: Registry,
@@ -157,6 +187,8 @@ struct Backend {
     ui: slint::Weak<AppWindow>,
     artwork: Arc<Artwork>,
     browsing: Arc<Mutex<Browsing>>,
+    /// Addresses that have answered, remembered between runs.
+    known: Arc<Mutex<BTreeSet<DeviceId>>>,
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -198,6 +230,12 @@ pub fn run_app() -> ExitCode {
         )
         .without_time()
         .init();
+
+    // Before any window is built: the id is read when the window is created,
+    // and setting it afterwards is too late.
+    if let Err(e) = slint::set_xdg_app_id(APP_ID) {
+        eprintln!("azzurro: could not set the application id: {e}");
+    }
 
     // reqwest is built with `rustls-no-provider`, which leaves choosing the
     // crypto backend to the application. ring rather than aws-lc-rs: it is what
@@ -306,10 +344,42 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_seek(move |id, secs| dispatch(&tx, &id, Action::Seek(secs.max(0) as u32)));
+
+    let tx = commands.clone();
+    ui.on_toggle_shuffle(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::ToggleShuffle(id));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_toggle_mute(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::ToggleMute(id));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_cycle_repeat(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::CycleRepeat(id));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_cycle_sleep(move |id| dispatch(&tx, &id, Action::Sleep));
+
+    let tx = commands.clone();
     ui.on_toggle_group(move |id| {
         if let Ok(id) = id.parse() {
             let _ = tx.send(Command::ToggleGroup(id));
         }
+    });
+
+    let tx = commands.clone();
+    ui.on_add_player(move |text| {
+        let _ = tx.send(Command::AddPlayer(text.to_string()));
     });
 
     ui.on_rescan(move || {
@@ -346,9 +416,16 @@ async fn run(
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(http.clone())),
         browsing: Arc::new(Mutex::new(Browsing::default())),
+        known: Arc::new(Mutex::new(BTreeSet::new())),
     };
 
-    tokio::spawn(run_commands(command_rx, backend.clone(), discovery.clone()));
+    tokio::spawn(run_commands(
+        command_rx,
+        backend.clone(),
+        discovery.clone(),
+        http.clone(),
+    ));
+    tokio::spawn(tick_position(backend.clone()));
 
     say(
         &ui,
@@ -362,6 +439,32 @@ async fn run(
                 .join(", ")
         ),
     );
+
+    // Remembered players first: one that was asleep when the app opened will
+    // never announce itself, and a broadcast does not always arrive. Addresses
+    // from another network are skipped rather than quietly timing out.
+    let remembered = tokio::task::spawn_blocking(known::load)
+        .await
+        .unwrap_or_default();
+
+    // Seeded with everything read, not only what answers: an address pinned by
+    // hand — for a player on the far side of a router — has to survive the next
+    // save, and a player that is merely switched off today should still be
+    // there tomorrow.
+    *backend.known.lock().unwrap() = remembered.clone();
+
+    let (here, elsewhere): (Vec<_>, Vec<_>) = remembered
+        .into_iter()
+        .partition(|id| bluos::discovery::is_local(id.host));
+    if !elsewhere.is_empty() {
+        tracing::debug!(
+            "{} remembered players are on another network",
+            elsewhere.len()
+        );
+    }
+    for id in here {
+        backend.track(id, &http, None, None);
+    }
 
     // The sweep is only the cold start. Players announce themselves unprompted
     // when they wake, so the same socket keeps listening afterwards and a
@@ -388,13 +491,25 @@ async fn run(
 }
 
 impl Backend {
-    /// Start tracking a player, unless it is already tracked.
+    /// Start tracking a player found by discovery.
     fn adopt(&self, announce: &bluos::Announce, http: &reqwest::Client) {
         let Some(player) = announce.player() else {
             return;
         };
-        let id = DeviceId::new(announce.address, player.port());
+        self.track(
+            DeviceId::new(announce.address, player.port()),
+            http,
+            player.get("name"),
+            player.get("model"),
+        );
+    }
 
+    /// Start tracking a player, unless it is already tracked.
+    ///
+    /// The name and model are only hints — from an announcement, or absent
+    /// entirely for an address typed in by hand. `/SyncStatus` replaces them
+    /// with the truth a moment later.
+    fn track(&self, id: DeviceId, http: &reqwest::Client, name: Option<&str>, model: Option<&str>) {
         {
             let mut guard = self.registry.lock().unwrap();
             if guard.contains_key(&id) {
@@ -408,8 +523,8 @@ impl Backend {
                     client: Client::with_http(id, http.clone()),
                     view: Device {
                         id: id.to_string().into(),
-                        name: player.get("name").unwrap_or("BluOS player").into(),
-                        model: player.get("model").unwrap_or_default().into(),
+                        name: name.unwrap_or("BluOS player").into(),
+                        model: model.unwrap_or_default().into(),
                         reachable: true,
                         ..Default::default()
                     },
@@ -613,10 +728,11 @@ impl Backend {
                         .collect();
 
                     let shown = rows.len() as u32;
+                    let plural = if queue.length == 1 { "track" } else { "tracks" };
                     let line = if shown == queue.length {
-                        format!("Queue · {shown} tracks")
+                        format!("Queue · {shown} {plural}")
                     } else {
-                        format!("Queue · {shown} of {} tracks", queue.length)
+                        format!("Queue · {shown} of {} {plural}", queue.length)
                     };
                     (rows, line)
                 }
@@ -653,15 +769,17 @@ impl Backend {
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
     fn publish_browse(&self) {
+        // Which player's screens these are, then everything about that player,
+        // then the screens themselves — three steps rather than two, so that no
+        // two of these locks are ever held at once. See the note on `Backend`.
+        let device = self.browsing.lock().unwrap().device;
+        let status = device
+            .and_then(|id| self.with_entry(id, |e| e.status.clone()))
+            .flatten();
+        let client = device.and_then(|id| self.with_entry(id, |e| e.client.clone()));
+
         let (rows, title, can_go_back, search) = {
             let browsing = self.browsing.lock().unwrap();
-            let status = browsing
-                .device
-                .and_then(|id| self.with_entry(id, |e| e.status.clone()))
-                .flatten();
-            let client = browsing
-                .device
-                .and_then(|id| self.with_entry(id, |e| e.client.clone()));
 
             let Some(screen) = browsing.current() else {
                 return self.send_browse(Vec::new(), "Browse".into(), false, None);
@@ -796,6 +914,65 @@ impl Backend {
         });
     }
 
+    /// Push the selected player's transport state to the window.
+    ///
+    /// Kept out of the device model on purpose: the position advances once a
+    /// second, and rebuilding every row for it would re-upload every cover on
+    /// screen along the way.
+    fn publish_transport(&self) {
+        let selected = *self.selected.lock().unwrap();
+        let snapshot = selected
+            .and_then(|id| self.with_entry(id, |e| (e.status.clone(), e.status_at)))
+            .and_then(|(status, at)| Some((status?, at)));
+
+        let sleep = snapshot
+            .as_ref()
+            .and_then(|(status, _)| status.sleep_minutes())
+            .map(|m| format!("Sleep {m}m"))
+            .unwrap_or_else(|| "Sleep".to_owned());
+
+        let (position, duration, seekable, shuffle, repeat) = match &snapshot {
+            Some((status, at)) => {
+                let reported = status.secs.unwrap_or(0) as i64;
+                let total = status.totlen.unwrap_or(0.0).max(0.0) as i64;
+                // The player only says where it is when it sends a status, so
+                // between polls the clock has to be carried forward here or the
+                // bar would sit still and then jump.
+                let elapsed = match (status.is_playing(), at) {
+                    (true, Some(at)) => at.elapsed().as_secs() as i64,
+                    _ => 0,
+                };
+                let position = if total > 0 {
+                    (reported + elapsed).clamp(0, total)
+                } else {
+                    reported + elapsed
+                };
+                (
+                    position,
+                    total,
+                    status.seekable(),
+                    status.shuffle_on(),
+                    status.repeat.unwrap_or(2) as i32,
+                )
+            }
+            None => (0, 0, false, false, 2),
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.set_position(position as i32);
+            ui.set_duration(duration as i32);
+            ui.set_position_text(bluos::clock(position).into());
+            ui.set_duration_text(bluos::clock(duration).into());
+            ui.set_seekable(seekable);
+            ui.set_shuffle(shuffle);
+            ui.set_repeat(repeat);
+            ui.set_sleep_label(sleep.as_str().into());
+            ui.set_sleep_on(sleep != "Sleep");
+        });
+    }
+
     /// Switch the right-hand panel. Used when opening a queue item's context
     /// menu, which is a browse document and belongs in the browser.
     fn show_pane(&self, pane: i32) {
@@ -808,11 +985,19 @@ impl Backend {
     }
 
     /// Put cover art in the now-playing panel, or clear it.
-    fn set_cover(&self, pixels: Option<Pixels>) {
+    ///
+    /// The tint travels with it: a colour taken from the artwork, which the
+    /// panel washes behind everything at low opacity so the room the music is
+    /// in picks up the colour of the record. Without artwork there is no
+    /// colour, and the panel is its ordinary self.
+    fn set_cover(&self, pixels: Option<Pixels>, tint: Option<[u8; 3]>) {
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                ui.set_cover(pixels.map(slint::Image::from_rgba8).unwrap_or_default());
+            let Some(ui) = ui.upgrade() else { return };
+            ui.set_cover(pixels.map(slint::Image::from_rgba8).unwrap_or_default());
+            ui.set_has_tint(tint.is_some());
+            if let Some([r, g, b]) = tint {
+                ui.set_cover_tint(slint::Color::from_rgb_u8(r, g, b));
             }
         });
     }
@@ -973,6 +1158,20 @@ async fn activate(backend: Backend, index: usize) {
     }
 }
 
+/// Advance the progress bar between polls.
+///
+/// Unconditional once a second: setting a Slint property to the value it
+/// already holds does not redraw anything, so a paused player costs two lock
+/// acquisitions and nothing else.
+async fn tick_position(backend: Backend) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        backend.publish_transport();
+    }
+}
+
 /// Read `/SyncStatus` and fold it into the player's row.
 ///
 /// This is where grouping becomes visible: who is leading, who is following,
@@ -982,6 +1181,16 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
 
     if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
         entry.sync = Some(sync.clone());
+    }
+
+    // Remembered only now, not when it was adopted: answering /SyncStatus is
+    // what makes an address a player, so a mistyped one is never written down.
+    let newly_known = {
+        let mut known = backend.known.lock().unwrap();
+        known.insert(id).then(|| known.clone())
+    };
+    if let Some(known) = newly_known {
+        tokio::task::spawn_blocking(move || known::save(&known));
     }
 
     let name = sync.name.clone();
@@ -1012,12 +1221,14 @@ async fn refresh_current(backend: Backend) {
 
 /// Fetch the icons and cover art for the screen on show.
 async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
+    // Registry first and released, then the browse state: never both at once.
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+
     let urls: Vec<String> = {
         let browsing = backend.browsing.lock().unwrap();
         let Some(screen) = browsing.current() else {
-            return;
-        };
-        let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
             return;
         };
 
@@ -1076,7 +1287,8 @@ async fn load_cover(backend: Backend, id: DeviceId) {
     if backend.with_entry(id, |e| e.cover_url.clone()).flatten() != wanted {
         return;
     }
-    backend.set_cover(pixels);
+    let tint = wanted.as_deref().and_then(|url| backend.artwork.tint(url));
+    backend.set_cover(pixels, tint);
 }
 
 /// Fetch thumbnails for the queue on screen.
@@ -1172,14 +1384,11 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
         name = sync.name.clone();
     }
 
-    let mpris = mpris::Bridge::attach(
-        mpris_index,
-        id,
-        name,
-        backend.registry.clone(),
-        backend.commands.clone(),
-    )
-    .await;
+    // Deliberately not exported yet. An address that never answers — one typed
+    // wrongly, or a player that has since been unplugged — would otherwise sit
+    // in the desktop's media controls forever, claiming to be a player nobody
+    // can reach. The bus name is claimed on the first real status instead.
+    let mut mpris: Option<mpris::Bridge> = None;
 
     let mut watch = client.watch();
     let mut backoff = Duration::from_secs(1);
@@ -1220,7 +1429,23 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     view.muted = status.is_muted();
                     view.volume = status.volume.unwrap_or(0);
                     view.now_playing = status.now_playing().unwrap_or_default().into();
-                    view.service = status.service.clone().unwrap_or_default().into();
+                    // Split as well as combined: the player list has one line
+                    // to spare and wants them joined, while the now-playing
+                    // panel gives the title its own size and the artist a
+                    // quieter one under it.
+                    view.title = status.title1.clone().unwrap_or_default().into();
+                    view.artist = status
+                        .artist
+                        .clone()
+                        .or_else(|| status.title2.clone())
+                        .unwrap_or_default()
+                        .into();
+                    view.service = status
+                        .service_name
+                        .clone()
+                        .or_else(|| status.service.clone())
+                        .unwrap_or_default()
+                        .into();
                 });
 
                 // `syncStat` mirrors /SyncStatus's own etag, so a change in it
@@ -1283,6 +1508,23 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     }
                 }
 
+                if backend.is_selected(id) {
+                    backend.publish_transport();
+                }
+
+                if mpris.is_none() {
+                    let name = backend
+                        .with_entry(id, |e| e.view.name.to_string())
+                        .unwrap_or_else(|| name.clone());
+                    mpris = mpris::Bridge::attach(
+                        mpris_index,
+                        id,
+                        name,
+                        backend.registry.clone(),
+                        backend.commands.clone(),
+                    )
+                    .await;
+                }
                 if let Some(bridge) = &mpris {
                     bridge.publish(&status).await;
                 }
@@ -1314,6 +1556,7 @@ async fn run_commands(
     mut commands: mpsc::UnboundedReceiver<Command>,
     backend: Backend,
     discovery: Arc<Discovery>,
+    http: reqwest::Client,
 ) {
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
@@ -1332,6 +1575,7 @@ async fn run_commands(
                 // Show whatever is already known straight away, and only go to
                 // the network when this is a player whose queue is not held.
                 backend.publish_queue();
+                backend.publish_transport();
                 tokio::spawn(load_cover(backend.clone(), id));
                 // Warm the browser for this player, so the tab is not a wait.
                 let fresh = {
@@ -1350,6 +1594,18 @@ async fn run_commands(
                 }
                 continue;
             }
+            Command::AddPlayer(text) => {
+                let text = text.trim();
+                match text.parse::<DeviceId>() {
+                    Ok(id) => {
+                        say(&backend.ui, format!("looking for a player at {id}"));
+                        backend.track(id, &http, None, None);
+                    }
+                    Err(_) => say(&backend.ui, format!("{text:?} is not an address")),
+                }
+                continue;
+            }
+
             Command::BrowseHome => {
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
@@ -1478,6 +1734,40 @@ async fn run_commands(
                 continue;
             }
 
+            Command::ToggleShuffle(id) => {
+                let on = backend
+                    .with_entry(id, |e| e.status.as_ref().is_some_and(|s| s.shuffle_on()))
+                    .unwrap_or(false);
+                let _ = backend
+                    .commands
+                    .send(Command::Player(id, Action::Shuffle(!on)));
+                continue;
+            }
+
+            Command::ToggleMute(id) => {
+                let muted = backend
+                    .with_entry(id, |e| e.status.as_ref().is_some_and(|s| s.is_muted()))
+                    .unwrap_or(false);
+                let _ = backend
+                    .commands
+                    .send(Command::Player(id, Action::Mute(!muted)));
+                continue;
+            }
+
+            Command::CycleRepeat(id) => {
+                let current = backend
+                    .with_entry(id, |e| e.status.as_ref().and_then(|s| s.repeat))
+                    .flatten()
+                    .unwrap_or(2);
+                // 0 all -> 1 one -> 2 off -> 0 all. Cycling by value order
+                // works out to the order the official controller uses.
+                let next = Repeat::from_status((current + 1) % 3);
+                let _ = backend
+                    .commands
+                    .send(Command::Player(id, Action::Repeat(next)));
+                continue;
+            }
+
             Command::ToggleGroup(target) => {
                 let Some(master) = *backend.selected.lock().unwrap() else {
                     continue;
@@ -1532,7 +1822,9 @@ async fn run_commands(
                 Action::PlayQueueIndex(index) => client.play_queue_index(index).await,
                 Action::Volume(level) => client.set_volume(level).await,
                 Action::Shuffle(on) => client.set_shuffle(on).await,
+                Action::Mute(on) => client.set_mute(on).await,
                 Action::Repeat(mode) => client.set_repeat(mode).await,
+                Action::Sleep => client.cycle_sleep().await,
             };
             if let Err(e) = result {
                 tracing::warn!(%id, ?action, "command failed: {e}");

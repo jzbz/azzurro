@@ -56,6 +56,9 @@ struct Key {
 pub struct Artwork {
     http: reqwest::Client,
     memory: Mutex<LruCache<Key, Pixels>>,
+    /// One colour per image, computed once when it is decoded. Keyed by URL
+    /// alone: the same cover gives the same colour at any size.
+    tints: Mutex<LruCache<String, [u8; 3]>>,
     /// `None` when there is nowhere to write, which is not fatal: the memory
     /// cache and the network still work.
     disk: Option<PathBuf>,
@@ -66,6 +69,8 @@ impl Artwork {
     pub fn new(http: reqwest::Client) -> Self {
         let disk = dirs::cache_dir().map(|d| d.join("azzurro").join("artwork"));
 
+        // `new` is called once, before the window opens, so this one is
+        // deliberately synchronous: there is nothing yet to block.
         if let Some(dir) = &disk {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::debug!("no artwork cache on disk: {e}");
@@ -77,6 +82,9 @@ impl Artwork {
         Self {
             http,
             memory: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
+            )),
+            tints: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
             disk: disk.filter(|d| d.is_dir()),
@@ -95,6 +103,12 @@ impl Artwork {
             size,
         };
         self.memory.lock().unwrap().get(&key).cloned()
+    }
+
+    /// The colour to tint a panel with behind this artwork, if it has been
+    /// decoded. See [`dominant`].
+    pub fn tint(&self, url: &str) -> Option<[u8; 3]> {
+        self.tints.lock().unwrap().get(url).copied()
     }
 
     /// Decoded art at `size`, fetching and decoding if it is not already held.
@@ -118,6 +132,9 @@ impl Artwork {
             .ok()
             .flatten()?;
 
+        if let Some(tint) = dominant(&decoded) {
+            self.tints.lock().unwrap().put(url.to_owned(), tint);
+        }
         self.memory.lock().unwrap().put(
             Key {
                 url: url.to_owned(),
@@ -132,11 +149,18 @@ impl Artwork {
     async fn bytes(&self, url: &str) -> Option<Vec<u8>> {
         let path = self.disk.as_ref().map(|dir| dir.join(file_name(url)));
 
-        if let Some(path) = &path
-            && let Ok(bytes) = std::fs::read(path)
-            && !bytes.is_empty()
-        {
-            return Some(bytes);
+        // Off the async workers. Reading a cover is a millisecond on a local
+        // disk and rather more when the cache directory turns out to live on a
+        // network mount, which is exactly the case that would otherwise stall a
+        // runtime thread.
+        if let Some(path) = path.clone() {
+            let cached = tokio::task::spawn_blocking(move || std::fs::read(path).ok())
+                .await
+                .ok()
+                .flatten();
+            if let Some(bytes) = cached.filter(|b| !b.is_empty()) {
+                return Some(bytes);
+            }
         }
 
         // Held across the request, not the decode: the point is to bound
@@ -165,12 +189,17 @@ impl Artwork {
             return None;
         }
 
-        if let Some(path) = &path
-            && let Err(e) = std::fs::write(path, &bytes)
-        {
-            tracing::debug!("could not cache artwork: {e}");
+        let bytes = bytes.to_vec();
+        if let Some(path) = path {
+            let copy = bytes.clone();
+            tokio::spawn(async move {
+                let written = tokio::task::spawn_blocking(move || std::fs::write(path, copy)).await;
+                if let Ok(Err(e)) = written {
+                    tracing::debug!("could not cache artwork: {e}");
+                }
+            });
         }
-        Some(bytes.to_vec())
+        Some(bytes)
     }
 }
 
@@ -195,6 +224,53 @@ fn decode(bytes: &[u8], size: u32) -> Option<Pixels> {
         scaled.width(),
         scaled.height(),
     ))
+}
+
+/// One colour standing for a whole cover, for tinting the panel behind it.
+///
+/// Not the average, which on almost any sleeve is a muddy brown: greys, the
+/// near-black and the near-white are all thrown away first, so what is left is
+/// whatever the cover is actually *coloured*. A sleeve that really is
+/// monochrome yields nothing, and the caller draws no tint rather than a
+/// dirty one.
+///
+/// The result is then pulled up to a consistent brightness, because the point
+/// is a wash of the right hue and not a faithful reproduction — a dark cover
+/// should not produce a tint indistinguishable from the background.
+fn dominant(pixels: &Pixels) -> Option<[u8; 3]> {
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+
+    for px in pixels.as_slice() {
+        let (pr, pg, pb) = (px.r as u32, px.g as u32, px.b as u32);
+        let high = pr.max(pg).max(pb);
+        let low = pr.min(pg).min(pb);
+
+        // Too dark or too bright to have a usable hue, or too close to grey
+        // to have one at all.
+        if high < 40 || low > 232 || high - low < 28 {
+            continue;
+        }
+        r += pr as u64;
+        g += pg as u64;
+        b += pb as u64;
+        n += 1;
+    }
+
+    // A handful of stray coloured pixels on a black-and-white sleeve is noise,
+    // not a colour.
+    if n < 64 {
+        return None;
+    }
+
+    let (r, g, b) = ((r / n) as f32, (g / n) as f32, (b / n) as f32);
+    let peak = r.max(g).max(b).max(1.0);
+    let lift = 190.0 / peak;
+
+    Some([
+        (r * lift).min(255.0) as u8,
+        (g * lift).min(255.0) as u8,
+        (b * lift).min(255.0) as u8,
+    ])
 }
 
 /// A stable file name for a URL.
@@ -279,6 +355,47 @@ mod tests {
         let same = decode(&png, 64).expect("a valid PNG decodes");
         assert_eq!(same.width(), 4);
         assert_eq!(same.height(), 2);
+    }
+
+    /// Build a buffer of one repeated colour, the way a test cover would be.
+    fn swatch(r: u8, g: u8, b: u8) -> Pixels {
+        let pixel = [r, g, b, 255];
+        let data: Vec<u8> = std::iter::repeat_n(pixel, 32 * 32).flatten().collect();
+        SharedPixelBuffer::clone_from_slice(&data, 32, 32)
+    }
+
+    #[test]
+    fn takes_its_colour_from_the_coloured_pixels() {
+        // A saturated cover gives its own hue back, lifted to a usable
+        // brightness rather than reproduced exactly.
+        let tint = dominant(&swatch(120, 30, 30)).expect("a red cover has a colour");
+        assert!(
+            tint[0] > tint[1] && tint[0] > tint[2],
+            "still red: {tint:?}"
+        );
+        assert!(tint[0] > 150, "lifted out of the dark: {tint:?}");
+
+        // Grey, black and white have no hue to take, and a muddy tint is worse
+        // than none.
+        assert_eq!(dominant(&swatch(128, 128, 128)), None);
+        assert_eq!(dominant(&swatch(0, 0, 0)), None);
+        assert_eq!(dominant(&swatch(255, 255, 255)), None);
+        // Nearly grey is still grey.
+        assert_eq!(dominant(&swatch(130, 140, 136)), None);
+    }
+
+    #[test]
+    fn a_dark_and_a_light_version_of_one_hue_tint_alike() {
+        let dark = dominant(&swatch(40, 20, 90)).unwrap();
+        let light = dominant(&swatch(120, 60, 230)).unwrap();
+        // Same hue, so the lift should land them close together.
+        for channel in 0..3 {
+            let gap = (dark[channel] as i32 - light[channel] as i32).abs();
+            assert!(
+                gap < 40,
+                "channel {channel} differs by {gap}: {dark:?} vs {light:?}"
+            );
+        }
     }
 
     #[test]
