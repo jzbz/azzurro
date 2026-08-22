@@ -40,6 +40,9 @@ pub mod screen;
 pub mod settings;
 pub mod status;
 
+/// Shared by the two XML parsers; not part of the crate's surface.
+mod xml;
+
 pub use client::{Client, Repeat, StatusWatch};
 pub use device::DeviceId;
 pub use discovery::Discovery;

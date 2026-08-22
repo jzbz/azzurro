@@ -825,7 +825,10 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
 
     let tx = commands.clone();
     ui.on_customise_move(move |from, to| {
-        let _ = tx.send(Command::CustomiseMove(from.max(0) as usize, to.max(0) as usize));
+        let _ = tx.send(Command::CustomiseMove(
+            from.max(0) as usize,
+            to.max(0) as usize,
+        ));
     });
 
     let tx = commands.clone();
@@ -1069,12 +1072,7 @@ impl Backend {
             }
         }
 
-        self.track(
-            id,
-            http,
-            player.get("name"),
-            player.get("model"),
-        );
+        self.track(id, http, player.get("name"), player.get("model"));
     }
 
     /// Start tracking a player, unless it is already tracked.
@@ -4590,8 +4588,6 @@ async fn run_commands(
                 continue;
             }
 
-            // Enter, which is not needed to search but does say the search was
-            // the one that mattered.
             Command::QueueReorder(from, to) => {
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
@@ -4941,6 +4937,9 @@ async fn run_commands(
                 continue;
             }
 
+            // Enter, which is not needed to search but does say the search was
+            // the one that mattered — so this is the only place a query is
+            // written to the recent list.
             Command::BrowseSearchDone(query) => {
                 let query = query.trim().to_owned();
                 if !query.is_empty() {

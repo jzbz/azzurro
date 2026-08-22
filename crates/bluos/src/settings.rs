@@ -25,10 +25,11 @@
 
 use std::collections::BTreeMap;
 
+use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
+use crate::xml::{attributes, flag, local_name};
 
 /// One settings page.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -433,32 +434,6 @@ fn push(settings: &mut Settings, groups: &mut [Group], entry: Entry) {
         Some(group) => group.entries.push(entry),
         None => settings.entries.push(entry),
     }
-}
-
-fn local_name(raw: &[u8]) -> String {
-    let full = String::from_utf8_lossy(raw).into_owned();
-    match full.split_once(':') {
-        Some((_, local)) => local.to_owned(),
-        None => full,
-    }
-}
-
-fn attributes(e: &BytesStart<'_>) -> BTreeMap<String, String> {
-    e.attributes()
-        .flatten()
-        .filter_map(|attr| {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-            if key.starts_with("xmlns") || key.starts_with("xsi:") {
-                return None;
-            }
-            let value = attr.normalized_value(XmlVersion::Explicit1_0).ok()?;
-            Some((key, value.into_owned()))
-        })
-        .collect()
-}
-
-fn flag(value: Option<String>) -> bool {
-    matches!(value.as_deref(), Some("true" | "1"))
 }
 
 #[cfg(test)]

@@ -96,10 +96,16 @@ pub fn parse(html: &str) -> Vec<Form> {
     for piece in pieces(html) {
         match piece {
             Piece::Text(text) => {
+                // Decoded here as well as in `attributes`. Without it a label
+                // and a value read from the same page disagreed: the value of
+                // an `<option>` came back decoded and the words between its
+                // tags did not, so a network really called `AT&T` offered
+                // itself in the list as `AT&amp;T`.
+                let text = unescape(text.trim());
                 if let Some(option) = option.as_mut() {
-                    option.label.push_str(text.trim());
+                    option.label.push_str(&text);
                 } else if let Some((_, words)) = label.as_mut() {
-                    words.push_str(text.trim());
+                    words.push_str(&text);
                 }
             }
 
@@ -433,12 +439,61 @@ fn attributes(raw: &str) -> BTreeMap<String, String> {
 
 /// The five entities these pages use. Anything else is left alone rather than
 /// guessed at.
+/// Turn the five entities these pages use back into the characters they stand
+/// for.
+///
+/// One left-to-right pass rather than a chain of `replace` calls. A chain
+/// re-reads its own output: `&amp;lt;` — an escaped ampersand followed by the
+/// literal text `lt;` — became `&lt;` after the first replacement and then `<`
+/// after the fourth, so a share named `a&lt;b` came back as `a<b` and was
+/// posted to the player wrong. Scanning once cannot do that, because what has
+/// been written is never looked at again.
 fn unescape(raw: &str) -> String {
-    raw.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    const ENTITIES: [(&str, char); 5] = [
+        ("&amp;", '&'),
+        ("&quot;", '"'),
+        ("&#39;", '\''),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+    ];
+
+    let Some(first) = raw.find('&') else {
+        return raw.to_owned();
+    };
+
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..first]);
+    let mut rest = &raw[first..];
+
+    while !rest.is_empty() {
+        match ENTITIES.iter().find(|(entity, _)| rest.starts_with(entity)) {
+            Some((entity, decoded)) => {
+                out.push(*decoded);
+                rest = &rest[entity.len()..];
+            }
+            // An `&` that begins nothing this knows — a bare ampersand, or an
+            // entity these templates do not emit. Kept as it is rather than
+            // dropped, and stepped over so it cannot match again.
+            None => {
+                let mut chars = rest.chars();
+                out.extend(chars.next());
+                rest = chars.as_str();
+            }
+        }
+
+        match rest.find('&') {
+            Some(at) => {
+                out.push_str(&rest[..at]);
+                rest = &rest[at..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -582,7 +637,13 @@ mod tests {
     fn a_page_truncated_mid_tag_degrades_instead_of_panicking() {
         // Every one of these ends inside a tag the page never closed. The
         // contract is "no form here", not a panic.
-        for page in ["<", "x<", "<form></form>x<", "<form><input name=\"a\"", "<<<"] {
+        for page in [
+            "<",
+            "x<",
+            "<form></form>x<",
+            "<form><input name=\"a\"",
+            "<<<",
+        ] {
             let forms = parse(page);
             assert!(
                 forms.iter().all(|f| f.fields.is_empty()),
@@ -591,4 +652,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn entities_decode_once_and_only_once() {
+        assert_eq!(unescape("plain"), "plain");
+        assert_eq!(unescape("a &amp; b"), "a & b");
+        assert_eq!(unescape("&lt;tag&gt;"), "<tag>");
+        assert_eq!(unescape("say &quot;hi&quot;"), "say \"hi\"");
+        assert_eq!(unescape("it&#39;s"), "it's");
+
+        // The ordering bug: chained replaces turned an escaped ampersand and
+        // the letters after it into a second entity.
+        assert_eq!(unescape("a&amp;lt;b"), "a&lt;b");
+        assert_eq!(unescape("&amp;amp;"), "&amp;");
+
+        // Ampersands that begin nothing are left alone rather than eaten.
+        assert_eq!(unescape("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(unescape("&"), "&");
+        assert_eq!(unescape("&nbsp;"), "&nbsp;");
+        assert_eq!(unescape("trailing &"), "trailing &");
+
+        // Multi-byte input must survive being stepped over a byte at a time.
+        assert_eq!(unescape("café & bar"), "café & bar");
+    }
+
+    #[test]
+    fn a_label_is_decoded_the_same_as_a_value() {
+        let page = r#"
+<form action="/x" method="POST">
+  <select name="carrier">
+    <option value="AT&amp;T">AT&amp;T</option>
+  </select>
+</form>"#;
+        let form = parse(page).pop().expect("a form");
+        let field = form.fields.first().expect("a field");
+        let choice = field.choices.first().expect("a choice");
+        assert_eq!(choice.value, "AT&T");
+        assert_eq!(choice.label, "AT&T", "the label kept its entity");
+    }
 }

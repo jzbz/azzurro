@@ -42,6 +42,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// ceiling is a property of the document rather than of the library behind it.
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
+/// Everything a form field may not carry raw. A share's name is a UNC path —
+/// `\\10.0.0.100\media\music` — so the backslashes matter as much as the
+/// ampersands.
+const FORM_FIELD: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 /// What this client tells the player it understands.
 ///
 /// The player serves different documents to different numbers, and it is not a
@@ -55,16 +64,11 @@ const MAX_BODY: usize = 4 * 1024 * 1024;
 /// The two numbers are what the official controller declares. Raising them
 /// past what it sends would be claiming to understand documents nobody has
 /// seen.
-/// Everything a form field may not carry raw. A share's name is a UNC path —
-/// `\\10.0.0.100\media\music` — so the backslashes matter as much as the
-/// ampersands.
-const FORM_FIELD: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
-
 const SCHEMA_VERSION: &str = "35";
+
+/// The interface half of the pair above, declared alongside it. The player
+/// reads the two together and serves the richer documents only when both are
+/// new enough.
 const UI_SCHEMA_VERSION: &str = "7";
 
 /// How long `/Status` is asked to hold a poll open.
@@ -174,7 +178,10 @@ impl Client {
             limit: MAX_BODY,
         };
 
-        if response.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_BODY as u64)
+        {
             return Err(oversized());
         }
 
