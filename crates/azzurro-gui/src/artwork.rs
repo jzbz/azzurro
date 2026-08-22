@@ -30,8 +30,29 @@ use tokio::sync::Semaphore;
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 
 /// How many decoded images to keep. A screenful of queue thumbnails plus the
-/// covers of everything recently selected, with room to spare; at 80×80 RGBA
-/// that is a few megabytes at most.
+/// covers of everything recently selected, with room to spare.
+///
+/// Counted in entries rather than bytes, so what it costs depends on which
+/// sizes are in it. Nothing asks for the 80×80 this comment used to claim; the
+/// three tiers the GUI requests are `THUMB_SIZE` 72, `TILE_SIZE` 232 and
+/// `COVER_SIZE` 360, and one LRU holds all of them. At four bytes a pixel the
+/// worst case for a full cache of each is
+///
+/// | tier | one entry | 256 entries |
+/// |------|-----------|-------------|
+/// | 72   | 20 KiB    | 5 MiB       |
+/// | 232  | 210 KiB   | 53 MiB      |
+/// | 360  | 506 KiB   | 127 MiB     |
+///
+/// so a realistic mix — mostly thumbnails and shelf tiles, a few covers — sits
+/// in the tens of megabytes. The 360 row needs 256 *different albums* opened
+/// at full size to be reached and is the least likely of the three; the 232
+/// row is the one a few minutes of browsing actually approaches.
+///
+/// Nothing here is unbounded and no player can push past it: the entry count
+/// is fixed and each entry is capped by the size that was asked for. Whether
+/// tens of megabytes of decoded pixels is the right price for not re-decoding
+/// is a separate question from recording what the price is.
 const MEMORY_CACHE: usize = 256;
 
 /// Fetches allowed at once. Enough to fill a list quickly, few enough that
@@ -56,7 +77,8 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A decoded image is identified by where it came from and how big it was
-/// wanted, since the same cover is drawn at two sizes.
+/// wanted, since the same cover is drawn at three sizes — a queue thumbnail, a
+/// shelf tile and a full cover — and each is scaled and stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
     url: String,
