@@ -40,6 +40,9 @@ pub mod screen;
 pub mod settings;
 pub mod status;
 
+/// Shared by the two HTML scrapers; not part of the crate's surface.
+mod html;
+
 /// Shared by the two XML parsers; not part of the crate's surface.
 mod xml;
 

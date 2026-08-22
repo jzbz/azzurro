@@ -186,7 +186,10 @@ component SettingRow inherits Rectangle {
     callback typed(string);
     callback opened();
 
-    height: root.item.heading ? 34px : 60px;
+    // A minimum rather than a height: the value below can be a file path
+    // longer than the window, and wrapping it needs somewhere to wrap to.
+    // Every ordinary row still comes out at exactly this height.
+    min-height: root.item.heading ? 34px : 60px;
     border-radius: Theme.radius-small;
     background: (root.item.control == "link"
             || root.item.control == "button"
@@ -217,6 +220,10 @@ component SettingRow inherits Rectangle {
     if !root.item.heading: HorizontalLayout {
         padding-left: Theme.gap;
         padding-right: Theme.gap;
+        // Vertical padding so a wrapped value has margin above and below
+        // rather than sitting against the row's edges.
+        padding-top: Theme.tight;
+        padding-bottom: Theme.tight;
         spacing: Theme.pad;
 
         // Only where there is one to draw. A row that is nothing but a button
@@ -257,7 +264,9 @@ component SettingRow inherits Rectangle {
                 text: root.item.detail;
                 font-size: Theme.small-size;
                 color: Theme.dim;
-                overflow: elide;
+                // Wrapped, not elided. This is where a technical-info page
+                // puts the file name, and half a path tells you nothing.
+                wrap: word-wrap;
             }
         }
 
@@ -815,13 +824,20 @@ component TrackRow inherits Rectangle {
             }
         }
 
-        if !root.editing: IconButton {
-            glyph: Icons.menu;
-            size: 30px;
-            glyph-size: 15px;
-            opacity: touch.has-hover ? 1.0 : 0.45;
-            animate opacity { duration: 120ms; }
-            clicked => { root.open-menu(); }
+        // Centred by its own layout, like the badge beside it. Left as a
+        // direct child of the row it filled the row's height instead, which
+        // put the dots above the middle of everything they sit next to.
+        if !root.editing: VerticalLayout {
+            alignment: center;
+
+            IconButton {
+                glyph: Icons.menu;
+                size: 30px;
+                glyph-size: 15px;
+                opacity: touch.has-hover ? 1.0 : 0.45;
+                animate opacity { duration: 120ms; }
+                clicked => { root.open-menu(); }
+            }
         }
 
         if !root.editing: Text {
@@ -1398,6 +1414,7 @@ component BrowseBlockView inherits VerticalLayout {
 }
 
 export component AppWindow inherits Window {
+
     in property <[Device]> devices;
     in property <[Track]> queue;
     in property <image> cover;
@@ -1523,10 +1540,13 @@ export component AppWindow inherits Window {
     // more once it ships as a Flatpak with only the runtime's fonts to hand.
     default-font-family: "Geist";
     default-font-size: Theme.body-size;
-    preferred-width: 1100px;
-    preferred-height: 660px;
-    min-width: 860px;
-    min-height: 520px;
+    // Three columns, and the middle one should be the widest. The sidebar is
+    // 268 and the queue 330; at the 1100 this used to open at, the part being
+    // read was barely wider than the two edges put together.
+    preferred-width: 1440px;
+    preferred-height: 920px;
+    min-width: 900px;
+    min-height: 560px;
     background: Theme.bg;
 
     property <bool> has-selection: root.devices.length > 0
@@ -2119,7 +2139,24 @@ export component AppWindow inherits Window {
                 // and the queue stay where they are — the official controller
                 // covers the middle and keeps the queue, and there is no reason
                 // to lose the navigation as well.
-                if root.now-playing: Rectangle {
+                // Faded in rather than switched on. Two elements and not one:
+                // the outer carries the animation and is always present, while
+                // the contents are still behind an `if`, because the record is
+                // sized from the window's width and a child that reads the
+                // window's width while contributing to it is a binding loop —
+                // one Slint now warns will eventually panic. Gating on the
+                // wrapper's own visibility rather than on the flag keeps the
+                // contents alive for the length of the fade out.
+                fade := Rectangle {
+                    opacity: root.now-playing ? 1.0 : 0.0;
+                    visible: self.opacity > 0.0;
+
+                    animate opacity {
+                        duration: 220ms;
+                        easing: ease-out;
+                    }
+
+                    if fade.visible: Rectangle {
                     background: Theme.bg;
                     clip: true;
 
@@ -2244,6 +2281,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
                     }
                 }
 
@@ -2544,12 +2582,8 @@ export component AppWindow inherits Window {
                         }
 
                         HorizontalLayout {
+                            alignment: center;
                             spacing: Theme.gap;
-
-                            PillButton {
-                                label: "Cancel";
-                                clicked => { pane.asking = -1; }
-                            }
 
                             PillButton {
                                 label: root.queue-buttons[pane.asking].label;
@@ -2558,6 +2592,11 @@ export component AppWindow inherits Window {
                                     root.queue-button(root.queue-buttons[pane.asking].index);
                                     pane.asking = -1;
                                 }
+                            }
+
+                            PillButton {
+                                label: "Cancel";
+                                clicked => { pane.asking = -1; }
                             }
                         }
                     }
@@ -2677,6 +2716,7 @@ export component AppWindow inherits Window {
                 Scrubber {
                     enabled: root.seekable && root.duration > 0;
                     value: root.position / Math.max(root.duration, 1);
+                    glide: 1s;
                     height: 12px;
                     seek(fraction) => {
                         root.seek(root.current.id, Math.round(fraction * root.duration));
@@ -3047,7 +3087,22 @@ export component AppWindow inherits Window {
 
                         VerticalLayout {
                             alignment: center;
-                            padding-right: Theme.gap;
+                            width: 208px;
+
+                            Level {
+                                value: root.current.volume;
+                                muted: root.current.muted;
+                                changed(v) => { root.set-volume(root.current.id, v); }
+                                toggle-mute => { root.toggle-mute(root.current.id); }
+                            }
+                        }
+
+                        // Past the volume rather than before it: the queue is
+                        // the pane on that side of the window, so the control
+                        // that hides it belongs on the same side.
+                        VerticalLayout {
+                            alignment: center;
+                            padding-left: Theme.gap;
 
                             IconButton {
                                 glyph: Icons.queue;
@@ -3056,18 +3111,6 @@ export component AppWindow inherits Window {
                                 tint: root.queue-shown ? Theme.text : Theme.dim;
                                 active: root.queue-shown;
                                 clicked => { root.queue-shown = !root.queue-shown; }
-                            }
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            width: 208px;
-
-                            Level {
-                                value: root.current.volume;
-                                muted: root.current.muted;
-                                changed(v) => { root.set-volume(root.current.id, v); }
-                                toggle-mute => { root.toggle-mute(root.current.id); }
                             }
                         }
 

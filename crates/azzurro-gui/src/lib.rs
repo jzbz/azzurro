@@ -303,6 +303,13 @@ struct FormPage {
     /// Whatever the player said in reply to the last attempt — a wrong password
     /// comes back as the same form with a sentence on it.
     note: String,
+    /// The page this was opened from, kept so Back can put it back.
+    ///
+    /// Signing into a music service is reached by picking one out of the
+    /// player's own list of them, and a form that forgot where it came from
+    /// sent Back to the browse screen instead — one service configured, and
+    /// the list you were working through is gone.
+    from: Option<WebPage>,
 }
 
 struct Crumb {
@@ -3133,12 +3140,22 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
         })
         .collect();
 
-    backend.browsing.lock().unwrap().pane = Pane::Form(Box::new(FormPage {
-        title,
-        form,
-        values,
-        note,
-    }));
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        // Taken rather than read: the form is replacing it, and putting it in
+        // the form is what lets Back give it back.
+        let from = match std::mem::replace(&mut browsing.pane, Pane::Browse) {
+            Pane::Web(page) => Some(page),
+            _ => None,
+        };
+        browsing.pane = Pane::Form(Box::new(FormPage {
+            title,
+            form,
+            values,
+            note,
+            from,
+        }));
+    }
     backend.publish_form();
 }
 
@@ -4033,6 +4050,15 @@ async fn run_commands(
                         }
                         Pane::Settings(trail) if trail.len() > 1 => {
                             trail.pop();
+                            true
+                        }
+                        // Back out of a service's sign-in form lands on the
+                        // list of services it was chosen from.
+                        Pane::Form(page) if page.from.is_some() => {
+                            let from = page.from.take();
+                            if let Some(page) = from {
+                                browsing.pane = Pane::Web(page);
+                            }
                             true
                         }
                         Pane::Help

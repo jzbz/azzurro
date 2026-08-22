@@ -186,6 +186,20 @@ export component Scrubber inherits Rectangle {
     // 0 to 1.
     in property <float> value;
     in property <bool> enabled: true;
+    // How long the fill takes to reach a new value.
+    //
+    // Off by default, because most of these answer a press and should look
+    // instant — the volume must not lag the button that set it. The transport
+    // asks for a second, which is exactly the interval its position arrives
+    // on, so a value that steps once a second is drawn as continuous motion.
+    in property <duration> glide: 0ms;
+    // Whether a press anywhere on the track jumps straight to that point.
+    //
+    // Right for the transport, where clicking a third of the way along a song
+    // means "go there". Wrong for volume, where the bar sits under the pointer
+    // on the way to the buttons beside it and a stray click is a room suddenly
+    // at full volume. With this off the bar still drags, but only deliberately.
+    in property <bool> jump-to-click: true;
     callback seek(float);
 
     height: 18px;
@@ -207,6 +221,13 @@ export component Scrubber inherits Rectangle {
             height: parent.height;
             border-radius: 2px;
             background: root.enabled ? Theme.accent : Theme.faint;
+
+            // Never while dragging: the bar is following the pointer then, and
+            // easing towards it would feel like a lag rather than a glide.
+            animate width {
+                duration: root.dragging ? 0ms : root.glide;
+                easing: linear;
+            }
         }
     }
 
@@ -227,13 +248,23 @@ export component Scrubber inherits Rectangle {
         enabled: root.enabled;
         moved => {
             if (self.pressed) {
-                root.dragging = true;
-                root.preview = Math.clamp(self.mouse-x / root.width, 0, 1);
+                // A press that has travelled is a drag whatever the mode, so
+                // the handle can always be taken hold of and moved.
+                if (root.jump-to-click || Math.abs(self.mouse-x - self.pressed-x) > 3px) {
+                    root.dragging = true;
+                }
+                if (root.dragging) {
+                    root.preview = Math.clamp(self.mouse-x / root.width, 0, 1);
+                }
             }
         }
         pointer-event(event) => {
             if (event.kind == PointerEventKind.up) {
-                root.seek(Math.clamp(self.mouse-x / root.width, 0, 1));
+                // A tap that never became a drag is only committed where a tap
+                // is meant to mean something.
+                if (root.dragging || root.jump-to-click) {
+                    root.seek(Math.clamp(self.mouse-x / root.width, 0, 1));
+                }
                 root.dragging = false;
             }
         }
@@ -295,6 +326,9 @@ export component Level inherits HorizontalLayout {
             bar := Scrubber {
                 width: 100%;
                 y: (parent.height - self.height) / 2;
+                // The buttons either side are how this is meant to be set; the
+                // bar is for a deliberate drag, not for a passing click.
+                jump-to-click: false;
                 enabled: !root.muted;
                 value: root.value / 100;
                 seek(fraction) => { root.changed(Math.round(fraction * 100)); }

@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::html::unescape;
+
 /// A form on one of those pages.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Form {
@@ -310,6 +312,24 @@ fn name_the_fields(form: &mut Form, labels: &BTreeMap<String, String>) {
         if field.label.is_empty() {
             field.label.clone_from(&field.placeholder);
         }
+        // Last resort, the field's own name: `<select name="quality">` on the
+        // Qobuz page carries neither a label nor a placeholder. Capitalised,
+        // because a name written for a form post is lower case by convention
+        // and reads as a mistake beside "Username" and "Password".
+        if field.label.is_empty() {
+            field.label = capitalise(&field.name);
+        }
+    }
+}
+
+/// The first character upper-cased, the rest left exactly as it is — a name
+/// that is already capitalised, or one like `ipAddress` with a capital inside
+/// it, must come through unharmed.
+fn capitalise(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -439,63 +459,6 @@ fn attributes(raw: &str) -> BTreeMap<String, String> {
 
 /// The five entities these pages use. Anything else is left alone rather than
 /// guessed at.
-/// Turn the five entities these pages use back into the characters they stand
-/// for.
-///
-/// One left-to-right pass rather than a chain of `replace` calls. A chain
-/// re-reads its own output: `&amp;lt;` — an escaped ampersand followed by the
-/// literal text `lt;` — became `&lt;` after the first replacement and then `<`
-/// after the fourth, so a share named `a&lt;b` came back as `a<b` and was
-/// posted to the player wrong. Scanning once cannot do that, because what has
-/// been written is never looked at again.
-fn unescape(raw: &str) -> String {
-    const ENTITIES: [(&str, char); 5] = [
-        ("&amp;", '&'),
-        ("&quot;", '"'),
-        ("&#39;", '\''),
-        ("&lt;", '<'),
-        ("&gt;", '>'),
-    ];
-
-    let Some(first) = raw.find('&') else {
-        return raw.to_owned();
-    };
-
-    let mut out = String::with_capacity(raw.len());
-    out.push_str(&raw[..first]);
-    let mut rest = &raw[first..];
-
-    while !rest.is_empty() {
-        match ENTITIES.iter().find(|(entity, _)| rest.starts_with(entity)) {
-            Some((entity, decoded)) => {
-                out.push(*decoded);
-                rest = &rest[entity.len()..];
-            }
-            // An `&` that begins nothing this knows — a bare ampersand, or an
-            // entity these templates do not emit. Kept as it is rather than
-            // dropped, and stepped over so it cannot match again.
-            None => {
-                let mut chars = rest.chars();
-                out.extend(chars.next());
-                rest = chars.as_str();
-            }
-        }
-
-        match rest.find('&') {
-            Some(at) => {
-                out.push_str(&rest[..at]);
-                rest = &rest[at..];
-            }
-            None => {
-                out.push_str(rest);
-                break;
-            }
-        }
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +631,12 @@ mod tests {
         // Ampersands that begin nothing are left alone rather than eaten.
         assert_eq!(unescape("Tom & Jerry"), "Tom & Jerry");
         assert_eq!(unescape("&"), "&");
-        assert_eq!(unescape("&nbsp;"), "&nbsp;");
+        // A real non-breaking space. Callers that collapse whitespace fold it
+        // into an ordinary one; callers that do not keep what the page meant.
+        assert_eq!(unescape("&nbsp;"), "\u{a0}");
+        assert_eq!(unescape("Sample&nbsp;rate"), "Sample\u{a0}rate");
+        // Still left alone: an entity these pages do not emit.
+        assert_eq!(unescape("&copy;"), "&copy;");
         assert_eq!(unescape("trailing &"), "trailing &");
 
         // Multi-byte input must survive being stepped over a byte at a time.
@@ -688,5 +656,27 @@ mod tests {
         let choice = field.choices.first().expect("a choice");
         assert_eq!(choice.value, "AT&T");
         assert_eq!(choice.label, "AT&T", "the label kept its entity");
+    }
+    #[test]
+    fn a_field_with_no_label_of_its_own_is_named_after_itself() {
+        // Qobuz's quality picker: a bare `<select>` with no label and no
+        // placeholder anywhere near it.
+        let page = r#"
+<form action="/credentials" method="POST">
+  <select name="quality">
+    <option value="6">CD</option>
+    <option value="27">Hi-Res</option>
+  </select>
+</form>"#;
+        let form = parse(page).pop().expect("a form");
+        assert_eq!(form.fields[0].label, "Quality");
+    }
+
+    #[test]
+    fn capitalising_leaves_the_rest_of_a_name_alone() {
+        assert_eq!(capitalise("quality"), "Quality");
+        assert_eq!(capitalise("Quality"), "Quality");
+        assert_eq!(capitalise("ipAddress"), "IpAddress");
+        assert_eq!(capitalise(""), "");
     }
 }

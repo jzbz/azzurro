@@ -248,7 +248,14 @@ fn strip_tags(raw: &str) -> String {
             _ => {}
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Decoded after the tags come off and before the whitespace is collapsed.
+    // That order matters for `&nbsp;`: it decodes to U+00A0, which the collapse
+    // then folds into an ordinary space — so `Sample&nbsp;rate` reads as two
+    // words rather than as the entity, which is what it looked like before.
+    crate::html::unescape(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -319,6 +326,9 @@ mod tests {
         assert_eq!(facts[0].0, "File");
         assert_eq!(facts[1], ("Format".to_owned(), "FLAC 24/96".to_owned()));
         assert_eq!(facts[3], ("Channels".to_owned(), "2".to_owned()));
+        // The player writes this label with a non-breaking space in it. It
+        // used to reach the screen as the literal text "Sample&nbsp;rate".
+        assert_eq!(facts[2].0, "Sample rate");
     }
 
     #[test]
