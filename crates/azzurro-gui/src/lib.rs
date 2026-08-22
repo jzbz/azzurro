@@ -92,6 +92,8 @@ enum Command {
     OpenSettings(Option<String>),
     /// Act on row `n` of the settings page currently shown.
     SettingAction(usize),
+    /// Change the value of the setting at row `n`.
+    SettingEdit(usize, Edit),
     /// Follow a sidebar entry: `(kind, index)`, where kind 0 is a screen and
     /// kind 1 is an item on the Sources screen.
     Sidebar(i32, i32),
@@ -258,6 +260,7 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Clear => icons.get_clear(),
         Glyph::Save => icons.get_save(),
         Glyph::Settings => icons.get_settings(),
+        Glyph::Tweak => icons.get_tweak(),
     }
 }
 
@@ -394,6 +397,40 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_queue_menu(move |song| {
         let _ = tx.send(Command::QueueMenu(song.max(0) as u32));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_toggle(move |index| {
+        let _ = tx.send(Command::SettingEdit(index.max(0) as usize, Edit::Toggle));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_choose(move |index, option| {
+        let _ = tx.send(Command::SettingEdit(
+            index.max(0) as usize,
+            Edit::Choose(option.max(0) as usize),
+        ));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_number(move |index, value| {
+        let _ = tx.send(Command::SettingEdit(
+            index.max(0) as usize,
+            Edit::Number(value),
+        ));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_text(move |index, text| {
+        let _ = tx.send(Command::SettingEdit(
+            index.max(0) as usize,
+            Edit::Text(text.to_string()),
+        ));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_open(move |index| {
+        let _ = tx.send(Command::SettingAction(index.max(0) as usize));
     });
 
     let tx = commands.clone();
@@ -953,103 +990,67 @@ impl Backend {
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
     /// Turn a settings page into rows for the middle pane.
-    ///
-    /// Deliberately the same row type the browse screens use: a settings page
-    /// is a list of named things you press, and giving it a second kind of row
-    /// would make the app look like two apps.
-    fn settings_rows(&self, page: &SettingsPage) -> (Vec<BrowseData>, String) {
-        fn walk(
-            entries: &[SettingEntry],
-            page: &SettingsPage,
-            rows: &mut Vec<BrowseData>,
-            index: &mut i32,
-        ) {
-            for entry in entries {
-                match entry {
-                    SettingEntry::Group(group) if group.is_page_link() => {
-                        rows.push(BrowseData {
-                            index: *index,
-                            title: group
-                                .display_name
-                                .clone()
-                                .unwrap_or_else(|| group.id.clone()),
-                            subtitle: group.description.clone().unwrap_or_default(),
-                            cover: None,
-                            glyph: glyphs::glyph_for(
-                                group.display_name.as_deref().unwrap_or(&group.id),
-                                None,
-                            ),
-                            heading: false,
-                            actionable: true,
-                            playing: false,
-                            has_menu: false,
-                        });
-                        *index += 1;
-                    }
-                    SettingEntry::Group(group) => {
-                        if let Some(title) = &group.display_name {
-                            rows.push(BrowseData {
-                                index: -1,
-                                title: title.clone(),
-                                subtitle: String::new(),
-                                cover: None,
-                                glyph: None,
-                                heading: true,
-                                actionable: false,
-                                playing: false,
-                                has_menu: false,
-                            });
-                        }
-                        walk(&group.entries, page, rows, index);
-                    }
-                    SettingEntry::Setting(setting) => {
-                        // A setting whose precondition is unmet is shown but
-                        // inert, with the reason in its second line — hiding it
-                        // would leave a gap where the player put something.
-                        let available = page.is_available(setting);
-                        let state = match setting.kind {
-                            Kind::Boolean => {
-                                Some(if setting.is_on() { "On" } else { "Off" }.to_owned())
-                            }
-                            Kind::Button => None,
-                            _ => setting.value.clone(),
-                        };
-                        let subtitle = setting.description.clone().or(state).unwrap_or_default();
-
-                        rows.push(BrowseData {
-                            index: *index,
-                            title: setting.label().to_owned(),
-                            subtitle: if available {
-                                subtitle
-                            } else {
-                                "Not available yet".to_owned()
-                            },
-                            cover: None,
-                            glyph: glyphs::glyph_for(setting.label(), None),
-                            heading: false,
-                            actionable: available
-                                && matches!(
-                                    setting.kind,
-                                    Kind::Boolean | Kind::Button | Kind::Other
-                                ),
-                            playing: setting.kind == Kind::Boolean && setting.is_on(),
-                            has_menu: false,
-                        });
-                        *index += 1;
-                    }
+    fn publish_settings(&self) {
+        let Some(page) = self.browsing.lock().unwrap().settings.clone() else {
+            let ui = self.ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_in_settings(false);
                 }
-            }
-        }
+            });
+            return;
+        };
 
-        let mut rows = Vec::new();
-        let mut index = 0;
-        walk(&page.entries, page, &mut rows, &mut index);
+        let mut rows: Vec<SettingData> = Vec::new();
+        let mut index = 0i32;
+        walk_settings(&page.entries, &page, &mut rows, &mut index);
 
         let title = match &page.page_id {
             Some(id) => format!("Settings · {id}"),
             None => "Settings".to_owned(),
         };
-        (rows, title)
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let icons = Icons::get(&ui);
+
+            let items: Vec<SettingItem> = rows
+                .into_iter()
+                .map(|row| SettingItem {
+                    index: row.index,
+                    label: row.label.into(),
+                    detail: row.detail.into(),
+                    cover: match row.glyph {
+                        Some(glyph) => glyph_image(&icons, glyph),
+                        None => Default::default(),
+                    },
+                    is_glyph: row.glyph.is_some(),
+                    heading: row.heading,
+                    control: row.control.into(),
+                    on: row.on,
+                    value: row.value.into(),
+                    number: row.number,
+                    minimum: row.minimum,
+                    maximum: row.maximum,
+                    step: row.step,
+                    units: row.units.into(),
+                    options: ModelRc::new(VecModel::from(
+                        row.options
+                            .into_iter()
+                            .map(slint::SharedString::from)
+                            .collect::<Vec<_>>(),
+                    )),
+                    option_index: row.option_index,
+                    available: row.available,
+                })
+                .collect();
+
+            ui.set_settings(ModelRc::new(VecModel::from(items)));
+            ui.set_in_settings(true);
+            ui.set_browse_title(title.into());
+            ui.set_browse_can_go_back(true);
+        });
     }
 
     fn publish_browse(&self) {
@@ -1062,15 +1063,10 @@ impl Backend {
             .flatten();
         let client = device.and_then(|id| self.with_entry(id, |e| e.client.clone()));
 
-        // Settings take over the pane while one is open.
-        if let Some((rows, title)) = {
-            let browsing = self.browsing.lock().unwrap();
-            browsing
-                .settings
-                .as_ref()
-                .map(|page| self.settings_rows(page))
-        } {
-            return self.send_browse(rows, title, true, None);
+        // Settings have a pane of their own; while one is open there is
+        // nothing to draw here, and publishing would fight it for the title.
+        if self.browsing.lock().unwrap().settings.is_some() {
+            return;
         }
 
         let (rows, title, can_go_back, search) = {
@@ -1284,6 +1280,194 @@ impl Backend {
             }
         });
     }
+}
+
+/// How a settings row was changed.
+#[derive(Debug, Clone)]
+enum Edit {
+    /// Flip a boolean, whichever pair of words it uses for its two states.
+    Toggle,
+    /// Pick option `n` of a list.
+    Choose(usize),
+    Number(f32),
+    Text(String),
+}
+
+/// One settings row on its way to the window.
+struct SettingData {
+    index: i32,
+    label: String,
+    detail: String,
+    glyph: Option<Glyph>,
+    heading: bool,
+    control: &'static str,
+    on: bool,
+    value: String,
+    number: f32,
+    minimum: f32,
+    maximum: f32,
+    step: f32,
+    units: String,
+    options: Vec<String>,
+    option_index: i32,
+    available: bool,
+}
+
+/// Flatten a settings page into rows, in the same order [`pick`] counts them.
+fn walk_settings(
+    entries: &[SettingEntry],
+    page: &SettingsPage,
+    rows: &mut Vec<SettingData>,
+    index: &mut i32,
+) {
+    for entry in entries {
+        match entry {
+            SettingEntry::Group(group) if group.is_page_link() => {
+                let label = group
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| group.id.clone());
+                rows.push(SettingData {
+                    index: *index,
+                    glyph: glyphs::glyph_for(&label, None).or(Some(Glyph::Tweak)),
+                    label,
+                    detail: group.description.clone().unwrap_or_default(),
+                    heading: false,
+                    control: "link",
+                    available: true,
+                    ..SettingData::blank()
+                });
+                *index += 1;
+            }
+            SettingEntry::Group(group) => {
+                if let Some(title) = &group.display_name {
+                    rows.push(SettingData {
+                        index: -1,
+                        label: title.clone(),
+                        heading: true,
+                        control: "none",
+                        available: true,
+                        ..SettingData::blank()
+                    });
+                }
+                walk_settings(&group.entries, page, rows, index);
+            }
+            SettingEntry::Setting(setting) => {
+                let available = page.is_available(setting);
+                let bounds = setting.range.clone().unwrap_or_default();
+
+                // A setting with a webview is one the player declines to
+                // describe, so it opens rather than being drawn.
+                let control = if setting.webview.is_some() {
+                    "link"
+                } else {
+                    match setting.kind {
+                        Kind::Boolean => "boolean",
+                        Kind::Range => "range",
+                        Kind::List => "list",
+                        Kind::Text => "text",
+                        Kind::Button => "button",
+                        Kind::Alarms | Kind::Sleep => "link",
+                        // Including dual-range, which needs a control of its
+                        // own and gets its value shown instead.
+                        _ => "none",
+                    }
+                };
+
+                let option_index = setting
+                    .options
+                    .iter()
+                    .position(|o| Some(o.name.as_str()) == setting.value.as_deref())
+                    .unwrap_or(0) as i32;
+
+                rows.push(SettingData {
+                    index: *index,
+                    // Falls back rather than leaving a hole; see Icons.tweak.
+                    glyph: glyphs::glyph_for(setting.label(), None).or(Some(Glyph::Tweak)),
+                    label: setting.label().to_owned(),
+                    detail: if available {
+                        setting.description.clone().unwrap_or_default()
+                    } else {
+                        setting
+                            .depends_on
+                            .as_ref()
+                            .map(|(n, v)| format!("Needs {n} set to {v}"))
+                            .unwrap_or_default()
+                    },
+                    heading: false,
+                    control,
+                    on: setting.is_on(),
+                    value: setting.value.clone().unwrap_or_default(),
+                    number: setting.number().unwrap_or(0.0),
+                    minimum: bounds.min,
+                    maximum: bounds.max,
+                    step: bounds.step.unwrap_or(1.0),
+                    units: bounds.units.unwrap_or_default(),
+                    options: setting
+                        .options
+                        .iter()
+                        .map(|o| o.label().to_owned())
+                        .collect(),
+                    option_index,
+                    available,
+                });
+                *index += 1;
+            }
+        }
+    }
+}
+
+impl SettingData {
+    fn blank() -> Self {
+        Self {
+            index: -1,
+            label: String::new(),
+            detail: String::new(),
+            glyph: None,
+            heading: false,
+            control: "none",
+            on: false,
+            value: String::new(),
+            number: 0.0,
+            minimum: 0.0,
+            maximum: 1.0,
+            step: 1.0,
+            units: String::new(),
+            options: Vec::new(),
+            option_index: 0,
+            available: true,
+        }
+    }
+}
+
+/// The setting at row `index`, for the writes.
+fn setting_at(page: &SettingsPage, index: usize) -> Option<bluos::settings::Setting> {
+    fn walk(
+        entries: &[SettingEntry],
+        at: &mut usize,
+        want: usize,
+    ) -> Option<bluos::settings::Setting> {
+        for entry in entries {
+            match entry {
+                SettingEntry::Group(group) if group.is_page_link() => *at += 1,
+                SettingEntry::Group(group) => {
+                    if let Some(found) = walk(&group.entries, at, want) {
+                        return Some(found);
+                    }
+                }
+                SettingEntry::Setting(setting) => {
+                    if *at == want {
+                        return Some((**setting).clone());
+                    }
+                    *at += 1;
+                }
+            }
+        }
+        None
+    }
+
+    let mut at = 0;
+    walk(&page.entries, &mut at, index)
 }
 
 /// What activating a settings row means.
@@ -2016,6 +2200,7 @@ async fn run_commands(
                     browsing.settings.take().is_some()
                 };
                 if leaving {
+                    backend.publish_settings();
                     backend.publish_browse();
                     continue;
                 }
@@ -2090,7 +2275,7 @@ async fn run_commands(
                 match client.settings(page.as_deref()).await {
                     Ok(page) => {
                         backend.browsing.lock().unwrap().settings = Some(page);
-                        backend.publish_browse();
+                        backend.publish_settings();
                     }
                     Err(e) => {
                         tracing::warn!(%id, "could not read settings: {e}");
@@ -2144,6 +2329,47 @@ async fn run_commands(
                         }
                     }
                     None => {}
+                }
+                continue;
+            }
+
+            Command::SettingEdit(index, edit) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let Some(page) = backend.browsing.lock().unwrap().settings.clone() else {
+                    continue;
+                };
+                let Some(setting) = setting_at(&page, index) else {
+                    continue;
+                };
+
+                let value = match edit {
+                    Edit::Toggle => setting.toggled(),
+                    Edit::Choose(n) => setting.options.get(n).map(|o| o.name.clone()),
+                    // The player wants the number as it writes it: a whole one
+                    // where the step is whole, and one decimal where it is not.
+                    Edit::Number(v) => Some(match setting.range.as_ref().and_then(|r| r.step) {
+                        Some(step) if step.fract() != 0.0 => format!("{v:.1}"),
+                        _ => format!("{}", v.round() as i64),
+                    }),
+                    Edit::Text(text) => Some(text),
+                };
+                let Some(value) = value else { continue };
+
+                match client.write_setting(&page, &setting, &value).await {
+                    Ok(()) => {
+                        // Re-read rather than assume: a write can move more
+                        // than the one value — turning tone controls on brings
+                        // treble and bass to life — and only the player knows.
+                        let _ = backend
+                            .commands
+                            .send(Command::OpenSettings(page.page_id.clone()));
+                    }
+                    Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
                 }
                 continue;
             }

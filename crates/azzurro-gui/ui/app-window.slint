@@ -1,4 +1,4 @@
-import { ListView, ComboBox, LineEdit } from "std-widgets.slint";
+import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge } from "widgets.slint";
 
@@ -68,6 +68,29 @@ export struct SidebarRow {
     index: int,
 }
 
+// One row of a settings page. The controls differ, so unlike a browse row
+// this cannot be one shape with a label swapped in.
+export struct SettingItem {
+    index: int,
+    label: string,
+    detail: string,
+    cover: image,
+    is-glyph: bool,
+    heading: bool,
+    // boolean | range | list | text | button | link | none
+    control: string,
+    on: bool,
+    value: string,
+    number: float,
+    minimum: float,
+    maximum: float,
+    step: float,
+    units: string,
+    options: [string],
+    option-index: int,
+    available: bool,
+}
+
 component SectionLabel inherits Text {
     font-size: Theme.micro-size;
     font-weight: 700;
@@ -75,6 +98,165 @@ component SectionLabel inherits Text {
     // Small caps are not available, so the spacing does the work of saying
     // "this is a label, not content".
     letter-spacing: 0.8px;
+}
+
+component SettingRow inherits Rectangle {
+    in property <SettingItem> item;
+    callback toggled();
+    callback chose(int);
+    callback numbered(float);
+    callback typed(string);
+    callback opened();
+
+    height: root.item.heading ? 34px : 60px;
+    border-radius: Theme.radius-small;
+    background: (root.item.control == "link" || root.item.control == "button") && touch.has-hover
+        ? Theme.hover
+        : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+    // Dimmed rather than hidden: the player put it there, and a gap where a
+    // setting should be is more confusing than a greyed one.
+    opacity: root.item.available ? 1.0 : 0.45;
+
+    touch := TouchArea {
+        enabled: root.item.control == "link";
+        clicked => { root.opened(); }
+    }
+
+    if root.item.heading: HorizontalLayout {
+        padding-left: Theme.pad;
+        alignment: start;
+
+        SectionLabel {
+            text: root.item.label;
+            vertical-alignment: bottom;
+        }
+    }
+
+    if !root.item.heading: HorizontalLayout {
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.pad;
+
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 5px;
+                background: Theme.raised;
+
+                Icon {
+                    glyph: root.item.cover;
+                    tint: Theme.dim;
+                    width: 18px;
+                    height: 18px;
+                    visible: root.item.is-glyph;
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            min-width: 0px;
+
+            Text {
+                text: root.item.label;
+                font-size: Theme.body-size;
+                color: Theme.text;
+                overflow: elide;
+            }
+
+            if root.item.detail != "": Text {
+                text: root.item.detail;
+                font-size: Theme.small-size;
+                color: Theme.dim;
+                overflow: elide;
+            }
+        }
+
+        if root.item.control == "boolean": VerticalLayout {
+            alignment: center;
+
+            Switch {
+                checked: root.item.on;
+                enabled: root.item.available;
+                toggled => { root.toggled(); }
+            }
+        }
+
+        if root.item.control == "range": HorizontalLayout {
+            spacing: Theme.gap;
+            width: 210px;
+
+            Slider {
+                enabled: root.item.available;
+                minimum: root.item.minimum;
+                maximum: root.item.maximum;
+                value: root.item.number;
+                // On release: a drag writes to the player, and every
+                // intermediate value would be a POST.
+                released(v) => { root.numbered(v); }
+            }
+
+            Text {
+                text: root.item.value + root.item.units;
+                font-size: Theme.small-size;
+                color: Theme.faint;
+                vertical-alignment: center;
+                width: 46px;
+                horizontal-alignment: right;
+            }
+        }
+
+        if root.item.control == "list": VerticalLayout {
+            alignment: center;
+            width: 176px;
+
+            ComboBox {
+                model: root.item.options;
+                current-index: root.item.option-index;
+                enabled: root.item.available;
+                selected => { root.chose(self.current-index); }
+            }
+        }
+
+        if root.item.control == "text": VerticalLayout {
+            alignment: center;
+            width: 196px;
+
+            LineEdit {
+                text: root.item.value;
+                enabled: root.item.available;
+                font-size: Theme.small-size;
+                accepted(t) => { root.typed(t); }
+            }
+        }
+
+        if root.item.control == "button": VerticalLayout {
+            alignment: center;
+
+            PillButton {
+                label: root.item.label;
+                enabled: root.item.available;
+                clicked => { root.opened(); }
+            }
+        }
+
+        if root.item.control == "link": VerticalLayout {
+            alignment: center;
+
+            Icon {
+                glyph: Icons.forward;
+                tint: Theme.faint;
+                width: 15px;
+                height: 15px;
+            }
+        }
+    }
 }
 
 component NavRow inherits Rectangle {
@@ -469,6 +651,8 @@ export component AppWindow inherits Window {
     in property <string> sleep-label: "Sleep";
     in property <bool> sleep-on: false;
     in property <[SidebarRow]> sidebar;
+    in property <[SettingItem]> settings;
+    in property <bool> in-settings: false;
     in-out property <int> selected: 0;
 
     callback toggle(string);
@@ -487,6 +671,11 @@ export component AppWindow inherits Window {
     callback queue-menu(int);
     callback sidebar-activate(int, int);
     callback open-settings();
+    callback setting-toggle(int);
+    callback setting-choose(int, int);
+    callback setting-number(int, float);
+    callback setting-text(int, string);
+    callback setting-open(int);
     callback open-help();
     callback seek(string, int);
     callback toggle-shuffle(string);
@@ -707,13 +896,26 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ListView {
+                    if !root.in-settings: ListView {
                         vertical-stretch: 1;
 
                         for entry in root.browse: BrowseRowView {
                             entry: entry;
                             activate => { root.browse-activate(entry.index); }
                             open-menu => { root.browse-menu(entry.index); }
+                        }
+                    }
+
+                    if root.in-settings: ListView {
+                        vertical-stretch: 1;
+
+                        for item in root.settings: SettingRow {
+                            item: item;
+                            toggled => { root.setting-toggle(item.index); }
+                            chose(i) => { root.setting-choose(item.index, i); }
+                            numbered(v) => { root.setting-number(item.index, v); }
+                            typed(t) => { root.setting-text(item.index, t); }
+                            opened => { root.setting-open(item.index); }
                         }
                     }
                 }

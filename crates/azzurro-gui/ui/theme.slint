@@ -139,6 +139,10 @@ export global Icons {
     out property <image> unfavourite: @image-url("icons/heart-off.svg");
     out property <image> clear: @image-url("icons/trash-2.svg");
     out property <image> save: @image-url("icons/download.svg");
+    // Stands in for a setting with no better icon — every row on a settings
+    // page gets a tile, so a few empty squares among them read as missing
+    // rather than as deliberate.
+    out property <image> tweak: @image-url("icons/sliders-horizontal.svg");
 
     // Not drawn anywhere in the window. `audio-lines` is the glyph the
     // application icon is built from, and it is kept here so that the icon in

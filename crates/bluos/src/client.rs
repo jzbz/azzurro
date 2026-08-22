@@ -221,14 +221,17 @@ impl Client {
 
     /// Change one setting.
     ///
-    /// A POST of `{name: value}` to the URL the setting names, resolved
-    /// against the page it came from — which is what the official controller's
-    /// own `updateSettings` does. **Not exercised against hardware**: every
-    /// call here changes the configuration of somebody's stereo, and there is
-    /// no inert one to try.
+    /// A POST of `{name: value}` to the URL the setting names — the shape the
+    /// official controller's own `updateSettings` uses.
+    ///
+    /// The URL resolves against the **control port, not the settings port**,
+    /// which is the trap here: settings are *read* from 11001 and *written* to
+    /// 11000, and posting a write back to where the document came from answers
+    /// 404. Confirmed against a player by writing a setting the value it
+    /// already held, then a different one, and watching it change and revert.
     pub async fn write_setting(
         &self,
-        settings: &Settings,
+        _settings: &Settings,
         setting: &Setting,
         value: &str,
     ) -> Result<()> {
@@ -244,7 +247,7 @@ impl Client {
         let body = format!("{{{}:{}}}", json_string(name), json_string(value));
 
         self.http
-            .post(format!("{}{url}", settings.base))
+            .post(format!("{}{url}", self.base))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(REQUEST_TIMEOUT)
             .body(body)

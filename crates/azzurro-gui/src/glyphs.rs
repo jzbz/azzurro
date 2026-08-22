@@ -46,6 +46,8 @@ pub enum Glyph {
     Clear,
     Save,
     Settings,
+    /// The generic stand-in for a setting with no icon of its own.
+    Tweak,
 }
 
 /// Whether `source` is something worth showing as it is.
