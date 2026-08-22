@@ -84,3 +84,21 @@ clap = { version = "4", features = ["derive"] }
 opt-level = 3
 lto = "thin"
 strip = "debuginfo"
+
+# A panic kills the process rather than unwinding.
+#
+# Not for the code size. The app spawns thirty-odd detached tasks and keeps
+# none of their handles, so nothing observes a panic in any of them: unwinding
+# ends one task quietly and leaves the rest running. The worst of those is the
+# command loop, where it means the window carries on drawing while every
+# control is dead — the channel still accepts, and nobody reads. That reads as
+# the app being broken in a way nobody can report usefully.
+#
+# Aborting is louder and more honest: the app is gone, the reason is on stderr,
+# and starting it again works. It also retires mutex poisoning as a category,
+# since no lock can be left poisoned by an unwind that never happens.
+#
+# The cost is that any panic anywhere is fatal, including in a dependency. The
+# one place this app relied on absorbing one was decoding a cover, which is why
+# `artwork::decode` was given explicit limits in the same change.
+panic = "abort"

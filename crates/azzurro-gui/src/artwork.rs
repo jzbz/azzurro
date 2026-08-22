@@ -76,6 +76,22 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// the interface waits on.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The largest cover this will decode, per side, and the most memory it may
+/// take to do it.
+///
+/// [`MAX_BYTES`] bounds the bytes that arrive, which says nothing about what
+/// they claim: a couple of hundred bytes of header can declare enormous
+/// dimensions. The `image` crate's own default is not nothing — it caps a
+/// single allocation at 512 MB — but it sets no bound on width or height at
+/// all, so a long thin cover can pass it while still being absurd. These are
+/// tighter on both counts.
+///
+/// Well above any real sleeve: the largest a streaming service serves is
+/// around 3000 a side, and everything here is scaled to 360 or less
+/// immediately afterwards.
+const MAX_SIDE: u32 = 8192;
+const MAX_DECODED: u64 = 128 * 1024 * 1024;
+
 /// A decoded image is identified by where it came from and how big it was
 /// wanted, since the same cover is drawn at three sizes — a queue thumbnail, a
 /// shelf tile and a full cover — and each is scaled and stored separately.
@@ -254,7 +270,26 @@ impl Artwork {
 
 /// Decode and scale to fit a `size` box.
 fn decode(bytes: &[u8], size: u32) -> Option<Pixels> {
-    let image = image::load_from_memory(bytes)
+    // Told what it may spend before it is given anything to read.
+    // `load_from_memory`, which this replaced, decodes under the crate's
+    // default limits — a 512 MB allocation ceiling and no dimension bound
+    // whatever. That was survivable while a panic in here cost one cover: the
+    // decode runs in `spawn_blocking` and a failed join was discarded. The
+    // release profile now aborts on panic, so this path has to fail by
+    // returning rather than by dying, and it should fail sooner than 512 MB.
+    let mut limits = image::Limits::no_limits();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_DECODED);
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .inspect_err(|e| tracing::debug!("unrecognisable artwork: {e}"))
+        .ok()?;
+    reader.limits(limits);
+
+    let image = reader
+        .decode()
         .inspect_err(|e| tracing::debug!("undecodable artwork: {e}"))
         .ok()?;
 
@@ -404,6 +439,58 @@ fn prune(dir: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid 24-bit BMP header declaring `w` by `h`, with almost no pixel
+    /// data behind it — the shape a header bomb takes.
+    fn header_claiming(w: i32, h: i32) -> Vec<u8> {
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // file size, unchecked
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel offset
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // DIB header size
+        bmp.extend_from_slice(&w.to_le_bytes());
+        bmp.extend_from_slice(&h.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
+        bmp.resize(54 + 16, 0);
+        bmp
+    }
+
+    #[test]
+    fn a_cover_wider_than_any_cover_is_refused_on_its_dimensions() {
+        // 9000 by 100 is the shape that tells this apart from the crate's
+        // default limits: it is far under the 512 MB those allow, so without
+        // a width bound the decoder starts reading it. Deliberately not a
+        // square — a square large enough to breach 512 MB would be refused
+        // either way and would prove nothing about this change.
+        const { assert!(MAX_SIDE < 9000, "the test no longer exceeds the limit") };
+        assert!(
+            decode(&header_claiming(9000, 100), 360).is_none(),
+            "a cover 9000 wide was accepted"
+        );
+    }
+
+    #[test]
+    fn rubbish_that_is_not_an_image_at_all_is_still_none() {
+        assert!(decode(b"", 360).is_none());
+        assert!(decode(b"not a picture", 360).is_none());
+    }
+
+    #[test]
+    fn an_ordinary_cover_still_decodes_under_the_limits() {
+        let mut png = Vec::new();
+        let mut source = image::RgbaImage::new(600, 600);
+        source
+            .pixels_mut()
+            .for_each(|p| *p = image::Rgba([9, 8, 7, 255]));
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let out = decode(&png, 360).expect("a real cover was refused");
+        assert_eq!(out.width(), 360, "not scaled to the size asked for");
+    }
 
     #[test]
     fn file_names_are_stable_and_distinct() {
