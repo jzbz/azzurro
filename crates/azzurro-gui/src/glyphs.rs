@@ -66,6 +66,8 @@ pub enum Glyph {
     Tone,
     Gauge,
     Edit,
+    /// A field whose value is never drawn back.
+    Secret,
     // A radio service writes its own menu, and the words are always much the
     // same: somewhere to start, somewhere near you, and the usual shelves.
     ForYou,

@@ -205,7 +205,10 @@ component SettingRow inherits Rectangle {
         padding-right: Theme.gap;
         spacing: Theme.pad;
 
-        VerticalLayout {
+        // Only where there is one to draw. A row that is nothing but a button
+        // — the submit at the end of one of the player's forms — would
+        // otherwise carry an empty tile where every other row has its icon.
+        if root.item.is-glyph: VerticalLayout {
             alignment: center;
 
             Rectangle {
@@ -219,7 +222,6 @@ component SettingRow inherits Rectangle {
                     tint: Theme.dim;
                     width: 18px;
                     height: 18px;
-                    visible: root.item.is-glyph;
                 }
             }
         }
@@ -299,6 +301,24 @@ component SettingRow inherits Rectangle {
                 text: root.item.value;
                 enabled: root.item.available;
                 font-size: Theme.small-size;
+                accepted(t) => { root.typed(t); }
+            }
+        }
+
+        // The player's own settings never ask for one; its web pages do, for a
+        // wireless key and for signing into a music service. Never seeded with
+        // what is held and never drawn back, so what is on screen is only ever
+        // what was typed here.
+        if root.item.control == "password": VerticalLayout {
+            alignment: center;
+            width: 196px;
+
+            LineEdit {
+                input-type: password;
+                placeholder-text: root.item.on ? "••••••••" : "";
+                enabled: root.item.available;
+                font-size: Theme.small-size;
+                edited(t) => { root.typed(t); }
                 accepted(t) => { root.typed(t); }
             }
         }

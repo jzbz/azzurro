@@ -125,6 +125,14 @@ enum Command {
     OpenShares,
     /// A row of whichever of those is showing.
     WebAction(usize),
+    /// Read a form off one of the player's pages and show it.
+    OpenForm {
+        title: String,
+        path: String,
+    },
+    /// A row of the form on show: a field filled in, or a button pressed.
+    FormEdit(usize, Edit),
+    FormPress(usize),
     /// Move a track from one place in the queue to another, both as positions
     /// in the queue rather than rows on screen.
     QueueReorder(u32, u32),
@@ -196,6 +204,14 @@ impl Pane {
             _ => None,
         }
     }
+
+    /// The form being filled in, if one is.
+    fn form(&self) -> Option<&FormPage> {
+        match self {
+            Pane::Form(page) => Some(page),
+            _ => None,
+        }
+    }
 }
 
 /// What the middle pane is showing. These are alternatives rather than layers:
@@ -214,6 +230,20 @@ enum Pane {
     HelpDetail(String, Vec<(String, String)>),
     /// One of the player's web configuration pages, drawn rather than opened.
     Web(WebPage),
+    /// A form off one of those pages, filled in here rather than in a browser.
+    Form(Box<FormPage>),
+}
+
+/// A form being filled in.
+struct FormPage {
+    title: String,
+    form: bluos::forms::Form,
+    /// What has been typed or chosen, by field name. Seeded from what the page
+    /// arrived with, so a field left alone goes back exactly as it came.
+    values: BTreeMap<String, String>,
+    /// Whatever the player said in reply to the last attempt — a wrong password
+    /// comes back as the same form with a sentence on it.
+    note: String,
 }
 
 struct Crumb {
@@ -441,6 +471,7 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Gauge => icons.get_gauge(),
         Glyph::Service => icons.get_service(),
         Glyph::Edit => icons.get_edit(),
+        Glyph::Secret => icons.get_secret(),
         Glyph::ForYou => icons.get_for_you(),
         Glyph::Sport => icons.get_sport(),
         Glyph::Podcast => icons.get_podcast(),
@@ -1387,6 +1418,94 @@ impl Backend {
         self.send_settings(rows, "Help".to_owned());
     }
 
+    /// Put a form from the player's web UI in the middle pane.
+    ///
+    /// Drawn with the settings pane's rows, which already have a control for
+    /// every shape these forms use: a line of text, a switch, a list to choose
+    /// from. Only the masked one is new, and only because nothing in the
+    /// player's own settings ever asks for a password.
+    fn publish_form(&self) {
+        let Some(page) = self.browsing.lock().unwrap().pane.form().map(|page| {
+            (
+                page.title.clone(),
+                page.form.clone(),
+                page.values.clone(),
+                page.note.clone(),
+            )
+        }) else {
+            return;
+        };
+        let (title, form, values, note) = page;
+
+        let mut rows: Vec<SettingData> = Vec::new();
+        if !note.is_empty() {
+            rows.push(SettingData {
+                index: -1,
+                glyph: Some(Glyph::Info),
+                label: note,
+                control: "none",
+                available: true,
+                ..SettingData::blank()
+            });
+        }
+
+        for field in &form.fields {
+            let held = values.get(&field.name).cloned().unwrap_or_default();
+            rows.push(SettingData {
+                index: -1,
+                glyph: Some(match field.kind {
+                    bluos::forms::Kind::Password => Glyph::Secret,
+                    bluos::forms::Kind::Choice => Glyph::Tweak,
+                    _ => Glyph::Details,
+                }),
+                label: if field.label.is_empty() {
+                    field.name.clone()
+                } else {
+                    field.label.clone()
+                },
+                control: match field.kind {
+                    bluos::forms::Kind::Text => "text",
+                    bluos::forms::Kind::Password => "password",
+                    bluos::forms::Kind::Choice => "list",
+                    bluos::forms::Kind::Switch => "boolean",
+                },
+                on: !held.is_empty(),
+                // A password is never drawn back, not even as its own length.
+                value: match field.kind {
+                    bluos::forms::Kind::Password => String::new(),
+                    _ => held.clone(),
+                },
+                options: field.choices.iter().map(|c| c.label.clone()).collect(),
+                option_index: field
+                    .choices
+                    .iter()
+                    .position(|c| c.value == held)
+                    .unwrap_or(0) as i32,
+                available: true,
+                ..SettingData::blank()
+            });
+        }
+
+        for submit in &form.submits {
+            rows.push(SettingData {
+                index: -1,
+                glyph: None,
+                // The button says what it does; a row saying the same thing
+                // beside it is the word twice.
+                label: String::new(),
+                value: submit.label.clone(),
+                control: "button",
+                available: true,
+                ..SettingData::blank()
+            });
+        }
+
+        for (at, row) in rows.iter_mut().enumerate() {
+            row.index = at as i32;
+        }
+        self.send_settings(rows, title);
+    }
+
     /// Put one of the player's web configuration pages in the middle pane.
     ///
     /// Drawn with the settings pane's own rows, because that is what these are:
@@ -1437,7 +1556,7 @@ impl Backend {
                             index: -1,
                             glyph: Some(Glyph::Add),
                             label: "Add a share".to_owned(),
-                            detail: "Asks for a server and a password".to_owned(),
+                            detail: String::new(),
                             control: "link",
                             available: true,
                             ..SettingData::blank()
@@ -1468,12 +1587,14 @@ impl Backend {
             Settings,
             Help,
             Web,
+            Form,
         }
         let showing = match self.browsing.lock().unwrap().pane {
             Pane::Browse => Showing::Browse,
             Pane::Settings(_) => Showing::Settings,
             Pane::Help | Pane::HelpDetail(..) => Showing::Help,
             Pane::Web(_) => Showing::Web,
+            Pane::Form(_) => Showing::Form,
         };
 
         match showing {
@@ -1486,6 +1607,7 @@ impl Backend {
             Showing::Settings => self.publish_settings(),
             Showing::Help => self.publish_help(),
             Showing::Web => self.publish_web(),
+            Showing::Form => self.publish_form(),
         }
     }
 
@@ -2499,6 +2621,39 @@ async fn activate(backend: Backend, index: usize) {
     run_action(backend, id, action, arrive).await;
 }
 
+/// Show a form, keeping whatever the page arrived filled in with.
+///
+/// Passwords are the exception: a page comes back with the field empty, and
+/// seeding it with anything would be inventing a value nobody typed.
+fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: String) {
+    let values = form
+        .fields
+        .iter()
+        .filter(|field| field.kind != bluos::forms::Kind::Password)
+        .map(|field| {
+            let value = if field.value.is_empty() {
+                field
+                    .choices
+                    .iter()
+                    .find(|c| c.selected)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            } else {
+                field.value.clone()
+            };
+            (field.name.clone(), value)
+        })
+        .collect();
+
+    backend.browsing.lock().unwrap().pane = Pane::Form(Box::new(FormPage {
+        title,
+        form,
+        values,
+        note,
+    }));
+    backend.publish_form();
+}
+
 /// Put a query at the top of the recent list.
 fn remember_search(backend: &Backend, query: String) {
     {
@@ -3279,7 +3434,7 @@ async fn run_commands(
                             trail.pop();
                             true
                         }
-                        Pane::Help | Pane::Settings(_) | Pane::Web(_) => {
+                        Pane::Help | Pane::Settings(_) | Pane::Web(_) | Pane::Form(_) => {
                             browsing.pane = Pane::Browse;
                             true
                         }
@@ -3399,6 +3554,10 @@ async fn run_commands(
                         let _ = backend.commands.send(Command::WebAction(index));
                         continue;
                     }
+                    Pane::Form(_) => {
+                        let _ = backend.commands.send(Command::FormPress(index));
+                        continue;
+                    }
                     _ => {}
                 }
 
@@ -3431,6 +3590,20 @@ async fn run_commands(
                         // password and is not.
                         if url.contains("/sharecfg") {
                             let _ = backend.commands.send(Command::OpenShares);
+                            continue;
+                        }
+                        // Joining a wireless network: a list of what the player
+                        // can see and a key to type. All of it is a form, and
+                        // the only reason it ever left the app is that nothing
+                        // here could draw one.
+                        if let Some(path) = url.split_once("://").map(|(_, rest)| rest)
+                            && let Some(path) = path.split_once('/').map(|(_, rest)| rest)
+                            && path.starts_with("wificfg")
+                        {
+                            let _ = backend.commands.send(Command::OpenForm {
+                                title: "WiFi".to_owned(),
+                                path: format!("/{path}"),
+                            });
                             continue;
                         }
                         tracing::info!("opening {url} in a browser");
@@ -3548,6 +3721,128 @@ async fn run_commands(
                             Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
                         }
                     }
+                }
+                continue;
+            }
+
+            Command::SettingEdit(index, edit)
+                if matches!(backend.browsing.lock().unwrap().pane, Pane::Form(_)) =>
+            {
+                let _ = backend.commands.send(Command::FormEdit(index, edit));
+                continue;
+            }
+
+            Command::OpenForm { title, path } => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.web_form(&path).await {
+                    Ok(Some(form)) => {
+                        show_form(&backend, title, form, String::new());
+                    }
+                    // No form on it, or a shape this crate cannot read. The
+                    // page itself still works, so offer that rather than
+                    // nothing.
+                    other => {
+                        if let Err(e) = other {
+                            tracing::debug!(%id, "could not read {path}: {e}");
+                        }
+                        let url = client.web_url(&path);
+                        tracing::info!(%id, "opening {url} in a browser");
+                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    }
+                }
+                continue;
+            }
+
+            Command::FormEdit(at, edit) => {
+                let mut browsing = backend.browsing.lock().unwrap();
+                let Pane::Form(page) = &mut browsing.pane else {
+                    continue;
+                };
+                // The note, when there is one, sits above the fields and is not
+                // one of them.
+                let at = at.wrapping_sub(usize::from(!page.note.is_empty()));
+                let Some(field) = page.form.fields.get(at) else {
+                    continue;
+                };
+
+                let value = match edit {
+                    Edit::Text(text) => Some(text),
+                    Edit::Choose(n) => field.choices.get(n).map(|c| c.value.clone()),
+                    Edit::Toggle => Some(
+                        match page.values.get(&field.name).map(String::as_str) {
+                            Some("") | None => "on",
+                            _ => "",
+                        }
+                        .to_owned(),
+                    ),
+                    Edit::Number(_) => None,
+                };
+                if let Some(value) = value {
+                    page.values.insert(field.name.clone(), value);
+                }
+                drop(browsing);
+                backend.publish_form();
+                continue;
+            }
+
+            Command::FormPress(at) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+
+                let sending = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Some(page) = browsing.pane.form() else {
+                        continue;
+                    };
+                    let first = usize::from(!page.note.is_empty()) + page.form.fields.len();
+                    page.form.submits.get(at.wrapping_sub(first)).map(|submit| {
+                        (
+                            page.title.clone(),
+                            page.form.clone(),
+                            page.values.clone(),
+                            submit.clone(),
+                        )
+                    })
+                };
+                let Some((title, form, values, submit)) = sending else {
+                    continue;
+                };
+
+                match client.submit_form(&form, &values, &submit).await {
+                    Ok(body) => {
+                        // The answer is another page: the same form with a
+                        // message when something was wrong, the next step's
+                        // form when it was right. Following it is what lets one
+                        // screen lead to another without knowing the route.
+                        match bluos::forms::parse(&body).into_iter().next() {
+                            Some(next) => {
+                                show_form(&backend, title, next, bluos::reports::message(&body))
+                            }
+                            None => {
+                                let said = bluos::reports::message(&body);
+                                say(
+                                    &backend.ui,
+                                    if said.is_empty() {
+                                        format!("{} done", submit.label)
+                                    } else {
+                                        said
+                                    },
+                                );
+                                backend.browsing.lock().unwrap().pane = Pane::Browse;
+                                backend.publish_pane();
+                            }
+                        }
+                    }
+                    Err(e) => say(&backend.ui, format!("{}: {e}", submit.label)),
                 }
                 continue;
             }
@@ -3815,7 +4110,8 @@ async fn run_commands(
                 };
 
                 enum Press {
-                    Open(String),
+                    /// A page with a form on it, filled in here.
+                    Form(String, String),
                     Remove(String, String),
                 }
 
@@ -3824,7 +4120,7 @@ async fn run_commands(
                     match browsing.pane.web() {
                         Some(WebPage::Services(services)) => services
                             .get(at)
-                            .map(|service| Press::Open(client.web_url(&service.href))),
+                            .map(|service| Press::Form(service.name.clone(), service.href.clone())),
                         Some(WebPage::Shares { action, shares }) => match shares.get(at) {
                             // A share, and the form that unmounts it.
                             Some(share) => action
@@ -3832,16 +4128,18 @@ async fn run_commands(
                                 .map(|action| Press::Remove(action, share.field.clone())),
                             // Past the last share is the row that adds one,
                             // which asks for a server and a password.
-                            None => Some(Press::Open(client.web_url("/sharecfg?noheader=1"))),
+                            None => Some(Press::Form(
+                                "Network shares".to_owned(),
+                                "/sharecfg?noheader=1".to_owned(),
+                            )),
                         },
                         None => None,
                     }
                 };
 
                 match press {
-                    Some(Press::Open(url)) => {
-                        tracing::info!(%id, "opening {url} in a browser");
-                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    Some(Press::Form(title, path)) => {
+                        let _ = backend.commands.send(Command::OpenForm { title, path });
                     }
                     Some(Press::Remove(action, field)) => {
                         match client
