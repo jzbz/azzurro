@@ -186,10 +186,16 @@ component SettingRow inherits Rectangle {
     callback typed(string);
     callback opened();
 
-    // A minimum rather than a height: the value below can be a file path
-    // longer than the window, and wrapping it needs somewhere to wrap to.
-    // Every ordinary row still comes out at exactly this height.
-    min-height: root.item.heading ? 34px : 60px;
+    // Tall enough for the contents, and never shorter than a row.
+    //
+    // A plain `min-height` is not enough: a ListView asks each item how tall
+    // it is, and these carry their contents in `if` blocks that answer zero —
+    // so every row collapsed onto the one above it. Measuring the block that
+    // is actually there and taking the larger of the two gives an ordinary row
+    // exactly its 60px, and a wrapped file path however many lines it needs.
+    height: root.item.heading
+        ? 34px
+        : Math.max(60px, body.preferred-height);
     border-radius: Theme.radius-small;
     background: (root.item.control == "link"
             || root.item.control == "button"
@@ -217,7 +223,8 @@ component SettingRow inherits Rectangle {
         }
     }
 
-    if !root.item.heading: HorizontalLayout {
+    body := HorizontalLayout {
+        visible: !root.item.heading;
         padding-left: Theme.gap;
         padding-right: Theme.gap;
         // Vertical padding so a wrapped value has margin above and below
@@ -1680,6 +1687,11 @@ export component AppWindow inherits Window {
 
             // What you are browsing.
             Rectangle {
+                // The column that grows. The sidebar and the queue are both a
+                // fixed width, so without this the middle takes whatever it
+                // happens to prefer and the rest of the window stays empty —
+                // which is what a wider default window made obvious.
+                horizontal-stretch: 1;
                 background: transparent;
                 clip: true;
 

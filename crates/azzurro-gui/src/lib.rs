@@ -4760,10 +4760,27 @@ async fn run_commands(
                             .as_ref()
                             .and_then(|screen| screen.items().nth(index.max(0) as usize))
                             .map(|item| {
-                                let browse = item.action.clone();
-                                let is_input = browse.is_none() && item.play_action.is_some();
+                                let action =
+                                    item.action.clone().or_else(|| item.play_action.clone());
+                                // An input is a `player-link` that starts
+                                // playing something. Not the absence of a
+                                // browse action, which is what this used to
+                                // test and why it never once fired: the
+                                // player writes an input as
+                                // `<action type="player-link" URI="/Play?…">`,
+                                // so `item.action` is always there and the
+                                // question was never asked. A service's action
+                                // is a browse and opens a screen; anything
+                                // here that plays takes the speaker away from
+                                // what it was doing.
+                                let is_input = action.as_ref().is_some_and(|a| {
+                                    a.kind == bluos::screen::ActionKind::PlayerLink
+                                        && a.uri
+                                            .as_deref()
+                                            .is_some_and(|uri| uri.starts_with("/Play"))
+                                });
                                 (
-                                    browse.or_else(|| item.play_action.clone()),
+                                    action,
                                     is_input,
                                     item.label().unwrap_or("that input").to_owned(),
                                 )

@@ -1480,4 +1480,82 @@ mod tests {
         assert!(menu.items().all(|item| item.title.is_none()));
         assert!(menu.items().all(|item| item.action.is_some()));
     }
+    /// `/ui/Sources` from a real NAD Powernode. Its inputs and its music
+    /// services sit in one flat list of items and are told apart only by the
+    /// action each carries.
+    const SOURCES_SCREEN: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="screen.xsd" version="1" screenTitle="Music Sources" id="screen-sources" refreshOnPlayerChange="true">
+  <refreshOnStatusChange key="sid" value="17"></refreshOnStatusChange>
+  <menuAction type="add">
+    <action type="webpage" URI="/redirectToCp?href=%2Fservices%3Fnoheader%3D1%26schemaVersion%3D35" title="Music Services" refreshScreen="true"></action>
+  </menuAction>
+  <row id="inputs" title="Inputs" scrollable="true" solidBackground="false">
+    <menuAction text="Customise">
+      <action type="setting" URI="/Settings?id=capture" title="Inputs" refreshScreen="true"></action>
+    </menuAction>
+    <input title="Bluetooth" icon="/images/BluetoothIcon.png">
+      <action type="player-link" URI="/Play?url=Capture%3Abluez%3Abluetooth&amp;title=Bluetooth&amp;image=%2Fimages%2FBluetoothIcon.png" haptic="true"></action>
+      <nowPlayingMatch key="inputId" value="input5"></nowPlayingMatch>
+    </input>
+    <input title="HDMI ARC" icon="/images/capture/ic_tv.png">
+      <action type="player-link" URI="/Play?url=Capture%3Ahw%3Aimxspdif%2C0%2F1%2F25%2F2%3Fid%3Dinput4&amp;title=HDMI+ARC&amp;image=%2Fimages%2Fcapture%2Fic_tv.png" haptic="true"></action>
+      <nowPlayingMatch key="inputId" value="input4"></nowPlayingMatch>
+    </input>
+  </row>
+  <row id="services" title="Music Services" solidBackground="false">
+    <menuAction text="Manage">
+      <action type="webpage" URI="/redirectToCp?href=%2Fservices%3Fnoheader%3D1%26schemaVersion%3D35" title="Music Services" refreshScreen="true"></action>
+    </menuAction>
+    <list>
+      <service icon="/images/ui/Source/LibrarySourceIcon.png" title="Library" isLink="true">
+        <action type="browse" URI="/ui/browseMenuGroup?service=LocalMusic" resultType="screen" title="Library" service="LocalMusic"></action>
+        <nowPlayingMatch key="service" value="LocalMusic"></nowPlayingMatch>
+      </service>
+      <service icon="/images/ui/Source/BluOSRadioSourceIcon.png" title="Radio" isLink="true">
+        <action type="browse" URI="/ui/browseMenuGroup?service=Airable" resultType="screen" title="Radio" service="Airable"></action>
+        <nowPlayingMatch key="service" value="Airable"></nowPlayingMatch>
+      </service>
+      <service icon="/images/ui/Source/RadioParadiseSourceIcon.png" title="Radio Paradise" isLink="true">
+        <action type="browse" URI="/ui/browseMenuGroup?service=RadioParadise" resultType="screen" title="Radio Paradise" service="RadioParadise"></action>
+        <nowPlayingMatch key="service" value="RadioParadise"></nowPlayingMatch>
+      </service>
+      <service icon="/images/ui/Source/TuneInSourceIcon.png" title="TuneIn" isLink="true">
+        <action type="browse" URI="/ui/browseMenuGroup?service=TuneIn" resultType="screen" title="TuneIn" service="TuneIn"></action>
+        <nowPlayingMatch key="service" value="TuneIn"></nowPlayingMatch>
+      </service>
+    </list>
+  </row>
+</screen>"##;
+
+    #[test]
+    fn an_input_is_a_player_link_that_plays_and_a_service_is_a_browse() {
+        let screen = parse(SOURCES_SCREEN).expect("parses");
+
+        let plays: Vec<&str> = screen
+            .items()
+            .filter(|item| {
+                item.action.as_ref().is_some_and(|a| {
+                    a.kind == ActionKind::PlayerLink
+                        && a.uri.as_deref().is_some_and(|uri| uri.starts_with("/Play"))
+                })
+            })
+            .filter_map(|item| item.label())
+            .collect();
+        assert_eq!(plays, ["Bluetooth", "HDMI ARC"]);
+
+        // The trap: every one of those carries `action`, not `play_action`, so
+        // "has no browse action" identifies none of them.
+        assert!(screen.items().all(|item| item.play_action.is_none()));
+
+        let browses: Vec<&str> = screen
+            .items()
+            .filter(|item| {
+                item.action
+                    .as_ref()
+                    .is_some_and(|a| a.kind == ActionKind::Browse)
+            })
+            .filter_map(|item| item.label())
+            .collect();
+        assert_eq!(browses, ["Library", "Radio", "Radio Paradise", "TuneIn"]);
+    }
 }
