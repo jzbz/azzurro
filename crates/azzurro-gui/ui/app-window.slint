@@ -2303,7 +2303,19 @@ export component AppWindow inherits Window {
             // Over the pane rather than instead of it, the same as Now Playing:
             // what is being rearranged is the screen underneath, and losing the
             // sidebar to edit it would be disorienting.
-            if root.customising: Rectangle {
+            // Faded like Now Playing, and for the same reason — these two are
+            // siblings covering the same pane, and only one of them arriving
+            // gently was the odd thing.
+            customise-fade := Rectangle {
+                opacity: root.customising ? 1.0 : 0.0;
+                visible: self.opacity > 0.0;
+
+                animate opacity {
+                    duration: 220ms;
+                    easing: ease-out;
+                }
+
+                if customise-fade.visible: Rectangle {
                 background: Theme.bg;
                 clip: true;
 
@@ -2414,6 +2426,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -3277,7 +3290,29 @@ export component AppWindow inherits Window {
     // all: the confirmations the player writes itself — "Added to Favourites"
     // — and the reason a settings write failed were both computed, published,
     // and then drawn by nothing.
-    if root.status-line != "": Rectangle {
+    // The last thing said, held past the moment it is cleared.
+    //
+    // The fade out needs words to fade: binding the label straight to
+    // `status-line` emptied it the instant the timer fired, so the toast spent
+    // its whole exit as a blank pill.
+    property <string> said;
+
+    changed status-line => {
+        if (root.status-line != "") {
+            root.said = root.status-line;
+        }
+    }
+
+    toast := Rectangle {
+        opacity: root.status-line != "" ? 1.0 : 0.0;
+        visible: self.opacity > 0.0;
+
+        animate opacity {
+            duration: 160ms;
+            easing: ease-out;
+        }
+
+        if toast.visible: Rectangle {
         x: (parent.width - self.width) / 2;
         // Clear of the transport bar, which is the one thing always at the
         // bottom of the window.
@@ -3297,7 +3332,7 @@ export component AppWindow inherits Window {
             padding-right: Theme.room;
 
             Text {
-                text: root.status-line;
+                text: root.said;
                 font-size: Theme.small-size;
                 color: Theme.text;
                 vertical-alignment: center;
@@ -3307,8 +3342,9 @@ export component AppWindow inherits Window {
 
         Timer {
             interval: 4s;
-            running: true;
+            running: root.status-line != "";
             triggered => { root.status-line = ""; }
+        }
         }
     }
 }

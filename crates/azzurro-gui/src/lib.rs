@@ -604,7 +604,6 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Language => icons.get_language(),
         Glyph::Local => icons.get_local(),
         Glyph::Place => icons.get_place(),
-        Glyph::Help => icons.get_help(),
         Glyph::Rescan => icons.get_rescan(),
     }
 }
@@ -2704,21 +2703,20 @@ enum Edit {
 /// list, and "Upgrade Check - Controller", which updates the controller
 /// itself and is the package manager's job on Linux.
 ///
-/// Everything here is a web page. One is Lenbrook's support site, one is
-/// served by the player on its control port, and the rest redirect to pages it
-/// serves on port 80.
+/// Lenbrook's own support site and its log-submission page used to head this
+/// list. Both are removed: neither is about this app, and the second sends a
+/// player's logs to a company that did not write it and cannot support it.
+/// Anyone who wants either can reach them from the player's own web UI.
+///
+/// About and the copyright line are added after these, in `publish_help` —
+/// they are built from what the selected player has said rather than being
+/// fixed strings, so they cannot live in a const.
 const HELP_ENTRIES: &[(&str, HelpKind, &str, Glyph)] = &[
     (
-        "Online Support",
-        HelpKind::Web("https://support.bluos.net"),
-        "BluOS support articles",
-        Glyph::Help,
-    ),
-    (
-        "Send Support Request",
-        HelpKind::Web("/redirectToCp?href=/diag"),
-        "Submits this player's logs — opens in a browser",
-        Glyph::Details,
+        "Azzurro on the web",
+        HelpKind::Web("https://azzurro.blue/"),
+        "azzurro.blue",
+        Glyph::Place,
     ),
     (
         "Upgrade Check",
@@ -2731,12 +2729,6 @@ const HELP_ENTRIES: &[(&str, HelpKind, &str, Glyph)] = &[
         HelpKind::Diagnostics,
         "Addresses, uptime and library size",
         Glyph::Info,
-    ),
-    (
-        "Azzurro on the web",
-        HelpKind::Web("https://azzurro.blue/"),
-        "azzurro.blue",
-        Glyph::Place,
     ),
 ];
 

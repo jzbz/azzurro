@@ -80,8 +80,6 @@ pub enum Glyph {
     /// A music service with no glyph of its own — the long tail of them, from
     /// Deezer to whatever the next firmware adds.
     Service,
-    /// Only used by the Help menu, which names its own icons.
-    Help,
     Rescan,
 }
 
