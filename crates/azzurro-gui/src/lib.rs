@@ -3895,6 +3895,23 @@ async fn run_commands(
                 if kind != 2 {
                     backend.browsing.lock().unwrap().highlighted = Some((kind, index));
                     backend.publish_sidebar();
+
+                    // Pressing anything in the sidebar means leaving whatever
+                    // pane is covering the screens. Most entries open one and
+                    // leave it that way themselves, but an input does not —
+                    // switching to Bluetooth sends a command and shows nothing
+                    // — so from Settings it left the settings rows on screen.
+                    let covered = {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        let covered = !matches!(browsing.pane, Pane::Browse);
+                        if covered {
+                            browsing.pane = Pane::Browse;
+                        }
+                        covered
+                    };
+                    if covered {
+                        backend.publish_pane();
+                    }
                 }
 
                 if kind == 2 {

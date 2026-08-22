@@ -249,6 +249,7 @@ pub fn parse(html: &str) -> Vec<Form> {
                                 }
                             }
                             "checkbox" => form.fields.push(Field {
+                                id: attrs.get("id").cloned().unwrap_or_default(),
                                 name: field,
                                 kind: Kind::Switch,
                                 value: if attrs.contains_key("checked") {
