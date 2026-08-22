@@ -389,6 +389,30 @@ struct Backend {
     /// takes a number on the way in and checks it is still the highest on the
     /// way out.
     searches: Arc<AtomicU64>,
+    /// What the transport looked like when it was last sent.
+    sent_transport: Arc<AtomicU64>,
+    /// What the queue and the player list looked like when they were last sent
+    /// to the window.
+    ///
+    /// Both are rebuilt on every status change, and a playing track changes its
+    /// status once a second. Replacing a model re-creates every row in it and
+    /// restarts the transitions on them, so sending an identical one is a
+    /// second of repainting for nothing — measured at eleven frames a second
+    /// with the app sitting idle.
+    sent_queue: Arc<AtomicU64>,
+    sent_players: Arc<AtomicU64>,
+}
+
+/// Whether this is the same thing the window already has.
+///
+/// Hashed rather than compared, because the rows carry decoded artwork and
+/// comparing that is more expensive than the redraw it would save. Every field
+/// that is drawn goes in; the artwork only as whether it has arrived, which is
+/// the only thing about it that can change once it has.
+fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
+    // Zero is the "nothing sent yet" value, so a fingerprint that happens to
+    // be zero simply sends once more than it needs to.
+    fingerprint != 0 && seen.swap(fingerprint, Ordering::Relaxed) == fingerprint
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -845,6 +869,9 @@ async fn run(
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(BTreeSet::new())),
         searches: Arc::new(AtomicU64::new(0)),
+        sent_transport: Arc::new(AtomicU64::new(0)),
+        sent_queue: Arc::new(AtomicU64::new(0)),
+        sent_players: Arc::new(AtomicU64::new(0)),
     };
 
     tokio::spawn(run_commands(
@@ -1077,6 +1104,30 @@ impl Backend {
             n => format!("{n} players"),
         };
 
+        if already_sent(&self.sent_players, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            line.hash(&mut hash);
+            for row in &rows {
+                row.id.hash(&mut hash);
+                row.name.hash(&mut hash);
+                row.now_playing.hash(&mut hash);
+                row.title.hash(&mut hash);
+                row.artist.hash(&mut hash);
+                row.album.hash(&mut hash);
+                row.volume.hash(&mut hash);
+                row.muted.hash(&mut hash);
+                row.playing.hash(&mut hash);
+                row.reachable.hash(&mut hash);
+                row.role.hash(&mut hash);
+                row.in_group.hash(&mut hash);
+                row.groupable.hash(&mut hash);
+            }
+            hash.finish()
+        }) {
+            return;
+        }
+
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -1232,6 +1283,32 @@ impl Backend {
                 None => (Vec::new(), "Queue".to_owned(), -1),
             }
         };
+
+        if already_sent(&self.sent_queue, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            line.hash(&mut hash);
+            cursor_row.hash(&mut hash);
+            for row in &rows {
+                row.id.hash(&mut hash);
+                row.title.hash(&mut hash);
+                row.artist.hash(&mut hash);
+                row.duration.hash(&mut hash);
+                row.quality.hash(&mut hash);
+                row.cursor.hash(&mut hash);
+                row.live.hash(&mut hash);
+                row.cover.is_some().hash(&mut hash);
+            }
+            for button in &buttons {
+                button.index.hash(&mut hash);
+                button.label.hash(&mut hash);
+                button.highlight.hash(&mut hash);
+                button.mode.hash(&mut hash);
+            }
+            hash.finish()
+        }) {
+            return;
+        }
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -1479,6 +1556,21 @@ impl Backend {
             label: "About".to_owned(),
             detail: about,
             glyph: Some(Glyph::Info),
+            control: "none",
+            available: true,
+            ..SettingData::blank()
+        });
+
+        // Two lines rather than one: who holds the copyright and what the
+        // licence is are the app's own, and the trademark note is about
+        // somebody else's — running them together reads as one claim.
+        rows.push(SettingData {
+            index: -1,
+            label: "© 2026 Jonathan Zeppettini · MIT licence".to_owned(),
+            detail: "Not affiliated with, endorsed by, or supported by Lenbrook \
+                     Industries. BluOS, Bluesound and NAD are their trademarks."
+                .to_owned(),
+            glyph: Some(Glyph::Details),
             control: "none",
             available: true,
             ..SettingData::blank()
@@ -2259,6 +2351,25 @@ impl Backend {
             None => (0, 0, false, false, 2),
         };
 
+        // A paused player's position does not move, and neither does anything
+        // else here, yet this ran once a second regardless — and each run
+        // repainted the progress line, which spans the whole window. Nothing to
+        // say means nothing to draw.
+        if already_sent(&self.sent_transport, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            position.hash(&mut hash);
+            duration.hash(&mut hash);
+            seekable.hash(&mut hash);
+            shuffle.hash(&mut hash);
+            repeat.hash(&mut hash);
+            indexing.hash(&mut hash);
+            quality.hash(&mut hash);
+            hash.finish()
+        }) {
+            return;
+        }
+
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -2339,6 +2450,12 @@ const HELP_ENTRIES: &[(&str, HelpKind, &str, Glyph)] = &[
         HelpKind::Diagnostics,
         "Addresses, uptime and library size",
         Glyph::Info,
+    ),
+    (
+        "Azzurro on the web",
+        HelpKind::Web("https://azzurro.blue/"),
+        "azzurro.blue",
+        Glyph::Place,
     ),
 ];
 
