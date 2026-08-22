@@ -117,6 +117,9 @@ enum Command {
     },
     Shuffle {
         device: DeviceId,
+        // Spelled out because a bare `bool` is a flag to clap, and a flag
+        // cannot be positional.
+        #[arg(value_parser = clap::value_parser!(bool))]
         on: bool,
     },
     /// all, one or off.
