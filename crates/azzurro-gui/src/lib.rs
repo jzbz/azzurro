@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bluos::settings::{Entry as SettingEntry, Kind, Settings as SettingsPage};
 use bluos::{
     ActionKind, Client, DeviceId, Discovery, Queue, Repeat, Screen, Status, SyncStatus,
     discovery::DEFAULT_SWEEP,
@@ -87,6 +88,10 @@ enum Command {
     BrowseMenu(usize),
     /// Open the context menu for a queue position.
     QueueMenu(u32),
+    /// Show the player's settings, or one page of them.
+    OpenSettings(Option<String>),
+    /// Act on row `n` of the settings page currently shown.
+    SettingAction(usize),
     /// Follow a sidebar entry: `(kind, index)`, where kind 0 is a screen and
     /// kind 1 is an item on the Sources screen.
     Sidebar(i32, i32),
@@ -112,6 +117,10 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
+    /// When set, the middle pane is showing settings rather than a browse
+    /// screen. The two are alternatives, not layers: opening settings is a
+    /// change of mode, and Back leaves it.
+    settings: Option<SettingsPage>,
     /// Which sidebar entry is lit, as `(kind, index)`. Recorded on activation
     /// rather than inferred, because a screen can be reached several ways.
     highlighted: Option<(i32, i32)>,
@@ -240,6 +249,15 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Home => icons.get_home(),
         Glyph::News => icons.get_news(),
         Glyph::Sources => icons.get_sources(),
+        Glyph::Play => icons.get_play(),
+        Glyph::Shuffle => icons.get_shuffle(),
+        Glyph::Info => icons.get_info(),
+        Glyph::Details => icons.get_details(),
+        Glyph::Enqueue => icons.get_enqueue(),
+        Glyph::Unfavourite => icons.get_unfavourite(),
+        Glyph::Clear => icons.get_clear(),
+        Glyph::Save => icons.get_save(),
+        Glyph::Settings => icons.get_settings(),
     }
 }
 
@@ -376,6 +394,24 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_queue_menu(move |song| {
         let _ = tx.send(Command::QueueMenu(song.max(0) as u32));
+    });
+
+    let tx = commands.clone();
+    ui.on_open_settings(move || {
+        let _ = tx.send(Command::OpenSettings(None));
+    });
+
+    // Lenbrook's own support site, which is where the settings' own helpUrl
+    // attributes point too.
+    ui.on_open_help(move || {
+        std::thread::spawn(|| {
+            // Reported rather than swallowed: when no browser opens, the only
+            // other clue is that nothing happened.
+            match open::that_detached("https://support.bluos.net/") {
+                Ok(()) => tracing::info!("opened the support site"),
+                Err(e) => tracing::warn!("could not open a browser: {e}"),
+            }
+        });
     });
 
     let tx = commands.clone();
@@ -916,6 +952,106 @@ impl Backend {
     /// nested rows and shelves the way the official app draws them — is a
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
+    /// Turn a settings page into rows for the middle pane.
+    ///
+    /// Deliberately the same row type the browse screens use: a settings page
+    /// is a list of named things you press, and giving it a second kind of row
+    /// would make the app look like two apps.
+    fn settings_rows(&self, page: &SettingsPage) -> (Vec<BrowseData>, String) {
+        fn walk(
+            entries: &[SettingEntry],
+            page: &SettingsPage,
+            rows: &mut Vec<BrowseData>,
+            index: &mut i32,
+        ) {
+            for entry in entries {
+                match entry {
+                    SettingEntry::Group(group) if group.is_page_link() => {
+                        rows.push(BrowseData {
+                            index: *index,
+                            title: group
+                                .display_name
+                                .clone()
+                                .unwrap_or_else(|| group.id.clone()),
+                            subtitle: group.description.clone().unwrap_or_default(),
+                            cover: None,
+                            glyph: glyphs::glyph_for(
+                                group.display_name.as_deref().unwrap_or(&group.id),
+                                None,
+                            ),
+                            heading: false,
+                            actionable: true,
+                            playing: false,
+                            has_menu: false,
+                        });
+                        *index += 1;
+                    }
+                    SettingEntry::Group(group) => {
+                        if let Some(title) = &group.display_name {
+                            rows.push(BrowseData {
+                                index: -1,
+                                title: title.clone(),
+                                subtitle: String::new(),
+                                cover: None,
+                                glyph: None,
+                                heading: true,
+                                actionable: false,
+                                playing: false,
+                                has_menu: false,
+                            });
+                        }
+                        walk(&group.entries, page, rows, index);
+                    }
+                    SettingEntry::Setting(setting) => {
+                        // A setting whose precondition is unmet is shown but
+                        // inert, with the reason in its second line — hiding it
+                        // would leave a gap where the player put something.
+                        let available = page.is_available(setting);
+                        let state = match setting.kind {
+                            Kind::Boolean => {
+                                Some(if setting.is_on() { "On" } else { "Off" }.to_owned())
+                            }
+                            Kind::Button => None,
+                            _ => setting.value.clone(),
+                        };
+                        let subtitle = setting.description.clone().or(state).unwrap_or_default();
+
+                        rows.push(BrowseData {
+                            index: *index,
+                            title: setting.label().to_owned(),
+                            subtitle: if available {
+                                subtitle
+                            } else {
+                                "Not available yet".to_owned()
+                            },
+                            cover: None,
+                            glyph: glyphs::glyph_for(setting.label(), None),
+                            heading: false,
+                            actionable: available
+                                && matches!(
+                                    setting.kind,
+                                    Kind::Boolean | Kind::Button | Kind::Other
+                                ),
+                            playing: setting.kind == Kind::Boolean && setting.is_on(),
+                            has_menu: false,
+                        });
+                        *index += 1;
+                    }
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut index = 0;
+        walk(&page.entries, page, &mut rows, &mut index);
+
+        let title = match &page.page_id {
+            Some(id) => format!("Settings · {id}"),
+            None => "Settings".to_owned(),
+        };
+        (rows, title)
+    }
+
     fn publish_browse(&self) {
         // Which player's screens these are, then everything about that player,
         // then the screens themselves — three steps rather than two, so that no
@@ -925,6 +1061,17 @@ impl Backend {
             .and_then(|id| self.with_entry(id, |e| e.status.clone()))
             .flatten();
         let client = device.and_then(|id| self.with_entry(id, |e| e.client.clone()));
+
+        // Settings take over the pane while one is open.
+        if let Some((rows, title)) = {
+            let browsing = self.browsing.lock().unwrap();
+            browsing
+                .settings
+                .as_ref()
+                .map(|page| self.settings_rows(page))
+        } {
+            return self.send_browse(rows, title, true, None);
+        }
 
         let (rows, title, can_go_back, search) = {
             let browsing = self.browsing.lock().unwrap();
@@ -1137,6 +1284,64 @@ impl Backend {
             }
         });
     }
+}
+
+/// What activating a settings row means.
+enum Chosen {
+    /// Another page, by id.
+    Page(String),
+    /// A page the player will not describe; hand it to a browser.
+    Web(String),
+    /// A value to write.
+    Write(Box<bluos::settings::Setting>, String),
+}
+
+/// Find what row `index` of a settings page refers to.
+///
+/// Walks the page the same way `settings_rows` draws it, so the two agree
+/// about what the numbers mean.
+fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
+    fn walk(entries: &[SettingEntry], at: &mut usize, want: usize) -> Option<Chosen> {
+        for entry in entries {
+            match entry {
+                SettingEntry::Group(group) if group.is_page_link() => {
+                    if *at == want {
+                        return Some(Chosen::Page(group.id.clone()));
+                    }
+                    *at += 1;
+                }
+                SettingEntry::Group(group) => {
+                    if let Some(found) = walk(&group.entries, at, want) {
+                        return Some(found);
+                    }
+                }
+                SettingEntry::Setting(setting) => {
+                    if *at == want {
+                        if let Some(url) = &setting.webview {
+                            return Some(Chosen::Web(url.clone()));
+                        }
+                        return match setting.kind {
+                            Kind::Boolean => setting
+                                .toggled()
+                                .map(|value| Chosen::Write(setting.clone(), value)),
+                            // A button has no value; the player wants its name
+                            // sent back at it.
+                            Kind::Button => Some(Chosen::Write(
+                                setting.clone(),
+                                setting.name.clone().unwrap_or_default(),
+                            )),
+                            _ => None,
+                        };
+                    }
+                    *at += 1;
+                }
+            }
+        }
+        None
+    }
+
+    let mut at = 0;
+    walk(&page.entries, &mut at, index)
 }
 
 /// The screens worth offering, in the order the player listed them.
@@ -1805,6 +2010,16 @@ async fn run_commands(
             }
 
             Command::BrowseBack => {
+                // Back out of settings before backing out of anything else.
+                let leaving = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.settings.take().is_some()
+                };
+                if leaving {
+                    backend.publish_browse();
+                    continue;
+                }
+
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
                     if browsing.trail.len() > 1 {
@@ -1816,7 +2031,12 @@ async fn run_commands(
             }
 
             Command::BrowseActivate(index) => {
-                tokio::spawn(activate(backend.clone(), index));
+                let in_settings = backend.browsing.lock().unwrap().settings.is_some();
+                if in_settings {
+                    let _ = backend.commands.send(Command::SettingAction(index));
+                } else {
+                    tokio::spawn(activate(backend.clone(), index));
+                }
                 continue;
             }
 
@@ -1857,6 +2077,74 @@ async fn run_commands(
                     format!("{base}?id={song}"),
                     true,
                 ));
+                continue;
+            }
+
+            Command::OpenSettings(page) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.settings(page.as_deref()).await {
+                    Ok(page) => {
+                        backend.browsing.lock().unwrap().settings = Some(page);
+                        backend.publish_browse();
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, "could not read settings: {e}");
+                        say(&backend.ui, format!("could not read settings: {e}"));
+                    }
+                }
+                continue;
+            }
+
+            Command::SettingAction(index) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                // The row index counts groups-that-are-links and settings, in
+                // the order settings_rows walks them, so the same walk finds it.
+                let chosen = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .settings
+                        .as_ref()
+                        .and_then(|page| pick(page, index))
+                };
+
+                match chosen {
+                    Some(Chosen::Page(id)) => {
+                        let _ = backend.commands.send(Command::OpenSettings(Some(id)));
+                    }
+                    Some(Chosen::Web(url)) => {
+                        tracing::info!("opening {url} in a browser");
+                        let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                    }
+                    Some(Chosen::Write(setting, value)) => {
+                        let page = backend.browsing.lock().unwrap().settings.clone();
+                        if let Some(page) = page {
+                            match client.write_setting(&page, &setting, &value).await {
+                                Ok(()) => {
+                                    // Re-read rather than guess: a write can
+                                    // change more than the one value, and the
+                                    // player is the only one who knows.
+                                    let _ = backend
+                                        .commands
+                                        .send(Command::OpenSettings(page.page_id.clone()));
+                                }
+                                Err(e) => {
+                                    say(&backend.ui, format!("{}: {e}", setting.label()));
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
                 continue;
             }
 

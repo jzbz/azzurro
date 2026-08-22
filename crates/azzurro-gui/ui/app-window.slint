@@ -395,6 +395,8 @@ component BrowseRowView inherits Rectangle {
                 corner: 5px;
                 width: 36px;
                 height: 36px;
+                // A browse row shows covers and service logos alike.
+                crop: false;
             }
         }
 
@@ -484,6 +486,8 @@ export component AppWindow inherits Window {
     callback browse-search(string);
     callback queue-menu(int);
     callback sidebar-activate(int, int);
+    callback open-settings();
+    callback open-help();
     callback seek(string, int);
     callback toggle-shuffle(string);
     callback cycle-repeat(string);
@@ -492,6 +496,11 @@ export component AppWindow inherits Window {
     callback add-player(string);
 
     title: "Azzurro";
+    // Geist, bundled — see ui/fonts/LICENSE. Bundled rather than asked of the
+    // system so the app looks the same however it is installed, which matters
+    // more once it ships as a Flatpak with only the runtime's fonts to hand.
+    default-font-family: "Geist";
+    default-font-size: Theme.body-size;
     preferred-width: 1100px;
     preferred-height: 660px;
     min-width: 860px;
@@ -505,6 +514,24 @@ export component AppWindow inherits Window {
         ? root.devices[root.selected]
         : { name: "", now-playing: "", service: "" };
 
+    // The ground everything else is translucent over.
+    Rectangle {
+        background: @linear-gradient(155deg,
+            Theme.backdrop-top 0%,
+            Theme.backdrop-bottom 68%);
+    }
+
+    // The record's own colour, spread wide and soft. Behind the panels rather
+    // than inside one, so it tints the whole window through them.
+    Rectangle {
+        background: @radial-gradient(circle,
+            root.cover-tint.with-alpha(0.30) 0%,
+            root.cover-tint.with-alpha(0.10) 38%,
+            transparent 72%);
+        opacity: root.has-tint ? 1.0 : 0.0;
+        animate opacity { duration: 600ms; easing: ease-out; }
+    }
+
     VerticalLayout {
         HorizontalLayout {
             vertical-stretch: 1;
@@ -514,8 +541,10 @@ export component AppWindow inherits Window {
             // services off its own Sources screen.
             Rectangle {
                 width: 268px;
-                background: Theme.surface;
+                background: Theme.glass;
                 clip: true;
+
+                Rectangle { x: parent.width - 1px; width: 1px; background: Theme.border; }
 
                 VerticalLayout {
                     padding-top: Theme.room;
@@ -559,6 +588,26 @@ export component AppWindow inherits Window {
                             entry: entry;
                             activate => { root.sidebar-activate(entry.kind, entry.index); }
                         }
+                    }
+
+                    // Where the official controller keeps them: below
+                    // everything the player describes, above nothing.
+                    NavRow {
+                        entry: {
+                            label: "Settings",
+                            cover: Icons.settings,
+                            is-glyph: true,
+                        };
+                        activate => { root.open-settings(); }
+                    }
+
+                    NavRow {
+                        entry: {
+                            label: "Help",
+                            cover: Icons.help,
+                            is-glyph: true,
+                        };
+                        activate => { root.open-help(); }
                     }
 
                     Rectangle { height: 1px; background: Theme.border; }
@@ -611,7 +660,7 @@ export component AppWindow inherits Window {
 
             // What you are browsing.
             Rectangle {
-                background: Theme.bg;
+                background: transparent;
                 clip: true;
 
                 VerticalLayout {
@@ -673,8 +722,10 @@ export component AppWindow inherits Window {
             // The queue, with the record it is playing behind it.
             Rectangle {
                 width: 330px;
-                background: Theme.surface;
+                background: Theme.glass;
                 clip: true;
+
+                Rectangle { x: 0; width: 1px; background: Theme.border; }
 
                 // The official controller puts a blurred copy of the cover
                 // behind this column. There is no blur here, so it is faded
@@ -687,14 +738,17 @@ export component AppWindow inherits Window {
                     image-fit: ImageFit.cover;
                     width: 100%;
                     height: 100%;
-                    opacity: 0.13;
+                    opacity: 0.10;
                 }
 
                 Rectangle {
+                    // Heavy enough that the cover reads as colour rather than
+                    // as a picture — a legible sleeve behind a track list is
+                    // just noise competing with the words on top of it.
                     background: @linear-gradient(180deg,
-                        Theme.surface.with-alpha(0.55) 0%,
-                        Theme.surface.with-alpha(0.9) 60%,
-                        Theme.surface 100%);
+                        Theme.backdrop-bottom.with-alpha(0.78) 0%,
+                        Theme.backdrop-bottom.with-alpha(0.9) 55%,
+                        Theme.backdrop-bottom.with-alpha(0.96) 100%);
                 }
 
                 VerticalLayout {
@@ -719,6 +773,7 @@ export component AppWindow inherits Window {
                             font-size: Theme.small-size;
                             color: Theme.faint;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
 
@@ -740,7 +795,7 @@ export component AppWindow inherits Window {
         // which player you are driving on the right.
         Rectangle {
             height: 88px;
-            background: Theme.surface;
+            background: Theme.glass-raised;
             clip: true;
 
             Rectangle {
@@ -754,7 +809,8 @@ export component AppWindow inherits Window {
             Rectangle {
                 y: 0;
                 height: 1px;
-                background: Theme.border;
+                background: Theme.rim;
+                opacity: 0.5;
             }
 
             VerticalLayout {

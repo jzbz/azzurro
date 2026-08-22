@@ -35,6 +35,7 @@ pub mod error;
 pub mod lsdp;
 pub mod queue;
 pub mod screen;
+pub mod settings;
 pub mod status;
 
 pub use client::{Client, Repeat, StatusWatch};

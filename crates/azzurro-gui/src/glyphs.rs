@@ -16,6 +16,7 @@
 /// A Lucide glyph to draw instead of the player's own picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
+    Play,
     Bluetooth,
     Tv,
     Cable,
@@ -37,6 +38,14 @@ pub enum Glyph {
     Home,
     News,
     Sources,
+    Shuffle,
+    Info,
+    Details,
+    Enqueue,
+    Unfavourite,
+    Clear,
+    Save,
+    Settings,
 }
 
 /// Whether `source` is something worth showing as it is.
@@ -85,6 +94,26 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Cable)
     } else if word("usb") {
         Some(Glyph::Usb)
+    // Context-menu verbs, checked before the nouns inside them: "Add to
+    // playlist…" is an add rather than a playlist, and "Play now" is neither.
+    } else if has("add to") || has("add next") || has("add last") || has("add all") {
+        Some(Glyph::Enqueue)
+    } else if has("play now") || has("play all") {
+        Some(Glyph::Play)
+    } else if has("shuffle") {
+        Some(Glyph::Shuffle)
+    } else if has("remove favourite") || has("remove favorite") {
+        Some(Glyph::Unfavourite)
+    } else if has("technical info") {
+        Some(Glyph::Details)
+    } else if word("info") {
+        Some(Glyph::Info)
+    } else if has("customise") || has("customize") || has("manage") || has("setting") {
+        Some(Glyph::Settings)
+    } else if word("clear") {
+        Some(Glyph::Clear)
+    } else if word("save") {
+        Some(Glyph::Save)
     } else if has("playlist") {
         Some(Glyph::Playlist)
     } else if has("librar") {
@@ -202,6 +231,32 @@ mod tests {
             glyph_for("TuneIn", Some("/images/ui/Source/TuneInSourceIcon.png")),
             None
         );
+    }
+
+    #[test]
+    fn context_menu_verbs_beat_the_nouns_inside_them() {
+        // Every one of these is a real row from a captured context menu, and
+        // each contains a word that would send it somewhere wrong.
+        assert_eq!(
+            glyph_for("Add to playlist\u{2026}", None),
+            Some(Glyph::Enqueue)
+        );
+        assert_eq!(glyph_for("Add next", None), Some(Glyph::Enqueue));
+        assert_eq!(glyph_for("Play now", None), Some(Glyph::Play));
+        assert_eq!(glyph_for("Shuffle", None), Some(Glyph::Shuffle));
+        assert_eq!(glyph_for("Info", None), Some(Glyph::Info));
+        assert_eq!(glyph_for("Technical info", None), Some(Glyph::Details));
+        assert_eq!(glyph_for("Favourite", None), Some(Glyph::Favourite));
+        assert_eq!(
+            glyph_for("Remove favourite", None),
+            Some(Glyph::Unfavourite)
+        );
+        assert_eq!(glyph_for("Go to album", None), Some(Glyph::Album));
+        assert_eq!(glyph_for("Go to artist", None), Some(Glyph::Artist));
+
+        // ...and the plain nouns still land where they should.
+        assert_eq!(glyph_for("Playlists", None), Some(Glyph::Playlist));
+        assert_eq!(glyph_for("Albums", None), Some(Glyph::Album));
     }
 
     #[test]

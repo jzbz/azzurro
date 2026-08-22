@@ -28,7 +28,17 @@ export global Theme {
     out property <brush> pressed: dark ? #ffffff17 : #00000014;
     out property <brush> selected: dark ? #38bdf81f : #0284c714;
 
-    out property <brush> border: dark ? #23282f : #e3e7ed;
+    // Glass. The panels are translucent rather than filled, so the backdrop
+    // below — and the wash taken from the cover — comes through them. There is
+    // no blur to be had in Slint, so the effect is carried by translucency, a
+    // lit rim along the top edge, and a backdrop worth seeing through to.
+    out property <brush> glass: dark ? #ffffff0a : #ffffffd9;
+    out property <brush> glass-raised: dark ? #ffffff14 : #ffffffef;
+    out property <brush> rim: dark ? #ffffff1f : #ffffff;
+    out property <brush> backdrop-top: dark ? #16202e : #eef2f7;
+    out property <brush> backdrop-bottom: dark ? #06080b : #dfe5ec;
+
+    out property <brush> border: dark ? #ffffff14 : #e3e7ed;
     out property <brush> border-strong: dark ? #2f3640 : #ccd3dc;
 
     // Ink. Three weights: what you read, what you glance at, and what is only
@@ -121,6 +131,14 @@ export global Icons {
     out property <image> home: @image-url("icons/house.svg");
     out property <image> news: @image-url("icons/newspaper.svg");
     out property <image> sources: @image-url("icons/speaker.svg");
+    out property <image> settings: @image-url("icons/settings.svg");
+    out property <image> help: @image-url("icons/circle-question-mark.svg");
+    out property <image> info: @image-url("icons/info.svg");
+    out property <image> details: @image-url("icons/file-text.svg");
+    out property <image> enqueue: @image-url("icons/list-plus.svg");
+    out property <image> unfavourite: @image-url("icons/heart-off.svg");
+    out property <image> clear: @image-url("icons/trash-2.svg");
+    out property <image> save: @image-url("icons/download.svg");
 
     // Not drawn anywhere in the window. `audio-lines` is the glyph the
     // application icon is built from, and it is kept here so that the icon in

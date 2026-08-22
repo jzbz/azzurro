@@ -19,6 +19,7 @@ use crate::device::DeviceId;
 use crate::error::{Error, Result};
 use crate::queue::Queue;
 use crate::screen::{Configuration, Screen};
+use crate::settings::{Setting, Settings};
 use crate::status::{Status, SyncStatus};
 
 /// Ordinary requests are answered from memory, so this is generous already;
@@ -183,6 +184,80 @@ impl Client {
         crate::screen::parse(&body)
     }
 
+    /// Read a page of settings.
+    ///
+    /// `/Settings` on the control port answers 301 to the settings service,
+    /// which is on a port of its own — 11001 on every player seen. Rather than
+    /// hard-coding that, the redirect is followed and the address it lands on
+    /// is what the returned document carries as its base, so a write goes back
+    /// to wherever the read came from.
+    pub async fn settings(&self, page: Option<&str>) -> Result<Settings> {
+        let path = match page {
+            Some(id) => format!("/Settings?id={id}"),
+            None => "/Settings".to_owned(),
+        };
+
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })?;
+
+        let landed = response.url().clone();
+        let base = format!("{}://{}", landed.scheme(), landed.authority());
+        let body = response.text().await.map_err(|source| Error::Http {
+            device: self.id,
+            source,
+        })?;
+
+        crate::settings::parse(&body, &base)
+    }
+
+    /// Change one setting.
+    ///
+    /// A POST of `{name: value}` to the URL the setting names, resolved
+    /// against the page it came from — which is what the official controller's
+    /// own `updateSettings` does. **Not exercised against hardware**: every
+    /// call here changes the configuration of somebody's stereo, and there is
+    /// no inert one to try.
+    pub async fn write_setting(
+        &self,
+        settings: &Settings,
+        setting: &Setting,
+        value: &str,
+    ) -> Result<()> {
+        let (Some(url), Some(name)) = (setting.url.as_deref(), setting.name.as_deref()) else {
+            return Err(Error::Screen(format!(
+                "the setting {:?} says nothing about where to write it",
+                setting.id
+            )));
+        };
+
+        // Built by hand rather than with a serialiser: this is the only JSON
+        // this crate ever sends, and it is two strings.
+        let body = format!("{{{}:{}}}", json_string(name), json_string(value));
+
+        self.http
+            .post(format!("{}{url}", settings.base))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map(drop)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })
+    }
+
     /// Send a path the player itself supplied, and discard the answer.
     ///
     /// This is how a `player-link` action is carried out: the screen document
@@ -330,6 +405,25 @@ impl Client {
     }
 }
 
+/// A JSON string literal, quotes and all.
+fn json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl From<reqwest::Error> for Error {
     fn from(source: reqwest::Error) -> Self {
         // Only reachable from client construction, which has no device yet.
@@ -423,6 +517,16 @@ mod tests {
             c.image_url("images/x.png"),
             "http://192.0.2.155:11000/images/x.png"
         );
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(json_string("plain"), r#""plain""#);
+        assert_eq!(json_string(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(json_string("back\\slash"), r#""back\\slash""#);
+        assert_eq!(json_string("a\nb"), r#""a\nb""#);
+        // A room name is free text and can contain anything.
+        assert_eq!(json_string("Ol\u{e1} \u{1f3b5}"), "\"Ol\u{e1} \u{1f3b5}\"");
     }
 
     #[test]

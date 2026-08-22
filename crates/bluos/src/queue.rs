@@ -29,6 +29,9 @@ pub struct Queue {
     pub shuffle: Option<u8>,
     #[serde(rename = "@repeat")]
     pub repeat: Option<u8>,
+    /// Set once the queue has been edited away from whatever loaded it.
+    #[serde(rename = "@modified")]
+    pub modified: Option<u8>,
 
     #[serde(default, rename = "song")]
     pub songs: Vec<QueueSong>,
@@ -76,9 +79,13 @@ pub struct QueueSong {
     #[serde(rename = "alb")]
     pub album: Option<String>,
 
-    pub track: Option<u32>,
+    /// As the player reports it, which is **not always a number**: some files
+    /// come back as `3/15`, meaning track three of fifteen. Kept as text so a
+    /// queue does not fail to parse over a tag format, with
+    /// [`QueueSong::track_number`] for when a number is wanted.
+    pub track: Option<String>,
     #[serde(rename = "discno")]
-    pub disc: Option<u32>,
+    pub disc: Option<String>,
     /// Release year, as the player has it — a string, because it is not always
     /// a year.
     pub date: Option<String>,
@@ -96,11 +103,26 @@ pub struct QueueSong {
 }
 
 impl QueueSong {
+    /// The track number, from either `3` or `3/15`.
+    pub fn track_number(&self) -> Option<u32> {
+        leading_number(self.track.as_deref()?)
+    }
+
+    /// The disc number, same treatment.
+    pub fn disc_number(&self) -> Option<u32> {
+        leading_number(self.disc.as_deref()?)
+    }
+
     /// `4:03`, or `1:02:17` for something long. `None` when the player did not
     /// say — a live stream in the queue has no length.
     pub fn duration(&self) -> Option<String> {
         Some(crate::clock(self.seconds? as i64))
     }
+}
+
+/// The number before any `/`, which is how a `3/15` tag reads.
+fn leading_number(raw: &str) -> Option<u32> {
+    raw.split('/').next()?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -158,9 +180,38 @@ mod tests {
         assert_eq!(first.artist.as_deref(), Some("The Rolling Stones"));
         assert_eq!(first.seconds, Some(238));
         assert_eq!(first.quality.as_deref(), Some("hd"));
+        assert_eq!(first.track_number(), Some(49));
         // Only on multi-disc releases.
         assert_eq!(first.disc, None);
-        assert_eq!(q.songs[1].disc, Some(2));
+        assert_eq!(q.songs[1].disc_number(), Some(2));
+    }
+
+    #[test]
+    fn a_track_number_may_carry_its_total() {
+        // Seen on a real player: "3/15" is track three of fifteen. Typing this
+        // as a number made the whole queue fail to parse.
+        let q: Queue = quick_xml::de::from_str(
+            r#"<playlist length="1" id="709" modified="1">
+                 <song service="LocalMusic" id="0">
+                   <title>In the Air Tonight</title>
+                   <track>3/15</track>
+                   <discno>1/2</discno>
+                   <time>336</time>
+                 </song>
+               </playlist>"#,
+        )
+        .unwrap();
+
+        assert_eq!(q.songs.len(), 1);
+        assert_eq!(q.songs[0].track.as_deref(), Some("3/15"));
+        assert_eq!(q.songs[0].track_number(), Some(3));
+        assert_eq!(q.songs[0].disc_number(), Some(1));
+
+        // A plain number still works, and rubbish is None rather than fatal.
+        assert_eq!(leading_number("7"), Some(7));
+        assert_eq!(leading_number(" 7 / 12"), Some(7));
+        assert_eq!(leading_number("A1"), None);
+        assert_eq!(leading_number(""), None);
     }
 
     #[test]

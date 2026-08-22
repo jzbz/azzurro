@@ -268,12 +268,23 @@ export component Level inherits HorizontalLayout {
 }
 
 // A card. The one place the panel treatment is decided.
+//
+// Translucent, with a lit hairline along the top edge — the trick that reads
+// as glass without a blur behind it, because a real pane of glass is brightest
+// where it catches the light at its edge.
 export component Panel inherits Rectangle {
-    background: Theme.surface;
+    background: Theme.glass;
     border-radius: Theme.radius;
     border-width: 1px;
     border-color: Theme.border;
     clip: true;
+
+    Rectangle {
+        y: 0;
+        height: 1px;
+        background: Theme.rim;
+        opacity: 0.5;
+    }
 }
 
 // Cover art, with something to show before it arrives.
@@ -281,6 +292,10 @@ export component Artwork inherits Rectangle {
     in property <image> source;
     in property <image> fallback: Icons.track;
     in property <length> corner: Theme.radius;
+    // Cover art is square and wants cropping to fill; a service's logo is
+    // whatever shape its designer chose, and cropping one cuts the name in
+    // half. Rows that may show either ask for `contain`.
+    in property <bool> crop: true;
 
     border-radius: root.corner;
     background: Theme.sunken;
@@ -296,7 +311,7 @@ export component Artwork inherits Rectangle {
 
     Image {
         source: root.source;
-        image-fit: cover;
+        image-fit: root.crop ? ImageFit.cover : ImageFit.contain;
         width: 100%;
         height: 100%;
     }

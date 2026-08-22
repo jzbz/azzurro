@@ -41,6 +41,14 @@ enum Command {
     Status {
         device: DeviceId,
     },
+    /// Show a page of the player's settings.
+    ///
+    /// With no page, shows the top level; the ids printed there are what to
+    /// pass back in.
+    Settings {
+        device: DeviceId,
+        page: Option<String>,
+    },
     /// List the screens this player offers.
     Screens {
         device: DeviceId,
@@ -151,6 +159,7 @@ async fn main() -> Result<()> {
         Command::Status { device } => status(device).await,
         Command::Queue { device, limit } => queue(device, limit).await,
         Command::Screens { device } => screens(device).await,
+        Command::Settings { device, page } => settings(device, page).await,
         Command::Browse { device, path } => browse(device, path).await,
         Command::Watch { device, poll } => watch(device, poll).await,
         Command::Volume { device, level } => volume(device, level).await,
@@ -294,6 +303,78 @@ fn print_status(s: &bluos::Status) {
         if s.can_skip() { "skip" } else { "" }
     );
     println!("etag      {}", s.etag);
+}
+
+async fn settings(device: DeviceId, page: Option<String>) -> Result<()> {
+    use bluos::settings::{Entry, Kind};
+
+    let page = client(device)?.settings(page.as_deref()).await?;
+    println!("served from {}", page.base);
+    if let Some(id) = &page.page_id {
+        println!("page      {id}");
+    }
+    println!();
+
+    fn show(entries: &[Entry], page: &bluos::settings::Settings, depth: usize) {
+        let pad = "  ".repeat(depth);
+        for entry in entries {
+            match entry {
+                Entry::Group(group) => {
+                    println!(
+                        "{pad}[{}]{}",
+                        group.display_name.as_deref().unwrap_or(&group.id),
+                        if group.is_page_link() {
+                            format!("  -> settings {}", group.id)
+                        } else {
+                            String::new()
+                        }
+                    );
+                    show(&group.entries, page, depth + 1);
+                }
+                Entry::Setting(setting) => {
+                    let state = match setting.kind {
+                        Kind::Boolean => {
+                            format!("[{}]", if setting.is_on() { "on" } else { "off" })
+                        }
+                        Kind::Button => "(press)".to_owned(),
+                        _ => setting
+                            .value
+                            .clone()
+                            .map(|v| format!("= {v}"))
+                            .unwrap_or_default(),
+                    };
+                    let bounds = setting
+                        .range
+                        .as_ref()
+                        .map(|r| {
+                            format!("  {}..{}{}", r.min, r.max, r.units.as_deref().unwrap_or(""))
+                        })
+                        .unwrap_or_default();
+                    let gated = if page.is_available(setting) {
+                        String::new()
+                    } else {
+                        let (name, value) = setting.depends_on.clone().unwrap_or_default();
+                        format!("  (needs {name}={value})")
+                    };
+                    println!(
+                        "{pad}{:<28} {:<12}{}{}{}",
+                        setting.label(),
+                        state,
+                        bounds,
+                        gated,
+                        setting
+                            .webview
+                            .as_deref()
+                            .map(|u| format!("  (web page {u})"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+
+    show(&page.entries, &page, 0);
+    Ok(())
 }
 
 async fn screens(device: DeviceId) -> Result<()> {
