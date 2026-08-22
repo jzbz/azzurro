@@ -461,9 +461,10 @@ pub fn parse(xml: &str) -> Result<Screen> {
         match reader.read_event() {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
-                let name = local_name(e.name().as_ref());
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 start(
-                    &name,
+                    name,
                     &e,
                     &mut stack,
                     &mut screen,
@@ -475,9 +476,10 @@ pub fn parse(xml: &str) -> Result<Screen> {
                 )?;
             }
             Ok(Event::Empty(e)) => {
-                let name = local_name(e.name().as_ref());
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 start(
-                    &name,
+                    name,
                     &e,
                     &mut stack,
                     &mut screen,
@@ -488,7 +490,7 @@ pub fn parse(xml: &str) -> Result<Screen> {
                     &mut seen_screen,
                 )?;
                 end(
-                    &name,
+                    name,
                     &mut stack,
                     &mut screen,
                     &mut section,
@@ -498,9 +500,10 @@ pub fn parse(xml: &str) -> Result<Screen> {
                 );
             }
             Ok(Event::End(e)) => {
-                let name = local_name(e.name().as_ref());
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 end(
-                    &name,
+                    name,
                     &mut stack,
                     &mut screen,
                     &mut section,

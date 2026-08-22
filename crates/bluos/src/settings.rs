@@ -281,21 +281,23 @@ pub fn parse(xml: &str, base: &str) -> Result<Settings> {
             // and closed here. The player writes `<setting></setting>` today,
             // and nothing should depend on it continuing to.
             Event::Empty(e) => {
-                let name = local_name(e.name().as_ref());
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 open(
-                    &name,
+                    name,
                     &e,
                     &mut settings,
                     &mut groups,
                     &mut setting,
                     &mut seen_root,
                 );
-                close(&name, &mut settings, &mut groups, &mut setting);
+                close(name, &mut settings, &mut groups, &mut setting);
             }
             Event::Start(e) => {
-                let name = local_name(e.name().as_ref());
+                let qname = e.name();
+                let name = local_name(qname.as_ref());
                 open(
-                    &name,
+                    name,
                     &e,
                     &mut settings,
                     &mut groups,
@@ -304,8 +306,9 @@ pub fn parse(xml: &str, base: &str) -> Result<Settings> {
                 );
             }
             Event::End(e) => {
+                let qname = e.name();
                 close(
-                    &local_name(e.name().as_ref()),
+                    local_name(qname.as_ref()),
                     &mut settings,
                     &mut groups,
                     &mut setting,

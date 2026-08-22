@@ -23,10 +23,19 @@ use quick_xml::events::BytesStart;
 /// away. The split stays anyway — it costs nothing on a name with no colon in
 /// it, and a parser matching `"item"` would silently stop recognising the same
 /// element the day a firmware did start writing `<ns:item>`.
-pub(crate) fn local_name(raw: &[u8]) -> String {
-    let full = String::from_utf8_lossy(raw).into_owned();
+pub(crate) fn local_name(raw: &[u8]) -> &str {
+    // Borrowed from the reader's buffer rather than copied: every caller wants
+    // a `&str` to match on and then drops it, so the owned `String` this used
+    // to build was allocated and freed once per element for nothing.
+    //
+    // A name that is not UTF-8 reads as empty. The lossy conversion this
+    // replaced could not be borrowed, and the two behave the same where it
+    // matters: no branch in either parser matches a mangled name, so both an
+    // empty string and a string full of replacement characters fall through to
+    // "an element this does not know about", which is already the common case.
+    let full = std::str::from_utf8(raw).unwrap_or_default();
     match full.split_once(':') {
-        Some((_, local)) => local.to_owned(),
+        Some((_, local)) => local,
         None => full,
     }
 }
@@ -78,6 +87,8 @@ mod tests {
         assert_eq!(local_name(b"item"), "item");
         assert_eq!(local_name(b"ns:item"), "item");
         assert_eq!(local_name(b""), "");
+        // Not UTF-8, so not a name any branch can match.
+        assert_eq!(local_name(&[b'i', 0xff, b'm']), "");
     }
 
     #[test]
