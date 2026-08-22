@@ -21,11 +21,15 @@ pub enum Error {
         source: reqwest::Error,
     },
 
-    #[error("{device} returned XML this crate could not read")]
+    #[error("{device} returned XML this crate could not read: {source} — {body}")]
     Xml {
         device: crate::DeviceId,
         #[source]
         source: quick_xml::DeError,
+        /// The start of what actually came back. Without it a parse failure
+        /// names no culprit, and the documents that fail are the transient
+        /// ones — gone by the time anyone goes looking.
+        body: String,
     },
 
     #[error("{0} is not a host:port a player can live at")]

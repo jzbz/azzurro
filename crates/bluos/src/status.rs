@@ -273,8 +273,10 @@ pub struct Status {
     pub prid: Option<u32>,
     /// Service identity.
     pub sid: Option<u32>,
-    /// Non-zero while the player is indexing a share.
-    pub indexing: Option<u8>,
+    /// How many songs the player has indexed so far, and zero when it is not
+    /// indexing. A library runs to five figures, so this is not a small number
+    /// and not a percentage — there is no total to measure it against.
+    pub indexing: Option<u32>,
     /// Minutes left on the sleep timer; empty when it is off.
     pub sleep: Option<String>,
     /// Mirrors `/SyncStatus`'s etag, so a change in grouping is visible from a

@@ -150,6 +150,7 @@ impl Client {
         quick_xml::de::from_str(&body).map_err(|source| Error::Xml {
             device: self.id,
             source,
+            body: snippet(&body),
         })
     }
 
@@ -460,6 +461,24 @@ impl From<reqwest::Error> for Error {
             source,
         }
     }
+}
+
+/// The head of a response, for an error message.
+///
+/// Enough to recognise the document and see which element went wrong, short
+/// enough to sit on one log line. Cut on a character boundary: a player's
+/// track titles are UTF-8 and slicing bytes would panic on the one document
+/// anyone actually needs to read.
+fn snippet(body: &str) -> String {
+    const LIMIT: usize = 240;
+    if body.len() <= LIMIT {
+        return body.trim().to_owned();
+    }
+    let end = (0..=LIMIT)
+        .rev()
+        .find(|i| body.is_char_boundary(*i))
+        .unwrap_or(0);
+    format!("{}…", body[..end].trim())
 }
 
 /// A long-poll on one player's `/Status`.
