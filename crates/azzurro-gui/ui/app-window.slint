@@ -1,6 +1,6 @@
 import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
-import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge } from "widgets.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton } from "widgets.slint";
 
 // A bare file import is how Slint registers a custom font: the family the
 // file declares becomes usable as a font-family anywhere, and the file is
@@ -602,6 +602,84 @@ component DeviceCard inherits Rectangle {
     }
 }
 
+// One movable section on the Customise screen.
+//
+// The same drag as TrackRow and for the same reason — see the note there about
+// `lift`. Simpler in every other respect: there is nothing to play, nothing to
+// remove, and no state but its own position.
+component CustomiseRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> lifted: false;
+    in property <length> lift: 0px;
+    callback drag-moved(length);
+    callback drag-done();
+    callback drag-cancelled();
+
+    property <bool> held: false;
+
+    height: 52px;
+    border-radius: Theme.radius-small;
+    background: root.lifted
+        ? Theme.raised
+        : (touch.has-hover ? Theme.hover : Theme.glass);
+    border-width: 1px;
+    border-color: root.lifted ? Theme.accent : Theme.border;
+    drop-shadow-blur: root.lifted ? 16px : 0px;
+    drop-shadow-color: #00000066;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    touch := TouchArea {
+        mouse-cursor: grab;
+        moved => {
+            if (self.pressed && (root.held || Math.abs(self.mouse-y - self.pressed-y) > 4px)) {
+                root.held = true;
+                root.drag-moved(self.mouse-y - self.pressed-y + root.lift);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up) {
+                if (root.held) {
+                    root.drag-done();
+                }
+                root.held = false;
+            }
+            if (event.kind == PointerEventKind.cancel) {
+                root.drag-cancelled();
+                root.held = false;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.gap;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                glyph: Icons.grip;
+                tint: Theme.faint;
+                width: 16px;
+                height: 16px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.label;
+                font-size: Theme.body-size;
+                color: Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
 component TrackRow inherits Rectangle {
     in property <Track> track;
     // Already played: the official controller dims everything above the cursor.
@@ -726,7 +804,7 @@ component TrackRow inherits Rectangle {
                 border-color: Theme.border;
 
                 format := Text {
-                    text: root.track.quality.to-uppercase();
+                    text: root.track.quality;
                     font-size: Theme.micro-size - 0.5px;
                     font-weight: 700;
                     letter-spacing: 0.4px;
@@ -913,7 +991,7 @@ component BrowseRowView inherits Rectangle {
                 border-color: Theme.border;
 
                 grade := Text {
-                    text: root.entry.quality.to-uppercase();
+                    text: root.entry.quality;
                     font-size: Theme.micro-size - 0.5px;
                     font-weight: 700;
                     letter-spacing: 0.4px;
@@ -1406,6 +1484,20 @@ export component AppWindow inherits Window {
     callback toggle-now-playing();
     callback browse-more();
     callback clear-recent();
+    // The cover reduced to a wash. Slint has no blur, so the softening is
+    // done in the pixels before they arrive — see artwork::frosted.
+    in property <image> cover-blur;
+    in-out property <bool> queue-shown: true;
+    callback now-playing-info();
+    // Rearranging a screen's sections. The titles only — the ids they map to
+    // stay in the backend, because nothing here needs to name them.
+    in property <bool> customising;
+    in property <string> customise-title;
+    in property <[string]> customise-rows;
+    callback customise-move(int, int);
+    callback customise-save();
+    callback group-all();
+    callback pause-all();
     callback queue-reorder(int, int);
     callback queue-remove(int);
     callback queue-save(string);
@@ -1491,8 +1583,8 @@ export component AppWindow inherits Window {
                             Icon {
                                 glyph: Icons.brand;
                                 tint: Theme.accent;
-                                width: 26px;
-                                height: 26px;
+                                width: 32px;
+                                height: 32px;
                             }
                         }
 
@@ -1506,14 +1598,14 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
-                            padding-top: 3px;
+                            padding-top: 4px;
 
                             Text {
                                 text: "AZZURRO";
                                 font-family: "Geo";
-                                font-size: 25px;
+                                font-size: 31px;
                                 color: Theme.text;
-                                letter-spacing: 2.6px;
+                                letter-spacing: 3.2px;
                                 vertical-alignment: center;
                             }
                         }
@@ -2031,19 +2123,25 @@ export component AppWindow inherits Window {
                     background: Theme.bg;
                     clip: true;
 
-                    // The sleeve's own colour, spread behind it.
+                    // The sleeve itself, frosted: blown up far past its own
+                    // resolution so nothing in it is legible, which is the
+                    // point — it is the colour of the record, not the record.
                     Image {
-                        source: root.cover;
+                        source: root.cover-blur;
                         image-fit: ImageFit.cover;
                         width: 100%;
                         height: 100%;
-                        opacity: 0.12;
+                        opacity: 0.55;
                     }
 
+                    // Held down to where text over it stays readable. The
+                    // gradient does the work a blur alone cannot: an evenly
+                    // frosted sheet is still bright enough to fight the
+                    // controls drawn on it.
                     Rectangle {
                         background: @linear-gradient(180deg,
-                            Theme.backdrop-bottom.with-alpha(0.72) 0%,
-                            Theme.backdrop-bottom.with-alpha(0.92) 100%);
+                            Theme.backdrop-bottom.with-alpha(0.62) 0%,
+                            Theme.backdrop-bottom.with-alpha(0.88) 100%);
                     }
 
                     VerticalLayout {
@@ -2130,13 +2228,18 @@ export component AppWindow inherits Window {
                                     border-color: Theme.border;
 
                                     grade := Text {
-                                        text: root.quality.to-uppercase();
+                                        text: root.quality;
                                         font-size: Theme.micro-size;
                                         font-weight: 700;
                                         letter-spacing: 0.5px;
                                         color: Theme.faint;
                                         vertical-alignment: center;
                                         horizontal-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.now-playing-info(); }
                                     }
                                 }
                             }
@@ -2146,26 +2249,145 @@ export component AppWindow inherits Window {
 
             }
 
-            // The queue, with the record it is playing behind it.
-            Rectangle {
+            // Rearranging the sections of a screen.
+            //
+            // Over the pane rather than instead of it, the same as Now Playing:
+            // what is being rearranged is the screen underneath, and losing the
+            // sidebar to edit it would be disorienting.
+            if root.customising: Rectangle {
+                background: Theme.bg;
+                clip: true;
+
+                VerticalLayout {
+                    padding: Theme.pad;
+                    spacing: Theme.pad;
+
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                glyph: Icons.close;
+                                size: 30px;
+                                glyph-size: 16px;
+                                clicked => { root.browse-back(); }
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+
+                            Text {
+                                text: root.customise-title;
+                                font-size: Theme.title-size + 2px;
+                                font-weight: 600;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            PillButton {
+                                label: "SAVE";
+                                primary: true;
+                                clicked => { root.customise-save(); }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Drag the sections into the order you want them on this screen. "
+                            + "Sections the player pins in place are not listed.";
+                        font-size: Theme.small-size;
+                        color: Theme.dim;
+                        wrap: word-wrap;
+                    }
+
+                    order-list := ListView {
+                        vertical-stretch: 1;
+
+                        property <length> row-height: 58px;
+                        // Where a drag started and where it would land. Both
+                        // -1 when nothing is being dragged.
+                        property <int> from-row: -1;
+                        property <int> to-row: -1;
+                        property <bool> dragging: self.from-row >= 0;
+
+                        for section-name[i] in root.customise-rows: VerticalLayout {
+                            place := Rectangle {
+                                height: order-list.row-height;
+
+                                // The same shuffle the queue does: everything
+                                // between the grabbed row and the drop steps
+                                // aside so the gap opens where it will land.
+                                property <length> lift: order-list.from-row == i
+                                    ? (order-list.to-row - order-list.from-row) * order-list.row-height
+                                    : (order-list.dragging
+                                        && i > order-list.from-row
+                                        && i <= order-list.to-row
+                                        ? -order-list.row-height
+                                        : (order-list.dragging
+                                            && i < order-list.from-row
+                                            && i >= order-list.to-row
+                                            ? order-list.row-height
+                                            : 0px));
+
+                                CustomiseRow {
+                                    label: section-name;
+                                    lifted: order-list.from-row == i;
+                                    y: place.lift;
+                                    lift: place.lift;
+                                    drag-moved(offset) => {
+                                        if (order-list.from-row < 0) {
+                                            order-list.from-row = i;
+                                        }
+                                        order-list.to-row = Math.clamp(
+                                            order-list.from-row
+                                                + Math.round(offset / order-list.row-height),
+                                            0, root.customise-rows.length - 1);
+                                    }
+                                    drag-done => {
+                                        if (order-list.to-row != order-list.from-row) {
+                                            root.customise-move(order-list.from-row, order-list.to-row);
+                                        }
+                                        order-list.from-row = -1;
+                                        order-list.to-row = -1;
+                                    }
+                                    drag-cancelled => {
+                                        order-list.from-row = -1;
+                                        order-list.to-row = -1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The queue, with the record it is playing behind it. Hidden by
+            // the button beside the volume: on a narrow window it is a third
+            // of the width spent on a list you may not be using.
+            if root.queue-shown: Rectangle {
                 width: 330px;
                 background: Theme.glass;
                 clip: true;
 
                 Rectangle { x: 0; width: 1px; background: Theme.border; }
 
-                // The official controller puts a blurred copy of the cover
-                // behind this column. There is no blur here, so it is faded
-                // hard instead and covered by a scrim — enough for the colour
-                // to come through, not enough to read as a picture.
+                // The same frosted copy the expanded view uses, faded further:
+                // this column has a list of track names over it.
                 Image {
-                    source: root.cover;
+                    source: root.cover-blur;
                     // Qualified: inside this component `cover` is the window's
                     // own artwork property, which shadows the enum value.
                     image-fit: ImageFit.cover;
                     width: 100%;
                     height: 100%;
-                    opacity: 0.10;
+                    opacity: 0.22;
                 }
 
                 Rectangle {
@@ -2535,13 +2757,18 @@ export component AppWindow inherits Window {
                                         border-color: Theme.border;
 
                                         format := Text {
-                                            text: root.quality.to-uppercase();
+                                            text: root.quality;
                                             font-size: Theme.micro-size - 1px;
                                             font-weight: 700;
                                             letter-spacing: 0.4px;
                                             color: Theme.faint;
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
+                                        }
+
+                                        TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.now-playing-info(); }
                                         }
                                     }
                                 }
@@ -2771,6 +2998,34 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
+                                            // Acting on every player at once,
+                                            // which is the one thing the list
+                                            // above cannot express: each card
+                                            // speaks only for its own player.
+                                            HorizontalLayout {
+                                                spacing: Theme.tight;
+                                                padding-top: Theme.tight;
+                                                padding-bottom: Theme.tight;
+
+                                                WideButton {
+                                                    glyph: Icons.group;
+                                                    label: "GROUP ALL";
+                                                    clicked => {
+                                                        root.group-all();
+                                                        players.close();
+                                                    }
+                                                }
+
+                                                WideButton {
+                                                    glyph: Icons.pause;
+                                                    label: "PAUSE ALL";
+                                                    clicked => {
+                                                        root.pause-all();
+                                                        players.close();
+                                                    }
+                                                }
+                                            }
+
                                             // For a player discovery cannot
                                             // reach: asleep at startup, on
                                             // another subnet, or behind
@@ -2787,6 +3042,20 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            padding-right: Theme.gap;
+
+                            IconButton {
+                                glyph: Icons.queue;
+                                size: 34px;
+                                glyph-size: 17px;
+                                tint: root.queue-shown ? Theme.text : Theme.dim;
+                                active: root.queue-shown;
+                                clicked => { root.queue-shown = !root.queue-shown; }
                             }
                         }
 

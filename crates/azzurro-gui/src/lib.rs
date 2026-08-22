@@ -14,6 +14,7 @@ mod artwork;
 mod glyphs;
 mod known;
 mod mpris;
+mod order;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -136,6 +137,16 @@ enum Command {
     BrowseMore,
     /// Forget every search made this session.
     ClearRecent,
+    /// Show what the playing track actually is: format, rate, bit depth.
+    NowPlayingInfo,
+    /// Move a section from one place in the Customise list to another.
+    CustomiseMove(usize, usize),
+    /// Keep the arrangement and go back to the screen it describes.
+    CustomiseSave,
+    /// Pull every other player into the selected one's group.
+    GroupAll,
+    /// Stop every player, grouped or not.
+    PauseAll,
     /// Read one of the player's web configuration pages and draw it.
     OpenServices,
     OpenShares,
@@ -173,6 +184,9 @@ struct Browsing {
     screens: Vec<(String, String)>,
     /// Where to ask for a queue item's context menu, also from the player.
     queue_menu_uri: Option<String>,
+    /// And the menu for whatever is playing, which is where the technical
+    /// details of the current file are offered.
+    now_playing_menu: Option<String>,
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
@@ -254,6 +268,20 @@ enum Pane {
     /// The record, large. Reached by pressing the artwork on the transport bar,
     /// which is where the official controller puts it too.
     NowPlaying,
+    /// Rearranging the sections of a screen — "Customise Home".
+    Customise(CustomisePage),
+}
+
+/// A screen being rearranged.
+struct CustomisePage {
+    /// Whose order is being edited, which is the key the preference is filed
+    /// under.
+    screen: String,
+    title: String,
+    /// The movable sections, `(id, title)`, in the order they would be saved
+    /// in. Sections the player pinned are not here at all: they cannot move,
+    /// so offering to move them would be a lie.
+    rows: Vec<(String, String)>,
 }
 
 /// A form being filled in.
@@ -403,6 +431,22 @@ struct Backend {
     /// with the app sitting idle.
     sent_queue: Arc<AtomicU64>,
     sent_players: Arc<AtomicU64>,
+    /// Section order per screen, as set by Customise Home and kept on disk.
+    orders: Arc<Mutex<order::Orders>>,
+}
+
+/// What to print on a format badge.
+///
+/// The player says `hd` for anything above CD, and the official controller
+/// shows that as HR — high resolution — which is what the word means on a
+/// hi-fi. Everything else is already the abbreviation it should be: `cd`,
+/// `mqa`.
+fn quality_label(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => String::new(),
+        "hd" => "HR".to_owned(),
+        other => other.to_ascii_uppercase(),
+    }
 }
 
 /// Whether this is the same thing the window already has.
@@ -771,6 +815,31 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_customise_move(move |from, to| {
+        let _ = tx.send(Command::CustomiseMove(from.max(0) as usize, to.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_customise_save(move || {
+        let _ = tx.send(Command::CustomiseSave);
+    });
+
+    let tx = commands.clone();
+    ui.on_group_all(move || {
+        let _ = tx.send(Command::GroupAll);
+    });
+
+    let tx = commands.clone();
+    ui.on_pause_all(move || {
+        let _ = tx.send(Command::PauseAll);
+    });
+
+    let tx = commands.clone();
+    ui.on_now_playing_info(move || {
+        let _ = tx.send(Command::NowPlayingInfo);
+    });
+
+    let tx = commands.clone();
     ui.on_clear_recent(move || {
         let _ = tx.send(Command::ClearRecent);
     });
@@ -879,6 +948,7 @@ async fn run(
         sent_transport: Arc::new(AtomicU64::new(0)),
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
+        orders: Arc::new(Mutex::new(order::load())),
     };
 
     tokio::spawn(run_commands(
@@ -1262,7 +1332,7 @@ impl Backend {
                                 title: song.title.clone().unwrap_or_default(),
                                 artist: song.artist.clone().unwrap_or_default(),
                                 duration: song.duration().unwrap_or_default(),
-                                quality: song.quality.clone().unwrap_or_default(),
+                                quality: quality_label(song.quality.as_deref().unwrap_or_default()),
                                 cursor: at_cursor,
                                 live: at_cursor && live,
                                 cover,
@@ -1757,6 +1827,7 @@ impl Backend {
             Web,
             Form,
             NowPlaying,
+            Customise,
         }
         let showing = match self.browsing.lock().unwrap().pane {
             Pane::Browse => Showing::Browse,
@@ -1765,13 +1836,16 @@ impl Backend {
             Pane::Web(_) => Showing::Web,
             Pane::Form(_) => Showing::Form,
             Pane::NowPlaying => Showing::NowPlaying,
+            Pane::Customise(_) => Showing::Customise,
         };
 
         let large = matches!(showing, Showing::NowPlaying);
+        let customising = matches!(showing, Showing::Customise);
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui.upgrade() {
                 ui.set_now_playing(large);
+                ui.set_customising(customising);
             }
         });
 
@@ -1788,6 +1862,7 @@ impl Backend {
             Showing::Form => self.publish_form(),
             // Nothing to send: it is drawn from what the transport already
             // publishes. Only the settings rows have to be taken down.
+            Showing::Customise => self.publish_customise(),
             Showing::NowPlaying => self.publish_settings(),
         }
     }
@@ -1878,6 +1953,49 @@ impl Backend {
         });
     }
 
+    /// The order to draw a screen's sections in.
+    ///
+    /// The identity permutation unless Customise Home has been used on this
+    /// screen, so a screen nobody has rearranged costs one map lookup.
+    fn arrangement(&self, screen: &Screen) -> Vec<usize> {
+        let plain = || (0..screen.sections.len()).collect::<Vec<_>>();
+        let Some(id) = screen.id.as_deref() else {
+            return plain();
+        };
+        let orders = self.orders.lock().unwrap();
+        let Some(wanted) = orders.get(id) else {
+            return plain();
+        };
+
+        let ids: Vec<Option<String>> = screen.sections.iter().map(|s| s.id.clone()).collect();
+        let pinned: Vec<bool> = screen.sections.iter().map(|s| s.no_reorder).collect();
+        order::arrange(&ids, &pinned, wanted)
+    }
+
+    /// Send the list of sections being rearranged to the window.
+    fn publish_customise(&self) {
+        let (title, rows) = {
+            let browsing = self.browsing.lock().unwrap();
+            let Pane::Customise(page) = &browsing.pane else {
+                return;
+            };
+            (
+                page.title.clone(),
+                page.rows
+                    .iter()
+                    .map(|(_, title)| slint::SharedString::from(title.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.set_customise_title(title.into());
+            ui.set_customise_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+        });
+    }
+
     fn publish_browse(&self) {
         // Which player's screens these are, then everything about that player,
         // then the screens themselves — three steps rather than two, so that no
@@ -1951,7 +2069,12 @@ impl Backend {
                 .filter(|s| s.kind == SectionKind::List && s.title.is_some())
                 .count();
 
-            for (ordinal, section) in screen.sections.iter().enumerate() {
+            // Whatever order Customise Home last put these in. `ordinal` stays
+            // the section's real index throughout, because every action
+            // published from this loop refers back into the screen the player
+            // sent — reordering the drawing must not reorder the addressing.
+            for ordinal in self.arrangement(screen) {
+                let section = &screen.sections[ordinal];
                 let kind = match section.kind {
                     SectionKind::Row => 1,
                     SectionKind::SelectorMenu => 2,
@@ -2025,7 +2148,7 @@ impl Backend {
 
                     rows.push(BrowseData {
                         track: item.extra.get("track").cloned().unwrap_or_default(),
-                        quality: item.quality.clone().unwrap_or_default(),
+                        quality: quality_label(item.quality.as_deref().unwrap_or_default()),
                         index: at,
                         action: String::new(),
                         // Some rows are an icon and nothing else — the "add a
@@ -2319,10 +2442,12 @@ impl Backend {
         // whole of what the player knows.
         // "cd", "hd", "mqa" — the player's own word for what it is decoding,
         // shown the way the official controller shows it.
-        let quality = snapshot
-            .as_ref()
-            .and_then(|(status, _)| status.quality.clone())
-            .unwrap_or_default();
+        let quality = quality_label(
+            snapshot
+                .as_ref()
+                .and_then(|(status, _)| status.quality.as_deref())
+                .unwrap_or_default(),
+        );
 
         let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
             Some(songs) if songs > 0 => {
@@ -2400,9 +2525,13 @@ impl Backend {
     /// colour, and the panel is its ordinary self.
     fn set_cover(&self, pixels: Option<Pixels>, tint: Option<[u8; 3]>) {
         let ui = self.ui.clone();
+        // Blurred here, off the UI thread, rather than in the event loop: it
+        // is a decode-sized job and the cover changes on every track.
+        let blurred = pixels.as_ref().and_then(artwork::frosted);
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
             ui.set_cover(pixels.map(slint::Image::from_rgba8).unwrap_or_default());
+            ui.set_cover_blur(blurred.map(slint::Image::from_rgba8).unwrap_or_default());
             ui.set_has_tint(tint.is_some());
             if let Some([r, g, b]) = tint {
                 ui.set_cover_tint(slint::Color::from_rgb_u8(r, g, b));
@@ -3089,6 +3218,59 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             // has not built. Saying so is the whole fix available here: the
             // alternative is a control that swallows the press, which reads as
             // the app being broken rather than unfinished.
+            // Rearranging the sections of a screen. The player has no say in
+            // this and no endpoint for it — `/customise-screen` is a route into
+            // the controller's own interface, and the preference lives on this
+            // machine. So the screen showing is read here and turned into a
+            // list to drag about.
+            Some("/customise-screen") => {
+                let page = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let screen = browsing.current();
+                    let arranged = screen.map(|screen| (screen, backend.arrangement(screen)));
+
+                    arranged.and_then(|(screen, arrangement)| {
+                        let rows: Vec<(String, String)> = arrangement
+                            .into_iter()
+                            .filter_map(|at| {
+                                let section = screen.sections.get(at)?;
+                                // A pinned section cannot move, so listing it
+                                // would only offer something that does not
+                                // work. One with no id cannot be named in the
+                                // saved order and so cannot be placed either.
+                                if section.no_reorder {
+                                    return None;
+                                }
+                                let id = section.id.clone()?;
+                                let title = section
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| id.replace('-', " "));
+                                Some((id, title))
+                            })
+                            .collect();
+
+                        Some(CustomisePage {
+                            screen: screen.id.clone()?,
+                            title: action
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| "Customise".to_owned()),
+                            rows,
+                        })
+                    })
+                };
+
+                match page {
+                    // Fewer than two and there is nothing to arrange.
+                    Some(page) if page.rows.len() > 1 => {
+                        backend.browsing.lock().unwrap().pane = Pane::Customise(page);
+                        backend.publish_pane();
+                    }
+                    _ => say(&backend.ui, "Nothing on this screen can be moved"),
+                }
+            }
+
             Some(route) => {
                 tracing::debug!(%id, "no equivalent for the route {route}");
                 say(
@@ -3767,6 +3949,10 @@ async fn run_commands(
                         .as_ref()
                         .and_then(|c| c.uri("queue"))
                         .map(str::to_owned);
+                    browsing.now_playing_menu = config
+                        .as_ref()
+                        .and_then(|c| c.uri("nowPlayingContextMenu"))
+                        .map(str::to_owned);
                     browsing.queue_menu_uri = config
                         .as_ref()
                         .and_then(|c| c.uri("queueItemContextMenu"))
@@ -3800,6 +3986,7 @@ async fn run_commands(
                         | Pane::Settings(_)
                         | Pane::Web(_)
                         | Pane::Form(_)
+                        | Pane::Customise(_)
                         | Pane::NowPlaying => {
                             browsing.pane = Pane::Browse;
                             true
@@ -4556,6 +4743,43 @@ async fn run_commands(
                 continue;
             }
 
+            Command::NowPlayingInfo => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                // Through the player's own menu rather than by building a
+                // request: it already offers Technical info for whatever is
+                // playing, and it knows the file name this app never sees.
+                let uri = backend
+                    .browsing
+                    .lock()
+                    .unwrap()
+                    .now_playing_menu
+                    .clone()
+                    .unwrap_or_else(|| "/ui/nowPlayingCM".to_owned());
+
+                match client.screen(&uri).await {
+                    Ok(menu) => {
+                        let action = menu.items().find_map(|item| {
+                            let action = item.action.as_ref()?;
+                            (action.result_type.as_deref() == Some("BriefInfo"))
+                                .then(|| action.clone())
+                        });
+                        match action {
+                            Some(action) => {
+                                run_action(backend.clone(), id, action, Arrive::Deeper).await;
+                            }
+                            None => say(&backend.ui, "The player offers nothing about this track"),
+                        }
+                    }
+                    Err(e) => tracing::debug!(%id, "no now-playing menu: {e}"),
+                }
+                continue;
+            }
+
             Command::ClearRecent => {
                 backend.browsing.lock().unwrap().recent.clear();
                 backend.publish_browse();
@@ -4746,6 +4970,97 @@ async fn run_commands(
                 continue;
             }
 
+            Command::CustomiseMove(from, to) => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Customise(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    if from >= page.rows.len() || to >= page.rows.len() || from == to {
+                        continue;
+                    }
+                    let row = page.rows.remove(from);
+                    page.rows.insert(to, row);
+                }
+                backend.publish_customise();
+                continue;
+            }
+
+            Command::CustomiseSave => {
+                let saved = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Pane::Customise(page) = &browsing.pane else {
+                        continue;
+                    };
+                    let ids: Vec<String> = page.rows.iter().map(|(id, _)| id.clone()).collect();
+                    let mut orders = backend.orders.lock().unwrap();
+                    orders.insert(page.screen.clone(), ids);
+                    orders.clone()
+                };
+                // Written on the spot rather than at exit: the app is a
+                // long-running window and there is no other moment that
+                // reliably arrives.
+                order::save(&saved);
+
+                backend.browsing.lock().unwrap().pane = Pane::Browse;
+                backend.publish_pane();
+                say(&backend.ui, "Home rearranged");
+                continue;
+            }
+
+            Command::GroupAll => {
+                let Some(master) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(master, |e| e.client.clone()) else {
+                    continue;
+                };
+                let others: Vec<DeviceId> = backend
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .filter(|id| *id != master)
+                    .collect();
+
+                if others.is_empty() {
+                    say(&backend.ui, "No other players to group");
+                    continue;
+                }
+
+                tokio::spawn(async move {
+                    // One at a time: the master rebuilds the group on each
+                    // call, and issuing them together has them race over the
+                    // same membership list.
+                    for target in others {
+                        if let Err(e) = client.add_slave(target).await {
+                            tracing::warn!(%master, %target, "group all: {e}");
+                        }
+                    }
+                });
+                continue;
+            }
+
+            Command::PauseAll => {
+                let clients: Vec<_> = backend
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|e| e.client.clone())
+                    .collect();
+
+                tokio::spawn(async move {
+                    for client in clients {
+                        if let Err(e) = client.pause().await {
+                            tracing::debug!("pause all: {e}");
+                        }
+                    }
+                });
+                continue;
+            }
+
             Command::Player(id, action) => (id, action),
         };
 
@@ -4787,4 +5102,21 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
             ui.set_status_line(message.into());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hd_is_shown_as_hr_and_the_rest_are_left_alone() {
+        // The player says "hd"; the official controller shows HR, for high
+        // resolution, which is what the word means on a hi-fi.
+        assert_eq!(quality_label("hd"), "HR");
+        assert_eq!(quality_label("HD"), "HR");
+        assert_eq!(quality_label("cd"), "CD");
+        assert_eq!(quality_label("mqa"), "MQA");
+        assert_eq!(quality_label(""), "");
+        assert_eq!(quality_label("  "), "");
+    }
 }

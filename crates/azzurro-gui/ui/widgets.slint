@@ -284,10 +284,41 @@ export component Level inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 1;
 
-        bar := Scrubber {
-            enabled: !root.muted;
-            value: root.value / 100;
-            seek(fraction) => { root.changed(Math.round(fraction * 100)); }
+        // The reading rides on the middle of the bar rather than trailing it.
+        // Off to one side it was a loose number with nothing to belong to; on
+        // the bar it reads as the bar's own label. It carries no touch area of
+        // its own, so a drag straight through the middle still reaches the
+        // scrubber underneath.
+        Rectangle {
+            height: 18px;
+
+            bar := Scrubber {
+                width: 100%;
+                y: (parent.height - self.height) / 2;
+                enabled: !root.muted;
+                value: root.value / 100;
+                seek(fraction) => { root.changed(Math.round(fraction * 100)); }
+            }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: reading.preferred-width + 13px;
+                height: 17px;
+                border-radius: self.height / 2;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                reading := Text {
+                    text: root.muted ? "\u{2014}" : root.value;
+                    font-size: Theme.micro-size;
+                    font-weight: 600;
+                    color: root.muted ? Theme.faint : Theme.dim;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+            }
         }
     }
 
@@ -303,18 +334,6 @@ export component Level inherits HorizontalLayout {
         }
     }
 
-    VerticalLayout {
-        alignment: center;
-
-        Text {
-            text: root.muted ? "—" : root.value;
-            font-size: Theme.small-size;
-            color: Theme.faint;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            width: 22px;
-        }
-    }
 }
 
 // A card. The one place the panel treatment is decided.
@@ -397,5 +416,55 @@ export component Badge inherits Rectangle {
             color: root.tint;
             vertical-alignment: center;
         }
+    }
+}
+
+// A labelled button that shares the row it is in, for the pair of them that
+// act on every player at once. Wider than an IconButton and captioned, because
+// "group all" is not a thing you want to guess at from a glyph.
+export component WideButton inherits Rectangle {
+    in property <image> glyph;
+    in property <string> label;
+    callback clicked();
+
+    horizontal-stretch: 1;
+    height: 46px;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: touch.pressed
+        ? Theme.pressed
+        : (touch.has-hover ? Theme.hover : Theme.raised);
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: Theme.tight;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                glyph: root.glyph;
+                tint: Theme.dim;
+                width: 16px;
+                height: 16px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                font-size: Theme.micro-size;
+                font-weight: 600;
+                letter-spacing: 0.6px;
+                color: Theme.dim;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
     }
 }

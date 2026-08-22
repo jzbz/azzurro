@@ -226,6 +226,50 @@ fn decode(bytes: &[u8], size: u32) -> Option<Pixels> {
     ))
 }
 
+/// The cover again, as a wash of colour rather than a picture.
+///
+/// Slint has no blur filter, so the blur has to arrive already in the pixels.
+///
+/// The temptation is to shrink the cover to almost nothing and let the GPU
+/// stretch it back, since bilinear upscaling is itself a kind of blur. It is
+/// the wrong kind. Magnifying twenty-odd pixels across a whole window makes
+/// the interpolation visible as facets and contour rings — the picture is
+/// gone, but so is the smoothness that was the point.
+///
+/// So the blur is done properly, at a size where a real Gaussian is still
+/// cheap: a few hundred microseconds on a 144px square, once per track. What
+/// gets stretched afterwards is already smooth, and stretching something
+/// smooth stays smooth.
+pub fn frosted(pixels: &Pixels) -> Option<Pixels> {
+    /// Enough pixels that upscaling has something to interpolate between.
+    const SMALL: u32 = 144;
+    /// A radius large relative to `SMALL`, which is what makes it a wash
+    /// rather than a soft-focus photograph.
+    const SIGMA: f32 = 20.0;
+
+    let source = image::RgbaImage::from_raw(
+        pixels.width(),
+        pixels.height(),
+        pixels.as_bytes().to_vec(),
+    )?;
+    // `resize` with a proper filter rather than `thumbnail`: nearest-ish
+    // downsampling aliases the sleeve's hard edges into the small image, and
+    // the blur then spreads the aliasing around instead of removing it.
+    let small = image::imageops::resize(
+        &source,
+        SMALL,
+        SMALL,
+        image::imageops::FilterType::Triangle,
+    );
+    let blurred = image::imageops::blur(&small, SIGMA);
+
+    Some(SharedPixelBuffer::clone_from_slice(
+        blurred.as_raw(),
+        blurred.width(),
+        blurred.height(),
+    ))
+}
+
 /// One colour standing for a whole cover, for tinting the panel behind it.
 ///
 /// Not the average, which on almost any sleeve is a muddy brown: greys, the
@@ -404,3 +448,31 @@ mod tests {
         assert!(decode(b"<html>404</html>", 64).is_none());
     }
 }
+
+#[cfg(test)]
+mod frost_timing {
+    use super::*;
+
+    #[test]
+    fn frosting_a_cover_is_quick_enough_to_do_per_track() {
+        let mut data = vec![0u8; 500 * 500 * 4];
+        // Hard edges, which is the case the blur has to work hardest on.
+        for (i, p) in data.chunks_mut(4).enumerate() {
+            let on = (i / 25) % 2 == 0;
+            p.copy_from_slice(if on { &[240, 30, 10, 255] } else { &[5, 5, 40, 255] });
+        }
+        let cover = SharedPixelBuffer::clone_from_slice(&data, 500, 500);
+
+        let start = std::time::Instant::now();
+        let out = frosted(&cover).expect("frosts");
+        let took = start.elapsed();
+
+        assert_eq!(out.width(), 144);
+        println!("frosted in {took:?}");
+        // 3ms in release, ~170ms unoptimised. The bound is loose on purpose:
+        // it is here to catch the blur becoming a whole different order of
+        // cost, not to police a few milliseconds on a busy machine.
+        assert!(took.as_millis() < 1500, "too slow for a track change: {took:?}");
+    }
+}
+

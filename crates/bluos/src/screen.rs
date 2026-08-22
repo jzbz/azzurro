@@ -129,6 +129,10 @@ pub struct Section {
     pub title: Option<String>,
     /// Only meaningful on a row.
     pub scrollable: bool,
+    /// The player pinning this section where it is. The home screen marks its
+    /// teaser row so, and a client offering to reorder the screen has to leave
+    /// that one alone.
+    pub no_reorder: bool,
     /// On a selector menu, whether picking replaces the current screen.
     pub replace_screen: bool,
     pub menu_actions: Vec<MenuAction>,
@@ -676,6 +680,7 @@ fn start(
                 id: a.remove("id"),
                 title: a.remove("title").or_else(|| a.remove("menuTitle")),
                 scrollable: flag(a.remove("scrollable")),
+                no_reorder: flag(a.remove("noReorder")),
                 replace_screen: flag(a.remove("replaceScreen")),
                 ..Default::default()
             });
