@@ -138,10 +138,7 @@ mod tests {
     #[test]
     fn a_line_per_screen() {
         let orders = parse("screen-home: mostUsed, recent , presets\n# a note\n\nother:a");
-        assert_eq!(
-            orders["screen-home"],
-            vec!["mostUsed", "recent", "presets"]
-        );
+        assert_eq!(orders["screen-home"], vec!["mostUsed", "recent", "presets"]);
         assert_eq!(orders["other"], vec!["a"]);
         assert_eq!(orders.len(), 2);
     }

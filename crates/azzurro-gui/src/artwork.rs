@@ -19,8 +19,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use lru::LruCache;
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -296,20 +296,13 @@ pub fn frosted(pixels: &Pixels) -> Option<Pixels> {
     /// rather than a soft-focus photograph.
     const SIGMA: f32 = 20.0;
 
-    let source = image::RgbaImage::from_raw(
-        pixels.width(),
-        pixels.height(),
-        pixels.as_bytes().to_vec(),
-    )?;
+    let source =
+        image::RgbaImage::from_raw(pixels.width(), pixels.height(), pixels.as_bytes().to_vec())?;
     // `resize` with a proper filter rather than `thumbnail`: nearest-ish
     // downsampling aliases the sleeve's hard edges into the small image, and
     // the blur then spreads the aliasing around instead of removing it.
-    let small = image::imageops::resize(
-        &source,
-        SMALL,
-        SMALL,
-        image::imageops::FilterType::Triangle,
-    );
+    let small =
+        image::imageops::resize(&source, SMALL, SMALL, image::imageops::FilterType::Triangle);
     let blurred = image::imageops::blur(&small, SIGMA);
 
     Some(SharedPixelBuffer::clone_from_slice(
@@ -508,7 +501,11 @@ mod frost_timing {
         // Hard edges, which is the case the blur has to work hardest on.
         for (i, p) in data.chunks_mut(4).enumerate() {
             let on = (i / 25) % 2 == 0;
-            p.copy_from_slice(if on { &[240, 30, 10, 255] } else { &[5, 5, 40, 255] });
+            p.copy_from_slice(if on {
+                &[240, 30, 10, 255]
+            } else {
+                &[5, 5, 40, 255]
+            });
         }
         let cover = SharedPixelBuffer::clone_from_slice(&data, 500, 500);
 
@@ -521,7 +518,9 @@ mod frost_timing {
         // 3ms in release, ~170ms unoptimised. The bound is loose on purpose:
         // it is here to catch the blur becoming a whole different order of
         // cost, not to police a few milliseconds on a busy machine.
-        assert!(took.as_millis() < 1500, "too slow for a track change: {took:?}");
+        assert!(
+            took.as_millis() < 1500,
+            "too slow for a track change: {took:?}"
+        );
     }
 }
-
