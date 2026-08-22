@@ -103,7 +103,7 @@ enum Command {
     /// Open the context menu for a queue position.
     QueueMenu(u32),
     /// Show the player's settings, or one page of them.
-    OpenSettings(Option<String>),
+    OpenSettings(Option<String>, Step),
     /// Show the Help menu.
     OpenHelp,
     /// Follow entry `n` of the Help menu.
@@ -152,10 +152,6 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
-    /// A page of the player's own web configuration, read and drawn here
-    /// rather than opened in a browser. Alternative to the panes above, the
-    /// same way Settings and Help are.
-    web: Option<WebPage>,
     /// The play queue's own document, kept for the row of buttons under it.
     ///
     /// The rows come from `/Playlist`, which is smaller and pages cleanly. The
@@ -172,17 +168,52 @@ struct Browsing {
     /// Recorded when a search is committed rather than on every keystroke, or
     /// every prefix of every word would be on it.
     recent: Vec<String>,
-    /// When set, the middle pane is showing the Help menu.
-    help: bool,
-    /// A page reached from the Help menu: its title and the facts on it.
-    help_detail: Option<(String, Vec<(String, String)>)>,
-    /// When set, the middle pane is showing settings rather than a browse
-    /// screen. The two are alternatives, not layers: opening settings is a
-    /// change of mode, and Back leaves it.
-    settings: Option<SettingsPage>,
+    /// What the middle pane is showing.
+    ///
+    /// One field rather than four flags, because it is one fact. As four they
+    /// could all be true at once, and a stale one routed a press to a pane that
+    /// was not on screen: with the services list left set, every row of the
+    /// settings page opened a music service's sign-in page instead.
+    pane: Pane,
     /// Which sidebar entry is lit, as `(kind, index)`. Recorded on activation
     /// rather than inferred, because a screen can be reached several ways.
     highlighted: Option<(i32, i32)>,
+}
+
+impl Pane {
+    /// The settings page on show, if that is what is.
+    fn settings(&self) -> Option<&SettingsPage> {
+        match self {
+            Pane::Settings(trail) => trail.last(),
+            _ => None,
+        }
+    }
+
+    /// The web configuration page on show, if that is what is.
+    fn web(&self) -> Option<&WebPage> {
+        match self {
+            Pane::Web(page) => Some(page),
+            _ => None,
+        }
+    }
+}
+
+/// What the middle pane is showing. These are alternatives rather than layers:
+/// opening any of them is a change of mode, and Back leaves it.
+#[derive(Default)]
+enum Pane {
+    /// The player's own screens, which is where the app spends its life.
+    #[default]
+    Browse,
+    /// The settings pages open, deepest last. A trail rather than one page,
+    /// so that Back out of Audio lands on Settings instead of leaving
+    /// altogether — which is what "back one level" has to mean here too.
+    Settings(Vec<SettingsPage>),
+    Help,
+    /// A page reached from the Help menu: its title and the facts on it.
+    HelpDetail(String, Vec<(String, String)>),
+    /// One of the player's web configuration pages, drawn rather than opened.
+    Web(WebPage),
 }
 
 struct Crumb {
@@ -196,6 +227,20 @@ struct Crumb {
     /// searching started — and the query is kept because that is what goes on
     /// the recent list once the search turns out to have been worth making.
     query: Option<String>,
+}
+
+/// How a settings page joins the pane's own trail.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Step {
+    /// Start again here: opening Settings, or arriving from a Customise button
+    /// on a screen somewhere else.
+    Root,
+    /// Opened from the page showing, which Back undoes.
+    Deeper,
+    /// The same page again. A write can change more than the value written —
+    /// turning tone controls on brings treble and bass to life — so the page is
+    /// re-read rather than assumed.
+    Reload,
 }
 
 /// How a newly fetched screen joins the trail.
@@ -591,7 +636,7 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
 
     let tx = commands.clone();
     ui.on_open_settings(move || {
-        let _ = tx.send(Command::OpenSettings(None));
+        let _ = tx.send(Command::OpenSettings(None, Step::Root));
     });
 
     let tx = commands.clone();
@@ -1279,7 +1324,8 @@ impl Backend {
     /// column where a horizontal shelf is not.
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
-        if let Some((title, facts)) = self.browsing.lock().unwrap().help_detail.clone() {
+        if let Pane::HelpDetail(title, facts) = &self.browsing.lock().unwrap().pane {
+            let (title, facts) = (title.clone(), facts.clone());
             let rows = facts
                 .into_iter()
                 .map(|(label, value)| SettingData {
@@ -1350,8 +1396,8 @@ impl Backend {
             .browsing
             .lock()
             .unwrap()
-            .web
-            .as_ref()
+            .pane
+            .web()
             .map(|page| match page {
                 WebPage::Services(services) => (
                     "Music Services".to_owned(),
@@ -1411,9 +1457,41 @@ impl Backend {
         self.send_settings(rows, title);
     }
 
+    /// Draw whichever pane is showing.
+    ///
+    /// One entry point rather than four, because a caller that has just changed
+    /// panes does not know which one it landed on — after Back it depends on
+    /// where Back went.
+    fn publish_pane(&self) {
+        enum Showing {
+            Browse,
+            Settings,
+            Help,
+            Web,
+        }
+        let showing = match self.browsing.lock().unwrap().pane {
+            Pane::Browse => Showing::Browse,
+            Pane::Settings(_) => Showing::Settings,
+            Pane::Help | Pane::HelpDetail(..) => Showing::Help,
+            Pane::Web(_) => Showing::Web,
+        };
+
+        match showing {
+            // Settings first: it is what takes the pane back off the browse
+            // screen when nothing else is showing.
+            Showing::Browse => {
+                self.publish_settings();
+                self.publish_browse();
+            }
+            Showing::Settings => self.publish_settings(),
+            Showing::Help => self.publish_help(),
+            Showing::Web => self.publish_web(),
+        }
+    }
+
     /// Turn a settings page into rows for the middle pane.
     fn publish_settings(&self) {
-        let Some(page) = self.browsing.lock().unwrap().settings.clone() else {
+        let Some(page) = self.browsing.lock().unwrap().pane.settings().cloned() else {
             let ui = self.ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui.upgrade() {
@@ -1511,7 +1589,7 @@ impl Backend {
         // here would fight them for the title.
         {
             let browsing = self.browsing.lock().unwrap();
-            if browsing.settings.is_some() || browsing.help || browsing.web.is_some() {
+            if !matches!(browsing.pane, Pane::Browse) {
                 return;
             }
         }
@@ -2325,10 +2403,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 // Showing a screen means leaving Settings and Help, which
                 // otherwise keep the pane and the sidebar navigates
                 // underneath them with nothing appearing to happen.
-                browsing.help = false;
-                browsing.help_detail = None;
-                browsing.settings = None;
-                browsing.web = None;
+                browsing.pane = Pane::Browse;
                 // Browsing follows the selection: a screen only means anything
                 // against the player that served it.
                 if browsing.device != Some(id) {
@@ -2548,7 +2623,9 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // app already renders — sending it to a browser would be
                 // handing back a page it can draw itself.
                 if let Some(page) = settings_page(&uri) {
-                    let _ = backend.commands.send(Command::OpenSettings(page));
+                    let _ = backend
+                        .commands
+                        .send(Command::OpenSettings(page, Step::Root));
                     return;
                 }
                 // The Manage button on Music Services. What it opens is a list
@@ -2995,7 +3072,9 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // The settings pane can be showing a row whose state is in
                 // the status rather than in the settings document — the sleep
                 // timer is one — so it is redrawn along with everything else.
-                if backend.is_selected(id) && backend.browsing.lock().unwrap().settings.is_some() {
+                if backend.is_selected(id)
+                    && matches!(backend.browsing.lock().unwrap().pane, Pane::Settings(_))
+                {
                     backend.publish_settings();
                 }
 
@@ -3180,41 +3259,44 @@ async fn run_commands(
             }
 
             Command::BrowseBack => {
-                // Back out of settings before backing out of anything else.
-                // One step at a time: out of a Help page, then out of Help.
-                let stepped_back = {
+                // One level, whatever a level is where you are standing: out of
+                // a page reached from Help back to Help, out of a settings
+                // sub-page back to the page above it, out of a pane back to
+                // browsing, and only then back along the trail of screens.
+                let moved = {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.web.take().is_some() || browsing.help_detail.take().is_some()
-                };
-                if stepped_back {
-                    backend.publish_help();
-                    continue;
-                }
-
-                let leaving = {
-                    let mut browsing = backend.browsing.lock().unwrap();
-                    let was_help = browsing.help;
-                    browsing.help = false;
-                    browsing.settings.take().is_some() || was_help
-                };
-                if leaving {
-                    backend.publish_settings();
-                    backend.publish_browse();
-                    continue;
-                }
-
-                {
-                    let mut browsing = backend.browsing.lock().unwrap();
-                    if browsing.trail.len() > 1 {
-                        browsing.trail.pop();
+                    match &mut browsing.pane {
+                        Pane::HelpDetail(..) => {
+                            browsing.pane = Pane::Help;
+                            true
+                        }
+                        Pane::Settings(trail) if trail.len() > 1 => {
+                            trail.pop();
+                            true
+                        }
+                        Pane::Help | Pane::Settings(_) | Pane::Web(_) => {
+                            browsing.pane = Pane::Browse;
+                            true
+                        }
+                        // Already browsing, so back means the screen before.
+                        Pane::Browse => {
+                            let deeper = browsing.trail.len() > 1;
+                            if deeper {
+                                browsing.trail.pop();
+                            }
+                            deeper
+                        }
                     }
+                };
+                if moved {
+                    backend.publish_pane();
                 }
-                backend.publish_browse();
                 continue;
             }
 
             Command::BrowseActivate(index) => {
-                let in_settings = backend.browsing.lock().unwrap().settings.is_some();
+                // Every pane but Browse draws settings-shaped rows.
+                let in_settings = !matches!(backend.browsing.lock().unwrap().pane, Pane::Browse);
                 if in_settings {
                     let _ = backend.commands.send(Command::SettingAction(index));
                 } else {
@@ -3263,7 +3345,7 @@ async fn run_commands(
                 continue;
             }
 
-            Command::OpenSettings(page) => {
+            Command::OpenSettings(page, step) => {
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
@@ -3273,8 +3355,16 @@ async fn run_commands(
                 match client.settings(page.as_deref()).await {
                     Ok(page) => {
                         let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.help = false;
-                        browsing.settings = Some(page);
+                        match (&mut browsing.pane, step) {
+                            // Deeper and reload both keep whatever is under
+                            // them; only the top of the trail differs.
+                            (Pane::Settings(trail), Step::Deeper) => trail.push(page),
+                            (Pane::Settings(trail), Step::Reload) if !trail.is_empty() => {
+                                let top = trail.len() - 1;
+                                trail[top] = page;
+                            }
+                            _ => browsing.pane = Pane::Settings(vec![page]),
+                        }
                         // Settings and Help are rows of their own below the
                         // list, so nothing in the list is where you are any
                         // more. Leaving the last screen lit says you are on a
@@ -3293,15 +3383,18 @@ async fn run_commands(
             }
 
             Command::SettingAction(index) => {
-                // Three panes share these rows, so the press goes wherever the
-                // rows came from.
-                if backend.browsing.lock().unwrap().help {
-                    let _ = backend.commands.send(Command::HelpAction(index));
-                    continue;
-                }
-                if backend.browsing.lock().unwrap().web.is_some() {
-                    let _ = backend.commands.send(Command::WebAction(index));
-                    continue;
+                // Three panes are drawn with these rows, so the press goes to
+                // whichever one is actually on screen.
+                match backend.browsing.lock().unwrap().pane {
+                    Pane::Help | Pane::HelpDetail(..) => {
+                        let _ = backend.commands.send(Command::HelpAction(index));
+                        continue;
+                    }
+                    Pane::Web(_) => {
+                        let _ = backend.commands.send(Command::WebAction(index));
+                        continue;
+                    }
+                    _ => {}
                 }
 
                 let Some(id) = *backend.selected.lock().unwrap() else {
@@ -3314,15 +3407,14 @@ async fn run_commands(
                 // the order settings_rows walks them, so the same walk finds it.
                 let chosen = {
                     let browsing = backend.browsing.lock().unwrap();
-                    browsing
-                        .settings
-                        .as_ref()
-                        .and_then(|page| pick(page, index))
+                    browsing.pane.settings().and_then(|page| pick(page, index))
                 };
 
                 match chosen {
                     Some(Chosen::Page(id)) => {
-                        let _ = backend.commands.send(Command::OpenSettings(Some(id)));
+                        let _ = backend
+                            .commands
+                            .send(Command::OpenSettings(Some(id), Step::Deeper));
                     }
                     Some(Chosen::Sleep) => {
                         let _ = backend.commands.send(Command::Player(id, Action::Sleep));
@@ -3340,7 +3432,7 @@ async fn run_commands(
                         let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
                     }
                     Some(Chosen::Write(setting, value)) => {
-                        let page = backend.browsing.lock().unwrap().settings.clone();
+                        let page = backend.browsing.lock().unwrap().pane.settings().cloned();
                         if let Some(page) = page {
                             match client.write_setting(&page, &setting, &value).await {
                                 Ok(()) => {
@@ -3356,9 +3448,10 @@ async fn run_commands(
                                     // Re-read rather than guess: a write can
                                     // change more than the one value, and the
                                     // player is the only one who knows.
-                                    let _ = backend
-                                        .commands
-                                        .send(Command::OpenSettings(page.page_id.clone()));
+                                    let _ = backend.commands.send(Command::OpenSettings(
+                                        page.page_id.clone(),
+                                        Step::Reload,
+                                    ));
                                 }
                                 Err(e) => {
                                     say(&backend.ui, format!("{}: {e}", setting.label()));
@@ -3374,9 +3467,8 @@ async fn run_commands(
             Command::OpenHelp => {
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.help = true;
+                    browsing.pane = Pane::Help;
                     browsing.highlighted = None;
-                    browsing.settings = None;
                 }
                 backend.publish_sidebar();
                 backend.publish_help();
@@ -3414,8 +3506,8 @@ async fn run_commands(
                         let Some(client) = client else { continue };
                         match client.diagnostics().await {
                             Ok(facts) if !facts.is_empty() => {
-                                backend.browsing.lock().unwrap().help_detail =
-                                    Some(("Diagnostics".to_owned(), facts));
+                                backend.browsing.lock().unwrap().pane =
+                                    Pane::HelpDetail("Diagnostics".to_owned(), facts);
                                 backend.publish_help();
                             }
                             // The page is the player's own HTML, so it can
@@ -3444,8 +3536,8 @@ async fn run_commands(
                                 if let Some((label, href)) = action {
                                     facts.push((label, client.image_url(&href)));
                                 }
-                                backend.browsing.lock().unwrap().help_detail =
-                                    Some(("Upgrade Check".to_owned(), facts));
+                                backend.browsing.lock().unwrap().pane =
+                                    Pane::HelpDetail("Upgrade Check".to_owned(), facts);
                                 backend.publish_help();
                             }
                             Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
@@ -3462,7 +3554,7 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                let Some(page) = backend.browsing.lock().unwrap().settings.clone() else {
+                let Some(page) = backend.browsing.lock().unwrap().pane.settings().cloned() else {
                     continue;
                 };
                 let Some(setting) = setting_at(&page, index) else {
@@ -3489,7 +3581,7 @@ async fn run_commands(
                         // treble and bass to life — and only the player knows.
                         let _ = backend
                             .commands
-                            .send(Command::OpenSettings(page.page_id.clone()));
+                            .send(Command::OpenSettings(page.page_id.clone(), Step::Reload));
                     }
                     Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
                 }
@@ -3664,9 +3756,7 @@ async fn run_commands(
                 match client.services().await {
                     Ok(services) if !services.is_empty() => {
                         let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.help = false;
-                        browsing.settings = None;
-                        browsing.web = Some(WebPage::Services(services));
+                        browsing.pane = Pane::Web(WebPage::Services(services));
                         browsing.highlighted = None;
                         drop(browsing);
                         backend.publish_sidebar();
@@ -3696,9 +3786,7 @@ async fn run_commands(
                 match client.shares().await {
                     Ok((action, shares)) => {
                         let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.help = false;
-                        browsing.settings = None;
-                        browsing.web = Some(WebPage::Shares { action, shares });
+                        browsing.pane = Pane::Web(WebPage::Shares { action, shares });
                         browsing.highlighted = None;
                         drop(browsing);
                         backend.publish_sidebar();
@@ -3728,7 +3816,7 @@ async fn run_commands(
 
                 let press = {
                     let browsing = backend.browsing.lock().unwrap();
-                    match browsing.web.as_ref() {
+                    match browsing.pane.web() {
                         Some(WebPage::Services(services)) => services
                             .get(at)
                             .map(|service| Press::Open(client.web_url(&service.href))),
