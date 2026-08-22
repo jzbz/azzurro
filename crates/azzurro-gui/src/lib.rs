@@ -146,6 +146,8 @@ enum Command {
     BrowseMore,
     /// Forget every search made this session.
     ClearRecent,
+    /// Answer the "switch input?" question: run it, or forget it.
+    ConfirmInput(bool),
     /// Run one line of the context menu open against a queue row.
     QueueMenuAction(usize),
     /// Show what the playing track actually is: format, rate, bit depth.
@@ -193,6 +195,9 @@ struct Browsing {
     /// The screens this player offers: `(label, uri)`, in the order it listed
     /// them. Read once from `/ui/Configuration`.
     screens: Vec<(String, String)>,
+    /// An input waiting to be confirmed, because switching to it stops
+    /// whatever is playing.
+    pending_input: Option<bluos::screen::Action>,
     /// Where to ask for a queue item's context menu, also from the player.
     queue_menu_uri: Option<String>,
     /// And the menu for whatever is playing, which is where the technical
@@ -755,6 +760,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     // already been written to `queue-menu-y` by the time this runs.
     ui.on_queue_menu(move |song, _at| {
         let _ = tx.send(Command::QueueMenu(song.max(0) as u32));
+    });
+
+    let tx = commands.clone();
+    ui.on_answer_input(move |go| {
+        let _ = tx.send(Command::ConfirmInput(go));
     });
 
     let tx = commands.clone();
@@ -3644,6 +3654,30 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
 async fn load_cover(backend: Backend, id: DeviceId) {
     let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
 
+    // What is already decoded, before anything is fetched. A cover that has
+    // been seen — every input's icon, after the first time — arrives with no
+    // gap at all.
+    let ready = wanted
+        .as_deref()
+        .and_then(|url| backend.artwork.cached(url, COVER_SIZE));
+
+    if ready.is_some() {
+        if !backend.is_selected(id) {
+            return;
+        }
+        let tint = wanted.as_deref().and_then(|url| backend.artwork.tint(url));
+        backend.set_cover(ready, tint);
+        return;
+    }
+
+    // Nothing to draw yet, so stop drawing the last thing. Left alone, the
+    // previous track's sleeve sat in the corner until the fetch returned —
+    // switching to Bluetooth showed the record that had been playing, which
+    // reads as the wrong icon rather than as a picture still loading.
+    if backend.is_selected(id) {
+        backend.set_cover(None, None);
+    }
+
     let pixels = match &wanted {
         Some(url) => backend.artwork.get(url, COVER_SIZE).await,
         None => None,
@@ -4225,6 +4259,16 @@ async fn run_commands(
                 continue;
             }
 
+            Command::ConfirmInput(go) => {
+                let pending = backend.browsing.lock().unwrap().pending_input.take();
+                if let (true, Some(action), Some(id)) =
+                    (go, pending, *backend.selected.lock().unwrap())
+                {
+                    tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
+                }
+                continue;
+            }
+
             Command::QueueMenuAction(at) => {
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
@@ -4705,15 +4749,48 @@ async fn run_commands(
                     // An entry off the Sources screen: run whatever that item
                     // says, which is a browse for a service and a play command
                     // for an input.
-                    let action = {
+                    // An input is the one thing here that stops the music: a
+                    // service opens a screen, an input sends a play command
+                    // that takes the speaker away from whatever it was doing.
+                    // The two are told apart by which action the item carries.
+                    let (action, is_input, label) = {
                         let browsing = backend.browsing.lock().unwrap();
-                        browsing.sources.as_ref().and_then(|screen| {
-                            screen.items().nth(index.max(0) as usize).and_then(|item| {
-                                item.action.clone().or_else(|| item.play_action.clone())
+                        browsing
+                            .sources
+                            .as_ref()
+                            .and_then(|screen| screen.items().nth(index.max(0) as usize))
+                            .map(|item| {
+                                let browse = item.action.clone();
+                                let is_input = browse.is_none() && item.play_action.is_some();
+                                (
+                                    browse.or_else(|| item.play_action.clone()),
+                                    is_input,
+                                    item.label().unwrap_or("that input").to_owned(),
+                                )
                             })
-                        })
+                            .unwrap_or((None, false, String::new()))
                     };
-                    if let Some(action) = action {
+
+                    let Some(action) = action else { continue };
+
+                    // Only worth asking while something is playing. Switching
+                    // a silent speaker costs nothing, and a dialog for it is
+                    // just one more press.
+                    let playing = backend
+                        .with_entry(id, |e| {
+                            e.status.as_ref().is_some_and(bluos::Status::is_playing)
+                        })
+                        .unwrap_or(false);
+
+                    if is_input && playing {
+                        backend.browsing.lock().unwrap().pending_input = Some(action);
+                        let ui = backend.ui.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui.upgrade() {
+                                ui.set_confirm_input(label.into());
+                            }
+                        });
+                    } else {
                         tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                     }
                 }

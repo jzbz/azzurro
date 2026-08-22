@@ -1531,6 +1531,9 @@ export component AppWindow inherits Window {
     in-out property <length> queue-menu-y: 0px;
     callback queue-menu(int, length);
     callback queue-menu-activate(int);
+    // The input waiting to be confirmed, by name. Empty when nothing is.
+    in-out property <string> confirm-input: "";
+    callback answer-input(bool);
     callback sidebar-activate(int, int);
     callback open-settings();
     callback setting-toggle(int);
@@ -3290,6 +3293,85 @@ export component AppWindow inherits Window {
     // all: the confirmations the player writes itself — "Added to Favourites"
     // — and the reason a settings write failed were both computed, published,
     // and then drawn by nothing.
+    // Switching input stops the music, and the inputs sit in the sidebar
+    // among things that do not — one row below Home, one above a service that
+    // merely opens a screen. Easy to hit on the way somewhere else, and there
+    // is no undo for a speaker that has stopped.
+    //
+    // Only raised while something is actually playing; the backend decides
+    // that, and a silent speaker switches without being asked.
+    if root.confirm-input != "": Rectangle {
+        background: #00000080;
+
+        TouchArea {
+            clicked => {
+                root.confirm-input = "";
+                root.answer-input(false);
+            }
+        }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 380px;
+            height: ask.preferred-height;
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #000000a6;
+
+            // Swallows presses that would otherwise reach the scrim behind and
+            // dismiss the question by accident.
+            TouchArea { }
+
+            ask := VerticalLayout {
+                padding: Theme.room;
+                spacing: Theme.pad;
+
+                Text {
+                    text: "Switch to " + root.confirm-input + "?";
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "This stops what is playing now.";
+                    font-size: Theme.small-size;
+                    color: Theme.dim;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: Theme.gap;
+
+                    PillButton {
+                        label: "Switch";
+                        primary: true;
+                        clicked => {
+                            root.confirm-input = "";
+                            root.answer-input(true);
+                        }
+                    }
+
+                    PillButton {
+                        label: "Cancel";
+                        clicked => {
+                            root.confirm-input = "";
+                            root.answer-input(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // The last thing said, held past the moment it is cleared.
     //
     // The fade out needs words to fade: binding the label straight to
