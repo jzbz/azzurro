@@ -214,7 +214,11 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Speaker)
     } else if word("edit") {
         Some(Glyph::Edit)
-    } else if word("clear") {
+    // "Clear" is the queue's own button; a track's context menu says "Delete
+    // from play queue" instead, and without this it kept the player's bitmap
+    // bin among a column of Lucide strokes. Removing a favourite is matched
+    // further up, so `remove` here cannot steal it.
+    } else if word("clear") || word("delete") || word("remove") {
         Some(Glyph::Clear)
     } else if word("save") {
         Some(Glyph::Save)
