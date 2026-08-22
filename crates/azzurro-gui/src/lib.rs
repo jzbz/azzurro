@@ -146,6 +146,8 @@ enum Command {
     BrowseMore,
     /// Forget every search made this session.
     ClearRecent,
+    /// Run one line of the context menu open against a queue row.
+    QueueMenuAction(usize),
     /// Show what the playing track actually is: format, rate, bit depth.
     NowPlayingInfo,
     /// Move a section from one place in the Customise list to another.
@@ -206,6 +208,10 @@ struct Browsing {
     /// is its business — Queue Builder Mode appears there only for a client
     /// that declares a new enough schema.
     queue_screen: Option<Screen>,
+    /// The context menu open against a queue row, if one is. Kept whole
+    /// because activating a line means running the action the player attached
+    /// to it, and that lives on the parsed document.
+    queue_menu: Option<Screen>,
     /// The queue screen's own uri, from `/ui/Configuration`.
     queue_uri: Option<String>,
     /// Whether a page of a long list is already on its way, so that scrolling
@@ -746,8 +752,15 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
-    ui.on_queue_menu(move |song| {
+    // The row's position is the window's business, not the backend's: it has
+    // already been written to `queue-menu-y` by the time this runs.
+    ui.on_queue_menu(move |song, _at| {
         let _ = tx.send(Command::QueueMenu(song.max(0) as u32));
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_menu_activate(move |at| {
+        let _ = tx.send(Command::QueueMenuAction(at.max(0) as usize));
     });
 
     let tx = commands.clone();
@@ -1291,6 +1304,78 @@ impl Backend {
     }
 
     /// Push the selected player's queue to the window.
+    /// Send the open queue-row menu to the window, and open it.
+    ///
+    /// The artwork is asked for at thumbnail size and only from what is
+    /// already decoded — the same cover is in the row underneath, so a menu
+    /// that waited on a fetch would open blank for no reason.
+    fn publish_queue_menu(&self) {
+        let (title, subtitle, cover, rows) = {
+            let browsing = self.browsing.lock().unwrap();
+            let Some(menu) = &browsing.queue_menu else {
+                return;
+            };
+
+            // `(index, label, glyph)` rather than the Slint struct: a
+            // `slint::Image` cannot be made off the UI thread, so the glyph
+            // stays an enum until the closure below.
+            let rows: Vec<(i32, String, Glyph)> = menu
+                .items()
+                .enumerate()
+                .filter_map(|(at, item)| {
+                    let label = item.title.clone()?;
+                    let glyph = glyphs::menu_glyph(&label);
+                    Some((at as i32, label, glyph))
+                })
+                .collect();
+
+            (
+                menu.heading().unwrap_or_default().to_owned(),
+                menu.subtitle.clone().unwrap_or_default(),
+                menu.image.clone(),
+                rows,
+            )
+        };
+
+        if rows.is_empty() {
+            say(&self.ui, "The player offers nothing for that track");
+            return;
+        }
+
+        let art = self.artwork.clone();
+        let client = self
+            .browsing
+            .lock()
+            .unwrap()
+            .device
+            .and_then(|id| self.with_entry(id, |e| e.client.clone()));
+        let cover = cover
+            .as_deref()
+            .zip(client.as_ref())
+            .and_then(|(src, client)| art.cached(&client.image_url(src), THUMB_SIZE));
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let icons = Icons::get(&ui);
+            let rows: Vec<ActionButton> = rows
+                .into_iter()
+                .map(|(index, label, glyph)| ActionButton {
+                    index,
+                    label: label.into(),
+                    glyph: glyph_image(&icons, glyph),
+                    primary: false,
+                })
+                .collect();
+
+            ui.set_queue_menu_title(title.into());
+            ui.set_queue_menu_subtitle(subtitle.into());
+            ui.set_queue_menu_cover(cover.map(slint::Image::from_rgba8).unwrap_or_default());
+            ui.set_queue_menu_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+            ui.set_queue_menu_open(true);
+        });
+    }
+
     fn publish_queue(&self) {
         // Read the selection out before taking the registry lock, so the two
         // are never held at once and there is no order to get wrong.
@@ -4127,13 +4212,47 @@ async fn run_commands(
                     .queue_menu_uri
                     .clone()
                     .unwrap_or_else(|| "/ui/queueItemCM".to_owned());
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
                 let backend = backend.clone();
-                tokio::spawn(open_screen(
-                    backend.clone(),
-                    id,
-                    format!("{base}?id={song}"),
-                    Arrive::Deeper,
-                ));
+                tokio::spawn(async move {
+                    match client.screen(&format!("{base}?id={song}")).await {
+                        Ok(menu) => {
+                            backend.browsing.lock().unwrap().queue_menu = Some(menu);
+                            backend.publish_queue_menu();
+                        }
+                        Err(e) => {
+                            tracing::debug!(%id, "no menu for queue item {song}: {e}");
+                            say(&backend.ui, "The player offers nothing for that track");
+                        }
+                    }
+                });
+                continue;
+            }
+
+            Command::QueueMenuAction(at) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let action = backend
+                    .browsing
+                    .lock()
+                    .unwrap()
+                    .queue_menu
+                    .as_ref()
+                    .and_then(|menu| menu.items().nth(at))
+                    .and_then(|item| item.action.clone());
+
+                if let Some(action) = action {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        run_action(backend.clone(), id, action, Arrive::Deeper).await;
+                        // Favouriting and deleting both change the queue, and
+                        // the player announces neither.
+                        fetch_queue(backend, id).await;
+                    });
+                }
                 continue;
             }
 

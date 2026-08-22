@@ -703,7 +703,8 @@ component TrackRow inherits Rectangle {
     // a drag converges instead of tracking.
     in property <length> lift: 0px;
     callback play();
-    callback open-menu();
+    // Carries the row's position so the menu can open against it.
+    callback open-menu(length);
     callback remove();
     callback drag-moved(length);
     callback drag-done();
@@ -836,7 +837,7 @@ component TrackRow inherits Rectangle {
                 glyph-size: 15px;
                 opacity: touch.has-hover ? 1.0 : 0.45;
                 animate opacity { duration: 120ms; }
-                clicked => { root.open-menu(); }
+                clicked => { root.open-menu(root.absolute-position.y); }
             }
         }
 
@@ -1519,7 +1520,17 @@ export component AppWindow inherits Window {
     callback queue-remove(int);
     callback queue-save(string);
     callback queue-button(int);
-    callback queue-menu(int);
+    // The context menu for one queue row: what the player offers for that
+    // track, drawn against the row rather than in place of the screen.
+    in property <[ActionButton]> queue-menu-rows;
+    in property <string> queue-menu-title;
+    in property <string> queue-menu-subtitle;
+    in property <image> queue-menu-cover;
+    in-out property <bool> queue-menu-open: false;
+    // Where the row that opened it sits, in window coordinates.
+    in-out property <length> queue-menu-y: 0px;
+    callback queue-menu(int, length);
+    callback queue-menu-activate(int);
     callback sidebar-activate(int, int);
     callback open-settings();
     callback setting-toggle(int);
@@ -2542,7 +2553,10 @@ export component AppWindow inherits Window {
                                 y: slot.lift;
                                 lift: slot.lift;
                                 play => { root.play-track(root.current.id, track.id); }
-                                open-menu => { root.queue-menu(track.id); }
+                                open-menu(at) => {
+                                    root.queue-menu-y = at;
+                                    root.queue-menu(track.id, at);
+                                }
                                 remove => { root.queue-remove(track.id); }
                                 drag-moved(offset) => {
                                     if (pane.from-row < 0) {
@@ -3114,6 +3128,122 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                    }
+                }
+            }
+        }
+    }
+
+    // The context menu for a queue row.
+    //
+    // Drawn over the window rather than pushed onto the browse screen, which
+    // is where this used to go: the menu is about a track in the list on the
+    // right, and answering it by replacing the page on the left meant the
+    // press appeared to do nothing at all.
+    //
+    // Anchored to the row that opened it and then clamped, so a menu opened
+    // against the last row in a full queue still sits on screen.
+    if root.queue-menu-open: Rectangle {
+        // Anything outside the panel dismisses it.
+        TouchArea {
+            clicked => { root.queue-menu-open = false; }
+        }
+
+        Rectangle {
+            x: parent.width - self.width - Theme.room;
+            y: Math.clamp(root.queue-menu-y + 34px,
+                Theme.room,
+                Math.max(Theme.room, parent.height - self.height - 96px));
+            width: 320px;
+            height: header.preferred-height + rows.preferred-height + 2 * Theme.gap;
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #0000008c;
+            clip: true;
+
+            VerticalLayout {
+                padding: Theme.gap;
+                spacing: Theme.tight;
+
+                header := HorizontalLayout {
+                    padding-left: Theme.tight;
+                    padding-bottom: Theme.tight;
+                    spacing: Theme.gap;
+
+                    Artwork {
+                        source: root.queue-menu-cover;
+                        corner: Theme.radius-small;
+                        width: 44px;
+                        height: 44px;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+
+                        Text {
+                            text: root.queue-menu-title;
+                            font-size: Theme.body-size;
+                            font-weight: 600;
+                            color: Theme.text;
+                            overflow: elide;
+                        }
+
+                        if root.queue-menu-subtitle != "": Text {
+                            text: root.queue-menu-subtitle;
+                            font-size: Theme.small-size;
+                            color: Theme.dim;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                rows := VerticalLayout {
+                    for entry[i] in root.queue-menu-rows: Rectangle {
+                        height: 44px;
+                        border-radius: Theme.radius-small;
+                        background: choose.has-hover ? Theme.hover : transparent;
+
+                        choose := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.queue-menu-open = false;
+                                root.queue-menu-activate(entry.index);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: Theme.tight;
+                            padding-right: Theme.tight;
+                            spacing: Theme.pad;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Icon {
+                                    glyph: entry.glyph;
+                                    tint: Theme.dim;
+                                    width: 18px;
+                                    height: 18px;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                min-width: 0px;
+
+                                Text {
+                                    text: entry.label;
+                                    font-size: Theme.body-size;
+                                    color: Theme.text;
+                                    overflow: elide;
+                                }
+                            }
+                        }
                     }
                 }
             }
