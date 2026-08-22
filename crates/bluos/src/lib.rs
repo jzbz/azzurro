@@ -34,6 +34,7 @@ pub mod discovery;
 pub mod error;
 pub mod lsdp;
 pub mod queue;
+pub mod reports;
 pub mod screen;
 pub mod settings;
 pub mod status;

@@ -261,6 +261,31 @@ impl Client {
             })
     }
 
+    /// Ask the player whether there is firmware to install.
+    ///
+    /// Reading only. Starting an upgrade is deliberately not offered here:
+    /// it is the one operation where getting it wrong leaves somebody with a
+    /// brick, and the player's own page does it perfectly well.
+    /// Returns what the player says, and the action it offers if any.
+    #[allow(clippy::type_complexity)]
+    pub async fn upgrade_check(&self) -> Result<(Option<String>, Option<(String, String)>)> {
+        let body = self
+            .get_text("/upgrade?noheader=1", &[], REQUEST_TIMEOUT)
+            .await?;
+        Ok((
+            crate::reports::upgrade_status(&body),
+            crate::reports::upgrade_action(&body),
+        ))
+    }
+
+    /// The player's diagnostics, as label and value.
+    pub async fn diagnostics(&self) -> Result<Vec<(String, String)>> {
+        let body = self
+            .get_text("/redirectToCp?href=/diagnostics", &[], REQUEST_TIMEOUT)
+            .await?;
+        Ok(crate::reports::diagnostics(&body))
+    }
+
     /// Send a path the player itself supplied, and discard the answer.
     ///
     /// This is how a `player-link` action is carried out: the screen document

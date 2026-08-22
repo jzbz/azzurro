@@ -125,6 +125,8 @@ struct Browsing {
     sources: Option<Screen>,
     /// When set, the middle pane is showing the Help menu.
     help: bool,
+    /// A page reached from the Help menu: its title and the facts on it.
+    help_detail: Option<(String, Vec<(String, String)>)>,
     /// When set, the middle pane is showing settings rather than a browse
     /// screen. The two are alternatives, not layers: opening settings is a
     /// change of mode, and Back leaves it.
@@ -989,8 +991,24 @@ impl Backend {
     /// nested rows and shelves the way the official app draws them — is a
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
-    /// Put the Help menu in the middle pane.
+    /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
+        if let Some((title, facts)) = self.browsing.lock().unwrap().help_detail.clone() {
+            let rows = facts
+                .into_iter()
+                .map(|(label, value)| SettingData {
+                    index: -1,
+                    label,
+                    detail: value,
+                    glyph: Some(Glyph::Info),
+                    control: "none",
+                    available: true,
+                    ..SettingData::blank()
+                })
+                .collect();
+            return self.send_settings(rows, title);
+        }
+
         // About is filled in from what the selected player has told us, so it
         // says something true rather than a version number on its own.
         let about = {
@@ -1013,7 +1031,7 @@ impl Backend {
         let mut rows: Vec<SettingData> = HELP_ENTRIES
             .iter()
             .enumerate()
-            .map(|(index, (label, _, detail, glyph))| SettingData {
+            .map(|(index, (label, _kind, detail, glyph))| SettingData {
                 index: index as i32,
                 label: (*label).to_owned(),
                 detail: (*detail).to_owned(),
@@ -1360,32 +1378,43 @@ enum Edit {
 /// Everything here is a web page. One is Lenbrook's support site, one is
 /// served by the player on its control port, and the rest redirect to pages it
 /// serves on port 80.
-const HELP_ENTRIES: &[(&str, &str, &str, Glyph)] = &[
+const HELP_ENTRIES: &[(&str, HelpKind, &str, Glyph)] = &[
     (
         "Online Support",
-        "https://support.bluos.net",
+        HelpKind::Web("https://support.bluos.net"),
         "BluOS support articles",
         Glyph::Help,
     ),
     (
         "Send Support Request",
-        "/redirectToCp?href=/diag",
-        "Send this player's logs to Lenbrook",
+        HelpKind::Web("/redirectToCp?href=/diag"),
+        "Submits this player's logs — opens in a browser",
         Glyph::Details,
     ),
     (
         "Upgrade Check",
-        "/upgrade?noheader=1",
+        HelpKind::Upgrade,
         "Check the player for new firmware",
         Glyph::Rescan,
     ),
     (
         "Diagnostics",
-        "/redirectToCp?href=/diagnostics",
-        "The player's own diagnostics page",
+        HelpKind::Diagnostics,
+        "Addresses, uptime and library size",
         Glyph::Info,
     ),
 ];
+
+/// What a Help entry does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpKind {
+    /// An interactive page — signing in, submitting logs — that has to be a
+    /// browser. Absolute for Lenbrook's site, relative for the player's own.
+    Web(&'static str),
+    /// Read-only, so it is read and shown here instead.
+    Upgrade,
+    Diagnostics,
+}
 
 /// One settings row on its way to the window.
 struct SettingData {
@@ -1630,17 +1659,16 @@ fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
 /// anything a future firmware adds, which is why the fallback keeps the raw
 /// name rather than dropping it.
 fn user_screens(config: &bluos::Configuration) -> Vec<(String, String)> {
-    const NOT_BROWSABLE: &[&str] = &[
-        "nowPlayingContextMenu",
-        "queueItemContextMenu",
-        "resolveSoviURL",
-        "queue",
-    ];
+    // What the official controller actually puts in its sidebar, which is
+    // three of these and not the rest: Recently Played and Presets are rows on
+    // the Home screen, Sources is the two sections drawn underneath, and News
+    // is an empty screen on every player seen.
+    const IN_SIDEBAR: &[&str] = &["home", "favourites", "search"];
 
     config
         .items
         .iter()
-        .filter(|item| !NOT_BROWSABLE.contains(&item.id.as_str()))
+        .filter(|item| IN_SIDEBAR.contains(&item.id.as_str()))
         .map(|item| (screen_label(&item.id), item.uri.clone()))
         .collect()
 }
@@ -1677,6 +1705,12 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
         Ok(screen) => {
             {
                 let mut browsing = backend.browsing.lock().unwrap();
+                // Showing a screen means leaving Settings and Help, which
+                // otherwise keep the pane and the sidebar navigates
+                // underneath them with nothing appearing to happen.
+                browsing.help = false;
+                browsing.help_detail = None;
+                browsing.settings = None;
                 // Browsing follows the selection: a screen only means anything
                 // against the player that served it.
                 if browsing.device != Some(id) {
@@ -2289,6 +2323,16 @@ async fn run_commands(
 
             Command::BrowseBack => {
                 // Back out of settings before backing out of anything else.
+                // One step at a time: out of a Help page, then out of Help.
+                let stepped_back = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.help_detail.take().is_some()
+                };
+                if stepped_back {
+                    backend.publish_help();
+                    continue;
+                }
+
                 let leaving = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     let was_help = browsing.help;
@@ -2448,27 +2492,74 @@ async fn run_commands(
             }
 
             Command::HelpAction(index) => {
-                let Some((_, target, _, _)) = HELP_ENTRIES.get(index) else {
+                let Some((_, kind, _, _)) = HELP_ENTRIES.get(index) else {
                     // The About row, which is text rather than a link.
                     continue;
                 };
-                // Absolute for Lenbrook's own site, relative for the pages the
-                // player serves; image_url already knows the difference.
-                let url = match backend
+                let client = backend
                     .selected
                     .lock()
                     .unwrap()
-                    .and_then(|id| backend.with_entry(id, |e| e.client.image_url(target)))
-                {
-                    Some(url) => url,
-                    None => (*target).to_owned(),
-                };
-                tracing::info!("opening {url} in a browser");
-                let _ = tokio::task::spawn_blocking(move || match open::that_detached(&url) {
-                    Ok(()) => tracing::info!("browser launched"),
-                    Err(e) => tracing::warn!("could not open a browser: {e}"),
-                })
-                .await;
+                    .and_then(|id| backend.with_entry(id, |e| e.client.clone()));
+
+                match kind {
+                    HelpKind::Web(target) => {
+                        // Absolute for Lenbrook's own site, relative for the
+                        // pages the player serves; image_url knows which.
+                        let url = match &client {
+                            Some(client) => client.image_url(target),
+                            None => (*target).to_owned(),
+                        };
+                        tracing::info!("opening {url} in a browser");
+                        let _ =
+                            tokio::task::spawn_blocking(move || match open::that_detached(&url) {
+                                Ok(()) => tracing::info!("browser launched"),
+                                Err(e) => tracing::warn!("could not open a browser: {e}"),
+                            })
+                            .await;
+                    }
+                    HelpKind::Diagnostics => {
+                        let Some(client) = client else { continue };
+                        match client.diagnostics().await {
+                            Ok(facts) if !facts.is_empty() => {
+                                backend.browsing.lock().unwrap().help_detail =
+                                    Some(("Diagnostics".to_owned(), facts));
+                                backend.publish_help();
+                            }
+                            // The page is the player's own HTML, so it can
+                            // change under us; offer it rather than nothing.
+                            _ => {
+                                let url = client.image_url("/redirectToCp?href=/diagnostics");
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = open::that_detached(&url);
+                                })
+                                .await;
+                            }
+                        }
+                    }
+                    HelpKind::Upgrade => {
+                        let Some(client) = client else { continue };
+                        match client.upgrade_check().await {
+                            Ok((status, action)) => {
+                                let mut facts = vec![(
+                                    "Status".to_owned(),
+                                    status.unwrap_or_else(|| {
+                                        "The player did not answer clearly".to_owned()
+                                    }),
+                                )];
+                                // Only present when the player itself offers
+                                // one; see reports::upgrade_action.
+                                if let Some((label, href)) = action {
+                                    facts.push((label, client.image_url(&href)));
+                                }
+                                backend.browsing.lock().unwrap().help_detail =
+                                    Some(("Upgrade Check".to_owned(), facts));
+                                backend.publish_help();
+                            }
+                            Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
+                        }
+                    }
+                }
                 continue;
             }
 

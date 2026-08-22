@@ -2,6 +2,19 @@ import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint"
 import { Theme, Icons } from "theme.slint";
 import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge } from "widgets.slint";
 
+// A bare file import is how Slint registers a custom font: the family the
+// file declares becomes usable as a font-family anywhere, and the file is
+// embedded in the binary. Naming the family in `default-font-family` without
+// this does nothing at all — it silently falls back to whatever the system
+// has, which is Noto Sans on this machine and DejaVu inside a Flatpak.
+//
+// Slint accepts only ttf/ttc/otf. See ui/fonts/LICENSE for the OFL text and
+// the Reserved Font Name notices.
+import "fonts/geist-regular.ttf";
+import "fonts/geist-semibold.ttf";
+import "fonts/geist-bold.ttf";
+import "fonts/geo.ttf";
+
 // Re-exported so Rust can reach the glyph set: only globals exported from the
 // entry file get generated bindings, and the browse rows pick their icon on
 // the Rust side.
