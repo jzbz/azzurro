@@ -48,6 +48,9 @@ pub enum Glyph {
     Settings,
     /// The generic stand-in for a setting with no icon of its own.
     Tweak,
+    /// Only used by the Help menu, which names its own icons.
+    Help,
+    Rescan,
 }
 
 /// Whether `source` is something worth showing as it is.

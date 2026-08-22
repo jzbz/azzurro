@@ -1,16 +1,21 @@
 All fonts here are redistributed under the SIL Open Font License 1.1, which
 requires this notice and licence text to accompany them.
 
+  geo.ttf              the Azzurro wordmark only
   geist-regular.ttf    the interface font, at the three weights the UI asks
   geist-semibold.ttf   for. Medium was tried and dropped in a sibling project:
   geist-bold.ttf       Slint resolves the 550 weight to SemiBold, so shipping
                        it changed nothing.
 
+Copyright (c) 2000-2010, Ben Weiner (ben@readingtype.org.uk),
+with Reserved Font Name Geo.
+
 Copyright (c) 2023 Vercel, Inc., with Reserved Font Name "Geist".
 
-Geist is shipped as the upstream static TrueType instances — TrueType being
-the only outline format Slint accepts. No outlines were modified, so the
-Reserved Font Name still applies and this is still Geist.
+Geo was converted from WOFF2 to TrueType, the only outline format Slint
+accepts; Geist is shipped as the upstream static TrueType instances. No
+outlines were modified, so the Reserved Font Names still apply and these are
+still Geo and Geist.
 
 ----------------------------------------------------------------------
 

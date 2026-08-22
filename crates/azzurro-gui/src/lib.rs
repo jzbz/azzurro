@@ -90,6 +90,10 @@ enum Command {
     QueueMenu(u32),
     /// Show the player's settings, or one page of them.
     OpenSettings(Option<String>),
+    /// Show the Help menu.
+    OpenHelp,
+    /// Follow entry `n` of the Help menu.
+    HelpAction(usize),
     /// Act on row `n` of the settings page currently shown.
     SettingAction(usize),
     /// Change the value of the setting at row `n`.
@@ -119,6 +123,8 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
+    /// When set, the middle pane is showing the Help menu.
+    help: bool,
     /// When set, the middle pane is showing settings rather than a browse
     /// screen. The two are alternatives, not layers: opening settings is a
     /// change of mode, and Back leaves it.
@@ -261,6 +267,8 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Save => icons.get_save(),
         Glyph::Settings => icons.get_settings(),
         Glyph::Tweak => icons.get_tweak(),
+        Glyph::Help => icons.get_help(),
+        Glyph::Rescan => icons.get_rescan(),
     }
 }
 
@@ -438,17 +446,9 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
         let _ = tx.send(Command::OpenSettings(None));
     });
 
-    // Lenbrook's own support site, which is where the settings' own helpUrl
-    // attributes point too.
+    let tx = commands.clone();
     ui.on_open_help(move || {
-        std::thread::spawn(|| {
-            // Reported rather than swallowed: when no browser opens, the only
-            // other clue is that nothing happened.
-            match open::that_detached("https://support.bluos.net/") {
-                Ok(()) => tracing::info!("opened the support site"),
-                Err(e) => tracing::warn!("could not open a browser: {e}"),
-            }
-        });
+        let _ = tx.send(Command::OpenHelp);
     });
 
     let tx = commands.clone();
@@ -989,6 +989,54 @@ impl Backend {
     /// nested rows and shelves the way the official app draws them — is a
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
+    /// Put the Help menu in the middle pane.
+    fn publish_help(&self) {
+        // About is filled in from what the selected player has told us, so it
+        // says something true rather than a version number on its own.
+        let about = {
+            let selected = *self.selected.lock().unwrap();
+            let guard = self.registry.lock().unwrap();
+            match selected
+                .and_then(|id| guard.get(&id))
+                .and_then(|e| e.sync.as_ref())
+            {
+                Some(sync) => format!(
+                    "Azzurro {} · {} on BluOS {}",
+                    env!("CARGO_PKG_VERSION"),
+                    sync.display_model(),
+                    sync.version.as_deref().unwrap_or("?")
+                ),
+                None => format!("Azzurro {}", env!("CARGO_PKG_VERSION")),
+            }
+        };
+
+        let mut rows: Vec<SettingData> = HELP_ENTRIES
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _, detail, glyph))| SettingData {
+                index: index as i32,
+                label: (*label).to_owned(),
+                detail: (*detail).to_owned(),
+                glyph: Some(*glyph),
+                control: "link",
+                available: true,
+                ..SettingData::blank()
+            })
+            .collect();
+
+        rows.push(SettingData {
+            index: HELP_ENTRIES.len() as i32,
+            label: "About".to_owned(),
+            detail: about,
+            glyph: Some(Glyph::Info),
+            control: "none",
+            available: true,
+            ..SettingData::blank()
+        });
+
+        self.send_settings(rows, "Help".to_owned());
+    }
+
     /// Turn a settings page into rows for the middle pane.
     fn publish_settings(&self) {
         let Some(page) = self.browsing.lock().unwrap().settings.clone() else {
@@ -1010,6 +1058,11 @@ impl Backend {
             None => "Settings".to_owned(),
         };
 
+        self.send_settings(rows, title);
+    }
+
+    /// Hand a list of setting-shaped rows to the middle pane.
+    fn send_settings(&self, rows: Vec<SettingData>, title: String) {
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -1063,10 +1116,13 @@ impl Backend {
             .flatten();
         let client = device.and_then(|id| self.with_entry(id, |e| e.client.clone()));
 
-        // Settings have a pane of their own; while one is open there is
-        // nothing to draw here, and publishing would fight it for the title.
-        if self.browsing.lock().unwrap().settings.is_some() {
-            return;
+        // Settings and Help have the pane while either is open; publishing
+        // here would fight them for the title.
+        {
+            let browsing = self.browsing.lock().unwrap();
+            if browsing.settings.is_some() || browsing.help {
+                return;
+            }
         }
 
         let (rows, title, can_go_back, search) = {
@@ -1292,6 +1348,44 @@ enum Edit {
     Number(f32),
     Text(String),
 }
+
+/// The Help menu.
+///
+/// Built here rather than fetched, because the official controller builds its
+/// own too — this is the list it hardcodes, minus two entries that mean
+/// nothing here: "Shortcuts", since this app has no keyboard shortcuts to
+/// list, and "Upgrade Check - Controller", which updates the controller
+/// itself and is the package manager's job on Linux.
+///
+/// Everything here is a web page. One is Lenbrook's support site, one is
+/// served by the player on its control port, and the rest redirect to pages it
+/// serves on port 80.
+const HELP_ENTRIES: &[(&str, &str, &str, Glyph)] = &[
+    (
+        "Online Support",
+        "https://support.bluos.net",
+        "BluOS support articles",
+        Glyph::Help,
+    ),
+    (
+        "Send Support Request",
+        "/redirectToCp?href=/diag",
+        "Send this player's logs to Lenbrook",
+        Glyph::Details,
+    ),
+    (
+        "Upgrade Check",
+        "/upgrade?noheader=1",
+        "Check the player for new firmware",
+        Glyph::Rescan,
+    ),
+    (
+        "Diagnostics",
+        "/redirectToCp?href=/diagnostics",
+        "The player's own diagnostics page",
+        Glyph::Info,
+    ),
+];
 
 /// One settings row on its way to the window.
 struct SettingData {
@@ -2197,7 +2291,9 @@ async fn run_commands(
                 // Back out of settings before backing out of anything else.
                 let leaving = {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.settings.take().is_some()
+                    let was_help = browsing.help;
+                    browsing.help = false;
+                    browsing.settings.take().is_some() || was_help
                 };
                 if leaving {
                     backend.publish_settings();
@@ -2274,7 +2370,10 @@ async fn run_commands(
                 };
                 match client.settings(page.as_deref()).await {
                     Ok(page) => {
-                        backend.browsing.lock().unwrap().settings = Some(page);
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.help = false;
+                        browsing.settings = Some(page);
+                        drop(browsing);
                         backend.publish_settings();
                     }
                     Err(e) => {
@@ -2286,6 +2385,11 @@ async fn run_commands(
             }
 
             Command::SettingAction(index) => {
+                if backend.browsing.lock().unwrap().help {
+                    let _ = backend.commands.send(Command::HelpAction(index));
+                    continue;
+                }
+
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
@@ -2330,6 +2434,41 @@ async fn run_commands(
                     }
                     None => {}
                 }
+                continue;
+            }
+
+            Command::OpenHelp => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.help = true;
+                    browsing.settings = None;
+                }
+                backend.publish_help();
+                continue;
+            }
+
+            Command::HelpAction(index) => {
+                let Some((_, target, _, _)) = HELP_ENTRIES.get(index) else {
+                    // The About row, which is text rather than a link.
+                    continue;
+                };
+                // Absolute for Lenbrook's own site, relative for the pages the
+                // player serves; image_url already knows the difference.
+                let url = match backend
+                    .selected
+                    .lock()
+                    .unwrap()
+                    .and_then(|id| backend.with_entry(id, |e| e.client.image_url(target)))
+                {
+                    Some(url) => url,
+                    None => (*target).to_owned(),
+                };
+                tracing::info!("opening {url} in a browser");
+                let _ = tokio::task::spawn_blocking(move || match open::that_detached(&url) {
+                    Ok(()) => tracing::info!("browser launched"),
+                    Err(e) => tracing::warn!("could not open a browser: {e}"),
+                })
+                .await;
                 continue;
             }
 

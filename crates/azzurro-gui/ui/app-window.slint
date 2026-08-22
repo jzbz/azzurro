@@ -751,12 +751,15 @@ export component AppWindow inherits Window {
                             height: 20px;
                         }
 
+                        // Geo for the wordmark alone — see ui/fonts/LICENSE.
+                        // The interface is Geist; a wordmark is a picture of a
+                        // name rather than text, and wants its own letterforms.
                         Text {
-                            text: "Azzurro";
-                            font-size: Theme.title-size;
-                            font-weight: 700;
+                            text: "AZZURRO";
+                            font-family: "Geo";
+                            font-size: Theme.title-size + 3px;
                             color: Theme.text;
-                            letter-spacing: 0.4px;
+                            letter-spacing: 2.2px;
                             vertical-alignment: center;
                         }
 
