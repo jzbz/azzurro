@@ -65,6 +65,7 @@ pub enum Glyph {
     Server,
     Tone,
     Gauge,
+    Edit,
     /// A music service with no glyph of its own — the long tail of them, from
     /// Deezer to whatever the next firmware adds.
     Service,
@@ -177,6 +178,8 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Volume)
     } else if has("audio") || has("amplifier") || title == "player" || has("room name") {
         Some(Glyph::Speaker)
+    } else if word("edit") {
+        Some(Glyph::Edit)
     } else if word("clear") {
         Some(Glyph::Clear)
     } else if word("save") {

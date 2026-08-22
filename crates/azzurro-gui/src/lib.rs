@@ -73,6 +73,14 @@ const SEARCH_SETTLE: Duration = Duration::from_millis(280);
 /// own list, and it lasts as long as the app is running.
 const RECENT_SEARCHES: usize = 8;
 
+/// How often the sweep bar redraws. Fine enough to read as movement, coarse
+/// enough that twelve seconds is a hundred repaints rather than a thousand.
+const SWEEP_TICK: Duration = Duration::from_millis(120);
+
+/// How long a finished sweep stays on screen before the bar goes away. Long
+/// enough to read the count, short enough not to become furniture.
+const SWEEP_LINGER: Duration = Duration::from_secs(3);
+
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
@@ -118,6 +126,13 @@ enum Command {
     /// Search the current screen for some text.
     BrowseSearch(String),
     BrowseSearchDone(String),
+    /// Move a track from one place in the queue to another, both as positions
+    /// in the queue rather than rows on screen.
+    QueueReorder(u32, u32),
+    QueueRemove(u32),
+    QueueSave(String),
+    /// Run whichever of the queue document's own buttons this is.
+    QueueButton(usize),
     /// Back one screen.
     BrowseBack,
 }
@@ -138,6 +153,15 @@ struct Browsing {
     /// The player's own Sources screen, kept because the sidebar is drawn from
     /// it: its two rows are the inputs and the music services.
     sources: Option<Screen>,
+    /// The play queue's own document, kept for the row of buttons under it.
+    ///
+    /// The rows come from `/Playlist`, which is smaller and pages cleanly. The
+    /// buttons only exist on `/ui/Queue`, and which of them the player offers
+    /// is its business — Queue Builder Mode appears there only for a client
+    /// that declares a new enough schema.
+    queue_screen: Option<Screen>,
+    /// The queue screen's own uri, from `/ui/Configuration`.
+    queue_uri: Option<String>,
     /// What has been searched for this session, most recent first.
     ///
     /// The player does not keep this — the official controller keeps its own,
@@ -267,6 +291,10 @@ struct Backend {
     /// takes a number on the way in and checks it is still the highest on the
     /// way out.
     searches: Arc<AtomicU64>,
+    /// How many sweeps for players have been asked for, so that pressing
+    /// rescan again takes the bar over from the sweep already running instead
+    /// of the two of them fighting for it.
+    sweeps: Arc<AtomicU64>,
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -349,6 +377,7 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Tone => icons.get_tone(),
         Glyph::Gauge => icons.get_gauge(),
         Glyph::Service => icons.get_service(),
+        Glyph::Edit => icons.get_edit(),
         Glyph::Help => icons.get_help(),
         Glyph::Rescan => icons.get_rescan(),
     }
@@ -364,9 +393,21 @@ struct TrackData {
     title: String,
     artist: String,
     duration: String,
+    quality: String,
     cursor: bool,
     live: bool,
     cover: Option<Pixels>,
+}
+
+/// One of the buttons the player puts under the play queue, on its way to the
+/// window.
+struct QueueButtonData {
+    index: i32,
+    label: String,
+    glyph: Option<Glyph>,
+    highlight: bool,
+    mode: i32,
+    question: String,
 }
 
 /// Distinguishes the several MPRIS bus names one process claims.
@@ -544,6 +585,32 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_queue_reorder(move |from, to| {
+        if from >= 0 && to >= 0 {
+            let _ = tx.send(Command::QueueReorder(from as u32, to as u32));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_remove(move |id| {
+        if id >= 0 {
+            let _ = tx.send(Command::QueueRemove(id as u32));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_save(move |name| {
+        let _ = tx.send(Command::QueueSave(name.to_string()));
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_button(move |index| {
+        if index >= 0 {
+            let _ = tx.send(Command::QueueButton(index as usize));
+        }
+    });
+
+    let tx = commands.clone();
     ui.on_browse_search_done(move |query| {
         let _ = tx.send(Command::BrowseSearchDone(query.to_string()));
     });
@@ -571,9 +638,6 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
             let _ = tx.send(Command::CycleRepeat(id));
         }
     });
-
-    let tx = commands.clone();
-    ui.on_cycle_sleep(move |id| dispatch(&tx, &id, Action::Sleep));
 
     let tx = commands.clone();
     ui.on_toggle_group(move |id| {
@@ -623,6 +687,7 @@ async fn run(
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(BTreeSet::new())),
         searches: Arc::new(AtomicU64::new(0)),
+        sweeps: Arc::new(AtomicU64::new(0)),
     };
 
     tokio::spawn(run_commands(
@@ -675,11 +740,7 @@ async fn run(
     // The sweep is only the cold start. Players announce themselves unprompted
     // when they wake, so the same socket keeps listening afterwards and a
     // player switched on an hour later still appears.
-    if let Ok(found) = discovery.sweep(DEFAULT_SWEEP).await {
-        for announce in found {
-            backend.adopt(&announce, &http);
-        }
-    }
+    sweep(backend.clone(), discovery.clone(), http.clone()).await;
 
     loop {
         match discovery.recv().await {
@@ -886,7 +947,63 @@ impl Backend {
         // are never held at once and there is no order to get wrong.
         let selected = *self.selected.lock().unwrap();
 
-        let (rows, line) = {
+        // What the player offers to do with the queue. Recognised by what each
+        // action is rather than by what it says: matching on the label is what
+        // the official controller does and it would break on the first player
+        // set to another language.
+        let buttons: Vec<QueueButtonData> = {
+            let browsing = self.browsing.lock().unwrap();
+            browsing
+                .queue_screen
+                .as_ref()
+                .map(|screen| {
+                    screen
+                        .buttons
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, button)| {
+                            let action = button.action.as_ref()?;
+                            let label = button.text.clone()?;
+                            let uri = action.uri.as_deref().unwrap_or_default();
+
+                            let mode = match action.kind {
+                                // A route into the client, not a request: the
+                                // official controller intercepts it before its
+                                // own router and turns it into a local flag.
+                                ActionKind::DeepLink if uri.starts_with("/edit-queue") => 1,
+                                // The player asking to be asked.
+                                ActionKind::Confirmation => 2,
+                                // Older firmware sends Clear without the ask.
+                                // Emptying a queue cannot be undone, so it is
+                                // asked for anyway.
+                                ActionKind::PlayerLink if uri.starts_with("/Clear") => 2,
+                                ActionKind::Browse
+                                    if action.result_type.as_deref()
+                                        == Some("SaveQueueOptions") =>
+                                {
+                                    3
+                                }
+                                _ => 0,
+                            };
+
+                            Some(QueueButtonData {
+                                index: at as i32,
+                                glyph: glyphs::glyph_for(&label, None),
+                                highlight: button.highlight,
+                                question: action
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| format!("{label}?")),
+                                label,
+                                mode,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let (rows, line, cursor_row) = {
             let guard = self.registry.lock().unwrap();
             match selected.and_then(|id| guard.get(&id)).and_then(|entry| {
                 entry
@@ -926,12 +1043,21 @@ impl Backend {
                                 title: song.title.clone().unwrap_or_default(),
                                 artist: song.artist.clone().unwrap_or_default(),
                                 duration: song.duration().unwrap_or_default(),
+                                quality: song.quality.clone().unwrap_or_default(),
                                 cursor: at_cursor,
                                 live: at_cursor && live,
                                 cover,
                             }
                         })
                         .collect();
+
+                    // Which row the player is on, which is not the same number
+                    // as the queue position once a window starts anywhere but
+                    // the beginning.
+                    let cursor_row = cursor
+                        .and_then(|at| queue.songs.iter().position(|song| song.id == at))
+                        .map(|row| row as i32)
+                        .unwrap_or(-1);
 
                     let shown = rows.len() as u32;
                     let plural = if queue.length == 1 { "track" } else { "tracks" };
@@ -940,15 +1066,16 @@ impl Backend {
                     } else {
                         format!("Queue · {shown} of {} {plural}", queue.length)
                     };
-                    (rows, line)
+                    (rows, line, cursor_row)
                 }
-                None => (Vec::new(), "Queue".to_owned()),
+                None => (Vec::new(), "Queue".to_owned(), -1),
             }
         };
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
+            let icons = Icons::get(&ui);
 
             let rows: Vec<Track> = rows
                 .into_iter()
@@ -957,6 +1084,7 @@ impl Backend {
                     title: row.title.into(),
                     artist: row.artist.into(),
                     duration: row.duration.into(),
+                    quality: row.quality.into(),
                     cursor: row.cursor,
                     live: row.live,
                     cover: row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
@@ -965,6 +1093,23 @@ impl Backend {
 
             ui.set_queue(ModelRc::new(VecModel::from(rows)));
             ui.set_queue_line(line.into());
+            ui.set_queue_cursor(cursor_row);
+            ui.set_queue_buttons(ModelRc::new(VecModel::from(
+                buttons
+                    .into_iter()
+                    .map(|button| QueueButton {
+                        index: button.index,
+                        label: button.label.into(),
+                        glyph: match button.glyph {
+                            Some(glyph) => glyph_image(&icons, glyph),
+                            None => Default::default(),
+                        },
+                        highlight: button.highlight,
+                        mode: button.mode,
+                        question: button.question.into(),
+                    })
+                    .collect::<Vec<_>>(),
+            )));
         });
     }
 
@@ -1177,9 +1322,17 @@ impl Backend {
             return;
         };
 
+        let sleep = self
+            .selected
+            .lock()
+            .unwrap()
+            .and_then(|id| self.with_entry(id, |e| e.status.clone()))
+            .flatten()
+            .and_then(|status| status.sleep_minutes());
+
         let mut rows: Vec<SettingData> = Vec::new();
         let mut index = 0i32;
-        walk_settings(&page.entries, &page, &mut rows, &mut index);
+        walk_settings(&page.entries, &page, sleep, &mut rows, &mut index);
 
         // A page fetched by id has one group on it and that group names
         // itself — "Customize sources", "Music library". Its own name beats
@@ -1550,6 +1703,17 @@ impl Backend {
     /// Kept out of the device model on purpose: the position advances once a
     /// second, and rebuilding every row for it would re-upload every cover on
     /// screen along the way.
+    fn set_sweep(&self, scanning: bool, label: String, left: String, progress: f32) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.set_scanning(scanning);
+            ui.set_scan_label(label.into());
+            ui.set_scan_left(left.into());
+            ui.set_scan_progress(progress);
+        });
+    }
+
     fn publish_transport(&self) {
         let selected = *self.selected.lock().unwrap();
         let snapshot = selected
@@ -1566,12 +1730,6 @@ impl Backend {
             }
             _ => String::new(),
         };
-
-        let sleep = snapshot
-            .as_ref()
-            .and_then(|(status, _)| status.sleep_minutes())
-            .map(|m| format!("Sleep {m}m"))
-            .unwrap_or_else(|| "Sleep".to_owned());
 
         let (position, duration, seekable, shuffle, repeat) = match &snapshot {
             Some((status, at)) => {
@@ -1610,9 +1768,7 @@ impl Backend {
             ui.set_seekable(seekable);
             ui.set_shuffle(shuffle);
             ui.set_repeat(repeat);
-            ui.set_sleep_label(sleep.as_str().into());
             ui.set_indexing(indexing.as_str().into());
-            ui.set_sleep_on(sleep != "Sleep");
         });
     }
 
@@ -1719,6 +1875,10 @@ struct SettingData {
 fn walk_settings(
     entries: &[SettingEntry],
     page: &SettingsPage,
+    // Minutes left on the sleep timer. It is not in the settings document —
+    // the player reports it in `/Status` — so the one row that needs it is
+    // handed it from outside.
+    sleep: Option<u32>,
     rows: &mut Vec<SettingData>,
     index: &mut i32,
 ) {
@@ -1752,7 +1912,7 @@ fn walk_settings(
                         ..SettingData::blank()
                     });
                 }
-                walk_settings(&group.entries, page, rows, index);
+                walk_settings(&group.entries, page, sleep, rows, index);
             }
             SettingEntry::Setting(setting) => {
                 let available = page.is_available(setting);
@@ -1769,7 +1929,8 @@ fn walk_settings(
                         Kind::List => "list",
                         Kind::Text => "text",
                         Kind::Button => "button",
-                        Kind::Alarms | Kind::Sleep => "link",
+                        Kind::Sleep => "cycle",
+                        Kind::Alarms => "link",
                         // Including dual-range, which needs a control of its
                         // own and gets its value shown instead.
                         _ => "none",
@@ -1798,8 +1959,22 @@ fn walk_settings(
                     },
                     heading: false,
                     control,
-                    on: setting.is_on(),
-                    value: setting.value.clone().unwrap_or_default(),
+                    // The sleep row bends both of these. Its state is not in
+                    // the document it is drawn from — the player reports the
+                    // timer in `/Status` — so it is filled in from there.
+                    on: if matches!(setting.kind, Kind::Sleep) {
+                        sleep.is_some()
+                    } else {
+                        setting.is_on()
+                    },
+                    value: match setting.kind {
+                        Kind::Sleep => match sleep {
+                            Some(1) => "1 min".to_owned(),
+                            Some(minutes) => format!("{minutes} min"),
+                            None => "Off".to_owned(),
+                        },
+                        _ => setting.value.clone().unwrap_or_default(),
+                    },
                     number: setting.number().unwrap_or(0.0),
                     minimum: bounds.min,
                     maximum: bounds.max,
@@ -1880,6 +2055,10 @@ enum Chosen {
     Web(String),
     /// A value to write.
     Write(Box<bluos::settings::Setting>, String),
+    /// One more step along the sleep timer's ladder. Not a write: the setting
+    /// carries no value and no options, because the player owns the ladder and
+    /// hands out the next rung on request.
+    Sleep,
 }
 
 /// Find what row `index` of a settings page refers to.
@@ -1910,6 +2089,7 @@ fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
                             Kind::Boolean => setting
                                 .toggled()
                                 .map(|value| Chosen::Write(setting.clone(), value)),
+                            Kind::Sleep => Some(Chosen::Sleep),
                             // A button has no value; the player wants its name
                             // sent back at it.
                             Kind::Button => Some(Chosen::Write(
@@ -1985,6 +2165,77 @@ fn settings_page(uri: &str) -> Option<Option<String>> {
         let (key, value) = pair.split_once('=')?;
         (key == "id").then(|| value.to_owned())
     }))
+}
+
+/// Broadcast for players, and show how the search is going.
+///
+/// The bar under the wordmark is the sweep window itself rather than a guess at
+/// it. A sweep is a schedule of broadcasts spread over twelve seconds, because
+/// one UDP query is dropped often enough to matter and a player that was asleep
+/// takes a moment to answer at all; without something on screen the button
+/// looks inert for all twelve of them.
+async fn sweep(backend: Backend, discovery: Arc<Discovery>, http: reqwest::Client) {
+    let generation = backend.sweeps.fetch_add(1, Ordering::Relaxed) + 1;
+    let reporter = tokio::spawn(report_sweep(backend.clone(), generation));
+
+    let found = discovery.sweep(DEFAULT_SWEEP).await.unwrap_or_default();
+    for announce in &found {
+        backend.adopt(announce, &http);
+    }
+
+    // Stopped and waited for, so that a tick already on its way to the window
+    // cannot land after the result and put "looking" back on the bar.
+    reporter.abort();
+    let _ = reporter.await;
+
+    if backend.sweeps.load(Ordering::Relaxed) != generation {
+        return;
+    }
+
+    let known = backend.registry.lock().unwrap().len();
+    backend.set_sweep(
+        false,
+        match known {
+            0 => "No players answered".to_owned(),
+            1 => "1 player found".to_owned(),
+            n => format!("{n} players found"),
+        },
+        String::new(),
+        1.0,
+    );
+
+    tokio::time::sleep(SWEEP_LINGER).await;
+    if backend.sweeps.load(Ordering::Relaxed) == generation {
+        backend.set_sweep(false, String::new(), String::new(), 0.0);
+    }
+}
+
+/// Move the bar for as long as one sweep lasts.
+async fn report_sweep(backend: Backend, generation: u64) {
+    let started = Instant::now();
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= DEFAULT_SWEEP || backend.sweeps.load(Ordering::Relaxed) != generation {
+            return;
+        }
+
+        // Counted from the registry rather than from what this sweep has
+        // received, because a player that answers the broadcast and a player
+        // remembered from last time are both there to be played.
+        let known = backend.registry.lock().unwrap().len();
+        backend.set_sweep(
+            true,
+            match known {
+                0 => "Looking for players…".to_owned(),
+                1 => "Looking for players — 1 so far".to_owned(),
+                n => format!("Looking for players — {n} so far"),
+            },
+            format!("{}s", (DEFAULT_SWEEP - elapsed).as_secs() + 1),
+            elapsed.as_secs_f32() / DEFAULT_SWEEP.as_secs_f32(),
+        );
+
+        tokio::time::sleep(SWEEP_TICK).await;
+    }
 }
 
 /// Fetch a screen and show it.
@@ -2166,7 +2417,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
 
         // The player handed over a complete request; sending it is the whole
         // job. Its own long poll reports the result.
-        ActionKind::PlayerLink | ActionKind::Add => {
+        ActionKind::PlayerLink | ActionKind::Add | ActionKind::Confirmation => {
             let Some(uri) = uri else { return };
             match client.follow(&uri).await {
                 Ok(()) => {
@@ -2444,9 +2695,39 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
                 entry.queue = Some(queue);
             }
             backend.publish_queue();
+            tokio::spawn(fetch_queue_buttons(backend.clone(), id));
             tokio::spawn(load_thumbnails(backend, id));
         }
         Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
+    }
+}
+
+/// Read the queue's own document, for the buttons the player puts under it.
+///
+/// Separate from the rows, which come from `/Playlist`: that endpoint pages and
+/// this one names the actions. Failing is not worth reporting — the queue still
+/// draws, just without its buttons.
+async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+    let uri = backend
+        .browsing
+        .lock()
+        .unwrap()
+        .queue_uri
+        .clone()
+        .unwrap_or_else(|| "/ui/Queue".to_owned());
+
+    match client.screen(&uri).await {
+        Ok(screen) => {
+            {
+                let mut browsing = backend.browsing.lock().unwrap();
+                browsing.queue_screen = Some(screen);
+            }
+            backend.publish_queue();
+        }
+        Err(e) => tracing::debug!(%id, "no queue document: {e}"),
     }
 }
 
@@ -2606,6 +2887,13 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     }
                 }
 
+                // The settings pane can be showing a row whose state is in
+                // the status rather than in the settings document — the sleep
+                // timer is one — so it is redrawn along with everything else.
+                if backend.is_selected(id) && backend.browsing.lock().unwrap().settings.is_some() {
+                    backend.publish_settings();
+                }
+
                 if backend.is_selected(id) {
                     backend.publish_transport();
                 }
@@ -2684,8 +2972,9 @@ async fn run_commands(
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
             Command::Rescan => {
-                say(&backend.ui, "rescanning");
-                let _ = discovery.query().await;
+                // Spawned rather than awaited: a sweep runs for twelve seconds
+                // and this loop is what carries every other command.
+                tokio::spawn(sweep(backend.clone(), discovery.clone(), http.clone()));
                 continue;
             }
             Command::Select(id) => {
@@ -2768,6 +3057,10 @@ async fn run_commands(
 
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.queue_uri = config
+                        .as_ref()
+                        .and_then(|c| c.uri("queue"))
+                        .map(str::to_owned);
                     browsing.queue_menu_uri = config
                         .as_ref()
                         .and_then(|c| c.uri("queueItemContextMenu"))
@@ -2919,6 +3212,9 @@ async fn run_commands(
                 match chosen {
                     Some(Chosen::Page(id)) => {
                         let _ = backend.commands.send(Command::OpenSettings(Some(id)));
+                    }
+                    Some(Chosen::Sleep) => {
+                        let _ = backend.commands.send(Command::Player(id, Action::Sleep));
                     }
                     Some(Chosen::Web(url)) => {
                         tracing::info!("opening {url} in a browser");
@@ -3155,6 +3451,90 @@ async fn run_commands(
 
             // Enter, which is not needed to search but does say the search was
             // the one that mattered.
+            Command::QueueReorder(from, to) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.move_queue_item(from, to).await {
+                    // The player does not announce a reorder — the queue's own
+                    // id does not change — so the list is re-read rather than
+                    // waited for.
+                    Ok(()) => tokio::spawn(fetch_queue(backend.clone(), id)),
+                    Err(e) => {
+                        say(&backend.ui, format!("could not move the track: {e}"));
+                        continue;
+                    }
+                };
+                continue;
+            }
+
+            Command::QueueRemove(index) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.delete_queue_item(index).await {
+                    Ok(()) => tokio::spawn(fetch_queue(backend.clone(), id)),
+                    Err(e) => {
+                        say(&backend.ui, format!("could not remove the track: {e}"));
+                        continue;
+                    }
+                };
+                continue;
+            }
+
+            Command::QueueSave(name) => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                match client.save_queue(&name).await {
+                    Ok(()) => {
+                        say(&backend.ui, format!("Saved as \"{name}\""));
+                        tokio::spawn(fetch_queue(backend.clone(), id));
+                    }
+                    Err(e) => say(&backend.ui, format!("could not save the queue: {e}")),
+                }
+                continue;
+            }
+
+            Command::QueueButton(at) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let action = backend
+                    .browsing
+                    .lock()
+                    .unwrap()
+                    .queue_screen
+                    .as_ref()
+                    .and_then(|screen| screen.buttons.get(at))
+                    .and_then(|button| button.action.clone());
+                if let Some(action) = action {
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        run_action(backend.clone(), id, action, Arrive::Deeper).await;
+                        // Every one of these changes the queue, and the player
+                        // reports none of them: clearing keeps the same queue
+                        // id, and turning a mode on changes only what the next
+                        // screen looks like.
+                        fetch_queue(backend, id).await;
+                    });
+                }
+                continue;
+            }
+
             Command::BrowseSearchDone(query) => {
                 let query = query.trim().to_owned();
                 if !query.is_empty() {

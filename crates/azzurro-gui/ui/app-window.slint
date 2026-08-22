@@ -46,11 +46,34 @@ export struct Track {
     title: string,
     artist: string,
     duration: string,
+    // The player's own word for the format — "cd", "hd", "mqa" — or empty
+    // where it does not say.
+    quality: string,
     // Where the player sits in the queue.
     cursor: bool,
     // ...and whether that position is what you are actually hearing.
     live: bool,
     cover: image,
+}
+
+// One of the buttons the player puts under the play queue.
+//
+// Save, Edit, Clear, and — to a client declaring a new enough schema — Queue
+// Builder Mode. Which of them exist is the player's business, not this app's:
+// the row is drawn from whatever it sends.
+export struct QueueButton {
+    index: int,
+    label: string,
+    glyph: image,
+    // The player's own recommendation of which one to press. Save carries it
+    // once the queue has been changed.
+    highlight: bool,
+    // What pressing it does here. 0 = send it to the player, which is the
+    // ordinary case; 1 = turn on Edit, which never leaves the app; 2 = ask
+    // first, then send; 3 = ask for a name, then save under it.
+    mode: int,
+    // The question to ask, for mode 2. The player writes it.
+    question: string,
 }
 
 // One row of a server-driven screen.
@@ -143,7 +166,10 @@ component SettingRow inherits Rectangle {
 
     height: root.item.heading ? 34px : 60px;
     border-radius: Theme.radius-small;
-    background: (root.item.control == "link" || root.item.control == "button") && touch.has-hover
+    background: (root.item.control == "link"
+            || root.item.control == "button"
+            || root.item.control == "cycle")
+            && touch.has-hover
         ? Theme.hover
         : transparent;
     animate background { duration: 120ms; easing: ease-out; }
@@ -152,7 +178,7 @@ component SettingRow inherits Rectangle {
     opacity: root.item.available ? 1.0 : 0.45;
 
     touch := TouchArea {
-        enabled: root.item.control == "link";
+        enabled: root.item.control == "link" || root.item.control == "cycle";
         clicked => { root.opened(); }
     }
 
@@ -276,6 +302,31 @@ component SettingRow inherits Rectangle {
                 label: root.item.label;
                 enabled: root.item.available;
                 clicked => { root.opened(); }
+            }
+        }
+
+        // A setting with no values to choose from, only a next state: the
+        // sleep timer walks its own ladder and the player decides what comes
+        // after what, so the row shows where it is and asks for one more step.
+        if root.item.control == "cycle": VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                height: 28px;
+                width: state.preferred-width + 26px;
+                border-radius: self.height / 2;
+                background: root.item.on ? Theme.accent-soft : Theme.raised;
+                border-width: 1px;
+                border-color: root.item.on ? Theme.accent : Theme.border;
+
+                state := Text {
+                    text: root.item.value;
+                    font-size: Theme.small-size;
+                    font-weight: root.item.on ? 600 : 400;
+                    color: root.item.on ? Theme.accent : Theme.dim;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
             }
         }
 
@@ -508,18 +559,73 @@ component DeviceCard inherits Rectangle {
 
 component TrackRow inherits Rectangle {
     in property <Track> track;
+    // Already played: the official controller dims everything above the cursor.
+    in property <bool> spent: false;
+    in property <bool> editing: false;
+    // Being dragged. The row under the pointer is lifted out of the list rather
+    // than moved, because the list is the player's order until the drop lands.
+    in property <bool> lifted: false;
+    // How far the row has already been moved from its slot. The pointer offset
+    // is measured inside this row, and the row moves with the pointer, so the
+    // offset comes back short by exactly this much — it has to be added back or
+    // a drag converges instead of tracking.
+    in property <length> lift: 0px;
     callback play();
     callback open-menu();
+    callback remove();
+    callback drag-moved(length);
+    callback drag-done();
+    callback drag-cancelled();
+
+    // True once a press has travelled far enough to be a drag rather than a
+    // click. Queue rows are narrow and reordering by a twitch is worse than
+    // needing a firmer gesture.
+    property <bool> held: false;
 
     height: 52px;
     border-radius: Theme.radius-small;
-    background: root.track.live
-        ? Theme.selected
-        : (touch.has-hover ? Theme.hover : transparent);
+    background: root.lifted
+        ? Theme.raised
+        : (root.track.live
+            ? Theme.selected
+            : (touch.has-hover ? Theme.hover : transparent));
+    border-width: root.lifted ? 1px : 0px;
+    border-color: Theme.accent;
+    opacity: root.spent && !root.editing ? 0.5 : 1.0;
+    drop-shadow-blur: root.lifted ? 16px : 0px;
+    drop-shadow-color: #00000066;
     animate background { duration: 120ms; easing: ease-out; }
+    animate opacity { duration: 120ms; }
 
     touch := TouchArea {
-        clicked => { root.play(); }
+        moved => {
+            // The scroll view's Flickable is built non-interactive, so it hands
+            // every pointer event down rather than claiming the drag.
+            if (self.pressed && (root.held || Math.abs(self.mouse-y - self.pressed-y) > 6px)) {
+                root.held = true;
+                root.drag-moved(self.mouse-y - self.pressed-y + root.lift);
+            }
+        }
+        pointer-event(event) => {
+            // Committed on release rather than on `clicked`, for the reason the
+            // scrubber does the same: `clicked` cannot tell a tap from the end
+            // of a drag.
+            if (event.kind == PointerEventKind.up) {
+                if (root.held) {
+                    root.drag-done();
+                // Not while editing. The row is a target for a bin and a grip
+                // then, and a finger that misses both should not start the
+                // track playing.
+                } else if (!root.editing) {
+                    root.play();
+                }
+                root.held = false;
+            }
+            if (event.kind == PointerEventKind.cancel) {
+                root.drag-cancelled();
+                root.held = false;
+            }
+        }
     }
 
     HorizontalLayout {
@@ -562,8 +668,32 @@ component TrackRow inherits Rectangle {
             }
         }
 
+        // What the player says the format is, in its own words.
+        if root.track.quality != "" && !root.editing: VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                height: 18px;
+                width: format.preferred-width + 12px;
+                border-radius: 4px;
+                background: Theme.raised;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                format := Text {
+                    text: root.track.quality.to-uppercase();
+                    font-size: Theme.micro-size - 0.5px;
+                    font-weight: 700;
+                    letter-spacing: 0.4px;
+                    color: Theme.faint;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
         // Only where the pointer is: forty of these at rest is furniture.
-        IconButton {
+        if !root.editing: IconButton {
             glyph: Icons.menu;
             size: 26px;
             glyph-size: 15px;
@@ -572,7 +702,7 @@ component TrackRow inherits Rectangle {
             clicked => { root.open-menu(); }
         }
 
-        Text {
+        if !root.editing: Text {
             text: root.track.duration;
             font-size: Theme.small-size;
             color: Theme.faint;
@@ -580,6 +710,48 @@ component TrackRow inherits Rectangle {
             horizontal-alignment: right;
             width: 36px;
         }
+
+        // In Edit mode the row trades what it says for what can be done to it,
+        // which is what the official controller does too: the menu and the
+        // running time give way to a delete and a grip.
+        if root.editing: IconButton {
+            glyph: Icons.clear;
+            size: 26px;
+            glyph-size: 15px;
+            tint: Theme.dim;
+            clicked => { root.remove(); }
+        }
+
+        if root.editing: VerticalLayout {
+            alignment: center;
+
+            Icon {
+                glyph: Icons.grip;
+                tint: Theme.faint;
+                width: 15px;
+                height: 15px;
+            }
+        }
+    }
+}
+
+// The caption over the playing row, and over the one after it.
+//
+// Two captions rather than two lists: everything below "Up Next" is still the
+// same queue, and the official controller marks exactly these two rows.
+component QueueBand inherits HorizontalLayout {
+    in property <string> label;
+
+    height: 26px;
+    padding-left: Theme.gap;
+
+    Text {
+        text: root.label;
+        font-size: Theme.micro-size;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        color: Theme.faint;
+        vertical-alignment: bottom;
     }
 }
 
@@ -989,10 +1161,20 @@ export component AppWindow inherits Window {
     in property <color> cover-tint;
     in property <bool> has-tint: false;
     in property <string> queue-line: "";
+    // Which row of the queue the player is sitting on, or -1. Worked out in
+    // Rust because it needs the status, which the row model does not carry.
+    in property <int> queue-cursor: -1;
+    in property <[QueueButton]> queue-buttons;
     // The last thing worth telling the user, cleared a few seconds later by
     // the toast that shows it. In-out because the clearing happens in the
     // window rather than back in the backend.
     in-out property <string> status-line: "";
+    // The sweep for players: what it is doing, how far through it is, and how
+    // much of the window is left. Empty label means no sweep worth reporting.
+    in property <bool> scanning: false;
+    in property <string> scan-label: "";
+    in property <string> scan-left: "";
+    in property <float> scan-progress: 0;
     // "Indexing — 1204 songs processed", or empty when it is not.
     in property <string> indexing: "";
     in property <[BrowseBlock]> browse-blocks;
@@ -1025,8 +1207,6 @@ export component AppWindow inherits Window {
     in property <bool> shuffle: false;
     // 0 all, 1 one, 2 off — BluOS's numbering, not a guess.
     in property <int> repeat: 2;
-    in property <string> sleep-label: "Sleep";
-    in property <bool> sleep-on: false;
     in property <[SidebarRow]> sidebar;
     in property <[SettingItem]> settings;
     in property <bool> in-settings: false;
@@ -1046,6 +1226,10 @@ export component AppWindow inherits Window {
     callback browse-home();
     callback browse-search(string);
     callback browse-search-done(string);
+    callback queue-reorder(int, int);
+    callback queue-remove(int);
+    callback queue-save(string);
+    callback queue-button(int);
     callback queue-menu(int);
     callback sidebar-activate(int, int);
     callback open-settings();
@@ -1058,7 +1242,6 @@ export component AppWindow inherits Window {
     callback seek(string, int);
     callback toggle-shuffle(string);
     callback cycle-repeat(string);
-    callback cycle-sleep(string);
     callback rescan();
     callback add-player(string);
 
@@ -1162,7 +1345,64 @@ export component AppWindow inherits Window {
                                 glyph: Icons.rescan;
                                 size: 28px;
                                 glyph-size: 15px;
+                                active: root.scanning;
                                 clicked => { root.rescan(); }
+                            }
+                        }
+                    }
+
+                    // How the search for players is going.
+                    //
+                    // A sweep is not one broadcast and an answer: it is a
+                    // schedule of broadcasts over twelve seconds, because a
+                    // single UDP query is lost often enough to matter and a
+                    // sleeping player takes a moment to answer at all. Without
+                    // this the button looks like it did nothing for those
+                    // twelve seconds.
+                    if root.scan-label != "": VerticalLayout {
+                        // Takes only its own height. The list below it is what
+                        // the sidebar's spare room belongs to, and without this
+                        // the bar shares it and pushes the list off the bottom.
+                        vertical-stretch: 0;
+                        padding-left: Theme.room;
+                        padding-right: Theme.pad;
+                        padding-bottom: Theme.gap;
+                        spacing: 5px;
+
+                        HorizontalLayout {
+                            Text {
+                                text: root.scan-label;
+                                font-size: Theme.micro-size;
+                                color: Theme.dim;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+
+                            if root.scanning: Text {
+                                text: root.scan-left;
+                                font-size: Theme.micro-size;
+                                color: Theme.faint;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 3px;
+                            border-radius: 1.5px;
+                            background: Theme.sunken;
+                            clip: true;
+
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * Math.clamp(root.scan-progress, 0, 1);
+                                height: parent.height;
+                                border-radius: parent.border-radius;
+                                background: root.scanning ? Theme.accent : Theme.accent-hover;
+                                // The step between ticks is small and regular,
+                                // so a short ease reads as a bar filling rather
+                                // than a bar jumping.
+                                animate width { duration: 160ms; easing: ease-out; }
                             }
                         }
                     }
@@ -1283,9 +1523,11 @@ export component AppWindow inherits Window {
 
                         // Keeps the title centred against the back button
                         // when there is no picker to balance it.
-                        if root.browse-selector.length == 0: Rectangle { width: 30px; }
+                        if root.in-settings || root.browse-selector.length == 0: Rectangle {
+                            width: 30px;
+                        }
 
-                        if root.browse-selector.length > 0: VerticalLayout {
+                        if !root.in-settings && root.browse-selector.length > 0: VerticalLayout {
                             alignment: center;
 
                             Rectangle {
@@ -1406,7 +1648,10 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.browse-has-search: HorizontalLayout {
+                    // Settings and Help take the pane whole. Leaving the last
+                    // screen's search box above them offers to search a screen
+                    // that is no longer on show.
+                    if !root.in-settings && root.browse-has-search: HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         padding-bottom: Theme.gap;
@@ -1423,7 +1668,8 @@ export component AppWindow inherits Window {
 
                     // What has been searched for before, offered where the
                     // results will appear.
-                    if root.browse-has-search
+                    if !root.in-settings
+                        && root.browse-has-search
                         && root.browse-blocks.length == 0
                         && root.browse-recent.length > 0: VerticalLayout {
                         padding-left: Theme.pad;
@@ -1576,10 +1822,45 @@ export component AppWindow inherits Window {
                         Theme.backdrop-bottom.with-alpha(0.96) 100%);
                 }
 
-                VerticalLayout {
+                pane := VerticalLayout {
                     padding: Theme.gap;
                     padding-top: Theme.room;
                     spacing: Theme.gap;
+
+                    // Edit mode never leaves the app. The player's Edit button
+                    // is a deep link to /edit-queue, which the official
+                    // controller intercepts before its own router and turns
+                    // into a local flag; no request goes out. This is that flag.
+                    property <bool> editing: false;
+                    // Which button, if any, is waiting on an answer, and which
+                    // is waiting on a name.
+                    property <int> asking: -1;
+                    property <int> naming: -1;
+
+                    // Where a drag started and where it would land, both as
+                    // rows of the model. A row's height is a constant because
+                    // the drag turns a pointer offset into a number of rows by
+                    // dividing by it — which is also why the captions come off
+                    // while one is running.
+                    property <length> row-height: 52px;
+                    property <int> from-row: -1;
+                    property <int> to-row: -1;
+                    property <bool> dragging: self.from-row >= 0;
+
+                    // What a queue button does here. Three of the four never
+                    // reach the player from this call: Edit is a flag, Clear
+                    // wants asking first, and Save wants a name.
+                    function press(button: QueueButton, at: int) {
+                        if (button.mode == 1) {
+                            self.editing = true;
+                        } else if (button.mode == 2) {
+                            self.asking = at;
+                        } else if (button.mode == 3) {
+                            self.naming = at;
+                        } else {
+                            root.queue-button(button.index);
+                        }
+                    }
 
                     HorizontalLayout {
                         padding-left: Theme.gap;
@@ -1602,13 +1883,194 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ListView {
+                    queue-list := ListView {
                         vertical-stretch: 1;
 
-                        for track in root.queue: TrackRow {
-                            track: track;
-                            play => { root.play-track(root.current.id, track.id); }
-                            open-menu => { root.queue-menu(track.id); }
+                        for track[i] in root.queue: VerticalLayout {
+                            // `i` is the row's place in the list; `track.id` is
+                            // its place in the player's queue. Anything said to
+                            // the player goes through `id`, anything that is
+                            // geometry goes through `i`.
+                            if i == root.queue-cursor && !pane.dragging && !pane.editing:
+                                QueueBand { label: "CURRENTLY PLAYING"; }
+
+                            if i == root.queue-cursor + 1 && !pane.dragging && !pane.editing:
+                                QueueBand { label: "UP NEXT"; }
+
+                            // The row sits in a slot of its own so that a drag
+                            // can move it: a layout owns its children's `y`,
+                            // and this Rectangle does not.
+                            slot := Rectangle {
+                                height: pane.row-height;
+
+                                // Everything between the grabbed row and where
+                                // it would land steps aside by one row, so the
+                                // gap opens where the drop will go.
+                                property <length> lift: pane.from-row == i
+                                    ? (pane.to-row - pane.from-row) * pane.row-height
+                                    : (pane.dragging
+                                        && i > pane.from-row
+                                        && i <= pane.to-row
+                                        ? -pane.row-height
+                                        : (pane.dragging
+                                            && i < pane.from-row
+                                            && i >= pane.to-row
+                                            ? pane.row-height
+                                            : 0px));
+
+                                TrackRow {
+                                track: track;
+                                editing: pane.editing;
+                                spent: root.queue-cursor >= 0 && i < root.queue-cursor;
+                                lifted: pane.from-row == i;
+                                y: slot.lift;
+                                lift: slot.lift;
+                                play => { root.play-track(root.current.id, track.id); }
+                                open-menu => { root.queue-menu(track.id); }
+                                remove => { root.queue-remove(track.id); }
+                                drag-moved(offset) => {
+                                    if (pane.from-row < 0) {
+                                        pane.from-row = i;
+                                    }
+                                    pane.to-row = Math.clamp(
+                                        pane.from-row + Math.round(offset / pane.row-height),
+                                        0, root.queue.length - 1);
+                                }
+                                drag-done => {
+                                    if (pane.to-row != pane.from-row) {
+                                        root.queue-reorder(pane.from-row, pane.to-row);
+                                    }
+                                    pane.from-row = -1;
+                                    pane.to-row = -1;
+                                }
+                                drag-cancelled => {
+                                    pane.from-row = -1;
+                                    pane.to-row = -1;
+                                }
+                                }
+                            }
+                        }
+                    }
+
+                    // Asking before clearing. The player writes the question
+                    // itself; this app only puts it on the screen.
+                    if pane.asking >= 0: VerticalLayout {
+                        spacing: Theme.gap;
+
+                        Text {
+                            text: root.queue-buttons[pane.asking].question;
+                            font-size: Theme.small-size;
+                            color: Theme.dim;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: Theme.gap;
+
+                            PillButton {
+                                label: "Cancel";
+                                clicked => { pane.asking = -1; }
+                            }
+
+                            PillButton {
+                                label: root.queue-buttons[pane.asking].label;
+                                primary: true;
+                                clicked => {
+                                    root.queue-button(root.queue-buttons[pane.asking].index);
+                                    pane.asking = -1;
+                                }
+                            }
+                        }
+                    }
+
+                    // Naming a playlist. The player's save endpoint wants a
+                    // name and nothing else.
+                    if pane.naming >= 0: VerticalLayout {
+                        spacing: Theme.gap;
+
+                        name-field := SearchField {
+                            prompt: "Name for this playlist";
+                            accepted(text) => {
+                                root.queue-save(text);
+                                pane.naming = -1;
+                                self.text = "";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: Theme.gap;
+
+                            PillButton {
+                                label: "Cancel";
+                                clicked => {
+                                    pane.naming = -1;
+                                    name-field.text = "";
+                                }
+                            }
+
+                            PillButton {
+                                label: "Save";
+                                primary: true;
+                                clicked => {
+                                    root.queue-save(name-field.text);
+                                    pane.naming = -1;
+                                    name-field.text = "";
+                                }
+                            }
+                        }
+                    }
+
+                    // The buttons are the player's, drawn in whatever order and
+                    // number it sends them. Edit is the exception it asks for:
+                    // its action is a route into the client, not a request.
+                    if pane.editing: HorizontalLayout {
+                        PillButton {
+                            label: "Done";
+                            primary: true;
+                            clicked => { pane.editing = false; }
+                        }
+                    }
+
+                    // Three to a line, which is what fits across a 330px
+                    // column and what the official controller draws: Save,
+                    // Edit and Clear together, and anything the player adds
+                    // after them — Queue Builder Mode — on its own line under.
+                    if !pane.editing && pane.asking < 0 && pane.naming < 0
+                        && root.queue-buttons.length > 0: HorizontalLayout {
+                        spacing: Theme.tight;
+                        alignment: center;
+
+                        for button[b] in root.queue-buttons: Rectangle {
+                            width: b < 3 ? pill.width : 0px;
+                            height: b < 3 ? pill.height : 0px;
+                            visible: b < 3;
+
+                            pill := PillButton {
+                                label: button.label;
+                                glyph: button.glyph;
+                                primary: button.highlight;
+                                clicked => { pane.press(button, b); }
+                            }
+                        }
+                    }
+
+                    if !pane.editing && pane.asking < 0 && pane.naming < 0
+                        && root.queue-buttons.length > 3: HorizontalLayout {
+                        spacing: Theme.tight;
+                        alignment: center;
+
+                        for button[b] in root.queue-buttons: Rectangle {
+                            width: b >= 3 ? extra.width : 0px;
+                            height: b >= 3 ? extra.height : 0px;
+                            visible: b >= 3;
+
+                            extra := PillButton {
+                                label: button.label;
+                                glyph: button.glyph;
+                                primary: button.highlight;
+                                clicked => { pane.press(button, b); }
+                            }
                         }
                     }
                 }
@@ -1942,18 +2404,6 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        VerticalLayout {
-                            alignment: center;
-
-                            IconButton {
-                                glyph: Icons.sleep;
-                                size: 28px;
-                                glyph-size: 15px;
-                                active: root.sleep-on;
-                                enabled: root.has-selection;
-                                clicked => { root.cycle-sleep(root.current.id); }
-                            }
-                        }
                     }
                 }
             }
