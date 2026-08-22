@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Azzurro
+GenericName=BluOS Controller
+Comment=Control BluOS players — Bluesound, NAD and PSB
+Exec=azzurro
+Icon=io.github.jzbz.azzurro
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=BluOS;Bluesound;NAD;PSB;music;multiroom;speaker;streaming;
+# The X11 window class, which is not the application id. slint::set_xdg_app_id
+# sets the Wayland app_id — where the compositor matches it against this file's
+# own name and needs no hint — but winit derives the X11 WM_CLASS from the
+# binary. Checked with xprop: WM_CLASS(STRING) = "azzurro", "azzurro". Putting
+# the app id here instead matches nothing under X11, and the window gets a
+# generic icon.
+StartupWMClass=azzurro

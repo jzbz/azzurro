@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!--
+    Lucide's `audio-lines`, on a ground of its own. ISC licensed — see
+    ui/icons/LICENSE, where the same glyph set the interface uses is kept.
+    Using one of them here means the icon in the launcher and the icons in the
+    window are drawn by the same hand.
+    
+    The glyph is placed by transform rather than by rewriting its coordinates,
+    so it stays a verbatim copy of the upstream paths and can be replaced by
+    pasting a newer version in. Lucide's own 1:2 stroke-to-gap ratio is
+    preserved by scaling the 2px stroke with everything else: at this size that
+    is a 15px stroke, which is still four pixels when the desktop draws the
+    icon at 64.
+
+    A ground rather than a bare glyph, because an icon is composited onto a
+    panel of unknown colour and a thin stroke on transparency disappears there.
+    The blue is the light-theme accent, fixed: the app follows the system
+    theme, but nothing asks an icon to redraw when the theme changes.
+  -->
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#0369a1"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#ground)"/>
+
+  <g transform="translate(36.8 36.8) scale(7.6)"
+     fill="none" stroke="#ffffff" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2 10v3"/>
+    <path d="M6 6v11"/>
+    <path d="M10 3v18"/>
+    <path d="M14 8v7"/>
+    <path d="M18 5v13"/>
+    <path d="M22 10v3"/>
+  </g>
+</svg>

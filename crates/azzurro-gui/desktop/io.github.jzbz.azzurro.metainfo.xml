@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Jonathan Zeppettini -->
+<component type="desktop-application">
+  <id>io.github.jzbz.azzurro</id>
+
+  <name>Azzurro</name>
+  <summary>Control BluOS players</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <developer id="io.github.jzbz">
+    <name>Jonathan Zeppettini</name>
+  </developer>
+
+  <description>
+    <p>
+      Azzurro is a controller for BluOS players — Bluesound, NAD and PSB. It
+      finds the players on your network, shows what each one is doing, and
+      drives them: transport, volume, the play queue, and browsing every source
+      the player offers.
+    </p>
+    <p>
+      Browsing is not built from a list of music services. Each player
+      describes its own screens, and Azzurro renders what it is given, so a
+      service added to BluOS after this was written browses and plays without
+      an update here.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Finds players by broadcast, and remembers ones that discovery cannot
+      reach</li>
+      <li>Now playing with cover art, seeking, shuffle, repeat and a sleep
+      timer</li>
+      <li>The play queue, with a context menu on every track</li>
+      <li>Browse and search every source the player offers, including music
+      services</li>
+      <li>Group players together for multi-room playback</li>
+      <li>Each player appears separately in the desktop's own media controls,
+      so the media keys work</li>
+    </ul>
+    <p>
+      Written in Rust throughout, with Slint for the interface. No webview, no
+      Electron, and no accounts.
+    </p>
+    <p>
+      Not affiliated with, endorsed by, or supported by Lenbrook Industries.
+      BluOS, Bluesound and NAD are their trademarks.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.jzbz.azzurro.desktop</launchable>
+
+  <!--
+    No <screenshots> yet. Flathub requires at least one, and every screenshot
+    of a controller necessarily shows somebody's music library and the
+    addresses on their network, so these have to be taken deliberately against
+    content that is fine to publish rather than grabbed from a running session.
+    This must be added before submitting to Flathub.
+  -->
+
+  <url type="homepage">https://github.com/jzbz/azzurro</url>
+  <url type="bugtracker">https://github.com/jzbz/azzurro/issues</url>
+  <url type="vcs-browser">https://github.com/jzbz/azzurro</url>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+
+  <keywords>
+    <keyword>BluOS</keyword>
+    <keyword>Bluesound</keyword>
+    <keyword>NAD</keyword>
+    <keyword>PSB</keyword>
+    <keyword>multiroom</keyword>
+    <keyword>streaming</keyword>
+  </keywords>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#0284c7</color>
+    <color type="primary" scheme_preference="dark">#38bdf8</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-21">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
