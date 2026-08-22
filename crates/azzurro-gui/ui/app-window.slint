@@ -32,6 +32,7 @@ export struct Device {
     now-playing: string,
     title: string,
     artist: string,
+    album: string,
     service: string,
     reachable: bool,
     // "Leading 2 players", "Following Kitchen", "Reconnecting…" or empty.
@@ -54,6 +55,15 @@ export struct Track {
     // ...and whether that position is what you are actually hearing.
     live: bool,
     cover: image,
+}
+
+// A button the player puts on the block at the top of a screen: "Play all" and
+// "Shuffle" on an album.
+export struct ActionButton {
+    index: int,
+    label: string,
+    glyph: image,
+    primary: bool,
 }
 
 // One of the buttons the player puts under the play queue.
@@ -81,6 +91,10 @@ export struct BrowseRow {
     index: int,
     title: string,
     subtitle: string,
+    // Its place on the record, and what the player says it is encoded as.
+    // Both empty except on a screen about one album.
+    track: string,
+    quality: string,
     cover: image,
     heading: bool,
     actionable: bool,
@@ -723,12 +737,11 @@ component TrackRow inherits Rectangle {
             }
         }
 
-        // Only where the pointer is: forty of these at rest is furniture.
         if !root.editing: IconButton {
             glyph: Icons.menu;
-            size: 26px;
+            size: 30px;
             glyph-size: 15px;
-            opacity: touch.has-hover ? 1.0 : 0.0;
+            opacity: touch.has-hover ? 1.0 : 0.45;
             animate opacity { duration: 120ms; }
             clicked => { root.open-menu(); }
         }
@@ -818,6 +831,20 @@ component BrowseRowView inherits Rectangle {
         padding-right: Theme.gap;
         spacing: Theme.gap;
 
+        // Its place on the record, where the screen is about one record.
+        if root.entry.track != "": VerticalLayout {
+            alignment: center;
+
+            Text {
+                text: root.entry.track;
+                font-size: Theme.small-size;
+                color: Theme.faint;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: 20px;
+            }
+        }
+
         VerticalLayout {
             alignment: center;
 
@@ -840,7 +867,10 @@ component BrowseRowView inherits Rectangle {
 
             if !root.entry.is-glyph: Artwork {
                 source: root.entry.cover;
-                fallback: Icons.radio;
+                // A note rather than a radio: most of what reaches this
+                // fallback is a library row whose art has not arrived, and an
+                // artist with a radio beside their name reads as a station.
+                fallback: Icons.track;
                 corner: 5px;
                 width: 36px;
                 height: 36px;
@@ -870,16 +900,46 @@ component BrowseRowView inherits Rectangle {
             }
         }
 
+        // What the player says the file is. Only an album's own page says.
+        if root.entry.quality != "": VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                height: 18px;
+                width: grade.preferred-width + 12px;
+                border-radius: 4px;
+                background: Theme.raised;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                grade := Text {
+                    text: root.entry.quality.to-uppercase();
+                    font-size: Theme.micro-size - 0.5px;
+                    font-weight: 700;
+                    letter-spacing: 0.4px;
+                    color: Theme.faint;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Always there, not only under the pointer. It is how a whole album
+        // gets played, and hunting for a control that appears when you are
+        // already on top of it is a poor way to find one.
         if root.entry.has-menu: IconButton {
             glyph: Icons.menu;
-            size: 26px;
-            glyph-size: 15px;
-            opacity: touch.has-hover ? 1.0 : 0.0;
+            size: 34px;
+            glyph-size: 16px;
+            opacity: touch.has-hover ? 1.0 : 0.5;
             animate opacity { duration: 120ms; }
             clicked => { root.open-menu(); }
         }
 
-        VerticalLayout {
+        // The chevron says "this opens something" and the dots say "this has a
+        // menu". A row with both said the same thing twice over, so the menu
+        // wins where there is one.
+        if !root.entry.has-menu: VerticalLayout {
             alignment: center;
 
             Icon {
@@ -1267,17 +1327,32 @@ export component AppWindow inherits Window {
     in property <color> cover-tint;
     in property <bool> has-tint: false;
     in property <string> queue-line: "";
+    // How many players have answered. Shown where the players are.
+    in property <string> players-line: "";
     // Which row of the queue the player is sitting on, or -1. Worked out in
     // Rust because it needs the status, which the row model does not carry.
     in property <int> queue-cursor: -1;
     in property <[QueueButton]> queue-buttons;
+    // Whatever did not fit on the line above.
+    in property <[QueueButton]> queue-buttons-below;
     // The last thing worth telling the user, cleared a few seconds later by
     // the toast that shows it. In-out because the clearing happens in the
     // window rather than back in the backend.
     in-out property <string> status-line: "";
     // "Indexing — 1204 songs processed", or empty when it is not.
     in property <string> indexing: "";
+    // What the player says it is decoding: "cd", "hd", "mqa".
+    in property <string> quality: "";
+    // Whether the middle pane is showing the record rather than a screen.
+    in property <bool> now-playing: false;
     in property <[BrowseBlock]> browse-blocks;
+    // What a screen about one thing says about it, straight from the player:
+    // an album's cover, who made it, when, and what to do with the whole of it.
+    in property <image> browse-header-cover;
+    in property <string> browse-header-title: "";
+    in property <string> browse-header-subtitle: "";
+    in property <string> browse-header-detail: "";
+    in property <[ActionButton]> browse-header-buttons;
     // A screen that is about one music service at a time — Favourites and
     // Search both are — names the others so you can switch.
     in property <[BrowseRow]> browse-selector;
@@ -1327,6 +1402,9 @@ export component AppWindow inherits Window {
     callback browse-search(string);
     callback browse-search-done(string);
     callback browse-section(int);
+    callback browse-header(int);
+    callback toggle-now-playing();
+    callback browse-more();
     callback queue-reorder(int, int);
     callback queue-remove(int);
     callback queue-save(string);
@@ -1481,54 +1559,6 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding-top: Theme.pad;
 
-                    // Indexing outlives the page it was started from — you can
-                    // walk away to Home and it is still running — so it is
-                    // reported here rather than on the settings row.
-                    if root.indexing != "": Rectangle {
-                        height: 52px;
-
-                        Rectangle {
-                            x: Theme.pad;
-                            y: 0;
-                            width: parent.width - 2 * Theme.pad;
-                            height: parent.height - Theme.gap;
-                            border-radius: Theme.radius-small;
-                            background: Theme.accent-soft;
-                            border-width: 1px;
-                            border-color: Theme.border;
-
-                            VerticalLayout {
-                                padding: Theme.gap;
-                                spacing: 7px;
-
-                                HorizontalLayout {
-                                    spacing: 7px;
-
-                                    VerticalLayout {
-                                        alignment: center;
-
-                                        Icon {
-                                            glyph: Icons.library;
-                                            tint: Theme.accent;
-                                            width: 14px;
-                                            height: 14px;
-                                        }
-                                    }
-
-                                    Text {
-                                        text: root.indexing;
-                                        font-size: Theme.small-size;
-                                        color: Theme.text;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                    }
-                                }
-
-                                Indeterminate {}
-                            }
-                        }
-                    }
-
                     HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
@@ -1670,8 +1700,13 @@ export component AppWindow inherits Window {
 
                                                 row := TouchArea {
                                                     clicked => {
-                                                        services.close();
+                                                        // Asked for before the
+                                                        // popup goes: closing it
+                                                        // takes the row with it,
+                                                        // and the index being
+                                                        // read from it.
                                                         root.browse-activate(entry.index);
+                                                        services.close();
                                                     }
                                                 }
                                             }
@@ -1755,8 +1790,82 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !root.in-settings: ListView {
+                    if !root.in-settings && root.browse-header-title != "": HorizontalLayout {
+                        padding-left: Theme.pad;
+                        padding-right: Theme.pad;
+                        padding-bottom: Theme.pad;
+                        spacing: Theme.room;
+                        vertical-stretch: 0;
+
+                        Artwork {
+                            source: root.browse-header-cover;
+                            fallback: Icons.album;
+                            corner: Theme.radius;
+                            width: 160px;
+                            height: 160px;
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: Theme.tight;
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+
+                            Text {
+                                text: root.browse-header-title;
+                                font-size: Theme.display-size;
+                                font-weight: 600;
+                                color: Theme.text;
+                                overflow: elide;
+                            }
+
+                            if root.browse-header-subtitle != "": Text {
+                                text: root.browse-header-subtitle;
+                                font-size: Theme.title-size;
+                                color: Theme.dim;
+                                overflow: elide;
+                            }
+
+                            if root.browse-header-detail != "": Text {
+                                text: root.browse-header-detail;
+                                font-size: Theme.small-size;
+                                color: Theme.faint;
+                                overflow: elide;
+                            }
+
+                            if root.browse-header-buttons.length > 0: HorizontalLayout {
+                                spacing: Theme.gap;
+                                padding-top: Theme.gap;
+                                alignment: start;
+
+                                for button[b] in root.browse-header-buttons: PillButton {
+                                    label: button.label;
+                                    glyph: button.glyph;
+                                    primary: button.primary;
+                                    clicked => { root.browse-header(button.index); }
+                                }
+                            }
+                        }
+                    }
+
+                    // Not while the empty state is showing: an empty list
+                    // still stretches, and it took the room the message should
+                    // have been centred in — which left it sitting near the
+                    // bottom of the pane.
+                    if !root.in-settings && root.browse-empty == "": ListView {
                         vertical-stretch: 1;
+
+                        // A library's Artists page answers thirty of four
+                        // hundred and hands over the request for the next
+                        // thirty. Asked for before the end arrives, so the
+                        // list grows under the scroll rather than stopping at
+                        // it. The backend ignores a second ask while one is
+                        // already out.
+                        changed viewport-y => {
+                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                root.browse-more();
+                            }
+                        }
 
                         for block in root.browse-blocks: BrowseBlockView {
                             block: block;
@@ -1766,12 +1875,62 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // Indexing outlives the page it was started from — you can
+                    // walk away to Home and it is still running — so it is
+                    // reported here rather than on the settings row. At the
+                    // bottom, because it arrives while you are reading
+                    // something and everything above it would otherwise jump
+                    // down a line the moment it did.
+                    if root.indexing != "": Rectangle {
+                        height: 52px;
+
+                        Rectangle {
+                            x: Theme.pad;
+                            y: 0;
+                            width: parent.width - 2 * Theme.pad;
+                            height: parent.height - Theme.gap;
+                            border-radius: Theme.radius-small;
+                            background: Theme.accent-soft;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding: Theme.gap;
+                                spacing: 7px;
+
+                                HorizontalLayout {
+                                    spacing: 7px;
+
+                                    VerticalLayout {
+                                        alignment: center;
+
+                                        Icon {
+                                            glyph: Icons.library;
+                                            tint: Theme.accent;
+                                            width: 14px;
+                                            height: 14px;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: root.indexing;
+                                        font-size: Theme.small-size;
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+
+                                Indeterminate {}
+                            }
+                        }
+                    }
+
                     if !root.in-settings && root.browse-empty != "": VerticalLayout {
                         alignment: center;
                         vertical-stretch: 1;
                         padding-left: 48px;
                         padding-right: 48px;
-                        padding-bottom: 60px;
                         spacing: Theme.pad;
 
                         HorizontalLayout {
@@ -1823,6 +1982,130 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                // The record, large.
+                //
+                // Drawn over the pane rather than instead of it, so the sidebar
+                // and the queue stay where they are — the official controller
+                // covers the middle and keeps the queue, and there is no reason
+                // to lose the navigation as well.
+                if root.now-playing: Rectangle {
+                    background: Theme.bg;
+                    clip: true;
+
+                    // The sleeve's own colour, spread behind it.
+                    Image {
+                        source: root.cover;
+                        image-fit: ImageFit.cover;
+                        width: 100%;
+                        height: 100%;
+                        opacity: 0.12;
+                    }
+
+                    Rectangle {
+                        background: @linear-gradient(180deg,
+                            Theme.backdrop-bottom.with-alpha(0.72) 0%,
+                            Theme.backdrop-bottom.with-alpha(0.92) 100%);
+                    }
+
+                    VerticalLayout {
+                        padding: Theme.pad;
+                        spacing: Theme.pad;
+
+                        HorizontalLayout {
+                            IconButton {
+                                glyph: Icons.close;
+                                size: 30px;
+                                glyph-size: 16px;
+                                clicked => { root.toggle-now-playing(); }
+                            }
+
+                            Text {
+                                text: "Now Playing";
+                                font-size: Theme.title-size + 2px;
+                                font-weight: 600;
+                                color: Theme.text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            Rectangle { width: 30px; }
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            vertical-stretch: 1;
+
+                            VerticalLayout {
+                                alignment: center;
+
+                                Artwork {
+                                    source: root.cover;
+                                    corner: Theme.radius;
+                                    // Sized from the window rather than from
+                                    // the room left over: asking the layout how
+                                    // much space there is, while being the
+                                    // thing that decides it, is a loop.
+                                    width: Math.max(140px,
+                                        Math.min(root.width - 700px, 400px));
+                                    height: self.width;
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: Theme.tight;
+                            padding-bottom: Theme.room;
+
+                            Text {
+                                text: root.current.title == ""
+                                    ? "Nothing playing"
+                                    : root.current.title;
+                                font-size: Theme.display-size;
+                                font-weight: 600;
+                                color: Theme.text;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.current.album == ""
+                                    ? root.current.artist
+                                    : root.current.artist + " • " + root.current.album;
+                                font-size: Theme.title-size;
+                                color: Theme.dim;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+
+                            if root.quality != "": HorizontalLayout {
+                                alignment: center;
+                                padding-top: Theme.tight;
+
+                                Rectangle {
+                                    height: 18px;
+                                    width: grade.preferred-width + 14px;
+                                    border-radius: 4px;
+                                    background: Theme.raised;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+
+                                    grade := Text {
+                                        text: root.quality.to-uppercase();
+                                        font-size: Theme.micro-size;
+                                        font-weight: 700;
+                                        letter-spacing: 0.5px;
+                                        color: Theme.faint;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
             }
 
             // The queue, with the record it is playing behind it.
@@ -2076,36 +2359,28 @@ export component AppWindow inherits Window {
                         spacing: Theme.tight;
                         alignment: center;
 
-                        for button[b] in root.queue-buttons: Rectangle {
-                            width: b < 3 ? pill.width : 0px;
-                            height: b < 3 ? pill.height : 0px;
-                            visible: b < 3;
-
-                            pill := PillButton {
-                                label: button.label;
-                                glyph: button.glyph;
-                                primary: button.highlight;
-                                clicked => { pane.press(button, b); }
-                            }
+                        for button[b] in root.queue-buttons: PillButton {
+                            label: button.label;
+                            glyph: button.glyph;
+                            primary: button.highlight;
+                            clicked => { pane.press(button, b); }
                         }
                     }
 
                     if !pane.editing && pane.asking < 0 && pane.naming < 0
-                        && root.queue-buttons.length > 3: HorizontalLayout {
+                        && root.queue-buttons-below.length > 0: HorizontalLayout {
                         spacing: Theme.tight;
                         alignment: center;
+                        padding-top: Theme.tight;
 
-                        for button[b] in root.queue-buttons: Rectangle {
-                            width: b >= 3 ? extra.width : 0px;
-                            height: b >= 3 ? extra.height : 0px;
-                            visible: b >= 3;
-
-                            extra := PillButton {
-                                label: button.label;
-                                glyph: button.glyph;
-                                primary: button.highlight;
-                                clicked => { pane.press(button, b); }
-                            }
+                        for button[b] in root.queue-buttons-below: PillButton {
+                            label: button.label;
+                            glyph: button.glyph;
+                            primary: button.highlight;
+                            // Its own place in the player's list, which
+                            // `press` needs for the ask-first and name-it
+                            // flows.
+                            clicked => { pane.press(button, root.queue-buttons.length + b); }
                         }
                     }
                 }
@@ -2163,11 +2438,22 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
 
-                            Artwork {
-                                source: root.cover;
-                                corner: 6px;
+                            Rectangle {
                                 width: 52px;
                                 height: 52px;
+
+                                Artwork {
+                                    source: root.cover;
+                                    corner: 6px;
+                                    width: 52px;
+                                    height: 52px;
+                                }
+
+                                // The record, large. Where the official
+                                // controller puts the same gesture.
+                                TouchArea {
+                                    clicked => { root.toggle-now-playing(); }
+                                }
                             }
                         }
 
@@ -2187,12 +2473,40 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
 
-                            Text {
-                                text: root.current.artist;
-                                font-size: Theme.small-size;
-                                color: Theme.dim;
-                                overflow: elide;
-                                visible: root.current.artist != "";
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                alignment: start;
+
+                                Text {
+                                    text: root.current.artist;
+                                    font-size: Theme.small-size;
+                                    color: Theme.dim;
+                                    overflow: elide;
+                                    visible: root.current.artist != "";
+                                }
+
+                                if root.quality != "": VerticalLayout {
+                                    alignment: center;
+
+                                    Rectangle {
+                                        height: 16px;
+                                        width: format.preferred-width + 11px;
+                                        border-radius: 4px;
+                                        background: Theme.raised;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+
+                                        format := Text {
+                                            text: root.quality.to-uppercase();
+                                            font-size: Theme.micro-size - 1px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.4px;
+                                            color: Theme.faint;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2382,6 +2696,17 @@ export component AppWindow inherits Window {
                                                 }
 
                                                 Rectangle { horizontal-stretch: 1; }
+
+                                                VerticalLayout {
+                                                    alignment: center;
+
+                                                    Text {
+                                                        text: root.players-line;
+                                                        font-size: Theme.micro-size;
+                                                        color: Theme.faint;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
 
                                                 IconButton {
                                                     glyph: Icons.rescan;

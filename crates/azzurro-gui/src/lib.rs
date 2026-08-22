@@ -73,6 +73,14 @@ const SEARCH_SETTLE: Duration = Duration::from_millis(280);
 /// own list, and it lasts as long as the app is running.
 const RECENT_SEARCHES: usize = 8;
 
+/// The longest label that shares a line with the others under the queue.
+///
+/// Which buttons the player sends varies — Edit only appears once there is
+/// something to edit — so counting them is not the way to decide. Save, Edit
+/// and Clear are one short word each and fit three across a 330px column;
+/// "Queue builder mode" is not, and goes on a line of its own.
+const QUEUE_BUTTON_SHORT: usize = 8;
+
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
@@ -120,6 +128,12 @@ enum Command {
     BrowseSearchDone(String),
     /// The button on a section's heading, by the section's place on the screen.
     BrowseSection(usize),
+    /// A button on the block at the top of a screen: "Play all", "Shuffle".
+    BrowseHeader(usize),
+    /// Show the record large, or stop showing it.
+    ToggleNowPlaying,
+    /// Fetch the next page of the list on show and add it to the end.
+    BrowseMore,
     /// Read one of the player's web configuration pages and draw it.
     OpenServices,
     OpenShares,
@@ -169,6 +183,9 @@ struct Browsing {
     queue_screen: Option<Screen>,
     /// The queue screen's own uri, from `/ui/Configuration`.
     queue_uri: Option<String>,
+    /// Whether a page of a long list is already on its way, so that scrolling
+    /// past the trigger a second time does not ask for it twice.
+    fetching_more: bool,
     /// What has been searched for this session, most recent first.
     ///
     /// The player does not keep this — the official controller keeps its own,
@@ -232,6 +249,9 @@ enum Pane {
     Web(WebPage),
     /// A form off one of those pages, filled in here rather than in a browser.
     Form(Box<FormPage>),
+    /// The record, large. Reached by pressing the artwork on the transport bar,
+    /// which is where the official controller puts it too.
+    NowPlaying,
 }
 
 /// A form being filled in.
@@ -377,6 +397,10 @@ struct BrowseData {
     index: i32,
     title: String,
     subtitle: String,
+    /// Its place on the record, and what the player says it is encoded as.
+    /// Both empty except on a screen about one album.
+    track: String,
+    quality: String,
     /// The caption on a section heading's button — "Customise" on the Inputs
     /// row, "Manage" on Music Services. Empty everywhere else, which is most
     /// places: only the sidebar draws these, and only on headings.
@@ -407,6 +431,15 @@ enum WebPage {
         action: Option<String>,
         shares: Vec<bluos::reports::Share>,
     },
+}
+
+/// What a screen about one thing says about it, on its way to the window.
+struct HeaderData {
+    cover: Option<Pixels>,
+    title: String,
+    subtitle: String,
+    detail: String,
+    buttons: Vec<(i32, String, Option<Glyph>)>,
 }
 
 /// One section of a screen, ready for the window.
@@ -708,6 +741,23 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     ui.on_queue_button(move |index| {
         if index >= 0 {
             let _ = tx.send(Command::QueueButton(index as usize));
+        }
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_more(move || {
+        let _ = tx.send(Command::BrowseMore);
+    });
+
+    let tx = commands.clone();
+    ui.on_toggle_now_playing(move || {
+        let _ = tx.send(Command::ToggleNowPlaying);
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_header(move |at| {
+        if at >= 0 {
+            let _ = tx.send(Command::BrowseHeader(at as usize));
         }
     });
 
@@ -1044,7 +1094,11 @@ impl Backend {
 
             ui.set_devices(ModelRc::new(VecModel::from(rows)));
             ui.set_selected(restored as i32);
-            ui.set_status_line(line.into());
+            // Not the toast. This is a standing fact about the system rather
+            // than something that just happened, and it was being republished
+            // on every status change — which, once the toast was drawn, meant
+            // "1 player" appearing over the window at every new song.
+            ui.set_players_line(line.into());
         });
     }
 
@@ -1201,21 +1255,30 @@ impl Backend {
             ui.set_queue(ModelRc::new(VecModel::from(rows)));
             ui.set_queue_line(line.into());
             ui.set_queue_cursor(cursor_row);
+            // Split here rather than in the window. Drawing every button in
+            // both rows and giving the wrong ones no width still left the
+            // spacing around them, which is what pushed the last button off
+            // the side of the pane.
+            let dressed = |button: QueueButtonData| QueueButton {
+                index: button.index,
+                label: button.label.into(),
+                glyph: match button.glyph {
+                    Some(glyph) => glyph_image(&icons, glyph),
+                    None => Default::default(),
+                },
+                highlight: button.highlight,
+                mode: button.mode,
+                question: button.question.into(),
+            };
+            let (across, below): (Vec<_>, Vec<_>) = buttons
+                .into_iter()
+                .partition(|button| button.label.chars().count() <= QUEUE_BUTTON_SHORT);
+
             ui.set_queue_buttons(ModelRc::new(VecModel::from(
-                buttons
-                    .into_iter()
-                    .map(|button| QueueButton {
-                        index: button.index,
-                        label: button.label.into(),
-                        glyph: match button.glyph {
-                            Some(glyph) => glyph_image(&icons, glyph),
-                            None => Default::default(),
-                        },
-                        highlight: button.highlight,
-                        mode: button.mode,
-                        question: button.question.into(),
-                    })
-                    .collect::<Vec<_>>(),
+                across.into_iter().map(dressed).collect::<Vec<_>>(),
+            )));
+            ui.set_queue_buttons_below(ModelRc::new(VecModel::from(
+                below.into_iter().map(dressed).collect::<Vec<_>>(),
             )));
         });
     }
@@ -1233,6 +1296,8 @@ impl Backend {
 
             for (index, (label, _)) in browsing.screens.iter().enumerate() {
                 rows.push(BrowseData {
+                    track: String::new(),
+                    quality: String::new(),
                     index: index as i32,
                     title: label.clone(),
                     subtitle: String::new(),
@@ -1256,6 +1321,8 @@ impl Backend {
                         // page, "Manage" opens the music-services page. The
                         // player supplies both the wording and the target.
                         rows.push(BrowseData {
+                            track: String::new(),
+                            quality: String::new(),
                             index: ordinal as i32,
                             title: title.clone(),
                             subtitle: String::new(),
@@ -1276,6 +1343,8 @@ impl Backend {
                     for item in &section.items {
                         let label = item.label().unwrap_or_default().to_owned();
                         rows.push(BrowseData {
+                            track: String::new(),
+                            quality: String::new(),
                             index,
                             title: label.clone(),
                             subtitle: String::new(),
@@ -1588,6 +1657,7 @@ impl Backend {
             Help,
             Web,
             Form,
+            NowPlaying,
         }
         let showing = match self.browsing.lock().unwrap().pane {
             Pane::Browse => Showing::Browse,
@@ -1595,7 +1665,16 @@ impl Backend {
             Pane::Help | Pane::HelpDetail(..) => Showing::Help,
             Pane::Web(_) => Showing::Web,
             Pane::Form(_) => Showing::Form,
+            Pane::NowPlaying => Showing::NowPlaying,
         };
+
+        let large = matches!(showing, Showing::NowPlaying);
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_now_playing(large);
+            }
+        });
 
         match showing {
             // Settings first: it is what takes the pane back off the browse
@@ -1608,6 +1687,9 @@ impl Backend {
             Showing::Help => self.publish_help(),
             Showing::Web => self.publish_web(),
             Showing::Form => self.publish_form(),
+            // Nothing to send: it is drawn from what the transport already
+            // publishes. Only the settings rows have to be taken down.
+            Showing::NowPlaying => self.publish_settings(),
         }
     }
 
@@ -1716,7 +1798,7 @@ impl Backend {
             }
         }
 
-        let (blocks, selector, recent, empty, title, can_go_back, search) = {
+        let (blocks, selector, recent, empty, header, title, can_go_back, search) = {
             let browsing = self.browsing.lock().unwrap();
 
             let Some(screen) = browsing.current() else {
@@ -1725,11 +1807,39 @@ impl Backend {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    None,
                     "Browse".into(),
                     false,
                     None,
                 );
             };
+
+            // The block at the top of an album's page. Its artwork is the one
+            // picture on the screen worth showing large, so it is asked for at
+            // the size a cover is drawn rather than a row's.
+            let header = screen.header.as_ref().map(|header| HeaderData {
+                cover: header
+                    .image
+                    .as_deref()
+                    .filter(|src| !src.is_empty())
+                    .zip(client.as_ref())
+                    .and_then(|(src, client)| {
+                        self.artwork.cached(&client.image_url(src), COVER_SIZE)
+                    }),
+                title: header.title.clone().unwrap_or_default(),
+                subtitle: header.subtitle.clone().unwrap_or_default(),
+                detail: header.subsubtitle.clone().unwrap_or_default(),
+                buttons: header
+                    .buttons
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, button)| {
+                        let label = button.text.clone()?;
+                        let glyph = glyphs::glyph_for(&label, None);
+                        Some((at as i32, label, glyph))
+                    })
+                    .collect(),
+            });
 
             let mut blocks: Vec<BlockData> = Vec::new();
             let mut selector: Vec<BrowseData> = Vec::new();
@@ -1815,6 +1925,8 @@ impl Backend {
                         });
 
                     rows.push(BrowseData {
+                        track: item.extra.get("track").cloned().unwrap_or_default(),
+                        quality: item.quality.clone().unwrap_or_default(),
                         index: at,
                         action: String::new(),
                         // Some rows are an icon and nothing else — the "add a
@@ -1900,13 +2012,23 @@ impl Backend {
                 selector,
                 recent,
                 empty,
+                header,
                 title,
                 browsing.trail.len() > 1,
                 search,
             )
         };
 
-        self.send_browse(blocks, selector, recent, empty, title, can_go_back, search);
+        self.send_browse(
+            blocks,
+            selector,
+            recent,
+            empty,
+            header,
+            title,
+            can_go_back,
+            search,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1916,6 +2038,7 @@ impl Backend {
         selector: Vec<BrowseData>,
         recent: Vec<String>,
         empty: Option<(String, String, Option<Glyph>)>,
+        header: Option<HeaderData>,
         title: String,
         can_go_back: bool,
         search: Option<String>,
@@ -1940,6 +2063,8 @@ impl Backend {
                                 index: row.index,
                                 title: row.title.into(),
                                 subtitle: row.subtitle.into(),
+                                track: row.track.into(),
+                                quality: row.quality.into(),
                                 // The glyphs live in the .slint file, so they
                                 // can only be reached from inside the event
                                 // loop — which is also the only place a
@@ -1982,6 +2107,8 @@ impl Backend {
                         index: row.index,
                         title: row.title.into(),
                         subtitle: Default::default(),
+                        track: Default::default(),
+                        quality: Default::default(),
                         cover: match row.glyph {
                             Some(glyph) => glyph_image(&icons, glyph),
                             None => Default::default(),
@@ -1999,6 +2126,53 @@ impl Backend {
                 recent
                     .into_iter()
                     .map(slint::SharedString::from)
+                    .collect::<Vec<_>>(),
+            )));
+            ui.set_browse_header_title(
+                header
+                    .as_ref()
+                    .map(|h| h.title.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_header_subtitle(
+                header
+                    .as_ref()
+                    .map(|h| h.subtitle.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_header_detail(
+                header
+                    .as_ref()
+                    .map(|h| h.detail.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_browse_header_cover(
+                header
+                    .as_ref()
+                    .and_then(|h| h.cover.clone())
+                    .map(slint::Image::from_rgba8)
+                    .unwrap_or_default(),
+            );
+            ui.set_browse_header_buttons(ModelRc::new(VecModel::from(
+                header
+                    .map(|h| h.buttons)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(index, label, glyph)| ActionButton {
+                        index,
+                        label: label.into(),
+                        glyph: match glyph {
+                            Some(glyph) => glyph_image(&icons, glyph),
+                            None => Default::default(),
+                        },
+                        // The player puts the one it means first and colours it
+                        // its own accent. The colour is dropped, the order is
+                        // not.
+                        primary: index == 0,
+                    })
                     .collect::<Vec<_>>(),
             )));
             ui.set_browse_blocks(ModelRc::new(VecModel::from(blocks)));
@@ -2044,6 +2218,13 @@ impl Backend {
         // It never says how many there are in total, so there is no percentage
         // to report — the count and a bar that says "still working" is the
         // whole of what the player knows.
+        // "cd", "hd", "mqa" — the player's own word for what it is decoding,
+        // shown the way the official controller shows it.
+        let quality = snapshot
+            .as_ref()
+            .and_then(|(status, _)| status.quality.clone())
+            .unwrap_or_default();
+
         let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
             Some(songs) if songs > 0 => {
                 format!("Indexing the music library — {songs} songs so far")
@@ -2089,6 +2270,7 @@ impl Backend {
             ui.set_shuffle(shuffle);
             ui.set_repeat(repeat);
             ui.set_indexing(indexing.as_str().into());
+            ui.set_quality(quality.as_str().into());
         });
     }
 
@@ -2717,8 +2899,34 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
 
     match action.kind {
         ActionKind::Browse | ActionKind::ContextBrowse => {
-            if let Some(uri) = uri {
-                open_screen(backend, id, uri, arrive).await;
+            let Some(uri) = uri else { return };
+
+            // Two rows of a track's context menu are browses that do not lead
+            // to a screen. The player says which by naming the result: a table
+            // of five facts about a file, and a redirect out to last.fm.
+            match action.result_type.as_deref() {
+                Some("BriefInfo") => {
+                    let title = action.title.clone().unwrap_or_else(|| "Info".to_owned());
+                    match client.technical_info(&uri).await {
+                        Ok(facts) if !facts.is_empty() => {
+                            backend.browsing.lock().unwrap().pane = Pane::HelpDetail(title, facts);
+                            backend.publish_pane();
+                        }
+                        other => {
+                            if let Err(e) = other {
+                                tracing::debug!(%id, "no technical info: {e}");
+                            }
+                            say(&backend.ui, "The player said nothing about this file");
+                        }
+                    }
+                }
+                // A page about the music on somebody else's site.
+                Some("Info") => {
+                    let url = client.image_url(&uri);
+                    tracing::info!(%id, "opening {url} in a browser");
+                    let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
+                }
+                _ => open_screen(backend, id, uri, arrive).await,
             }
         }
 
@@ -2882,42 +3090,55 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
         };
 
         let mut seen = std::collections::BTreeSet::new();
-        screen
-            .sections
-            .iter()
-            // A cover on a shelf is drawn four times the size of one on a row,
-            // so the two want different fetches. Walking sections rather than
-            // items is what makes that distinction available here.
-            .flat_map(|section| {
-                let size = if section.kind == SectionKind::Row {
-                    TILE_SIZE
-                } else {
-                    THUMB_SIZE
-                };
-                section.items.iter().map(move |item| (item, size))
-            })
-            .filter_map(|(item, size)| {
-                // A menu row is drawn as a glyph whatever picture came with it,
-                // so fetching TuneIn's logo for "Sports" would be a request for
-                // something that never reaches the screen.
-                if item
-                    .action
-                    .as_ref()
-                    .is_some_and(bluos::Action::is_browse_menu)
-                {
-                    return None;
-                }
-                let source = item
-                    .image
-                    .as_deref()
-                    .or(item.icon.as_deref())
-                    .filter(|src| !src.is_empty())?;
-                // Drawn as a glyph, so there is nothing to fetch.
-                glyphs::glyph_for(item.label().unwrap_or_default(), Some(source))
-                    .is_none()
-                    .then_some((source, size))
-            })
-            .map(|(src, size)| (client.image_url(src), size))
+        // The header's cover first: it is the largest thing on the screen and
+        // the one the eye lands on, so it should not queue behind forty rows.
+        let header = screen
+            .header
+            .as_ref()
+            .and_then(|header| header.image.as_deref())
+            .filter(|src| !src.is_empty())
+            .map(|src| (client.image_url(src), COVER_SIZE))
+            .into_iter();
+
+        header
+            .chain(
+                screen
+                    .sections
+                    .iter()
+                    // A cover on a shelf is drawn four times the size of one on a row,
+                    // so the two want different fetches. Walking sections rather than
+                    // items is what makes that distinction available here.
+                    .flat_map(|section| {
+                        let size = if section.kind == SectionKind::Row {
+                            TILE_SIZE
+                        } else {
+                            THUMB_SIZE
+                        };
+                        section.items.iter().map(move |item| (item, size))
+                    })
+                    .filter_map(|(item, size)| {
+                        // A menu row is drawn as a glyph whatever picture came with it,
+                        // so fetching TuneIn's logo for "Sports" would be a request for
+                        // something that never reaches the screen.
+                        if item
+                            .action
+                            .as_ref()
+                            .is_some_and(bluos::Action::is_browse_menu)
+                        {
+                            return None;
+                        }
+                        let source = item
+                            .image
+                            .as_deref()
+                            .or(item.icon.as_deref())
+                            .filter(|src| !src.is_empty())?;
+                        // Drawn as a glyph, so there is nothing to fetch.
+                        glyphs::glyph_for(item.label().unwrap_or_default(), Some(source))
+                            .is_none()
+                            .then_some((source, size))
+                    })
+                    .map(|(src, size)| (client.image_url(src), size)),
+            )
             .filter(|entry| seen.insert(entry.clone()))
             .collect()
     };
@@ -2926,8 +3147,15 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
         return;
     }
 
+    // A few at a time. A library's Albums page is four hundred rows, and one
+    // request per row means four hundred at once against a player that is also
+    // being long-polled — which stalls the poll, the artwork and the window
+    // together. The screen fills in slightly later and stays responsive while
+    // it does.
+    const AT_ONCE: usize = 6;
+    let mut urls = urls.into_iter();
     let mut fetches = tokio::task::JoinSet::new();
-    for (url, size) in urls {
+    for (url, size) in urls.by_ref().take(AT_ONCE) {
         let artwork = backend.artwork.clone();
         fetches.spawn(async move {
             artwork.get(&url, size).await;
@@ -2936,7 +3164,16 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
 
     let mut last_publish = Instant::now();
     while fetches.join_next().await.is_some() {
-        if last_publish.elapsed() >= Duration::from_millis(150) {
+        if let Some((url, size)) = urls.next() {
+            let artwork = backend.artwork.clone();
+            fetches.spawn(async move {
+                artwork.get(&url, size).await;
+            });
+        }
+        // Redrawing rebuilds every row, so on a long list it costs more than
+        // the fetch it is reporting. Often enough to look alive, rarely enough
+        // not to be the reason the list stutters.
+        if last_publish.elapsed() >= Duration::from_millis(400) {
             backend.publish_browse();
             last_publish = Instant::now();
         }
@@ -3155,6 +3392,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     // panel gives the title its own size and the artist a
                     // quieter one under it.
                     view.title = status.title1.clone().unwrap_or_default().into();
+                    view.album = status.album.clone().unwrap_or_default().into();
                     view.artist = status
                         .artist
                         .clone()
@@ -3434,7 +3672,11 @@ async fn run_commands(
                             trail.pop();
                             true
                         }
-                        Pane::Help | Pane::Settings(_) | Pane::Web(_) | Pane::Form(_) => {
+                        Pane::Help
+                        | Pane::Settings(_)
+                        | Pane::Web(_)
+                        | Pane::Form(_)
+                        | Pane::NowPlaying => {
                             browsing.pane = Pane::Browse;
                             true
                         }
@@ -3739,6 +3981,17 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
+                // Up before the request, not after it. Asking the player for
+                // its wireless page makes it scan for access points first, and
+                // that is three and a half seconds of a window that looks like
+                // it ignored the press.
+                show_form(
+                    &backend,
+                    title.clone(),
+                    bluos::forms::Form::default(),
+                    "Reading the page…".to_owned(),
+                );
+
                 match client.web_form(&path).await {
                     Ok(Some(form)) => {
                         show_form(&backend, title, form, String::new());
@@ -3750,6 +4003,10 @@ async fn run_commands(
                         if let Err(e) = other {
                             tracing::debug!(%id, "could not read {path}: {e}");
                         }
+                        // Nothing here to draw, so put the page itself up and
+                        // leave the placeholder behind.
+                        backend.browsing.lock().unwrap().pane = Pane::Browse;
+                        backend.publish_pane();
                         let url = client.web_url(&path);
                         tracing::info!(%id, "opening {url} in a browser");
                         let _ = tokio::task::spawn_blocking(move || open::that_detached(url)).await;
@@ -4171,6 +4428,90 @@ async fn run_commands(
                         }
                     }
                     None => {}
+                }
+                continue;
+            }
+
+            Command::BrowseMore => {
+                let asking = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    if browsing.fetching_more {
+                        continue;
+                    }
+                    let next = browsing
+                        .current()
+                        .and_then(|screen| screen.next.clone())
+                        .zip(browsing.device);
+                    if next.is_some() {
+                        browsing.fetching_more = true;
+                    }
+                    next
+                };
+                let Some((next, id)) = asking else { continue };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    backend.browsing.lock().unwrap().fetching_more = false;
+                    continue;
+                };
+
+                match client.screen(&next).await {
+                    Ok(more) => {
+                        {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            browsing.fetching_more = false;
+                            if let Some(crumb) = browsing.trail.last_mut() {
+                                // Added to the section already on screen rather
+                                // than as one of its own: it is the same list,
+                                // continued, and a heading between page one and
+                                // page two would be inventing a division the
+                                // player never made.
+                                let arriving: Vec<_> = more
+                                    .sections
+                                    .into_iter()
+                                    .flat_map(|section| section.items)
+                                    .collect();
+                                match crumb.screen.sections.last_mut() {
+                                    Some(section) => section.items.extend(arriving),
+                                    None => {}
+                                }
+                                crumb.screen.next = more.next;
+                            }
+                        }
+                        backend.publish_browse();
+                        tokio::spawn(load_browse_thumbnails(backend.clone(), id));
+                    }
+                    Err(e) => {
+                        backend.browsing.lock().unwrap().fetching_more = false;
+                        tracing::debug!(%id, "could not read {next}: {e}");
+                    }
+                }
+                continue;
+            }
+
+            Command::ToggleNowPlaying => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.pane = match browsing.pane {
+                        Pane::NowPlaying => Pane::Browse,
+                        _ => Pane::NowPlaying,
+                    };
+                }
+                backend.publish_pane();
+                continue;
+            }
+
+            Command::BrowseHeader(at) => {
+                let found = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.device.zip(
+                        browsing
+                            .current()
+                            .and_then(|screen| screen.header.as_ref())
+                            .and_then(|header| header.buttons.get(at))
+                            .and_then(|button| button.action.clone()),
+                    )
+                };
+                if let Some((id, action)) = found {
+                    tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                 }
                 continue;
             }
