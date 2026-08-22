@@ -2432,7 +2432,12 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 };
                 browsing.trail.push(Crumb { uri, screen, query });
             }
-            backend.publish_browse();
+            // The whole pane, not only the browse rows. Opening a screen is
+            // also leaving whichever pane was covering them, and the window
+            // keeps drawing the settings rows until it is told otherwise —
+            // which showed as a screen with the right title and the wrong list
+            // under it.
+            backend.publish_pane();
             tokio::spawn(load_browse_thumbnails(backend, id));
         }
         Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
@@ -3212,7 +3217,7 @@ async fn run_commands(
                     let browsing = backend.browsing.lock().unwrap();
                     if browsing.device == Some(id) && !browsing.trail.is_empty() {
                         drop(browsing);
-                        backend.publish_browse();
+                        backend.publish_pane();
                         continue;
                     }
                 }
