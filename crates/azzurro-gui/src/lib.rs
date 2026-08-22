@@ -11,6 +11,7 @@
 //! reaches a player.
 
 mod artwork;
+mod glyphs;
 mod known;
 mod mpris;
 
@@ -26,6 +27,7 @@ use bluos::{
 };
 
 use crate::artwork::{Artwork, Pixels};
+use crate::glyphs::Glyph;
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 
@@ -85,8 +87,9 @@ enum Command {
     BrowseMenu(usize),
     /// Open the context menu for a queue position.
     QueueMenu(u32),
-    /// Jump to screen `n` of the ones the player offers.
-    BrowseScreen(usize),
+    /// Follow a sidebar entry: `(kind, index)`, where kind 0 is a screen and
+    /// kind 1 is an item on the Sources screen.
+    Sidebar(i32, i32),
     /// Search the current screen for some text.
     BrowseSearch(String),
     /// Back one screen.
@@ -106,6 +109,12 @@ struct Browsing {
     screens: Vec<(String, String)>,
     /// Where to ask for a queue item's context menu, also from the player.
     queue_menu_uri: Option<String>,
+    /// The player's own Sources screen, kept because the sidebar is drawn from
+    /// it: its two rows are the inputs and the music services.
+    sources: Option<Screen>,
+    /// Which sidebar entry is lit, as `(kind, index)`. Recorded on activation
+    /// rather than inferred, because a screen can be reached several ways.
+    highlighted: Option<(i32, i32)>,
 }
 
 struct Crumb {
@@ -198,10 +207,40 @@ struct BrowseData {
     title: String,
     subtitle: String,
     cover: Option<Pixels>,
+    /// Drawn instead of `cover` where the player's own picture is interface
+    /// furniture rather than content. See [`glyphs`].
+    glyph: Option<Glyph>,
     heading: bool,
     actionable: bool,
     playing: bool,
     has_menu: bool,
+}
+
+/// The Lucide glyph for a [`Glyph`], out of the set the .slint file holds.
+fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
+    match glyph {
+        Glyph::Bluetooth => icons.get_bluetooth(),
+        Glyph::Tv => icons.get_tv(),
+        Glyph::Cable => icons.get_cable(),
+        Glyph::Usb => icons.get_usb(),
+        Glyph::Playlist => icons.get_playlist(),
+        Glyph::Library => icons.get_library(),
+        Glyph::Radio => icons.get_radio(),
+        Glyph::Station => icons.get_station(),
+        Glyph::Favourite => icons.get_favourite(),
+        Glyph::Preset => icons.get_preset(),
+        Glyph::Search => icons.get_search(),
+        Glyph::Album => icons.get_album(),
+        Glyph::Artist => icons.get_artist(),
+        Glyph::Track => icons.get_track(),
+        Glyph::Genre => icons.get_genre(),
+        Glyph::Folder => icons.get_folder(),
+        Glyph::Recent => icons.get_recent(),
+        Glyph::Add => icons.get_add(),
+        Glyph::Home => icons.get_home(),
+        Glyph::News => icons.get_news(),
+        Glyph::Sources => icons.get_sources(),
+    }
 }
 
 /// One queue row on its way to the window.
@@ -231,8 +270,14 @@ pub fn run_app() -> ExitCode {
         .without_time()
         .init();
 
-    // Before any window is built: the id is read when the window is created,
-    // and setting it afterwards is too late.
+    // Selecting the backend has to come first. Slint initialises its platform
+    // lazily on first use, and `set_xdg_app_id` needs one already there —
+    // called before anything else it fails with "No default Slint platform was
+    // selected", silently leaving the window without an id. Then the id, which
+    // has to be set before the window is built because that is when it is read.
+    if let Err(e) = slint::BackendSelector::new().select() {
+        eprintln!("azzurro: could not select a rendering backend: {e}");
+    }
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         eprintln!("azzurro: could not set the application id: {e}");
     }
@@ -334,8 +379,8 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
-    ui.on_browse_screen(move |index| {
-        let _ = tx.send(Command::BrowseScreen(index.max(0) as usize));
+    ui.on_sidebar_activate(move |kind, index| {
+        let _ = tx.send(Command::Sidebar(kind, index));
     });
 
     let tx = commands.clone();
@@ -762,6 +807,109 @@ impl Backend {
         });
     }
 
+    /// Push the navigation sidebar to the window.
+    ///
+    /// Everything in it comes from the player: the screens it reports having,
+    /// then the inputs and services off its own Sources screen, under that
+    /// screen's own headings.
+    fn publish_sidebar(&self) {
+        let rows = {
+            let browsing = self.browsing.lock().unwrap();
+            let lit = browsing.highlighted;
+            let mut rows: Vec<BrowseData> = Vec::new();
+
+            for (index, (label, _)) in browsing.screens.iter().enumerate() {
+                rows.push(BrowseData {
+                    index: index as i32,
+                    title: label.clone(),
+                    subtitle: String::new(),
+                    cover: None,
+                    glyph: glyphs::glyph_for(label, None),
+                    heading: false,
+                    actionable: true,
+                    playing: lit == Some((0, index as i32)),
+                    has_menu: false,
+                });
+            }
+
+            if let Some(sources) = &browsing.sources {
+                let mut index = 0i32;
+                for section in &sources.sections {
+                    if let Some(title) = &section.title {
+                        rows.push(BrowseData {
+                            index: -1,
+                            title: title.clone(),
+                            subtitle: String::new(),
+                            cover: None,
+                            glyph: None,
+                            heading: true,
+                            actionable: false,
+                            playing: false,
+                            has_menu: false,
+                        });
+                    }
+                    for item in &section.items {
+                        let label = item.label().unwrap_or_default().to_owned();
+                        rows.push(BrowseData {
+                            index,
+                            title: label.clone(),
+                            subtitle: String::new(),
+                            cover: None,
+                            glyph: glyphs::glyph_for(
+                                &label,
+                                item.icon.as_deref().or(item.image.as_deref()),
+                            ),
+                            heading: false,
+                            actionable: item.is_actionable(),
+                            playing: lit == Some((1, index)),
+                            has_menu: false,
+                        });
+                        index += 1;
+                    }
+                }
+            }
+            rows
+        };
+
+        // The kind has to survive into the model, and BrowseData has no room
+        // for it, so it is recovered from whether a heading precedes: simpler
+        // to carry it explicitly.
+        let screens = self.browsing.lock().unwrap().screens.len();
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let icons = Icons::get(&ui);
+
+            let mut seen = 0usize;
+            let rows: Vec<SidebarRow> = rows
+                .into_iter()
+                .map(|row| {
+                    let kind = if !row.heading && seen < screens {
+                        seen += 1;
+                        0
+                    } else {
+                        1
+                    };
+                    SidebarRow {
+                        label: row.title.into(),
+                        cover: match row.glyph {
+                            Some(glyph) => glyph_image(&icons, glyph),
+                            None => Default::default(),
+                        },
+                        is_glyph: row.glyph.is_some(),
+                        header: row.heading,
+                        selected: row.playing,
+                        kind,
+                        index: row.index,
+                    }
+                })
+                .collect();
+
+            ui.set_sidebar(ModelRc::new(VecModel::from(rows)));
+        });
+    }
+
     /// Push the current browse screen to the window.
     ///
     /// Sections become headings in a single flat list. The alternative — real
@@ -800,6 +948,7 @@ impl Backend {
                         title: title.clone(),
                         subtitle: String::new(),
                         cover: None,
+                        glyph: None,
                         heading: true,
                         actionable: false,
                         playing: false,
@@ -808,11 +957,19 @@ impl Backend {
                 }
 
                 for item in &section.items {
-                    let cover = item
+                    let source = item
                         .image
                         .as_deref()
                         .or(item.icon.as_deref())
-                        .filter(|src| !src.is_empty())
+                        .filter(|src| !src.is_empty());
+
+                    let glyph = glyphs::glyph_for(item.label().unwrap_or_default(), source);
+                    // A glyph makes the picture beside it redundant, and not
+                    // fetching it saves a request the player would have served.
+                    let cover = glyph
+                        .is_none()
+                        .then_some(source)
+                        .flatten()
                         .zip(client.as_ref())
                         .and_then(|(src, client)| {
                             self.artwork.cached(&client.image_url(src), THUMB_SIZE)
@@ -835,6 +992,7 @@ impl Backend {
                             .or_else(|| item.body.clone())
                             .unwrap_or_default(),
                         cover,
+                        glyph,
                         heading: false,
                         actionable: item.is_actionable(),
                         playing: status.as_ref().is_some_and(|s| item.is_playing(s)),
@@ -870,6 +1028,7 @@ impl Backend {
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
+            let icons = Icons::get(&ui);
 
             let rows: Vec<BrowseRow> = rows
                 .into_iter()
@@ -877,7 +1036,14 @@ impl Backend {
                     index: row.index,
                     title: row.title.into(),
                     subtitle: row.subtitle.into(),
-                    cover: row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
+                    // The glyphs live in the .slint file, so they can only be
+                    // reached from inside the event loop — which is also the
+                    // only place a slint::Image may be built.
+                    cover: match row.glyph {
+                        Some(glyph) => glyph_image(&icons, glyph),
+                        None => row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
+                    },
+                    is_glyph: row.glyph.is_some(),
                     heading: row.heading,
                     actionable: row.actionable,
                     playing: row.playing,
@@ -891,25 +1057,6 @@ impl Backend {
             ui.set_browse_has_search(search.is_some());
             if let Some(prompt) = search {
                 ui.set_browse_search_prompt(prompt.into());
-            }
-        });
-    }
-
-    /// Hand the window the list of screens this player offers.
-    fn publish_screens(&self) {
-        let names: Vec<slint::SharedString> = self
-            .browsing
-            .lock()
-            .unwrap()
-            .screens
-            .iter()
-            .map(|(label, _)| label.as_str().into())
-            .collect();
-
-        let ui = self.ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                ui.set_screens(ModelRc::new(VecModel::from(names)));
             }
         });
     }
@@ -970,17 +1117,6 @@ impl Backend {
             ui.set_repeat(repeat);
             ui.set_sleep_label(sleep.as_str().into());
             ui.set_sleep_on(sleep != "Sleep");
-        });
-    }
-
-    /// Switch the right-hand panel. Used when opening a queue item's context
-    /// menu, which is a browse document and belongs in the browser.
-    fn show_pane(&self, pane: i32) {
-        let ui = self.ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                ui.set_pane(pane);
-            }
         });
     }
 
@@ -1077,10 +1213,6 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, push: bool) {
 }
 
 /// Do whatever row `index` of the current screen says to do.
-///
-/// Every branch here is the player's instruction rather than this app's
-/// decision — which is the whole point of the server-driven screens, and why a
-/// music service nobody has heard of still browses and plays.
 async fn activate(backend: Backend, index: usize) {
     let (id, action) = {
         let browsing = backend.browsing.lock().unwrap();
@@ -1095,6 +1227,15 @@ async fn activate(backend: Backend, index: usize) {
     };
 
     let Some(action) = action else { return };
+    run_action(backend, id, action).await;
+}
+
+/// Carry out one action from a screen.
+///
+/// Every branch is the player's instruction rather than this app's decision —
+/// which is the whole point of the server-driven screens, and why a music
+/// service nobody has heard of still browses and plays.
+async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action) {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
@@ -1236,10 +1377,15 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
         screen
             .items()
             .filter_map(|item| {
-                item.image
+                let source = item
+                    .image
                     .as_deref()
                     .or(item.icon.as_deref())
-                    .filter(|src| !src.is_empty())
+                    .filter(|src| !src.is_empty())?;
+                // Drawn as a glyph, so there is nothing to fetch.
+                glyphs::glyph_for(item.label().unwrap_or_default(), Some(source))
+                    .is_none()
+                    .then_some(source)
             })
             .map(|src| client.image_url(src))
             .filter(|url| seen.insert(url.clone()))
@@ -1633,6 +1779,16 @@ async fn run_commands(
                     .map(|(_, uri)| uri.clone())
                     .unwrap_or_else(|| "/ui/Sources".to_owned());
 
+                // The sidebar's lower half is the Sources screen's own rows,
+                // so it is read once here rather than every time the sidebar
+                // is redrawn.
+                let sources_uri = config
+                    .as_ref()
+                    .and_then(|c| c.uri("sources"))
+                    .unwrap_or("/ui/Sources")
+                    .to_owned();
+                let sources = client.screen(&sources_uri).await.ok();
+
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
                     browsing.queue_menu_uri = config
@@ -1640,8 +1796,10 @@ async fn run_commands(
                         .and_then(|c| c.uri("queueItemContextMenu"))
                         .map(str::to_owned);
                     browsing.screens = screens;
+                    browsing.sources = sources;
+                    browsing.highlighted = Some((0, 0));
                 }
-                backend.publish_screens();
+                backend.publish_sidebar();
                 tokio::spawn(open_screen(backend.clone(), id, root, false));
                 continue;
             }
@@ -1693,22 +1851,48 @@ async fn run_commands(
                     .clone()
                     .unwrap_or_else(|| "/ui/queueItemCM".to_owned());
                 let backend = backend.clone();
-                tokio::spawn(async move {
-                    open_screen(backend.clone(), id, format!("{base}?id={song}"), true).await;
-                    backend.show_pane(1);
-                });
+                tokio::spawn(open_screen(
+                    backend.clone(),
+                    id,
+                    format!("{base}?id={song}"),
+                    true,
+                ));
                 continue;
             }
 
-            Command::BrowseScreen(index) => {
-                let chosen = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    browsing
-                        .device
-                        .zip(browsing.screens.get(index).map(|(_, uri)| uri.clone()))
+            Command::Sidebar(kind, index) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
                 };
-                if let Some((id, uri)) = chosen {
-                    tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                backend.browsing.lock().unwrap().highlighted = Some((kind, index));
+                backend.publish_sidebar();
+
+                if kind == 0 {
+                    let uri = backend
+                        .browsing
+                        .lock()
+                        .unwrap()
+                        .screens
+                        .get(index.max(0) as usize)
+                        .map(|(_, uri)| uri.clone());
+                    if let Some(uri) = uri {
+                        tokio::spawn(open_screen(backend.clone(), id, uri, false));
+                    }
+                } else {
+                    // An entry off the Sources screen: run whatever that item
+                    // says, which is a browse for a service and a play command
+                    // for an input.
+                    let action = {
+                        let browsing = backend.browsing.lock().unwrap();
+                        browsing.sources.as_ref().and_then(|screen| {
+                            screen.items().nth(index.max(0) as usize).and_then(|item| {
+                                item.action.clone().or_else(|| item.play_action.clone())
+                            })
+                        })
+                    };
+                    if let Some(action) = action {
+                        tokio::spawn(run_action(backend.clone(), id, action));
+                    }
                 }
                 continue;
             }

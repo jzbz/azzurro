@@ -99,6 +99,29 @@ export global Icons {
     out property <image> add: @image-url("icons/plus.svg");
     out property <image> rescan: @image-url("icons/refresh-cw.svg");
 
+    // Stand-ins for the player's own interface furniture. BluOS ships a PNG
+    // for every input and every kind of list, drawn in its own style; beside a
+    // Lucide set they read as somebody else's icons pasted in. Content
+    // artwork — a cover, a station logo, a service's own brand mark — is never
+    // replaced, because that is the player telling us something we do not know.
+    out property <image> bluetooth: @image-url("icons/bluetooth.svg");
+    out property <image> tv: @image-url("icons/tv.svg");
+    out property <image> cable: @image-url("icons/cable.svg");
+    out property <image> usb: @image-url("icons/usb.svg");
+    out property <image> playlist: @image-url("icons/list-music.svg");
+    out property <image> library: @image-url("icons/library-big.svg");
+    out property <image> favourite: @image-url("icons/heart.svg");
+    out property <image> preset: @image-url("icons/star.svg");
+    out property <image> album: @image-url("icons/disc-3.svg");
+    out property <image> artist: @image-url("icons/mic-vocal.svg");
+    out property <image> genre: @image-url("icons/tags.svg");
+    out property <image> folder: @image-url("icons/folder.svg");
+    out property <image> recent: @image-url("icons/clock.svg");
+    out property <image> station: @image-url("icons/radio-tower.svg");
+    out property <image> home: @image-url("icons/house.svg");
+    out property <image> news: @image-url("icons/newspaper.svg");
+    out property <image> sources: @image-url("icons/speaker.svg");
+
     // Not drawn anywhere in the window. `audio-lines` is the glyph the
     // application icon is built from, and it is kept here so that the icon in
     // the launcher and the icons in the window are traceably the same set —

@@ -19,13 +19,29 @@
     theme, but nothing asks an icon to redraw when the theme changes.
   -->
   <defs>
-    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#38bdf8"/>
-      <stop offset="1" stop-color="#0369a1"/>
+    <!--
+      Diagonal rather than straight down, and through three stops rather than
+      two: a vertical two-stop ramp reads as a flat card with a shadow on it,
+      while running light-to-deep across the corner gives the tile a direction
+      the eye follows. Sky at the top left, azure through the middle, indigo in
+      the far corner — all blue, so it still reads as one colour at 32px.
+    -->
+    <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="0.45" stop-color="#0ea5e9"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
     </linearGradient>
+
+    <!-- A soft highlight where the light would fall, for a little depth. -->
+    <radialGradient id="sheen" cx="0.28" cy="0.18" r="0.85">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
   </defs>
 
   <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#ground)"/>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#sheen)"/>
 
   <g transform="translate(36.8 36.8) scale(7.6)"
      fill="none" stroke="#ffffff" stroke-width="2"
