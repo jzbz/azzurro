@@ -2045,8 +2045,23 @@ export component AppWindow inherits Window {
                     // bottom, because it arrives while you are reading
                     // something and everything above it would otherwise jump
                     // down a line the moment it did.
-                    if root.indexing != "": Rectangle {
-                        height: 52px;
+                    // Grown rather than inserted. It arrives unannounced while
+                    // you are reading something else, and a strip that simply
+                    // exists on the next frame reads as the page having jumped.
+                    //
+                    // Clipped, so the contents are cut off by the shrinking
+                    // edge instead of spilling past it, and the words are held
+                    // past the moment indexing finishes — bound straight to
+                    // `indexing`, the bar would empty itself and then collapse.
+                    Rectangle {
+                        height: root.indexing != "" ? 52px : 0px;
+                        clip: true;
+                        opacity: root.indexing != "" ? 1.0 : 0.0;
+
+                        animate height, opacity {
+                            duration: 200ms;
+                            easing: ease-out;
+                        }
 
                         Rectangle {
                             x: Theme.pad;
@@ -2077,7 +2092,7 @@ export component AppWindow inherits Window {
                                     }
 
                                     Text {
-                                        text: root.indexing;
+                                        text: root.indexed;
                                         font-size: Theme.small-size;
                                         color: Theme.text;
                                         vertical-alignment: center;
@@ -2436,10 +2451,24 @@ export component AppWindow inherits Window {
             // The queue, with the record it is playing behind it. Hidden by
             // the button beside the volume: on a narrow window it is a third
             // of the width spent on a list you may not be using.
-            if root.queue-shown: Rectangle {
-                width: 330px;
+            // Slid rather than switched. Already clipped, which is what makes
+            // this work: the contents keep their own width while the column
+            // narrows past them, instead of reflowing on every frame.
+            queue-col := Rectangle {
+                width: root.queue-shown ? 330px : 0px;
                 background: Theme.glass;
                 clip: true;
+
+                animate width {
+                    duration: 200ms;
+                    easing: ease-in-out;
+                }
+
+                // Alive for exactly as long as the column has width, so the
+                // slide has something to reveal on the way out and nothing is
+                // laid out once it is shut. A ListView with no width still
+                // materialises the rows it thinks are on screen.
+                if queue-col.width > 0px: Rectangle {
 
                 Rectangle { x: 0; width: 1px; background: Theme.border; }
 
@@ -2714,7 +2743,8 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-        }
+            }
+            }
 
         // Transport, across the whole width, the way the official controller
         // has it: what is playing on the left, the controls in the middle, and
@@ -3369,6 +3399,15 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // What the indexing strip last said, for the same reason as `said` below.
+    property <string> indexed;
+
+    changed indexing => {
+        if (root.indexing != "") {
+            root.indexed = root.indexing;
         }
     }
 
