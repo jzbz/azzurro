@@ -408,6 +408,15 @@ impl Status {
         self.can("back")
     }
 
+    /// Minutes left on the sleep timer, or `None` when it is off.
+    ///
+    /// The player sends an empty `<sleep></sleep>` rather than omitting the
+    /// element, so "off" and "not reported" look the same on the wire and are
+    /// both `None` here.
+    pub fn sleep_minutes(&self) -> Option<u32> {
+        self.sleep.as_deref()?.trim().parse().ok()
+    }
+
     /// Look a field up by the name the player uses for it in a screen's
     /// `nowPlayingMatch` rule.
     ///
@@ -610,6 +619,23 @@ mod tests {
         assert!(stream.can_skip());
         // ...but nothing said it could go back.
         assert!(!stream.can_go_back());
+    }
+
+    #[test]
+    fn an_empty_sleep_element_means_off() {
+        let off: Status = quick_xml::de::from_str(STATUS).unwrap();
+        // The player sends <sleep></sleep>, not nothing at all.
+        assert_eq!(off.sleep.as_deref(), Some(""));
+        assert_eq!(off.sleep_minutes(), None);
+
+        let set = Status {
+            sleep: Some("30".into()),
+            ..Default::default()
+        };
+        assert_eq!(set.sleep_minutes(), Some(30));
+
+        // Never reported at all reads the same as off.
+        assert_eq!(Status::default().sleep_minutes(), None);
     }
 
     #[test]

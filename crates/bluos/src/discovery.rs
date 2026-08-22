@@ -6,7 +6,7 @@
 //! that was powered off when the app opened will announce itself when it wakes.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant, SystemTime};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -143,6 +143,33 @@ impl Discovery {
     }
 }
 
+/// Whether `address` is on a subnet this machine is attached to.
+///
+/// Used before re-probing a remembered player: a list of addresses from the
+/// home network is worth nothing on a hotel wifi, and quietly trying them all
+/// wastes a connection attempt each. The official controller filters its own
+/// stored list the same way.
+pub fn is_local(address: IpAddr) -> bool {
+    let IpAddr::V4(address) = address else {
+        return false;
+    };
+    let address = u32::from(address);
+
+    if_addrs::get_if_addrs()
+        .into_iter()
+        .flatten()
+        .filter(|iface| !iface.is_loopback())
+        .any(|iface| match iface.addr {
+            if_addrs::IfAddr::V4(v4) => {
+                let mask = u32::from(v4.netmask);
+                // A /32 — a point-to-point or VPN interface — matches only
+                // itself, which is the right answer rather than a special case.
+                (u32::from(v4.ip) & mask) == (address & mask)
+            }
+            if_addrs::IfAddr::V6(_) => false,
+        })
+}
+
 /// The broadcast address of every usable IPv4 interface.
 ///
 /// Derived as `ip | !netmask` rather than read from the interface's own
@@ -190,6 +217,17 @@ fn jitter() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locality_follows_the_interfaces() {
+        // Loopback is deliberately not "local": nothing is discovered there,
+        // and a player reporting 127.0.0.1 is reporting its own view, not ours.
+        assert!(!is_local("127.0.0.1".parse().unwrap()));
+        // Documentation space is not on anybody's LAN.
+        assert!(!is_local("192.0.2.155".parse().unwrap()));
+        // IPv6 is not handled at all, and says so rather than guessing.
+        assert!(!is_local("::1".parse().unwrap()));
+    }
 
     #[test]
     fn always_has_somewhere_to_broadcast() {

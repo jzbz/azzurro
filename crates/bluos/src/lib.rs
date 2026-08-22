@@ -46,6 +46,20 @@ pub use queue::{Queue, QueueSong};
 pub use screen::{Action, ActionKind, Configuration, Item, ItemKind, Screen, Section};
 pub use status::{Status, SyncStatus};
 
+/// Seconds as a clock: `4:03`, or `1:02:17` once it runs past an hour.
+///
+/// Negative input clamps to zero, because a position can briefly read past the
+/// end of a track and the difference is not worth showing as `-0:02`.
+pub fn clock(seconds: i64) -> String {
+    let total = seconds.max(0);
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 /// The control API's port. Players advertise it in their LSDP announcement and
 /// have never been seen to use another, but the announcement is authoritative.
 pub const DEFAULT_PORT: u16 = 11000;

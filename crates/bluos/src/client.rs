@@ -285,6 +285,16 @@ impl Client {
             .await
     }
 
+    /// Advance the sleep timer one step.
+    ///
+    /// There is no way to set a particular duration: the endpoint cycles
+    /// through the player's own ladder — 15, 30, 45, 60, 90 minutes and then
+    /// off — which is what the hardware remote's Sleep button does too. The new
+    /// value comes back in `/Status`.
+    pub async fn cycle_sleep(&self) -> Result<()> {
+        self.command("/Sleep", &[]).await
+    }
+
     pub async fn clear_queue(&self) -> Result<()> {
         self.command("/Clear", &[]).await
     }

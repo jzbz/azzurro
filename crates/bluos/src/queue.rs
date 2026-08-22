@@ -99,13 +99,7 @@ impl QueueSong {
     /// `4:03`, or `1:02:17` for something long. `None` when the player did not
     /// say — a live stream in the queue has no length.
     pub fn duration(&self) -> Option<String> {
-        let total = self.seconds?;
-        let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
-        Some(if hours > 0 {
-            format!("{hours}:{minutes:02}:{seconds:02}")
-        } else {
-            format!("{minutes}:{seconds:02}")
-        })
+        Some(crate::clock(self.seconds? as i64))
     }
 }
 
