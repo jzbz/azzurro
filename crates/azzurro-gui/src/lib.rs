@@ -146,6 +146,13 @@ enum Command {
     BrowseMore,
     /// Forget every search made this session.
     ClearRecent,
+    /// A row on the "add to playlist" list: an existing one, or the line that
+    /// makes a new one.
+    PlaylistPress(usize),
+    /// The name typed into that line.
+    PlaylistNamed(String),
+    /// Send the add, once somewhere has been settled on.
+    PlaylistAdd(Option<String>, bluos::client::PlaylistTarget),
     /// Answer the "switch input?" question: run it, or forget it.
     ConfirmInput(bool),
     /// Run one line of the context menu open against a queue row.
@@ -290,6 +297,18 @@ enum Pane {
     NowPlaying,
     /// Rearranging the sections of a screen — "Customise Home".
     Customise(CustomisePage),
+    /// Choosing where to file a track.
+    Playlists(Box<PlaylistPage>),
+}
+
+/// Somewhere to put a track, being chosen.
+struct PlaylistPage {
+    title: String,
+    options: bluos::playlists::AddToPlaylist,
+    /// Whether the row for a new playlist is open for typing. Closed, it is a
+    /// line to press; open, it is a field — the same two states the queue's
+    /// Save button has, and for the same reason.
+    naming: bool,
 }
 
 /// A screen being rearranged.
@@ -1734,6 +1753,81 @@ impl Backend {
     /// nested rows and shelves the way the official app draws them — is a
     /// bigger UI job than the parsing was, and a list is legible in a 340px
     /// column where a horizontal shelf is not.
+    /// The list of places a track can go.
+    ///
+    /// Indices are positions in a flattened walk of the groups, so that
+    /// `SettingAction` can find its way back to the same playlist — the same
+    /// arrangement the settings pages already use.
+    fn publish_playlists(&self) {
+        let (title, rows) = {
+            let browsing = self.browsing.lock().unwrap();
+            let Pane::Playlists(page) = &browsing.pane else {
+                return;
+            };
+
+            let mut rows: Vec<SettingData> = Vec::new();
+            let mut at = 0i32;
+
+            for group in &page.options.groups {
+                // A heading only where there is more than one service to tell
+                // apart. One service is just a list.
+                if page.options.groups.len() > 1 {
+                    rows.push(SettingData {
+                        index: -1,
+                        label: group
+                            .service_name
+                            .clone()
+                            .or_else(|| group.service.clone())
+                            .unwrap_or_else(|| "Playlists".to_owned()),
+                        heading: true,
+                        available: true,
+                        ..SettingData::blank()
+                    });
+                }
+
+                for playlist in &group.playlists {
+                    rows.push(SettingData {
+                        index: at,
+                        label: playlist.name.clone(),
+                        glyph: Some(Glyph::Playlist),
+                        control: "link",
+                        available: true,
+                        ..SettingData::blank()
+                    });
+                    at += 1;
+                }
+
+                if group.can_create {
+                    rows.push(if page.naming {
+                        SettingData {
+                            index: at,
+                            label: "New playlist".to_owned(),
+                            detail: "Type a name and press Enter".to_owned(),
+                            glyph: Some(Glyph::Add),
+                            control: "text",
+                            available: true,
+                            ..SettingData::blank()
+                        }
+                    } else {
+                        SettingData {
+                            index: at,
+                            label: "New playlist…".to_owned(),
+                            glyph: Some(Glyph::Add),
+                            control: "link",
+                            available: true,
+                            ..SettingData::blank()
+                        }
+                    });
+                    at += 1;
+                }
+            }
+
+            (page.title.clone(), rows)
+        };
+
+        self.send_settings(rows, title);
+    }
+
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
         if let Pane::HelpDetail(title, facts) = &self.browsing.lock().unwrap().pane {
@@ -1995,6 +2089,9 @@ impl Backend {
             Pane::Form(_) => Showing::Form,
             Pane::NowPlaying => Showing::NowPlaying,
             Pane::Customise(_) => Showing::Customise,
+            // Drawn with the settings rows, which already have a line that is
+            // a link and a line that is a text field.
+            Pane::Playlists(_) => Showing::Settings,
         };
 
         let large = matches!(showing, Showing::NowPlaying);
@@ -2014,7 +2111,13 @@ impl Backend {
                 self.publish_settings();
                 self.publish_browse();
             }
-            Showing::Settings => self.publish_settings(),
+            Showing::Settings => {
+                if matches!(self.browsing.lock().unwrap().pane, Pane::Playlists(_)) {
+                    self.publish_playlists();
+                } else {
+                    self.publish_settings();
+                }
+            }
             Showing::Help => self.publish_help(),
             Showing::Web => self.publish_web(),
             Showing::Form => self.publish_form(),
@@ -3334,6 +3437,31 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                         }
                     }
                 }
+                // Not a screen either: the ingredients for a request the
+                // client assembles, once somewhere has been picked to put the
+                // track.
+                Some("AddToPlaylistOptions") => match client.playlist_options(&uri).await {
+                    Ok(options) if !options.is_empty() => {
+                        let title = action
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "Add to playlist".to_owned());
+                        backend.browsing.lock().unwrap().pane =
+                            Pane::Playlists(Box::new(PlaylistPage {
+                                title,
+                                options,
+                                naming: false,
+                            }));
+                        backend.publish_pane();
+                    }
+                    other => {
+                        if let Err(e) = other {
+                            tracing::debug!(%id, "no playlist options: {e}");
+                        }
+                        say(&backend.ui, "Nowhere to put this track");
+                    }
+                },
+
                 // A page about the music on somebody else's site.
                 Some("Info") => {
                     let url = client.image_url(&uri);
@@ -4179,6 +4307,7 @@ async fn run_commands(
                         | Pane::Web(_)
                         | Pane::Form(_)
                         | Pane::Customise(_)
+                        | Pane::Playlists(_)
                         | Pane::NowPlaying => {
                             browsing.pane = Pane::Browse;
                             true
@@ -4256,6 +4385,102 @@ async fn run_commands(
                         }
                     }
                 });
+                continue;
+            }
+
+            Command::PlaylistPress(index) => {
+                let chosen = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Playlists(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    match playlist_at(&page.options, index) {
+                        // The line that makes one. It becomes a field rather
+                        // than acting, because a new playlist needs a name.
+                        Some((_, None)) => {
+                            page.naming = true;
+                            None
+                        }
+                        Some((service, Some(playlist))) => Some((
+                            service,
+                            bluos::client::PlaylistTarget::Existing {
+                                name: playlist.name,
+                                id: playlist.id,
+                            },
+                        )),
+                        None => None,
+                    }
+                };
+
+                match chosen {
+                    Some((service, target)) => {
+                        let _ = backend.commands.send(Command::PlaylistAdd(service, target));
+                    }
+                    None => backend.publish_pane(),
+                }
+                continue;
+            }
+
+            Command::PlaylistNamed(name) => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    continue;
+                }
+                // The first group that will make one. There is only ever a
+                // choice of service when the player offers several, and the
+                // field belongs to whichever offered it.
+                let service = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Pane::Playlists(page) = &browsing.pane else {
+                        continue;
+                    };
+                    page.options
+                        .groups
+                        .iter()
+                        .find(|group| group.can_create)
+                        .and_then(|group| group.service.clone())
+                };
+                let _ = backend.commands.send(Command::PlaylistAdd(
+                    service,
+                    bluos::client::PlaylistTarget::New(name),
+                ));
+                continue;
+            }
+
+            Command::PlaylistAdd(service, target) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let options = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Pane::Playlists(page) = &browsing.pane else {
+                        continue;
+                    };
+                    page.options.clone()
+                };
+
+                let named = match &target {
+                    bluos::client::PlaylistTarget::New(name) => name.clone(),
+                    bluos::client::PlaylistTarget::Existing { name, .. } => name.clone(),
+                };
+
+                match client
+                    .add_to_playlist(&options, service.as_deref(), &target)
+                    .await
+                {
+                    Ok(()) => {
+                        backend.browsing.lock().unwrap().pane = Pane::Browse;
+                        backend.publish_pane();
+                        say(&backend.ui, format!("Added to {named}"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, "could not add to {named}: {e}");
+                        say(&backend.ui, format!("Could not add to {named}"));
+                    }
+                }
                 continue;
             }
 
@@ -4345,6 +4570,10 @@ async fn run_commands(
                     }
                     Pane::Form(_) => {
                         let _ = backend.commands.send(Command::FormPress(index));
+                        continue;
+                    }
+                    Pane::Playlists(_) => {
+                        let _ = backend.commands.send(Command::PlaylistPress(index));
                         continue;
                     }
                     _ => {}
@@ -4651,6 +4880,16 @@ async fn run_commands(
             }
 
             Command::SettingEdit(index, edit) => {
+                // The naming line on the "add to playlist" list is a settings
+                // text row like any other, but there is no setting behind it
+                // to write — the name is the whole request.
+                if matches!(backend.browsing.lock().unwrap().pane, Pane::Playlists(_)) {
+                    if let Edit::Text(name) = edit {
+                        let _ = backend.commands.send(Command::PlaylistNamed(name));
+                    }
+                    continue;
+                }
+
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
@@ -5405,6 +5644,33 @@ async fn open_in_browser(ui: &slint::Weak<AppWindow>, url: String) {
             say(ui, "Could not open your browser");
         }
     }
+}
+
+/// Which playlist a row index means, and which service it belongs to.
+///
+/// The rows are a flattened walk of the groups, so this walks them the same
+/// way. Returns `None` for the row that makes a new one, which the caller
+/// distinguishes from a miss by the index still being in range.
+fn playlist_at(
+    options: &bluos::playlists::AddToPlaylist,
+    want: usize,
+) -> Option<(Option<String>, Option<bluos::playlists::Playlist>)> {
+    let mut at = 0;
+    for group in &options.groups {
+        for playlist in &group.playlists {
+            if at == want {
+                return Some((group.service.clone(), Some(playlist.clone())));
+            }
+            at += 1;
+        }
+        if group.can_create {
+            if at == want {
+                return Some((group.service.clone(), None));
+            }
+            at += 1;
+        }
+    }
+    None
 }
 
 fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {

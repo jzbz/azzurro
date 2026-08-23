@@ -160,6 +160,17 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// Which playlist an add is aimed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistTarget {
+    /// One that does not exist yet.
+    New(String),
+    Existing {
+        name: String,
+        id: Option<String>,
+    },
+}
+
 impl Client {
     /// A client for one player.
     ///
@@ -245,6 +256,49 @@ impl Client {
         } else {
             format!("{}/{src}", self.base)
         }
+    }
+
+    /// Where this track can be filed.
+    pub async fn playlist_options(&self, uri: &str) -> Result<crate::playlists::AddToPlaylist> {
+        let body = self.get_text(uri, &[], REQUEST_TIMEOUT).await?;
+        crate::playlists::parse(&body)
+    }
+
+    /// Put the track on a playlist, making it first if `name` is a new one.
+    ///
+    /// The shape is the official controller's: the path and the parameters
+    /// both come out of the document rather than being built here, because
+    /// they carry the identity of the track and differ per service. `create=1`
+    /// is what turns an add into a make-and-add; the player answers the same
+    /// either way.
+    pub async fn add_to_playlist(
+        &self,
+        options: &crate::playlists::AddToPlaylist,
+        service: Option<&str>,
+        target: &PlaylistTarget,
+    ) -> Result<()> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(service) = service {
+            query.push(("service", service));
+        }
+        for (name, value) in &options.parameters {
+            query.push((name.as_str(), value.as_str()));
+        }
+        match target {
+            PlaylistTarget::New(name) => {
+                query.push(("create", "1"));
+                query.push(("name", name));
+            }
+            // An id where the service uses one, the name where it does not.
+            PlaylistTarget::Existing { name, id } => match id {
+                Some(id) => query.push(("playlistid", id)),
+                None => query.push(("name", name)),
+            },
+        }
+
+        self.get_text(&options.url_path, &query, REQUEST_TIMEOUT)
+            .await
+            .map(drop)
     }
 
     /// Read a response body, giving up if it grows past [`MAX_BODY`].
