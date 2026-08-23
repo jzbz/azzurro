@@ -60,8 +60,21 @@ const MEMORY_CACHE: usize = 256;
 /// also trying to play music.
 const CONCURRENT_FETCHES: usize = 4;
 
-/// Files kept on disk. Pruned to this on startup, oldest first.
+/// Files kept on disk. Pruned to this on startup and every [`PRUNE_EVERY`]
+/// covers after that, oldest first.
+///
+/// Startup alone was not enough: a session left open for a week fetches art
+/// the whole time and nothing between one launch and the next ever looks at
+/// the directory, so the limit held only for as long as the app had just
+/// started.
 const DISK_CACHE_FILES: usize = 512;
+
+/// How many covers may be written before the directory is checked again.
+///
+/// Often enough that it cannot run far past the limit, rarely enough that the
+/// cost — one directory listing and a sort — is nothing against the hundred
+/// fetches that earned it.
+const PRUNE_EVERY: usize = 100;
 
 /// Refuse anything implausible for a piece of cover art rather than decoding
 /// it. Guards against a redirect to something that is not an image at all.
@@ -110,6 +123,9 @@ pub struct Artwork {
     /// `None` when there is nowhere to write, which is not fatal: the memory
     /// cache and the network still work.
     disk: Option<PathBuf>,
+    /// Covers written since the process started. Every [`PRUNE_EVERY`] of them
+    /// buys a look at the directory; see [`DISK_CACHE_FILES`].
+    written: std::sync::atomic::AtomicUsize,
     limit: Semaphore,
 }
 
@@ -129,6 +145,7 @@ impl Artwork {
 
         Self {
             http,
+            written: std::sync::atomic::AtomicUsize::new(0),
             memory: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
@@ -140,17 +157,25 @@ impl Artwork {
         }
     }
 
-    /// What is already decoded, without touching the disk or the network.
+    /// What is already decoded, without touching the disk or the network — and
+    /// without counting as a use.
     ///
     /// This is what the queue view calls while building rows: it fills in the
     /// covers it has and leaves the rest blank, and a later republish picks up
     /// whatever arrived in the meantime.
+    ///
+    /// `peek` and not `get`: this is called while drawing, and drawing every
+    /// row four hundred milliseconds apart would otherwise walk the whole
+    /// visible list to the front of the LRU on each pass. What is on screen
+    /// then looks more recently used than what was actually asked for, and the
+    /// eviction order stops meaning anything. Wanting a cover is `get`, in
+    /// [`Self::get`]; drawing one is this.
     pub fn cached(&self, url: &str, size: u32) -> Option<Pixels> {
         let key = Key {
             url: url.to_owned(),
             size,
         };
-        self.memory.lock().unwrap().get(&key).cloned()
+        self.memory.lock().unwrap().peek(&key).cloned()
     }
 
     /// The color to tint a panel with behind this artwork, if it has been
@@ -257,8 +282,25 @@ impl Artwork {
         }
         if let Some(path) = path {
             let copy = bytes.clone();
+            // Every so often, check the directory has not run away. Counted
+            // here rather than timed, because writing is what fills it.
+            let due = self
+                .written
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let sweep = (due % PRUNE_EVERY == 0)
+                .then(|| self.disk.clone())
+                .flatten();
+
             tokio::spawn(async move {
-                let written = tokio::task::spawn_blocking(move || std::fs::write(path, copy)).await;
+                let written = tokio::task::spawn_blocking(move || {
+                    let out = std::fs::write(path, copy);
+                    if let Some(dir) = sweep {
+                        prune(&dir);
+                    }
+                    out
+                })
+                .await;
                 if let Ok(Err(e)) = written {
                     tracing::debug!("could not cache artwork: {e}");
                 }
