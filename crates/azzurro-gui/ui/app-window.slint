@@ -2058,7 +2058,75 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    if !root.in-settings && root.browse-empty != "": VerticalLayout {
+                        alignment: center;
+                        vertical-stretch: 1;
+                        padding-left: 48px;
+                        padding-right: 48px;
+                        spacing: Theme.pad;
+
+                        HorizontalLayout {
+                            alignment: center;
+
+                            Rectangle {
+                                width: 58px;
+                                height: 58px;
+                                border-radius: Theme.radius;
+                                background: Theme.raised;
+
+                                Icon {
+                                    glyph: root.browse-empty-icon;
+                                    tint: Theme.faint;
+                                    width: 26px;
+                                    height: 26px;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: root.browse-empty;
+                            font-size: Theme.body-size + 1px;
+                            font-weight: 600;
+                            color: Theme.dim;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: root.browse-empty-detail;
+                            font-size: Theme.small-size;
+                            color: Theme.faint;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if root.in-settings: ListView {
+                        vertical-stretch: 1;
+                        // As above: without this the settings, Help and
+                        // technical-info rows are as wide as they would like
+                        // rather than as wide as the pane.
+                        viewport-width: self.width;
+
+                        for item in root.settings: SettingRow {
+                            item: item;
+                            toggled => { root.setting-toggle(item.index); }
+                            chose(i) => { root.setting-choose(item.index, i); }
+                            numbered(v) => { root.setting-number(item.index, v); }
+                            typed(t) => { root.setting-text(item.index, t); }
+                            opened => { root.setting-open(item.index); }
+                        }
+                    }
+
                     // Indexing outlives the page it was started from — you can
+                    // walk away to Home and it is still running — so it is
+                    // reported here rather than on the settings row.
+                    //
+                    // Last in this column on purpose. It arrives while you are
+                    // reading something, and anything above the lists pushes
+                    // them down the moment it appears — which is what it did
+                    // on Settings, where it sat between the two lists and so
+                    // landed above the one that was showing.
                     // walk away to Home and it is still running — so it is
                     // reported here rather than on the settings row. At the
                     // bottom, because it arrives while you are reading
@@ -2121,66 +2189,6 @@ export component AppWindow inherits Window {
 
                                 Indeterminate {}
                             }
-                        }
-                    }
-
-                    if !root.in-settings && root.browse-empty != "": VerticalLayout {
-                        alignment: center;
-                        vertical-stretch: 1;
-                        padding-left: 48px;
-                        padding-right: 48px;
-                        spacing: Theme.pad;
-
-                        HorizontalLayout {
-                            alignment: center;
-
-                            Rectangle {
-                                width: 58px;
-                                height: 58px;
-                                border-radius: Theme.radius;
-                                background: Theme.raised;
-
-                                Icon {
-                                    glyph: root.browse-empty-icon;
-                                    tint: Theme.faint;
-                                    width: 26px;
-                                    height: 26px;
-                                }
-                            }
-                        }
-
-                        Text {
-                            text: root.browse-empty;
-                            font-size: Theme.body-size + 1px;
-                            font-weight: 600;
-                            color: Theme.dim;
-                            horizontal-alignment: center;
-                            wrap: word-wrap;
-                        }
-
-                        Text {
-                            text: root.browse-empty-detail;
-                            font-size: Theme.small-size;
-                            color: Theme.faint;
-                            horizontal-alignment: center;
-                            wrap: word-wrap;
-                        }
-                    }
-
-                    if root.in-settings: ListView {
-                        vertical-stretch: 1;
-                        // As above: without this the settings, Help and
-                        // technical-info rows are as wide as they would like
-                        // rather than as wide as the pane.
-                        viewport-width: self.width;
-
-                        for item in root.settings: SettingRow {
-                            item: item;
-                            toggled => { root.setting-toggle(item.index); }
-                            chose(i) => { root.setting-choose(item.index, i); }
-                            numbered(v) => { root.setting-number(item.index, v); }
-                            typed(t) => { root.setting-text(item.index, t); }
-                            opened => { root.setting-open(item.index); }
                         }
                     }
                 }

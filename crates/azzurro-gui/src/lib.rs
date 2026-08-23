@@ -209,6 +209,9 @@ struct Browsing {
     /// The screens this player offers: `(label, uri)`, in the order it listed
     /// them. Read once from `/ui/Configuration`.
     screens: Vec<(String, String)>,
+    /// Queue Builder Mode: pressing a track adds it to the end of the queue
+    /// instead of playing it.
+    queue_building: bool,
     /// An input waiting to be confirmed, because switching to it stops
     /// whatever is playing.
     pending_input: Option<bluos::screen::Action>,
@@ -1426,6 +1429,7 @@ impl Backend {
         // set to another language.
         let buttons: Vec<QueueButtonData> = {
             let browsing = self.browsing.lock().unwrap();
+            let building = browsing.queue_building;
             browsing
                 .queue_screen
                 .as_ref()
@@ -1456,13 +1460,23 @@ impl Backend {
                                 {
                                     3
                                 }
+                                // Queue Builder Mode. The player takes the
+                                // call and does nothing observable with it —
+                                // `/ui/Queue` and every browse screen come
+                                // back byte-identical either way — so the mode
+                                // is this app's to keep, exactly as it is the
+                                // official controller's.
+                                ActionKind::PlayerLink if uri.contains("CBQ=") => 4,
                                 _ => 0,
                             };
 
                             Some(QueueButtonData {
                                 index: at as i32,
                                 glyph: glyphs::glyph_for(&label, None),
-                                highlight: button.highlight,
+                                // Lit from this app's own flag where the
+                                // player has no opinion to report.
+                                highlight: button.highlight || (mode == 4 && building),
+
                                 question: action
                                     .title
                                     .clone()
@@ -3534,8 +3548,25 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
         // job. Its own long poll reports the result.
         ActionKind::PlayerLink | ActionKind::Add | ActionKind::Confirmation => {
             let Some(uri) = uri else { return };
+
+            // While Queue Builder Mode is on, anything that would start
+            // playing is turned into an append instead. `appending` returns
+            // nothing for an action that does not play — favouriting,
+            // switching service, clearing — so those run untouched.
+            let building = backend.browsing.lock().unwrap().queue_building;
+            let (uri, appended) = match building.then(|| bluos::screen::appending(&uri)).flatten() {
+                Some(rewritten) => (rewritten, true),
+                None => (uri, false),
+            };
+
             match client.follow(&uri).await {
                 Ok(()) => {
+                    // The player has no phrase for this one, because it does
+                    // not know the mode exists.
+                    if appended {
+                        say(&backend.ui, "Added to the end of the queue");
+                        fetch_queue(backend.clone(), id).await;
+                    }
                     // Even the wording of the confirmation comes from the
                     // player — "Added to favourites" is its phrase, not ours.
                     if let Some(text) = &action.notification {
@@ -5218,6 +5249,32 @@ async fn run_commands(
                     .as_ref()
                     .and_then(|screen| screen.buttons.get(at))
                     .and_then(|button| button.action.clone());
+
+                // Queue Builder Mode is kept here, not on the player. The call
+                // still goes out — another controller may be listening for it
+                // and it costs nothing — but the behaviour it names is this
+                // app's: while it is on, pressing a track appends instead of
+                // playing. See `screen::appending`.
+                let toggled = action
+                    .as_ref()
+                    .and_then(|a| a.uri.as_deref())
+                    .is_some_and(|uri| uri.contains("CBQ="));
+                if toggled {
+                    let now = {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.queue_building = !browsing.queue_building;
+                        browsing.queue_building
+                    };
+                    say(
+                        &backend.ui,
+                        if now {
+                            "Queue builder mode on — tracks are added to the end"
+                        } else {
+                            "Queue builder mode off"
+                        },
+                    );
+                    backend.publish_queue();
+                }
                 if let Some(action) = action {
                     let backend = backend.clone();
                     tokio::spawn(async move {

@@ -913,6 +913,72 @@ fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
     }
 }
 
+/// The same action, but adding to the queue instead of playing.
+///
+/// A track's action is a play command wrapped in the player's own
+/// `/ui/prf?…&u=<command>`, and the command inside is `/Add?playnow=1&file=…`.
+/// Dropping `playnow` is the whole difference between "play this now" and "put
+/// this at the end" — verified on a Powernode, where `/Add?where=last&file=…`
+/// grew the queue from three to four without interrupting what was playing.
+///
+/// Returns `None` where the action is not one that plays, so a caller can tell
+/// "nothing to change" from "changed".
+pub fn appending(uri: &str) -> Option<String> {
+    let (path, query) = uri.split_once('?')?;
+
+    // The wrapper carries the real command percent-encoded in `u`, and repeats
+    // its parameters in `a` for the player's own bookkeeping. Both mention
+    // playing; only `u` decides it.
+    let mut parts: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("u", encoded)) => {
+                let (inner, dropped) = without_playnow(encoded);
+                changed |= dropped;
+                parts.push(format!("u={inner}"));
+            }
+            _ => parts.push(pair.to_owned()),
+        }
+    }
+
+    // A bare command, not wrapped: `/Add?playnow=1&file=…` on its own.
+    if !changed {
+        let (rebuilt, dropped) = without_playnow(query);
+        if !dropped {
+            return None;
+        }
+        return Some(format!("{path}?{rebuilt}"));
+    }
+
+    Some(format!("{path}?{}", parts.join("&")))
+}
+
+/// Strip `playnow=1` from a query, however many times it is encoded.
+///
+/// The wrapper's `u` is encoded once, so its separators read as `%3D` and
+/// `%26`; the same query unwrapped uses `=` and `&`. Both spellings are
+/// handled rather than decoding and re-encoding, which would rewrite every
+/// other parameter on the way through and risk changing a file name.
+fn without_playnow(query: &str) -> (String, bool) {
+    let mut out = query.to_owned();
+    let mut dropped = false;
+
+    for pattern in [
+        "playnow%3D1%26",
+        "%26playnow%3D1",
+        "playnow=1&",
+        "&playnow=1",
+    ] {
+        while let Some(at) = out.find(pattern) {
+            out.replace_range(at..at + pattern.len(), "");
+            dropped = true;
+        }
+    }
+    (out, dropped)
+}
+
 /// `/ui/Configuration` — which screens this player offers.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Configuration {
@@ -1557,5 +1623,46 @@ mod tests {
             .filter_map(|item| item.label())
             .collect();
         assert_eq!(browses, ["Library", "Radio", "Radio Paradise", "TuneIn"]);
+    }
+    /// A favourite track's action, exactly as a Powernode writes it.
+    const PLAY_ACTION: &str = "/ui/prf?a=category%3DFAVOURITES%26cursor%3Dlast%26listindex%3D0%26nextlist%3D1%26playnow%3D1%26service%3DLocalMusic%26where%3Dlast&t=1&u=%2FAdd%3Fplaynow%3D1%26file%3D%252Fvar%252Fmnt%252Fx.flac";
+
+    #[test]
+    fn playing_becomes_appending() {
+        let appended = appending(PLAY_ACTION).expect("this one plays");
+        // The command inside no longer says to play it now...
+        assert!(!appended.contains("u=%2FAdd%3Fplaynow%3D1"));
+        assert!(appended.contains("u=%2FAdd%3Ffile%3D%252Fvar%252Fmnt%252Fx.flac"));
+        // ...and nothing else about it moved.
+        assert!(appended.starts_with("/ui/prf?a=category%3DFAVOURITES"));
+        assert!(appended.contains("&t=1&"));
+        assert!(appended.contains("where%3Dlast"));
+    }
+
+    #[test]
+    fn a_bare_add_is_rewritten_too() {
+        let appended = appending("/Add?playnow=1&file=%2Fx.flac").expect("plays");
+        assert_eq!(appended, "/Add?file=%2Fx.flac");
+    }
+
+    #[test]
+    fn an_action_that_does_not_play_is_left_alone() {
+        // Browsing, favouriting, switching service: none of these play, and a
+        // caller needs to know so it can run them unchanged.
+        assert_eq!(appending("/ui/BrowseObjects?service=LocalMusic"), None);
+        assert_eq!(appending("/ui/action?CfavouritesService=TuneIn"), None);
+        assert_eq!(appending("/Clear"), None);
+        assert_eq!(appending("/Play"), None);
+    }
+
+    #[test]
+    fn a_file_name_that_mentions_playing_is_not_mangled() {
+        // The pattern is anchored to the parameter, not to the text: a track
+        // called "playnow=1.flac" must survive.
+        let uri = "/Add?playnow=1&file=%2Fmusic%2Fplaynow%3D1.flac";
+        assert_eq!(
+            appending(uri).as_deref(),
+            Some("/Add?file=%2Fmusic%2Fplaynow%3D1.flac")
+        );
     }
 }
