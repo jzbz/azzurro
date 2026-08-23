@@ -67,6 +67,9 @@ export component IconButton inherits Rectangle {
 }
 
 // A text button, optionally with a glyph before the label.
+// Rounded rectangle rather than a pill, matching the panels, rows and tiles
+// it sits among. The name is left as it was: renaming it would touch every
+// call site for nothing.
 export component PillButton inherits Rectangle {
     in property <string> label;
     in property <image> glyph;
@@ -76,7 +79,7 @@ export component PillButton inherits Rectangle {
 
     height: 30px;
     width: content.preferred-width + 26px;
-    border-radius: self.height / 2;
+    border-radius: Theme.radius-small;
 
     background: root.primary
         ? (touch.pressed ? Theme.accent-hover : Theme.accent)
@@ -131,7 +134,7 @@ export component Segmented inherits Rectangle {
     callback changed(int);
 
     height: 30px;
-    border-radius: self.height / 2;
+    border-radius: Theme.radius-small;
     background: Theme.sunken;
 
     HorizontalLayout {
@@ -142,7 +145,7 @@ export component Segmented inherits Rectangle {
             { label: root.first, glyph: root.first-glyph },
             { label: root.second, glyph: root.second-glyph },
         ]: Rectangle {
-            border-radius: self.height / 2;
+            border-radius: Theme.radius-small;
             background: root.index == i
                 ? Theme.raised
                 : (segment.has-hover ? Theme.hover : transparent);

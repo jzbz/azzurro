@@ -1254,7 +1254,7 @@ component ServiceChip inherits Rectangle {
 
     height: 32px;
     width: caption.preferred-width + 50px;
-    border-radius: self.height / 2;
+    border-radius: Theme.radius-small;
     background: root.entry.selected
         ? Theme.accent-soft
         : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : Theme.raised));
@@ -1472,7 +1472,7 @@ component BrowseBlockView inherits VerticalLayout {
             Rectangle {
                 height: 22px;
                 width: more.preferred-width + 20px;
-                border-radius: self.height / 2;
+                border-radius: Theme.radius-small;
                 background: shelf.pressed
                     ? Theme.pressed
                     : (shelf.has-hover ? Theme.hover : transparent);
@@ -1847,7 +1847,7 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 height: 30px;
                                 width: chosen.preferred-width + 54px;
-                                border-radius: self.height / 2;
+                                border-radius: Theme.radius-small;
                                 background: swap.pressed
                                     ? Theme.pressed
                                     : (swap.has-hover ? Theme.hover : transparent);
@@ -2013,7 +2013,7 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     height: 22px;
                                     width: wipe.preferred-width + 20px;
-                                    border-radius: self.height / 2;
+                                    border-radius: Theme.radius-small;
                                     background: forget.pressed
                                         ? Theme.pressed
                                         : (forget.has-hover ? Theme.hover : transparent);
@@ -3602,8 +3602,20 @@ export component AppWindow inherits Window {
         if toast.visible: Rectangle {
         x: (parent.width - self.width) / 2;
         // Clear of the transport bar, which is the one thing always at the
-        // bottom of the window.
-        y: parent.height - 88px - self.height - Theme.pad;
+        // bottom of the window — and of the indexing strip above it, which is
+        // not always there. Without the second term the two overlapped, and
+        // the message a reindex produces is exactly the one that lands while
+        // the strip is up.
+        //
+        // Animated on the same curve as the strip, so they move together
+        // rather than the message jumping when indexing starts or stops.
+        y: parent.height - 88px - (root.indexing != "" ? 52px : 0px)
+            - self.height - Theme.pad;
+
+        animate y {
+            duration: 200ms;
+            easing: ease-out;
+        }
         width: Math.min(line.preferred-width, parent.width - 2 * Theme.room);
         height: 38px;
         border-radius: self.height / 2;

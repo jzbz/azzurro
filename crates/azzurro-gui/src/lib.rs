@@ -3337,6 +3337,31 @@ fn with_service(uri: &str, service: &str) -> String {
     format!("{path}?{}", kept.join("&"))
 }
 
+/// The item a published row index refers to, and the section it came from.
+///
+/// The rows are published in [`Backend::arrangement`] order, with hidden
+/// sections dropped — so counting through `screen.items()` finds a different
+/// item than the one drawn. That is not a hypothetical: with Home's promo
+/// shelf hidden and Recently Played lifted to the top, pressing the first
+/// tile ran an action from the shelf that is not on screen, and the app
+/// reported a route it had never been asked to open.
+fn item_at<'a>(
+    screen: &'a Screen,
+    arrangement: &[usize],
+    index: usize,
+) -> Option<(&'a bluos::screen::Section, &'a bluos::screen::Item)> {
+    let mut at = 0usize;
+    for section in arrangement.iter().filter_map(|s| screen.sections.get(*s)) {
+        for item in &section.items {
+            if at == index {
+                return Some((section, item));
+            }
+            at += 1;
+        }
+    }
+    None
+}
+
 /// Do whatever row `index` of the current screen says to do.
 async fn activate(backend: Backend, index: usize) {
     let (id, action, arrive, worth_keeping, switch_to) = {
@@ -3350,23 +3375,12 @@ async fn activate(backend: Backend, index: usize) {
         // service picker asks to replace the screen it sits on — switching
         // from Library to TuneIn is the same screen about a different service,
         // not a step into one.
-        let mut at = 0usize;
-        let mut found = None;
-        'sections: for section in &crumb.screen.sections {
-            for item in &section.items {
-                if at == index {
-                    let replaces =
-                        section.kind == SectionKind::SelectorMenu && section.replace_screen;
-                    let picker = section.kind == SectionKind::SelectorMenu;
-                    found = Some((item, replaces, picker));
-                    break 'sections;
-                }
-                at += 1;
-            }
-        }
-        let Some((item, replaces, picker)) = found else {
+        let arrangement = backend.arrangement(&crumb.screen);
+        let Some((section, item)) = item_at(&crumb.screen, &arrangement, index) else {
             return;
         };
+        let picker = section.kind == SectionKind::SelectorMenu;
+        let replaces = picker && section.replace_screen;
 
         // Choosing a service out of a picker is done on the URL, not by the
         // action attached to it.
@@ -4503,12 +4517,14 @@ async fn run_commands(
             Command::BrowseMenu(index) => {
                 let opened = {
                     let browsing = backend.browsing.lock().unwrap();
+                    let item = browsing.current().and_then(|screen| {
+                        let arrangement = backend.arrangement(screen);
+                        item_at(screen, &arrangement, index).map(|(_, item)| item.clone())
+                    });
+
                     browsing.device.zip(
-                        browsing
-                            .current()
-                            .and_then(|screen| screen.items().nth(index))
-                            .and_then(|item| item.context_menu.as_ref())
-                            .and_then(|action| action.uri.clone()),
+                        item.and_then(|item| item.context_menu)
+                            .and_then(|action| action.uri),
                     )
                 };
                 let Some((id, uri)) = opened else { continue };
