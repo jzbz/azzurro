@@ -29,7 +29,7 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::error::{Error, Result};
-use crate::xml::{attributes, flag, local_name};
+use crate::xml::{attributes, entity as resolve_entity, flag, local_name};
 
 /// One screen, as the player describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -530,14 +530,7 @@ pub fn parse(xml: &str) -> Result<Screen> {
                 if let Some(next) = screen.next.as_mut()
                     && let Ok(name) = entity.decode()
                 {
-                    next.push_str(match name.as_ref() {
-                        "amp" => "&",
-                        "lt" => "<",
-                        "gt" => ">",
-                        "quot" => "\"",
-                        "apos" => "'",
-                        _ => "",
-                    });
+                    next.push_str(&resolve_entity(name.as_ref()));
                 }
             }
             Ok(_) => {}
@@ -842,7 +835,13 @@ fn end(
         }
         Some(Ctx::MenuAction) => {
             if let Some(done) = menu_action.take() {
-                match section {
+                // Not `section.is_some()`: a screen whose items sit loose under
+                // the root — every context menu — has a section open that no
+                // tag opened and no tag will close, built to hold them by the
+                // `Ctx::Item` arm above. Everything at the root after the first
+                // of those items would have been swallowed by it. The stack
+                // says what is really open.
+                match section.as_mut().filter(|_| in_section(stack)) {
                     Some(section) => section.menu_actions.push(done),
                     None => screen.menu_actions.push(done),
                 }
@@ -853,7 +852,8 @@ fn end(
                 // Innermost open context wins, the same rule `<action>` follows.
                 match (
                     item.as_mut(),
-                    section.as_mut(),
+                    // Only a section a tag actually opened; see `Ctx::MenuAction`.
+                    section.as_mut().filter(|_| in_section(stack)),
                     screen.mode_indicator.as_mut(),
                 ) {
                     (Some(item), _, _) => item.buttons.push(done),
@@ -875,6 +875,14 @@ fn end(
         _ => {}
     }
     let _ = name;
+}
+
+/// Whether a `<row>`, `<list>` or `<selectorMenu>` is open around here.
+///
+/// Called after the closing element has been popped, so the top of the stack
+/// is what encloses it.
+fn in_section(stack: &[Ctx]) -> bool {
+    matches!(stack.last(), Some(Ctx::Section | Ctx::NestedList))
 }
 
 fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
@@ -1701,5 +1709,52 @@ mod tests {
         // The half that makes the fallback necessary.
         let labels: Vec<Option<&str>> = screen.items().map(|item| item.label()).collect();
         assert_eq!(labels, [Some("Library"), None, None]);
+    }
+
+    /// A context menu is items directly under its root, with no `<row>` to
+    /// group them, so the parser opens a section of its own to hold them. That
+    /// section has no closing tag to end it, and anything at the root that
+    /// follows the items used to be read as part of it.
+    #[test]
+    fn what_follows_a_rows_worth_of_loose_items_still_belongs_to_the_document() {
+        let doc = r#"<contextMenu title="Now playing">
+            <item title="Technical info"><action type="browse" URI="/info"/></item>
+            <item title="Add to playlist"><action type="browse" URI="/add"/></item>
+            <menuAction title="Edit" id="edit"/>
+            <button title="Clear" id="clear"/>
+        </contextMenu>"#;
+        let screen = parse(doc).expect("parses");
+
+        assert_eq!(screen.sections.len(), 1, "{:?}", screen.sections);
+        assert_eq!(screen.sections[0].items.len(), 2);
+        assert!(
+            screen.sections[0].menu_actions.is_empty(),
+            "the menu action was filed under the items"
+        );
+        assert!(
+            screen.sections[0].buttons.is_empty(),
+            "the button was filed under the items"
+        );
+        assert_eq!(screen.menu_actions.len(), 1);
+        assert_eq!(screen.buttons.len(), 1);
+    }
+
+    /// The same two elements inside a real `<row>` still belong to it.
+    #[test]
+    fn a_row_that_was_written_down_keeps_what_is_inside_it() {
+        let doc = r#"<screen screenTitle="Library">
+            <row title="Albums">
+                <item title="One"/>
+                <menuAction title="Sort" id="sort"/>
+                <button title="Play all" id="play"/>
+            </row>
+        </screen>"#;
+        let screen = parse(doc).expect("parses");
+
+        assert_eq!(screen.sections.len(), 1);
+        assert_eq!(screen.sections[0].menu_actions.len(), 1);
+        assert_eq!(screen.sections[0].buttons.len(), 1);
+        assert!(screen.menu_actions.is_empty());
+        assert!(screen.buttons.is_empty());
     }
 }
