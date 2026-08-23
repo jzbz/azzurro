@@ -98,15 +98,6 @@ const MAX_TRACKED: usize = 256;
 /// "Queue builder mode" is not, and goes on a line of its own.
 const QUEUE_BUTTON_SHORT: usize = 8;
 
-/// The index this app gives its own line on a context menu.
-///
-/// Far past anything the player will send, so a press on it cannot be mistaken
-/// for one of the menu's own rows.
-const PRESET_ROW: i32 = 10_000;
-
-/// And the one for removing the preset a row already is.
-const PRESET_REMOVE_ROW: i32 = 10_001;
-
 /// What the window and the desktop can ask the backend to do.
 #[derive(Debug)]
 enum Command {
@@ -162,8 +153,6 @@ enum Command {
     BrowseMore,
     /// Forget every search made this session.
     ClearRecent,
-    /// Write the preset being edited to the player.
-    PresetSave,
     /// A row on the "add to playlist" list: an existing one, or the line that
     /// makes a new one.
     PlaylistPress(usize),
@@ -220,13 +209,6 @@ struct Browsing {
     /// The screens this player offers: `(label, uri)`, in the order it listed
     /// them. Read once from `/ui/Configuration`.
     screens: Vec<(String, String)>,
-    /// The preset the open menu belongs to, where it belongs to one: its slot
-    /// and what it is called.
-    preset_open: Option<(u32, String)>,
-    /// What the open menu could be saved as, where its row plays something.
-    /// The menu document names no stream — only the row does — so it is taken
-    /// at the moment the menu is opened, and cleared when it is not.
-    preset_source: Option<PresetSource>,
     /// Queue Builder Mode: pressing a track adds it to the end of the queue
     /// instead of playing it.
     queue_building: bool,
@@ -327,27 +309,6 @@ enum Pane {
     Customise(CustomisePage),
     /// Choosing where to file a track.
     Playlists(Box<PlaylistPage>),
-    /// Naming a preset and choosing its slot.
-    Preset(Box<PresetPage>),
-}
-
-/// A row that could become a preset.
-#[derive(Debug, Clone)]
-struct PresetSource {
-    name: String,
-    /// The player's own scheme, carried from the row's play action.
-    url: String,
-    image: Option<String>,
-}
-
-/// A preset being written.
-struct PresetPage {
-    source: PresetSource,
-    /// What it will be called. Starts as the row's own name.
-    name: String,
-    /// Which numbered slot, and the ones still free to choose from.
-    slot: u32,
-    free: Vec<u32>,
 }
 
 /// Somewhere to put a track, being chosen.
@@ -1400,28 +1361,6 @@ impl Backend {
     /// already decoded — the same cover is in the row underneath, so a menu
     /// that waited on a fetch would open blank for no reason.
     fn publish_queue_menu(&self) {
-        // A preset's panel has no document behind it: one line, and the name
-        // the player drew on the row.
-        if let Some((slot, name)) = self.browsing.lock().unwrap().preset_open.clone() {
-            let ui = self.ui.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some(ui) = ui.upgrade() else { return };
-                let icons = Icons::get(&ui);
-                let rows = vec![ActionButton {
-                    index: PRESET_REMOVE_ROW,
-                    label: format!("Remove preset {slot}").into(),
-                    glyph: glyph_image(&icons, Glyph::Clear),
-                    primary: false,
-                }];
-                ui.set_queue_menu_title(name.into());
-                ui.set_queue_menu_subtitle("Preset".into());
-                ui.set_queue_menu_cover(slint::Image::default());
-                ui.set_queue_menu_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
-                ui.set_queue_menu_open(true);
-            });
-            return;
-        }
-
         let (title, subtitle, cover, rows) = {
             let browsing = self.browsing.lock().unwrap();
             let Some(menu) = &browsing.queue_menu else {
@@ -1444,20 +1383,6 @@ impl Backend {
                     Some((at as i32, label, glyph))
                 })
                 .collect();
-
-            // One line of this app's own, under the player's. Presets are
-            // written by a client — the player offers no menu entry for
-            // making one — so if it is not added here it does not exist.
-            // Numbered past the end of the menu, which is how the press is
-            // told apart from a line the player sent.
-            let mut rows = rows;
-            if browsing.preset_source.is_some() {
-                rows.push((
-                    PRESET_ROW,
-                    "Save as preset…".to_owned(),
-                    glyphs::menu_glyph("preset"),
-                ));
-            }
 
             (
                 menu.heading().unwrap_or_default().to_owned(),
@@ -1937,56 +1862,6 @@ impl Backend {
         self.send_settings(rows, title);
     }
 
-    /// The preset being written: what to call it and where to put it.
-    fn publish_preset(&self) {
-        let (title, rows) = {
-            let browsing = self.browsing.lock().unwrap();
-            let Pane::Preset(page) = &browsing.pane else {
-                return;
-            };
-
-            let rows = vec![
-                SettingData {
-                    index: 0,
-                    label: "Name".to_owned(),
-                    detail: String::new(),
-                    glyph: Some(Glyph::Details),
-                    control: "text",
-                    value: page.name.clone(),
-                    available: true,
-                    ..SettingData::blank()
-                },
-                SettingData {
-                    index: 1,
-                    label: "Slot".to_owned(),
-                    // The numbers are printed on the remote, so which one this
-                    // lands in is worth saying plainly.
-                    detail: format!("Button {} on the player", page.slot),
-                    glyph: Some(Glyph::Preset),
-                    control: "list",
-                    options: page.free.iter().map(|n| n.to_string()).collect(),
-                    option_index: page.free.iter().position(|n| *n == page.slot).unwrap_or(0)
-                        as i32,
-                    available: true,
-                    ..SettingData::blank()
-                },
-                SettingData {
-                    index: 2,
-                    label: String::new(),
-                    glyph: None,
-                    control: "button",
-                    value: "Save preset".to_owned(),
-                    available: !page.name.trim().is_empty(),
-                    ..SettingData::blank()
-                },
-            ];
-
-            (format!("Preset · {}", page.source.name), rows)
-        };
-
-        self.send_settings(rows, title);
-    }
-
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
         if let Pane::HelpDetail(title, facts, _) = &self.browsing.lock().unwrap().pane {
@@ -2253,7 +2128,7 @@ impl Backend {
             Pane::Customise(_) => Showing::Customise,
             // Drawn with the settings rows, which already have a line that is
             // a link and a line that is a text field.
-            Pane::Playlists(_) | Pane::Preset(_) => Showing::Settings,
+            Pane::Playlists(_) => Showing::Settings,
         };
 
         let large = matches!(showing, Showing::NowPlaying);
@@ -2274,23 +2149,10 @@ impl Backend {
                 self.publish_browse();
             }
             Showing::Settings => {
-                // Which one, decided and the lock dropped, before calling
-                // any of them: each publisher takes `browsing` itself, and a
-                // match on a guard holds it for the whole arm.
-                enum Rows {
-                    Playlists,
-                    Preset,
-                    Settings,
-                }
-                let which = match self.browsing.lock().unwrap().pane {
-                    Pane::Playlists(_) => Rows::Playlists,
-                    Pane::Preset(_) => Rows::Preset,
-                    _ => Rows::Settings,
-                };
-                match which {
-                    Rows::Playlists => self.publish_playlists(),
-                    Rows::Preset => self.publish_preset(),
-                    Rows::Settings => self.publish_settings(),
+                if matches!(self.browsing.lock().unwrap().pane, Pane::Playlists(_)) {
+                    self.publish_playlists();
+                } else {
+                    self.publish_settings();
                 }
             }
             Showing::Help => self.publish_help(),
@@ -2641,11 +2503,7 @@ impl Backend {
                         actionable: item.is_actionable(),
                         playing: status.as_ref().is_some_and(|s| item.is_playing(s)),
                         selected: item.selected,
-                        // Or it is a preset, which the player draws with no
-                        // menu at all — there is nothing it offers to do with
-                        // one. Removing it is this app's line to add, so the
-                        // row has to have somewhere to put it.
-                        has_menu: item.context_menu.is_some() || preset_slot(item).is_some(),
+                        has_menu: item.context_menu.is_some(),
                     });
                 }
 
@@ -3493,24 +3351,6 @@ fn with_service(uri: &str, service: &str) -> String {
     let service = format!("service={service}");
     kept.push(&service);
     format!("{path}?{}", kept.join("&"))
-}
-
-/// The slot a row plays, if the row is a preset.
-///
-/// The player draws them as `<smallThumbnail>` with a bare
-/// `player-link` to `/Preset?id=N` and no menu of any kind, so this is the
-/// only thing distinguishing one from any other row that plays.
-fn preset_slot(item: &bluos::screen::Item) -> Option<u32> {
-    let uri = item
-        .action
-        .as_ref()
-        .or(item.play_action.as_ref())
-        .and_then(|a| a.uri.as_deref())?;
-    let rest = uri.strip_prefix("/Preset?")?;
-    rest.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name == "id").then(|| value.parse().ok())?
-    })
 }
 
 /// The item a published row index refers to, and the section it came from.
@@ -4659,7 +4499,6 @@ async fn run_commands(
                         | Pane::Form(_)
                         | Pane::Customise(_)
                         | Pane::Playlists(_)
-                        | Pane::Preset(_)
                         | Pane::NowPlaying => {
                             browsing.pane = Pane::Browse;
                             true
@@ -4693,33 +4532,10 @@ async fn run_commands(
 
             Command::BrowseMenu(index) => {
                 let opened = {
-                    let mut browsing = backend.browsing.lock().unwrap();
+                    let browsing = backend.browsing.lock().unwrap();
                     let item = browsing.current().and_then(|screen| {
                         let arrangement = backend.arrangement(screen);
                         item_at(screen, &arrangement, index).map(|(_, item)| item.clone())
-                    });
-
-                    browsing.preset_open = item
-                        .as_ref()
-                        .and_then(|item| Some((preset_slot(item)?, item.label()?.to_owned())));
-
-                    // Taken while the row is still in hand. The menu the
-                    // player returns names no stream of its own, so this is
-                    // the only moment a preset could learn what to play.
-                    browsing.preset_source = item.as_ref().and_then(|item| {
-                        let uri = item
-                            .play_action
-                            .as_ref()
-                            .or(item.action.as_ref())
-                            .and_then(|a| a.uri.as_deref())?;
-                        Some(PresetSource {
-                            name: item
-                                .label()
-                                .or_else(|| item.action.as_ref().and_then(|a| a.title.as_deref()))?
-                                .to_owned(),
-                            url: bluos::screen::stream_url(uri)?,
-                            image: item.image.clone(),
-                        })
                     });
 
                     browsing.device.zip(
@@ -4727,15 +4543,6 @@ async fn run_commands(
                             .and_then(|action| action.uri),
                     )
                 };
-                // A preset has no menu document to ask for — the player
-                // offers none — so the panel is built from this app's own line
-                // and nothing is fetched.
-                if let Some((slot, name)) = backend.browsing.lock().unwrap().preset_open.clone() {
-                    tracing::debug!("menu for preset {slot} ({name})");
-                    backend.publish_queue_menu();
-                    continue;
-                }
-
                 let Some((id, uri)) = opened else { continue };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
@@ -4779,11 +4586,6 @@ async fn run_commands(
                     continue;
                 };
                 let backend = backend.clone();
-                {
-                    let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.preset_source = None;
-                    browsing.preset_open = None;
-                }
                 tokio::spawn(async move {
                     match client.screen(&format!("{base}?id={song}")).await {
                         Ok(menu) => {
@@ -4895,45 +4697,6 @@ async fn run_commands(
                 continue;
             }
 
-            Command::PresetSave => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                    continue;
-                };
-                let asked = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    let Pane::Preset(page) = &browsing.pane else {
-                        continue;
-                    };
-                    let name = page.name.trim().to_owned();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    Some((page.slot, name, page.source.clone()))
-                };
-                let Some((slot, name, source)) = asked else {
-                    continue;
-                };
-
-                match client
-                    .set_preset(slot, &name, &source.url, source.image.as_deref())
-                    .await
-                {
-                    Ok(_) => {
-                        backend.browsing.lock().unwrap().pane = Pane::Browse;
-                        backend.publish_pane();
-                        say(&backend.ui, format!("Saved to preset {slot}"));
-                    }
-                    Err(e) => {
-                        tracing::warn!(%id, "could not write preset {slot}: {e}");
-                        say(&backend.ui, format!("Could not save preset {slot}"));
-                    }
-                }
-                continue;
-            }
-
             Command::ConfirmInput(go) => {
                 let pending = backend.browsing.lock().unwrap().pending_input.take();
                 if let (true, Some(action), Some(id)) =
@@ -4948,69 +4711,6 @@ async fn run_commands(
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
-
-                if at == PRESET_REMOVE_ROW as usize {
-                    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                        continue;
-                    };
-                    let Some((slot, name)) = backend.browsing.lock().unwrap().preset_open.clone()
-                    else {
-                        continue;
-                    };
-
-                    match client.delete_preset(slot).await {
-                        Ok(_) => {
-                            say(&backend.ui, format!("Removed {name}"));
-                            // The row is drawn from the screen, and the screen
-                            // still has it until it is asked for again.
-                            refresh_current(backend.clone()).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(%id, "could not remove preset {slot}: {e}");
-                            say(&backend.ui, format!("Could not remove {name}"));
-                        }
-                    }
-                    continue;
-                }
-
-                if at == PRESET_ROW as usize {
-                    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                        continue;
-                    };
-                    let Some(source) = backend.browsing.lock().unwrap().preset_source.clone()
-                    else {
-                        continue;
-                    };
-
-                    // The slots have to be read before the form can offer one:
-                    // which numbers are free is the player's to say.
-                    let backend = backend.clone();
-                    tokio::spawn(async move {
-                        let taken = match client.presets().await {
-                            Ok(taken) => taken,
-                            Err(e) => {
-                                tracing::warn!(%id, "could not read the presets: {e}");
-                                say(&backend.ui, "Could not read this player's presets");
-                                return;
-                            }
-                        };
-                        let free = bluos::presets::free_slots(&taken);
-                        let Some(slot) = free.first().copied() else {
-                            say(&backend.ui, "Every preset slot is taken");
-                            return;
-                        };
-
-                        backend.browsing.lock().unwrap().pane =
-                            Pane::Preset(Box::new(PresetPage {
-                                name: source.name.clone(),
-                                source,
-                                slot,
-                                free,
-                            }));
-                        backend.publish_pane();
-                    });
-                    continue;
-                }
                 let action = backend
                     .browsing
                     .lock()
@@ -5083,14 +4783,6 @@ async fn run_commands(
                     }
                     Pane::Form(_) => {
                         let _ = backend.commands.send(Command::FormPress(index));
-                        continue;
-                    }
-                    Pane::Preset(_) => {
-                        // Only the Save line does anything; the other two are
-                        // a field and a picker and answer their own edits.
-                        if index == 2 {
-                            let _ = backend.commands.send(Command::PresetSave);
-                        }
                         continue;
                     }
                     Pane::Playlists(_) => {
@@ -5404,27 +5096,6 @@ async fn run_commands(
             }
 
             Command::SettingEdit(index, edit) => {
-                // The preset form is settings-shaped but has no settings
-                // behind it: the two rows are this app's own, and editing one
-                // changes the page rather than the player.
-                {
-                    let mut browsing = backend.browsing.lock().unwrap();
-                    if let Pane::Preset(page) = &mut browsing.pane {
-                        match (index, &edit) {
-                            (0, Edit::Text(name)) => page.name = name.clone(),
-                            (1, Edit::Choose(at)) => {
-                                if let Some(slot) = page.free.get(*at) {
-                                    page.slot = *slot;
-                                }
-                            }
-                            _ => {}
-                        }
-                        drop(browsing);
-                        backend.publish_pane();
-                        continue;
-                    }
-                }
-
                 // The naming line on the "add to playlist" list is a settings
                 // text row like any other, but there is no setting behind it
                 // to write — the name is the whole request.
@@ -6256,27 +5927,6 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn a_preset_row_is_told_apart_by_what_it_plays() {
-        let row = |uri: &str| bluos::screen::Item {
-            action: Some(bluos::screen::Action {
-                uri: Some(uri.to_owned()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(preset_slot(&row("/Preset?id=1")), Some(1));
-        assert_eq!(preset_slot(&row("/Preset?id=40&x=1")), Some(40));
-
-        // The `+` at the end of the shelf, which must not read as one.
-        assert_eq!(preset_slot(&row("/add-preset")), None);
-        assert_eq!(preset_slot(&row("/Play?url=RadioParadise%3A")), None);
-        assert_eq!(preset_slot(&row("/Preset")), None);
-        assert_eq!(preset_slot(&row("/Preset?name=x")), None);
-        assert_eq!(preset_slot(&bluos::screen::Item::default()), None);
-    }
 
     #[test]
     fn a_picker_action_names_its_service() {

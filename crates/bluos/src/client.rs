@@ -258,48 +258,6 @@ impl Client {
         }
     }
 
-    /// The player's numbered slots.
-    pub async fn presets(&self) -> Result<Vec<crate::presets::Preset>> {
-        let body = self.get_text("/Presets", &[], REQUEST_TIMEOUT).await?;
-        crate::presets::parse(&body)
-    }
-
-    /// Put `url` in slot `id` under `name`, replacing whatever was there.
-    ///
-    /// `encoded_url` is the player's own name for the parameter and its own
-    /// scheme for the value — `RadioParadise:/5:20/Beyond...` — carried from
-    /// whichever row offered it rather than built here. The reply is the new
-    /// list, which saves asking for it again.
-    pub async fn set_preset(
-        &self,
-        id: u32,
-        name: &str,
-        url: &str,
-        image: Option<&str>,
-    ) -> Result<Vec<crate::presets::Preset>> {
-        let id = id.to_string();
-        let mut query: Vec<(&str, &str)> = vec![("id", &id), ("name", name), ("encoded_url", url)];
-        if let Some(image) = image {
-            query.push(("image", image));
-        }
-        let body = self.get_text("/SetPreset", &query, REQUEST_TIMEOUT).await?;
-        crate::presets::parse(&body)
-    }
-
-    /// Empty slot `id`. The same endpoint as writing one; `delete` is the
-    /// whole difference.
-    pub async fn delete_preset(&self, id: u32) -> Result<Vec<crate::presets::Preset>> {
-        let id = id.to_string();
-        let body = self
-            .get_text(
-                "/SetPreset",
-                &[("id", &id), ("delete", "1")],
-                REQUEST_TIMEOUT,
-            )
-            .await?;
-        crate::presets::parse(&body)
-    }
-
     /// Where this track can be filed.
     pub async fn playlist_options(&self, uri: &str) -> Result<crate::playlists::AddToPlaylist> {
         let body = self.get_text(uri, &[], REQUEST_TIMEOUT).await?;

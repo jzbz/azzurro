@@ -35,7 +35,6 @@ pub mod error;
 pub mod forms;
 pub mod lsdp;
 pub mod playlists;
-pub mod presets;
 pub mod queue;
 pub mod reports;
 pub mod screen;

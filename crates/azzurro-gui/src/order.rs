@@ -99,7 +99,11 @@ pub fn save(orders: &Orders) {
 /// get above it. It says nothing about the music on the system, and this app
 /// is not the place the vendor gets to promote its features.
 pub fn is_hidden(id: Option<&str>) -> bool {
-    id == Some("teaser")
+    // `presets` joins it. The row is a shelf of numbered slots plus a `+` that
+    // leads to a route only the official controller answers, so with nothing
+    // behind it here it is a heading over an empty space and a button that
+    // reports itself unbuilt. Better absent than present and inert.
+    matches!(id, Some("teaser" | "presets"))
 }
 
 /// The order a screen takes before anyone has arranged it.
@@ -219,9 +223,11 @@ mod tests {
         assert_eq!(arrange(&ids, &pinned, &[]), vec![0, 1, 2]);
     }
     #[test]
-    fn the_promotional_shelf_is_never_drawn() {
+    fn the_shelves_with_nothing_behind_them_are_never_drawn() {
         assert!(is_hidden(Some("teaser")));
+        assert!(is_hidden(Some("presets")));
         assert!(!is_hidden(Some("recent")));
+        assert!(!is_hidden(Some("mostUsed")));
         assert!(!is_hidden(None));
     }
 

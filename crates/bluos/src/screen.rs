@@ -913,39 +913,6 @@ fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
     }
 }
 
-/// The stream a play action would start, if it names one.
-///
-/// A row's action is `/ui/prf?…&u=%2FPlay%3Furl%3D<stream>` or a bare
-/// `/Play?url=<stream>`, and the `url` inside is exactly what `/SetPreset`
-/// wants as `encoded_url` — the player's own scheme, carried rather than
-/// built. Returns `None` for a row that browses rather than plays, which is
-/// how a caller knows there is nothing to make a preset of.
-pub fn stream_url(uri: &str) -> Option<String> {
-    let (_, query) = uri.split_once('?')?;
-
-    // The wrapper first: its `u` holds the real command, encoded once.
-    for pair in query.split('&') {
-        if let Some(("u", encoded)) = pair.split_once('=') {
-            let inner = percent_encoding::percent_decode_str(encoded)
-                .decode_utf8()
-                .ok()?;
-            return stream_url(&inner);
-        }
-    }
-
-    // Otherwise this is the command itself.
-    query.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        if name != "url" || value.is_empty() {
-            return None;
-        }
-        percent_encoding::percent_decode_str(value)
-            .decode_utf8()
-            .ok()
-            .map(|decoded| decoded.replace('+', " "))
-    })
-}
-
 /// The same action, but adding to the queue instead of playing.
 ///
 /// A track's action is a play command wrapped in the player's own
@@ -1697,28 +1664,6 @@ mod tests {
             appending(uri).as_deref(),
             Some("/Add?file=%2Fmusic%2Fplaynow%3D1.flac")
         );
-    }
-    #[test]
-    fn a_play_action_names_the_stream_it_would_start() {
-        // A Recent Stations row, exactly as a Powernode writes it.
-        let wrapped = "/ui/prf?u=%2FPlay%3Furl%3DRadioParadise%3A%2F5%3A20%2FBeyond...";
-        assert_eq!(
-            stream_url(wrapped).as_deref(),
-            Some("RadioParadise:/5:20/Beyond...")
-        );
-        // And the bare form.
-        assert_eq!(
-            stream_url("/Play?url=Capture%3Abluez%3Abluetooth&title=Bluetooth").as_deref(),
-            Some("Capture:bluez:bluetooth")
-        );
-    }
-
-    #[test]
-    fn a_row_that_only_browses_names_no_stream() {
-        assert_eq!(stream_url("/ui/BrowseObjects?service=LocalMusic"), None);
-        assert_eq!(stream_url("/Play"), None);
-        assert_eq!(stream_url("/Play?url="), None);
-        assert_eq!(stream_url("/Add?playnow=1&file=%2Fx.flac"), None);
     }
     #[test]
     fn a_source_may_carry_its_name_only_on_its_action() {
