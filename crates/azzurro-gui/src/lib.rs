@@ -53,6 +53,13 @@ const APP_ID: &str = "blue.azzurro.Azzurro";
 /// the view is a window rather than the whole thing.
 const QUEUE_WINDOW: u32 = 500;
 
+/// How long the artwork has to stop changing before it is drawn.
+///
+/// Short enough that a cover still appears to arrive with the track, long
+/// enough to swallow the burst of values a player emits while it switches
+/// between sources. See [`load_cover`].
+const COVER_SETTLE: Duration = Duration::from_millis(180);
+
 /// Cover art is drawn into a 180px box, doubled so it stays sharp on a HiDPI
 /// screen. Fetched once at this size rather than per scale factor.
 const COVER_SIZE: u32 = 360;
@@ -3833,6 +3840,26 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
 /// changed under it. Both are checked before anything reaches the window.
 async fn load_cover(backend: Backend, id: DeviceId) {
     let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
+
+    // Let the artwork settle before drawing any of it.
+    //
+    // Switching input walks it through three values in about a second: the
+    // plain icon named in the `/Play` command, the now-playing variant of the
+    // same icon seventy milliseconds after that, and then whatever the player
+    // lands on. Measured on a Powernode — the middle one arrives so soon after
+    // the first that drawing both is a flicker rather than a change, and the
+    // first is not usually cached, so it costs a blank frame on the way in too.
+    //
+    // Anything superseded inside this window never reaches the window at all:
+    // a newer value has its own `load_cover`, and this one finds the address
+    // has moved on and gives up.
+    tokio::time::sleep(COVER_SETTLE).await;
+    if !backend.is_selected(id) {
+        return;
+    }
+    if backend.with_entry(id, |e| e.cover_url.clone()).flatten() != wanted {
+        return;
+    }
 
     // What is already decoded, before anything is fetched. A cover that has
     // been seen — every input's icon, after the first time — arrives with no
