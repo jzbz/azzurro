@@ -665,6 +665,18 @@ fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
     fingerprint != 0 && seen.swap(fingerprint, Ordering::Relaxed) == fingerprint
 }
 
+/// Whether a row is the app's own furniture rather than something on the system.
+///
+/// [`american`] is kept off item titles on purpose: a record really can be
+/// called "Colours" and a band "The Organisers", and rewriting those would be
+/// putting words in the player's mouth. These kinds are not the name of
+/// anything — they are the affordances the player draws at the end of a
+/// screen, and "Customise Home" is chrome in exactly the way the sidebar is.
+/// It arrives as an `<item>` only because that is how the document carries it.
+fn is_chrome_row(kind: ItemKind) -> bool {
+    matches!(kind, ItemKind::Customise | ItemKind::Footer)
+}
+
 /// One browse row on its way to the window, for the same reason as
 /// [`TrackData`]: the pixels are `Send` and the `Image` is not.
 struct BrowseData {
@@ -2608,8 +2620,12 @@ impl Backend {
                         // draw instead of the screen.
                         ItemKind::InfoPanel => {
                             empty = Some((
-                                item.label().unwrap_or_default().to_owned(),
-                                item.extra.get("subText").cloned().unwrap_or_default(),
+                                // Prose about the app, not the name of
+                                // anything on the system; see `is_chrome_row`.
+                                american(item.label().unwrap_or_default()),
+                                american(
+                                    item.extra.get("subText").map(String::as_str).unwrap_or(""),
+                                ),
                                 glyphs::glyph_for(screen.heading().unwrap_or_default(), None),
                             ));
                             continue;
@@ -2673,11 +2689,17 @@ impl Backend {
                         // preset" tile is one — so fall back to what the
                         // action calls itself, and then to nothing rather than
                         // to a placeholder dash.
-                        title: item
-                            .label()
-                            .or_else(|| item.action.as_ref().and_then(|a| a.title.as_deref()))
-                            .unwrap_or_default()
-                            .to_owned(),
+                        title: {
+                            let named = item
+                                .label()
+                                .or_else(|| item.action.as_ref().and_then(|a| a.title.as_deref()))
+                                .unwrap_or_default();
+                            if is_chrome_row(item.kind) {
+                                american(named)
+                            } else {
+                                named.to_owned()
+                            }
+                        },
                         subtitle: item
                             .subtitle
                             .clone()
@@ -6332,6 +6354,40 @@ mod tests {
         assert_eq!(american("Added to favourites"), "Added to favorites");
         assert_eq!(american("My Favourites"), "My Favorites");
         assert_eq!(american("Remove favourite"), "Remove favorite");
+        // Both words in one label, which is what the Favourites screen sends.
+        assert_eq!(
+            american("Customise Favourites"),
+            "Customize Favorites",
+            "the `customiseScreen` row on /ui/Favourites"
+        );
+    }
+
+    /// The rows that get the transform and the rows that must not.
+    ///
+    /// This is the whole of the rule: the affordance the player draws at the
+    /// end of a screen is the app's own furniture, and everything else on a
+    /// browse screen is the name of something and stays as it was written.
+    /// `customiseScreen` reaching the window as an ordinary row, with its
+    /// title untouched, is what put "Customise Home" on screen after the
+    /// chrome elsewhere had been changed.
+    #[test]
+    fn only_the_screens_own_furniture_is_respelled() {
+        assert!(is_chrome_row(ItemKind::Customise));
+        assert!(is_chrome_row(ItemKind::Footer));
+
+        for kind in [
+            ItemKind::Item,
+            ItemKind::Source,
+            ItemKind::Input,
+            ItemKind::Service,
+            ItemKind::Teaser,
+            ItemKind::Thumbnail,
+        ] {
+            assert!(
+                !is_chrome_row(kind),
+                "{kind:?} names something on the system and must keep its own spelling"
+            );
+        }
     }
 
     #[test]
