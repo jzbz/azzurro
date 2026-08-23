@@ -3255,9 +3255,34 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
     }
 }
 
+/// The service a picker's action names, out of its query.
+///
+/// By convention the parameter is `C…Service`: `CfavouritesService` on the
+/// Favourites screen. Matched by the suffix rather than the whole name, since
+/// only that half is the same from screen to screen.
+fn service_named(uri: &str) -> Option<String> {
+    let (_, query) = uri.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.ends_with("Service") && !value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// `uri` with `service` set, replacing one already there.
+fn with_service(uri: &str, service: &str) -> String {
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let mut kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("service="))
+        .collect();
+    let service = format!("service={service}");
+    kept.push(&service);
+    format!("{path}?{}", kept.join("&"))
+}
+
 /// Do whatever row `index` of the current screen says to do.
 async fn activate(backend: Backend, index: usize) {
-    let (id, action, arrive, worth_keeping) = {
+    let (id, action, arrive, worth_keeping, switch_to) = {
         let browsing = backend.browsing.lock().unwrap();
         let Some(id) = browsing.device else { return };
         let Some(crumb) = browsing.trail.last() else {
@@ -3275,15 +3300,32 @@ async fn activate(backend: Backend, index: usize) {
                 if at == index {
                     let replaces =
                         section.kind == SectionKind::SelectorMenu && section.replace_screen;
-                    found = Some((item, replaces));
+                    let picker = section.kind == SectionKind::SelectorMenu;
+                    found = Some((item, replaces, picker));
                     break 'sections;
                 }
                 at += 1;
             }
         }
-        let Some((item, replaces)) = found else {
+        let Some((item, replaces, picker)) = found else {
             return;
         };
+
+        // Choosing a service out of a picker is done on the URL, not by the
+        // action attached to it.
+        //
+        // The Favourites picker offers `<action type="player-link"
+        // URI="/ui/action?CfavouritesService=TuneIn" refreshScreen="true">`,
+        // and on a Powernode that call answers 200 and changes nothing: the
+        // refresh that follows fetches the same address and gets Library back,
+        // so pressing TuneIn did nothing at all. `/ui/Favourites?service=TuneIn`
+        // does answer with TuneIn — and does not stick either, so the choice
+        // has to stay on the address this app keeps for the screen.
+        let switch_to = picker
+            .then(|| item.action.as_ref().and_then(|a| a.uri.as_deref()))
+            .flatten()
+            .and_then(service_named)
+            .map(|service| with_service(&crumb.uri, &service));
 
         let arrive = if replaces {
             Arrive::Replace(crumb.query.clone())
@@ -3300,12 +3342,22 @@ async fn activate(backend: Backend, index: usize) {
             item.action.clone().or_else(|| item.play_action.clone()),
             arrive,
             worth_keeping,
+            switch_to,
         )
     };
 
     if let Some(query) = worth_keeping {
         remember_search(&backend, query);
     }
+    // The picker's own address, where it has one: the same screen asked for a
+    // different service. Replaces rather than pushes, because it is not a step
+    // into anything — Back from TuneIn's favourites should leave Favourites,
+    // not return to Library's.
+    if let Some(uri) = switch_to {
+        open_screen(backend, id, uri, Arrive::Replace(None)).await;
+        return;
+    }
+
     let Some(action) = action else { return };
     run_action(backend, id, action, arrive).await;
 }
@@ -5685,6 +5737,39 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_picker_action_names_its_service() {
+        assert_eq!(
+            service_named("/ui/action?CfavouritesService=TuneIn").as_deref(),
+            Some("TuneIn")
+        );
+        assert_eq!(
+            service_named("/ui/action?x=1&CfavouritesService=LocalMusic&y=2").as_deref(),
+            Some("LocalMusic")
+        );
+        // Not every player-link is a picker.
+        assert_eq!(service_named("/ui/action?CBQ=true"), None);
+        assert_eq!(service_named("/Play"), None);
+        assert_eq!(service_named("/ui/action?CfavouritesService="), None);
+    }
+
+    #[test]
+    fn the_service_replaces_one_already_on_the_address() {
+        assert_eq!(
+            with_service("/ui/Favourites", "TuneIn"),
+            "/ui/Favourites?service=TuneIn"
+        );
+        // Switching twice must not leave both behind.
+        assert_eq!(
+            with_service("/ui/Favourites?service=LocalMusic", "TuneIn"),
+            "/ui/Favourites?service=TuneIn"
+        );
+        assert_eq!(
+            with_service("/ui/Favourites?page=2&service=LocalMusic", "TuneIn"),
+            "/ui/Favourites?page=2&service=TuneIn"
+        );
+    }
     use super::*;
 
     #[test]

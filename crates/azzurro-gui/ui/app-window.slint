@@ -2476,11 +2476,17 @@ export component AppWindow inherits Window {
                     easing: ease-in-out;
                 }
 
-                // Alive for exactly as long as the column has width, so the
-                // slide has something to reveal on the way out and nothing is
-                // laid out once it is shut. A ListView with no width still
-                // materialises the rows it thinks are on screen.
-                if queue-col.width > 0px: Rectangle {
+                // Gated on the flag and not on the animated width. Reading
+                // the width back is what emptied this column: the layout is
+                // what actually sizes a child, so the binding read here is not
+                // the width the column ends up with, and the contents never
+                // appeared at all — a 330px strip of nothing beside a browse
+                // screen squeezed into what was left.
+                //
+                // The cost is that the closing slide has nothing in it. That
+                // is a fifth of a second of empty column against a queue that
+                // does not draw.
+                if root.queue-shown: Rectangle {
 
                 Rectangle { x: 0; width: 1px; background: Theme.border; }
 
