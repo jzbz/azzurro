@@ -577,7 +577,7 @@ impl PlayerInterface for Exported {
     }
 
     // Both read the `<actions>` list the player publishes, so a desktop widget
-    // greys out the buttons on a source that has no next track — an HDMI input
+    // grays out the buttons on a source that has no next track — an HDMI input
     // or a live stream — instead of offering them and doing nothing.
     async fn can_go_next(&self) -> fdo::Result<bool> {
         Ok(self.snapshot().map(|(s, _)| s.can_skip()).unwrap_or(false))

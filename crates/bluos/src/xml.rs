@@ -21,7 +21,7 @@ use quick_xml::events::BytesStart;
 /// fetched from a Powernode on BluOS 4.16.6 has bare element names, and the
 /// only `xsi:` in any of them is on two attributes that [`attributes`] throws
 /// away. The split stays anyway — it costs nothing on a name with no colon in
-/// it, and a parser matching `"item"` would silently stop recognising the same
+/// it, and a parser matching `"item"` would silently stop recognizing the same
 /// element the day a firmware did start writing `<ns:item>`.
 pub(crate) fn local_name(raw: &[u8]) -> &str {
     // Borrowed from the reader's buffer rather than copied: every caller wants
@@ -55,7 +55,7 @@ pub(crate) fn attributes(e: &BytesStart<'_>) -> BTreeMap<String, String> {
                 return None;
             }
             // These documents all declare XML 1.0, and quick-xml wants to be
-            // told which rules to normalise entities under.
+            // told which rules to normalize entities under.
             let value = attr
                 .normalized_value(XmlVersion::Explicit1_0)
                 .ok()?

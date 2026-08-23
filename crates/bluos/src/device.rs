@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 ///
 /// BluOS itself uses `host:port` as a device's identity — `/SyncStatus`
 /// reports `id="10.0.0.155:11000"` — so this crate does too, rather than
-/// inventing a key the device would not recognise.
+/// inventing a key the device would not recognize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId {
     pub host: IpAddr,

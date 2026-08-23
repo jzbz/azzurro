@@ -104,8 +104,8 @@ struct Key {
 pub struct Artwork {
     http: reqwest::Client,
     memory: Mutex<LruCache<Key, Pixels>>,
-    /// One colour per image, computed once when it is decoded. Keyed by URL
-    /// alone: the same cover gives the same colour at any size.
+    /// One color per image, computed once when it is decoded. Keyed by URL
+    /// alone: the same cover gives the same color at any size.
     tints: Mutex<LruCache<String, [u8; 3]>>,
     /// `None` when there is nowhere to write, which is not fatal: the memory
     /// cache and the network still work.
@@ -153,7 +153,7 @@ impl Artwork {
         self.memory.lock().unwrap().get(&key).cloned()
     }
 
-    /// The colour to tint a panel with behind this artwork, if it has been
+    /// The color to tint a panel with behind this artwork, if it has been
     /// decoded. See [`dominant`].
     pub fn tint(&self, url: &str) -> Option<[u8; 3]> {
         self.tints.lock().unwrap().get(url).copied()
@@ -310,7 +310,7 @@ fn decode(bytes: &[u8], size: u32) -> Option<Pixels> {
     ))
 }
 
-/// The cover again, as a wash of colour rather than a picture.
+/// The cover again, as a wash of color rather than a picture.
 ///
 /// Slint has no blur filter, so the blur has to arrive already in the pixels.
 ///
@@ -347,11 +347,11 @@ pub fn frosted(pixels: &Pixels) -> Option<Pixels> {
     ))
 }
 
-/// One colour standing for a whole cover, for tinting the panel behind it.
+/// One color standing for a whole cover, for tinting the panel behind it.
 ///
-/// Not the average, which on almost any sleeve is a muddy brown: greys, the
+/// Not the average, which on almost any sleeve is a muddy brown: grays, the
 /// near-black and the near-white are all thrown away first, so what is left is
-/// whatever the cover is actually *coloured*. A sleeve that really is
+/// whatever the cover is actually *colored*. A sleeve that really is
 /// monochrome yields nothing, and the caller draws no tint rather than a
 /// dirty one.
 ///
@@ -366,7 +366,7 @@ fn dominant(pixels: &Pixels) -> Option<[u8; 3]> {
         let high = pr.max(pg).max(pb);
         let low = pr.min(pg).min(pb);
 
-        // Too dark or too bright to have a usable hue, or too close to grey
+        // Too dark or too bright to have a usable hue, or too close to gray
         // to have one at all.
         if high < 40 || low > 232 || high - low < 28 {
             continue;
@@ -377,8 +377,8 @@ fn dominant(pixels: &Pixels) -> Option<[u8; 3]> {
         n += 1;
     }
 
-    // A handful of stray coloured pixels on a black-and-white sleeve is noise,
-    // not a colour.
+    // A handful of stray colored pixels on a black-and-white sleeve is noise,
+    // not a color.
     if n < 64 {
         return None;
     }
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(same.height(), 2);
     }
 
-    /// Build a buffer of one repeated colour, the way a test cover would be.
+    /// Build a buffer of one repeated color, the way a test cover would be.
     fn swatch(r: u8, g: u8, b: u8) -> Pixels {
         let pixel = [r, g, b, 255];
         let data: Vec<u8> = std::iter::repeat_n(pixel, 32 * 32).flatten().collect();
@@ -548,12 +548,12 @@ mod tests {
         );
         assert!(tint[0] > 150, "lifted out of the dark: {tint:?}");
 
-        // Grey, black and white have no hue to take, and a muddy tint is worse
+        // Gray, black and white have no hue to take, and a muddy tint is worse
         // than none.
         assert_eq!(dominant(&swatch(128, 128, 128)), None);
         assert_eq!(dominant(&swatch(0, 0, 0)), None);
         assert_eq!(dominant(&swatch(255, 255, 255)), None);
-        // Nearly grey is still grey.
+        // Nearly gray is still gray.
         assert_eq!(dominant(&swatch(130, 140, 136)), None);
     }
 

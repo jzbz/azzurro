@@ -440,7 +440,7 @@ enum Ctx {
     Header,
     /// The request for the next page of a long list, whose text is the uri.
     NextLink,
-    /// Anything unrecognised, so its end tag pops the right thing.
+    /// Anything unrecognized, so its end tag pops the right thing.
     Other,
 }
 

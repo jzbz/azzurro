@@ -73,7 +73,7 @@ const UI_SCHEMA_VERSION: &str = "7";
 
 /// How long `/Status` is asked to hold a poll open.
 ///
-/// The player honours this exactly: a poll with an unchanged etag returns after
+/// The player honors this exactly: a poll with an unchanged etag returns after
 /// the timeout with the same document. A hundred seconds keeps the request rate
 /// near zero on an idle player while staying well inside any NAT idle timeout.
 pub const DEFAULT_POLL: Duration = Duration::from_secs(100);
@@ -913,7 +913,7 @@ impl From<reqwest::Error> for Error {
 
 /// The head of a response, for an error message.
 ///
-/// Enough to recognise the document and see which element went wrong, short
+/// Enough to recognize the document and see which element went wrong, short
 /// enough to sit on one log line. Cut on a character boundary: a player's
 /// track titles are UTF-8 and slicing bytes would panic on the one document
 /// anyone actually needs to read.

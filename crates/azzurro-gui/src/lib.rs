@@ -694,7 +694,7 @@ pub fn run_app() -> ExitCode {
         .without_time()
         .init();
 
-    // Selecting the backend has to come first. Slint initialises its platform
+    // Selecting the backend has to come first. Slint initializes its platform
     // lazily on first use, and `set_xdg_app_id` needs one already there —
     // called before anything else it fails with "No default Slint platform was
     // selected", silently leaving the window without an id. Then the id, which
@@ -1335,7 +1335,7 @@ impl Backend {
 
             // Keep the selection on the same player rather than the same
             // index: a player appearing above the selected one would otherwise
-            // silently move the selection to its neighbour.
+            // silently move the selection to its neighbor.
             let selected_id = ui
                 .get_devices()
                 .row_data(ui.get_selected() as usize)
@@ -1925,11 +1925,14 @@ impl Backend {
         });
 
         // Two lines rather than one: who holds the copyright and what the
-        // licence is are the app's own, and the trademark note is about
+        // license is are the app's own, and the trademark note is about
         // somebody else's — running them together reads as one claim.
         rows.push(SettingData {
             index: -1,
-            label: "© 2026 Jonathan Zeppettini · MIT licence".to_owned(),
+            // "License", not "licence": that is the name of the thing, and
+            // the MIT License spells itself that way whatever the surrounding
+            // prose does.
+            label: "© 2026 Jonathan Zeppettini · MIT License".to_owned(),
             detail: "Not affiliated with, endorsed by, or supported by Lenbrook \
                      Industries. BluOS, Bluesound and NAD are their trademarks."
                 .to_owned(),
@@ -2703,8 +2706,8 @@ impl Backend {
                             Some(glyph) => glyph_image(&icons, glyph),
                             None => Default::default(),
                         },
-                        // The player puts the one it means first and colours it
-                        // its own accent. The colour is dropped, the order is
+                        // The player puts the one it means first and colors it
+                        // its own accent. The color is dropped, the order is
                         // not.
                         primary: index == 0,
                     })
@@ -2832,10 +2835,10 @@ impl Backend {
 
     /// Put cover art in the now-playing panel, or clear it.
     ///
-    /// The tint travels with it: a colour taken from the artwork, which the
+    /// The tint travels with it: a color taken from the artwork, which the
     /// panel washes behind everything at low opacity so the room the music is
-    /// in picks up the colour of the record. Without artwork there is no
-    /// colour, and the panel is its ordinary self.
+    /// in picks up the color of the record. Without artwork there is no
+    /// color, and the panel is its ordinary self.
     fn set_cover(&self, pixels: Option<Pixels>, tint: Option<[u8; 3]>) {
         let ui = self.ui.clone();
         // Blurred here, off the UI thread, rather than in the event loop: it
@@ -3208,7 +3211,9 @@ fn screen_label(id: &str) -> String {
         "home" => "Home".to_owned(),
         "recentlyPlayed" => "Recently Played".to_owned(),
         "news" => "News".to_owned(),
-        "favourites" => "Favourites".to_owned(),
+        // The id on the left is the player's and stays as it spells it; the
+        // words on the right are this app's own and do not have to.
+        "favourites" => "Favorites".to_owned(),
         "sources" => "Sources".to_owned(),
         "search" => "Search".to_owned(),
         "presets" => "Presets".to_owned(),
@@ -4272,7 +4277,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // player that answered with a document this crate cannot read
                 // is perfectly alive, and it does emit one on occasion while
                 // it changes input. Taking the whole app offline over that —
-                // greying the transport and writing "Not responding" under
+                // graying the transport and writing "Not responding" under
                 // the name — is what makes switching inputs look like a
                 // freeze, and it lasted as long as the backoff.
                 let answered = matches!(e, bluos::Error::Xml { .. });
@@ -5321,7 +5326,7 @@ async fn run_commands(
 
                 // Queue Builder Mode is kept here, not on the player. The call
                 // still goes out — another controller may be listening for it
-                // and it costs nothing — but the behaviour it names is this
+                // and it costs nothing — but the behavior it names is this
                 // app's: while it is on, pressing a track appends instead of
                 // playing. See `screen::appending`.
                 let toggled = action

@@ -104,7 +104,7 @@ export struct BrowseRow {
     selected: bool,
     has-menu: bool,
     // Whether `cover` is one of our own glyphs rather than a picture: a line
-    // icon has to be centred and tinted, not cropped to fill a tile.
+    // icon has to be centered and tinted, not cropped to fill a tile.
     is-glyph: bool,
 }
 
@@ -205,11 +205,15 @@ component SettingRow inherits Rectangle {
         : transparent;
     animate background { duration: 120ms; easing: ease-out; }
     // Dimmed rather than hidden: the player put it there, and a gap where a
-    // setting should be is more confusing than a greyed one.
+    // setting should be is more confusing than a grayed one.
     opacity: root.item.available ? 1.0 : 0.45;
 
     touch := TouchArea {
-        enabled: root.item.control == "link" || root.item.control == "cycle";
+        // A button row too, where the pill has been left off: the row is then
+        // the control, and it has to be pressable for that to mean anything.
+        enabled: root.item.control == "link"
+            || root.item.control == "cycle"
+            || root.item.control == "button";
         clicked => { root.opened(); }
     }
 
@@ -353,14 +357,16 @@ component SettingRow inherits Rectangle {
             }
         }
 
-        if root.item.control == "button": VerticalLayout {
+        // Only where the player gave the button words of its own. Reindex
+        // gives none, so the pill fell back to the row's title and stood there
+        // saying "Reindex music collection" beside "Reindex music collection".
+        // With no pill the row itself is the button, which is what a row with
+        // exactly one thing to do should be.
+        if root.item.control == "button" && root.item.value != "": VerticalLayout {
             alignment: center;
 
             PillButton {
-                // A settings button says the same as its row — "Reindex music
-                // collection" — but a row that lists something and offers one
-                // thing to do with it needs the two to differ.
-                label: root.item.value != "" ? root.item.value : root.item.label;
+                label: root.item.value;
                 enabled: root.item.available;
                 clicked => { root.opened(); }
             }
@@ -841,7 +847,7 @@ component TrackRow inherits Rectangle {
             }
         }
 
-        // Centred by its own layout, like the badge beside it. Left as a
+        // Centered by its own layout, like the badge beside it. Left as a
         // direct child of the row it filled the row's height instead, which
         // put the dots above the middle of everything they sit next to.
         if !root.editing && !root.lifted: VerticalLayout {
@@ -873,7 +879,7 @@ component TrackRow inherits Rectangle {
         // In Edit mode the row trades what it says for what can be done to it,
         // which is what the official controller does too: the menu and the
         // running time give way to a delete and a grip.
-        // Centred by its own layout, like the grip beside it. As a direct
+        // Centered by its own layout, like the grip beside it. As a direct
         // child it filled the row's height instead and sat above the middle of
         // everything next to it — the same thing the menu button used to do.
         if root.editing: VerticalLayout {
@@ -1113,6 +1119,9 @@ component BrowseRowView inherits Rectangle {
 component BrowseTile inherits Rectangle {
     in property <BrowseRow> entry;
     callback activate();
+    // Where the tile is, so its menu opens against it — the same pair the
+    // rows send.
+    callback open-menu(length, length);
 
     width: 128px;
     height: 176px;
@@ -1144,6 +1153,38 @@ component BrowseTile inherits Rectangle {
                 width: parent.width;
                 height: parent.height;
                 crop: false;
+            }
+
+            // Over the corner of the art, because a tile has no margin to put
+            // it in. On its own dark disc so it stays legible against a sleeve
+            // of any color, and only once the tile is under the pointer — a
+            // shelf of these with a permanent dot on every one would read as
+            // clutter where a list of rows does not.
+            if root.entry.has-menu: Rectangle {
+                x: parent.width - self.width - 4px;
+                y: 4px;
+                width: 26px;
+                height: 26px;
+                border-radius: self.height / 2;
+                background: #000000a6;
+                opacity: touch.has-hover || dots.has-hover ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; }
+
+                Icon {
+                    glyph: Icons.menu;
+                    tint: Theme.text;
+                    width: 15px;
+                    height: 15px;
+                }
+
+                dots := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.open-menu(
+                            root.absolute-position.y,
+                            root.absolute-position.x + root.width);
+                    }
+                }
             }
 
             // Marked in the corner rather than across the middle: the cover is
@@ -1186,8 +1227,22 @@ component BrowseTile inherits Rectangle {
     }
 
     touch := TouchArea {
-        enabled: root.entry.actionable;
-        clicked => { root.activate(); }
+        // A tile with a menu but nowhere to go is still worth pressing.
+        enabled: root.entry.actionable || root.entry.has-menu;
+        clicked => {
+            if (root.entry.actionable) {
+                root.activate();
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up
+                && event.button == PointerEventButton.right
+                && root.entry.has-menu) {
+                root.open-menu(
+                    root.absolute-position.y,
+                    root.absolute-position.x + root.width);
+            }
+        }
     }
 }
 
@@ -1459,6 +1514,7 @@ component BrowseBlockView inherits VerticalLayout {
             for entry in root.block.rows: BrowseTile {
                 entry: entry;
                 activate => { root.activate(entry.index); }
+                open-menu(y, right) => { root.open-menu(entry.index, y, right); }
             }
         }
     }
@@ -1477,7 +1533,7 @@ export component AppWindow inherits Window {
     in property <[Device]> devices;
     in property <[Track]> queue;
     in property <image> cover;
-    // A colour taken from the artwork, washed behind the now-playing panel.
+    // A color taken from the artwork, washed behind the now-playing panel.
     in property <color> cover-tint;
     in property <bool> has-tint: false;
     in property <string> queue-line: "";
@@ -1639,7 +1695,7 @@ export component AppWindow inherits Window {
             Theme.backdrop-bottom 68%);
     }
 
-    // The record's own colour, spread wide and soft. Behind the panels rather
+    // The record's own color, spread wide and soft. Behind the panels rather
     // than inside one, so it tints the whole window through them.
     Rectangle {
         background: @radial-gradient(circle,
@@ -1688,7 +1744,7 @@ export component AppWindow inherits Window {
                         // The interface is Geist; a wordmark is a picture of a
                         // name rather than text, and wants its own letterforms.
                         //
-                        // Optically centred rather than centred: Geo's caps sit
+                        // Optically centered rather than centered: Geo's caps sit
                         // high in the line box, so centring the box leaves the
                         // letters riding above the mark beside them.
                         VerticalLayout {
@@ -1779,7 +1835,7 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
 
-                        // Keeps the title centred against the back button
+                        // Keeps the title centered against the back button
                         // when there is no picker to balance it.
                         if root.in-settings || root.browse-selector.length == 0: Rectangle {
                             width: 30px;
@@ -2081,7 +2137,7 @@ export component AppWindow inherits Window {
 
                     // Not while the empty state is showing: an empty list
                     // still stretches, and it took the room the message should
-                    // have been centred in — which left it sitting near the
+                    // have been centered in — which left it sitting near the
                     // bottom of the pane.
                     if !root.in-settings && root.browse-empty == "": ListView {
                         vertical-stretch: 1;
@@ -2281,7 +2337,7 @@ export component AppWindow inherits Window {
 
                     // The sleeve itself, frosted: blown up far past its own
                     // resolution so nothing in it is legible, which is the
-                    // point — it is the colour of the record, not the record.
+                    // point — it is the color of the record, not the record.
                     Image {
                         source: root.cover-blur;
                         image-fit: ImageFit.cover;
@@ -2588,7 +2644,7 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    // Heavy enough that the cover reads as colour rather than
+                    // Heavy enough that the cover reads as color rather than
                     // as a picture — a legible sleeve behind a track list is
                     // just noise competing with the words on top of it.
                     background: @linear-gradient(180deg,

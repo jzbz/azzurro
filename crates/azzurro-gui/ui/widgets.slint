@@ -4,14 +4,14 @@ import { Theme, Icons } from "theme.slint";
 // than wrapping a std-widget, so that hover, press and disabled states behave
 // the same way in every corner of the app.
 
-// A Lucide glyph, recoloured.
+// A Lucide glyph, recolored.
 export component Icon inherits Image {
     in property <image> glyph;
     in property <brush> tint: Theme.text;
 
     source: root.glyph;
     // colorize treats the SVG as an alpha mask and paints it in `tint`, so one
-    // copy of each glyph serves every colour the theme has.
+    // copy of each glyph serves every color the theme has.
     colorize: root.tint;
     image-fit: contain;
     width: 18px;
@@ -92,8 +92,8 @@ export component PillButton inherits Rectangle {
         padding-left: 13px;
         padding-right: 13px;
 
-        // Centred by its own layout: a fixed-size child of a row is not
-        // centred against the taller text beside it, which left every glyph on
+        // Centered by its own layout: a fixed-size child of a row is not
+        // centered against the taller text beside it, which left every glyph on
         // the queue's buttons riding above its label.
         if root.glyph.width > 0: VerticalLayout {
             alignment: center;
@@ -291,7 +291,7 @@ export component Level inherits HorizontalLayout {
 
     spacing: Theme.tight;
 
-    // Every child here is a different height, and a row does not centre what
+    // Every child here is a different height, and a row does not center what
     // it does not have to. Each one carries its own centring layout.
     VerticalLayout {
         alignment: center;
@@ -461,7 +461,7 @@ export component Badge inherits Rectangle {
     }
 }
 
-// A labelled button that shares the row it is in, for the pair of them that
+// A labeled button that shares the row it is in, for the pair of them that
 // act on every player at once. Wider than an IconButton and captioned, because
 // "group all" is not a thing you want to guess at from a glyph.
 export component WideButton inherits Rectangle {

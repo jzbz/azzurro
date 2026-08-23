@@ -104,14 +104,14 @@ fn is_content(source: &str) -> bool {
 ///
 /// Unlike [`glyph_for`], this never defers to the player's picture and always
 /// returns something. A menu row's image is the service's branding for a
-/// category — TuneIn ships a coloured logo for "Sports" and another for
+/// category — TuneIn ships a colored logo for "Sports" and another for
 /// "Trending" — and beside a column of Lucide strokes those read as somebody
 /// else's icons pasted in. The rows that carry real artwork are the ones that
 /// play something, and they go through [`glyph_for`] as before.
 ///
 /// The fallback is a station, because a category in a radio service leads to
 /// stations however it is named — and some of them, like the listener's own
-/// country, cannot be recognised from the word alone.
+/// country, cannot be recognized from the word alone.
 pub fn menu_glyph(title: &str) -> Glyph {
     glyph_for(title, None).unwrap_or(Glyph::Station)
 }
@@ -121,7 +121,7 @@ pub fn menu_glyph(title: &str) -> Glyph {
 /// Unlike [`glyph_for`], this never defers to the player's own picture. The
 /// sidebar draws the services as a list of names, and the brand marks beside
 /// them are PNGs of somebody else's logo; in a column of Lucide strokes they
-/// read as a rip in the page. Names it recognises get something apt, and the
+/// read as a rip in the page. Names it recognizes get something apt, and the
 /// rest get a note.
 pub fn service_glyph(title: &str) -> Glyph {
     glyph_for(title, None).unwrap_or(Glyph::Service)
@@ -141,7 +141,7 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
     let title = title.to_lowercase();
     let has = |needle: &str| title.contains(needle);
     // Short tokens have to match a whole word. "Search" contains "arc", which
-    // is how the search screen came to be labelled with a television.
+    // is how the search screen came to be labeled with a television.
     let word = |needle: &str| title.split_whitespace().any(|w| w == needle);
 
     // Inputs first: several of these words also appear in content titles, and

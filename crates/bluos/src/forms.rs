@@ -9,7 +9,7 @@
 //! The player marks what does not apply. Qobuz's sign-in page leaves a username
 //! and a password visible and hides its captcha and its Logout button, because
 //! nobody is signed in yet; TuneIn's hides all three, because it wants none of
-//! them. That marking is the whole of the page's logic, so honouring it is the
+//! them. That marking is the whole of the page's logic, so honoring it is the
 //! whole of the work.
 //!
 //! Like [`crate::reports`] this is scraping rather than an API, and it degrades

@@ -5,7 +5,7 @@
 //! on the player — the official controller keeps the same preference in its
 //! own local storage, so a rearranged home screen follows the *app*, not the
 //! speaker, and two controllers on one system can disagree about it. This
-//! matches that behaviour rather than inventing a place on the player to put
+//! matches that behavior rather than inventing a place on the player to put
 //! it, which would be a guess at an API that does not exist.
 //!
 //! The file is `~/.config/azzurro/screen-order`, one screen per line:

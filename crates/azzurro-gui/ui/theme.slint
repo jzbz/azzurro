@@ -1,6 +1,6 @@
 import { Palette } from "std-widgets.slint";
 
-// One source of truth for colour, spacing and type.
+// One source of truth for color, spacing and type.
 //
 // The app follows the system light/dark setting but draws its own controls, so
 // it looks like itself on any desktop and picks up platform character only
@@ -22,7 +22,7 @@ export global Theme {
     out property <brush> raised: dark ? #1b1f26 : #f1f4f7;
     out property <brush> sunken: dark ? #0e1116 : #e8ecf1;
 
-    // Interaction, as overlays rather than fixed colours, so they compose over
+    // Interaction, as overlays rather than fixed colors, so they compose over
     // whichever surface they land on.
     out property <brush> hover: dark ? #ffffff0d : #0000000a;
     out property <brush> pressed: dark ? #ffffff17 : #00000014;
@@ -73,8 +73,8 @@ export global Theme {
 }
 
 // Lucide, ISC licensed — see icons/LICENSE. Every glyph is 24x24 on a 2px
-// round-cap stroke, and `Icon` recolours it through the alpha channel, so the
-// set follows the theme without a second copy per colour.
+// round-cap stroke, and `Icon` recolors it through the alpha channel, so the
+// set follows the theme without a second copy per color.
 //
 // The names here are the app's, not Lucide's: `previous`/`next` because that
 // is what the buttons do, `sleep` because `moon` describes the picture and not

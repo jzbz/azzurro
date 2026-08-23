@@ -1,7 +1,7 @@
 //! `bluosctl` — the protocol crate with a command line bolted on.
 //!
 //! This exists mostly to be the fast way to check something against real
-//! hardware without opening a window, and it is what the GUI's behaviour gets
+//! hardware without opening a window, and it is what the GUI's behavior gets
 //! compared against when the two disagree.
 
 use std::time::Duration;
