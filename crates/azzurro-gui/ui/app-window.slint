@@ -939,8 +939,26 @@ component BrowseRowView inherits Rectangle {
     animate background { duration: 120ms; easing: ease-out; }
 
     touch := TouchArea {
-        enabled: root.entry.actionable && !root.entry.heading;
-        clicked => { root.activate(); }
+        // Also where the row only has a menu. A row that leads nowhere but
+        // offers one — an album you can queue without opening — would
+        // otherwise be a dead surface with a live pair of dots on it.
+        enabled: (root.entry.actionable || root.entry.has-menu) && !root.entry.heading;
+        clicked => {
+            if (root.entry.actionable) {
+                root.activate();
+            }
+        }
+        pointer-event(event) => {
+            // The right button asks what can be done with the row, anywhere
+            // along it, wherever there are dots to have pressed instead.
+            if (event.kind == PointerEventKind.up
+                && event.button == PointerEventButton.right
+                && root.entry.has-menu) {
+                root.open-menu(
+                    root.absolute-position.y,
+                    root.absolute-position.x + root.width);
+            }
+        }
     }
 
     if root.entry.heading: HorizontalLayout {
