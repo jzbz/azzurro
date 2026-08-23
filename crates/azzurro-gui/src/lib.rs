@@ -2349,7 +2349,23 @@ impl Backend {
 
     /// Hand a list of setting-shaped rows to the middle pane.
     fn send_settings(&self, rows: Vec<SettingData>, title: String) {
-        if already_sent(&self.sent_settings, {
+        // The memo covers the rows and only the rows.
+        //
+        // It used to gate the whole function, which was wrong: this call does
+        // two separate things, and only one of them is about the content. It
+        // also puts the pane up — `in_settings`, the title, the back arrow —
+        // and something else takes the pane down behind its back:
+        // [`Self::publish_settings`] clears `in_settings` whenever the pane is
+        // no longer a settings page, and knows nothing about this memo. So the
+        // second press of the format badge on one track built the identical
+        // page, matched the memo, skipped everything, and left the pane down.
+        // The press did nothing at all, and went on doing nothing for the rest
+        // of the session.
+        //
+        // What was expensive is still skipped — building a row per setting,
+        // each with an image. Asserting three properties that are already at
+        // the value asked for costs a comparison each.
+        let unchanged = already_sent(&self.sent_settings, {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             title.hash(&mut hash);
@@ -2368,13 +2384,19 @@ impl Backend {
                 row.number.to_bits().hash(&mut hash);
             }
             hash.finish()
-        }) {
-            return;
-        }
+        });
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
+            if unchanged {
+                // The rows on screen are already these. Put the pane up anyway
+                // — that is the part the caller is always asking for.
+                ui.set_in_settings(true);
+                ui.set_browse_title(title.into());
+                ui.set_browse_can_go_back(true);
+                return;
+            }
             let icons = Icons::get(&ui);
 
             let items: Vec<SettingItem> = rows
