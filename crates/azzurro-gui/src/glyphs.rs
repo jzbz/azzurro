@@ -88,10 +88,16 @@ pub enum Glyph {
 /// Absolute URLs are a service's CDN, `/Artwork` is the player's own art
 /// endpoint, and the two service-icon directories hold brand marks.
 fn is_content(source: &str) -> bool {
-    source.starts_with("http")
-        || source.contains("/Artwork")
-        || source.contains("/Sources/images/")
-        || source.contains("/images/ui/Source/")
+    // `/Sources/images/` and `/images/ui/Source/` are deliberately not here.
+    // Those two hold the services' own brand marks — the Radio Paradise
+    // headphones, the TuneIn wordmark — and a brand mark is not content: it
+    // says which service a row belongs to, which the row's own name already
+    // says. Beside a column of Lucide strokes they read as somebody else's
+    // icons pasted in, so the glyph wins.
+    //
+    // What stays is the artwork that carries information nothing else does: a
+    // cover, a station's own picture, anything off a service's CDN.
+    source.starts_with("http") || source.contains("/Artwork")
 }
 
 /// The glyph for a row in a service's own menu.
@@ -344,17 +350,29 @@ mod tests {
             glyph_for("Beyond...", Some("https://img.radioparadise.com/cover.jpg")),
             None
         );
-        // A service's own brand mark, in either of the two places they live —
-        // "Radio Paradise" would otherwise be caught by the word "radio".
+        // A service's own brand mark is replaced, in either of the two places
+        // they live. The row already says which service it is.
         assert_eq!(
             glyph_for(
                 "Radio Paradise",
                 Some("/Sources/images/RadioParadiseIcon.png")
             ),
-            None
+            Some(Glyph::Radio)
         );
         assert_eq!(
             glyph_for("TuneIn", Some("/images/ui/Source/TuneInSourceIcon.png")),
+            Some(Glyph::Radio)
+        );
+
+        // Still deferred to, and this is the line that matters: a station's
+        // own picture and a cover are content, and replacing either would be
+        // throwing away the only thing the row has to look at.
+        assert_eq!(
+            glyph_for("Beyond...", Some("https://img.radioparadise.com/cover.jpg")),
+            None
+        );
+        assert_eq!(
+            glyph_for("Gang Shit", Some("/Artwork?service=LocalMusic&fn=x.flac")),
             None
         );
     }

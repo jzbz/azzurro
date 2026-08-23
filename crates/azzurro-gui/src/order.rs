@@ -91,6 +91,29 @@ pub fn save(orders: &Orders) {
     }
 }
 
+/// Sections that are never drawn.
+///
+/// The home screen's `teaser` row is BluOS advertising itself — "Add your
+/// Music Services", "Queue Builder Mode" — pinned to the top by the player
+/// with `noReorder`, so Customise Home cannot move it and nothing else can
+/// get above it. It says nothing about the music on the system, and this app
+/// is not the place the vendor gets to promote its features.
+pub fn is_hidden(id: Option<&str>) -> bool {
+    id == Some("teaser")
+}
+
+/// The order a screen takes before anyone has arranged it.
+///
+/// Only Home has one, and only to lift Recently Played above the shelves the
+/// player happens to list first. Anything not named keeps the player's own
+/// order, after the ones that are.
+pub fn default_for(screen: &str) -> Vec<String> {
+    match screen {
+        "screen-home" => vec!["recent".to_owned()],
+        _ => Vec::new(),
+    }
+}
+
 /// Put `sections` in the saved order.
 ///
 /// `pinned` marks the sections the player will not have moved; they keep the
@@ -194,5 +217,23 @@ mod tests {
         let ids = ids(&["a", "b", "c"]);
         let pinned = [true, false, false];
         assert_eq!(arrange(&ids, &pinned, &[]), vec![0, 1, 2]);
+    }
+    #[test]
+    fn the_promotional_shelf_is_never_drawn() {
+        assert!(is_hidden(Some("teaser")));
+        assert!(!is_hidden(Some("recent")));
+        assert!(!is_hidden(None));
+    }
+
+    #[test]
+    fn home_leads_with_what_was_last_played() {
+        let wanted = default_for("screen-home");
+        let ids = ids(&["teaser", "mostUsed", "presets", "recent", "playlists"]);
+        let pinned = [true, false, false, false, false];
+        // Teaser is still first here — `arrange` keeps what the player pinned —
+        // and the caller drops it afterwards. Of what is left, recent leads and
+        // the rest hold the player's order.
+        assert_eq!(arrange(&ids, &pinned, &wanted), vec![0, 3, 1, 2, 4]);
+        assert!(default_for("screen-favourites").is_empty());
     }
 }

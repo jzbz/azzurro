@@ -296,8 +296,8 @@ enum Pane {
     /// altogether — which is what "back one level" has to mean here too.
     Settings(Vec<SettingsPage>),
     Help,
-    /// A page reached from the Help menu: its title and the facts on it.
-    HelpDetail(String, Vec<(String, String)>),
+    /// A page of plain facts: its title, what is on it, and where Back goes.
+    HelpDetail(String, Vec<(String, String)>, Whence),
     /// One of the player's web configuration pages, drawn rather than opened.
     Web(WebPage),
     /// A form off one of those pages, filled in here rather than in a browser.
@@ -331,6 +331,19 @@ struct CustomisePage {
     /// in. Sections the player pinned are not here at all: they cannot move,
     /// so offering to move them would be a lie.
     rows: Vec<(String, String)>,
+}
+
+/// Where Back goes from a page that can be reached from more than one place.
+///
+/// Technical info is the case that needs it: the Help menu leads to pages
+/// shaped exactly like it, and so does a track's context menu, and so does the
+/// format badge on the record. Landing all three back on Help was right for
+/// one of them and baffling for the other two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Whence {
+    Help,
+    Browse,
+    NowPlaying,
 }
 
 /// A form being filled in.
@@ -1851,7 +1864,7 @@ impl Backend {
 
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
-        if let Pane::HelpDetail(title, facts) = &self.browsing.lock().unwrap().pane {
+        if let Pane::HelpDetail(title, facts, _) = &self.browsing.lock().unwrap().pane {
             let (title, facts) = (title.clone(), facts.clone());
             let rows = facts
                 .into_iter()
@@ -2240,18 +2253,36 @@ impl Backend {
     /// The identity permutation unless Customise Home has been used on this
     /// screen, so a screen nobody has rearranged costs one map lookup.
     fn arrangement(&self, screen: &Screen) -> Vec<usize> {
-        let plain = || (0..screen.sections.len()).collect::<Vec<_>>();
+        let shown = |at: &usize| {
+            screen
+                .sections
+                .get(*at)
+                .is_none_or(|section| !order::is_hidden(section.id.as_deref()))
+        };
+        let plain = || (0..screen.sections.len()).filter(shown).collect::<Vec<_>>();
+
         let Some(id) = screen.id.as_deref() else {
             return plain();
         };
-        let orders = self.orders.lock().unwrap();
-        let Some(wanted) = orders.get(id) else {
-            return plain();
+
+        let wanted = {
+            let orders = self.orders.lock().unwrap();
+            orders.get(id).cloned()
         };
+        // A default where nothing has been arranged, so Home leads with what
+        // was last played rather than with whatever the player listed first.
+        // Customise Home overrides it the moment it is used.
+        let wanted = wanted.unwrap_or_else(|| order::default_for(id));
+        if wanted.is_empty() {
+            return plain();
+        }
 
         let ids: Vec<Option<String>> = screen.sections.iter().map(|s| s.id.clone()).collect();
         let pinned: Vec<bool> = screen.sections.iter().map(|s| s.no_reorder).collect();
-        order::arrange(&ids, &pinned, wanted)
+        order::arrange(&ids, &pinned, &wanted)
+            .into_iter()
+            .filter(shown)
+            .collect()
     }
 
     /// Send the list of sections being rearranged to the window.
@@ -3499,7 +3530,18 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                     let title = action.title.clone().unwrap_or_else(|| "Info".to_owned());
                     match client.technical_info(&uri).await {
                         Ok(facts) if !facts.is_empty() => {
-                            backend.browsing.lock().unwrap().pane = Pane::HelpDetail(title, facts);
+                            // Read from where the press came from rather
+                            // than threaded through: the format badge on the
+                            // record opens this with Now Playing up, and a
+                            // track's context menu opens the same page from a
+                            // browse screen. Back belongs wherever you were.
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            let whence = match browsing.pane {
+                                Pane::NowPlaying => Whence::NowPlaying,
+                                _ => Whence::Browse,
+                            };
+                            browsing.pane = Pane::HelpDetail(title, facts, whence);
+                            drop(browsing);
                             backend.publish_pane();
                         }
                         other => {
@@ -4395,8 +4437,12 @@ async fn run_commands(
                 let moved = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     match &mut browsing.pane {
-                        Pane::HelpDetail(..) => {
-                            browsing.pane = Pane::Help;
+                        Pane::HelpDetail(_, _, whence) => {
+                            browsing.pane = match whence {
+                                Whence::Help => Pane::Help,
+                                Whence::Browse => Pane::Browse,
+                                Whence::NowPlaying => Pane::NowPlaying,
+                            };
                             true
                         }
                         Pane::Settings(trail) if trail.len() > 1 => {
@@ -4826,7 +4872,7 @@ async fn run_commands(
                         match client.diagnostics().await {
                             Ok(facts) if !facts.is_empty() => {
                                 backend.browsing.lock().unwrap().pane =
-                                    Pane::HelpDetail("Diagnostics".to_owned(), facts);
+                                    Pane::HelpDetail("Diagnostics".to_owned(), facts, Whence::Help);
                                 backend.publish_help();
                             }
                             // The page is the player's own HTML, so it can
@@ -4852,8 +4898,11 @@ async fn run_commands(
                                 if let Some((label, href)) = action {
                                     facts.push((label, client.image_url(&href)));
                                 }
-                                backend.browsing.lock().unwrap().pane =
-                                    Pane::HelpDetail("Upgrade Check".to_owned(), facts);
+                                backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
+                                    "Upgrade Check".to_owned(),
+                                    facts,
+                                    Whence::Help,
+                                );
                                 backend.publish_help();
                             }
                             Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
