@@ -13,10 +13,11 @@
 mod artwork;
 mod glyphs;
 mod known;
+mod lane;
 mod mpris;
 mod order;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -206,6 +207,16 @@ struct Browsing {
     device: Option<DeviceId>,
     /// One entry per screen fetched, so Back is a pop.
     trail: Vec<Crumb>,
+    /// Bumped every time the trail changes.
+    ///
+    /// The screens are fetched off the loop, so a reply can land after the
+    /// screen it was for has gone: a page of a long list appended itself to
+    /// whatever crumb happened to be on top, and an abandoned artwork loader
+    /// kept fetching for a screen nobody could see. Anything that leaves the
+    /// trail and comes back takes this number with it and checks it still
+    /// holds — the same shape as `searches`, which has guarded typing this
+    /// way from the start.
+    era: u64,
     /// The screens this player offers: `(label, uri)`, in the order it listed
     /// them. Read once from `/ui/Configuration`.
     screens: Vec<(String, String)>,
@@ -234,6 +245,14 @@ struct Browsing {
     /// because activating a line means running the action the player attached
     /// to it, and that lives on the parsed document.
     queue_menu: Option<Screen>,
+    /// Which player wrote the open menu.
+    ///
+    /// A browse row's menu is fetched from `device` — the player whose screens
+    /// are being read — and its lines were run against `selected`. Those are
+    /// normally the same player and briefly are not, so a Favourite carrying
+    /// one player's local file path could be sent to another. Recorded with
+    /// the menu and checked before anything on it is run.
+    queue_menu_owner: Option<DeviceId>,
     /// The queue screen's own uri, from `/ui/Configuration`.
     queue_uri: Option<String>,
     /// Whether a page of a long list is already on its way, so that scrolling
@@ -378,6 +397,13 @@ struct Crumb {
     query: Option<String>,
 }
 
+impl Browsing {
+    /// Note that the trail is no longer what it was.
+    fn moved_on(&mut self) {
+        self.era = self.era.wrapping_add(1);
+    }
+}
+
 /// How a settings page joins the pane's own trail.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
@@ -472,6 +498,14 @@ type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
 /// anything else. Held singly there is no order to get wrong and nothing to
 /// deadlock; the moment two are nested, every future caller has to know which
 /// way round, and one that gets it backwards hangs the whole app.
+///
+/// `orders` is the one exception, and it is not one anybody chose:
+/// [`Backend::arrangement`] reads it, and every caller of that is already
+/// holding `browsing` because the screen being arranged lives there. So the
+/// rule for that pair is an order rather than a ban — **`browsing` first,
+/// `orders` second, never the reverse.** `orders` is a leaf: nothing is taken
+/// while it is held, which is what keeps the cycle from closing. Anything new
+/// that wants both must take them in that order.
 #[derive(Clone)]
 struct Backend {
     registry: Registry,
@@ -481,12 +515,23 @@ struct Backend {
     ui: slint::Weak<AppWindow>,
     artwork: Arc<Artwork>,
     browsing: Arc<Mutex<Browsing>>,
-    /// Addresses that have answered, remembered between runs.
-    known: Arc<Mutex<BTreeSet<DeviceId>>>,
+    /// Addresses that have answered, remembered between runs. Oldest first
+    /// and bounded; see [`known`].
+    known: Arc<Mutex<Vec<DeviceId>>>,
+    /// The line the requests that must keep their order stand in. See
+    /// [`lane`]; the arms that use it say why they have to.
+    writes: Arc<lane::Lane>,
     /// How many searches have been asked for. Typing asks for one per
-    /// keystroke and only the last of them should reach the player, so each
-    /// takes a number on the way in and checks it is still the highest on the
-    /// way out.
+    /// keystroke, so each takes a number and checks it is still the highest
+    /// before the request goes out — which collapses a typed word into one
+    /// search rather than eight.
+    ///
+    /// Before, and only before. Two searches that both get past that check
+    /// still race, and the slower one lands last and takes the screen with the
+    /// box reading something else. Correcting that means carrying the number
+    /// through the fetch and refusing to apply a stale reply, which `open_screen`
+    /// has no way to express today; the next keystroke fixes it, so it has been
+    /// left. This comment used to claim the check happened on the way out.
     searches: Arc<AtomicU64>,
     /// What the transport looked like when it was last sent.
     sent_transport: Arc<AtomicU64>,
@@ -500,6 +545,11 @@ struct Backend {
     /// with the app sitting idle.
     sent_queue: Arc<AtomicU64>,
     sent_players: Arc<AtomicU64>,
+    /// And the settings rows, for the same reason as the three above: the
+    /// status ticks every second and rebuilding a settings model replaces
+    /// every row instance, which throws away whatever was being typed into
+    /// one and jumps the scroll on a page of mixed heights.
+    sent_settings: Arc<AtomicU64>,
     /// Section order per screen, as set by Customise Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
 }
@@ -1121,11 +1171,13 @@ async fn run(
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(art)),
         browsing: Arc::new(Mutex::new(Browsing::default())),
-        known: Arc::new(Mutex::new(BTreeSet::new())),
+        known: Arc::new(Mutex::new(Vec::new())),
+        writes: Arc::new(lane::Lane::default()),
         searches: Arc::new(AtomicU64::new(0)),
         sent_transport: Arc::new(AtomicU64::new(0)),
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
+        sent_settings: Arc::new(AtomicU64::new(0)),
         orders: Arc::new(Mutex::new(order::load())),
     };
 
@@ -2297,6 +2349,29 @@ impl Backend {
 
     /// Hand a list of setting-shaped rows to the middle pane.
     fn send_settings(&self, rows: Vec<SettingData>, title: String) {
+        if already_sent(&self.sent_settings, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            title.hash(&mut hash);
+            for row in &rows {
+                row.index.hash(&mut hash);
+                row.label.hash(&mut hash);
+                row.detail.hash(&mut hash);
+                row.control.hash(&mut hash);
+                row.value.hash(&mut hash);
+                row.on.hash(&mut hash);
+                row.heading.hash(&mut hash);
+                row.available.hash(&mut hash);
+                row.options.hash(&mut hash);
+                row.option_index.hash(&mut hash);
+                // The numbers a slider carries, which change as it is dragged.
+                row.number.to_bits().hash(&mut hash);
+            }
+            hash.finish()
+        }) {
+            return;
+        }
+
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -3406,6 +3481,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                     }
                 };
                 browsing.trail.push(Crumb { uri, screen, query });
+                browsing.moved_on();
             }
             // The whole pane, not only the browse rows. Opening a screen is
             // also leaving whichever pane was covering them, and the window
@@ -3413,7 +3489,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             // which showed as a screen with the right title and the wrong list
             // under it.
             backend.publish_pane();
-            tokio::spawn(load_browse_thumbnails(backend, id));
+            tokio::spawn(load_browse_thumbnails(backend, id, 0));
         }
         Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
     }
@@ -3626,7 +3702,11 @@ async fn run_search(backend: Backend, query: String) {
             open_screen(backend, id, uri, Arrive::Found(query)).await;
         }
         Some((_, None)) => {
-            backend.browsing.lock().unwrap().trail.pop();
+            {
+                let mut browsing = backend.browsing.lock().unwrap();
+                browsing.trail.pop();
+                browsing.moved_on();
+            }
             backend.publish_browse();
         }
         None => {}
@@ -3896,7 +3976,7 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
     // what makes an address a player, so a mistyped one is never written down.
     let newly_known = {
         let mut known = backend.known.lock().unwrap();
-        known.insert(id).then(|| known.clone())
+        known::remember(&mut known, id).then(|| known.clone())
     };
     if let Some(known) = newly_known {
         tokio::task::spawn_blocking(move || known::save(&known));
@@ -3917,23 +3997,52 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
 
 /// Re-fetch the screen on show, keeping its place on the trail.
 async fn refresh_current(backend: Backend) {
-    let Some((id, uri)) = ({
-        let mut browsing = backend.browsing.lock().unwrap();
-        browsing
-            .device
-            .zip(browsing.trail.pop().map(|crumb| crumb.uri))
+    // Read the crumb, do not take it. Popping first and pushing back only on
+    // success meant a refetch that failed deleted the screen outright — the
+    // pane kept drawing rows nobody could reach, and Back skipped a level —
+    // while two refreshes in flight at once swapped two levels around. The
+    // shape that works is already in `open_screen`: peek, fetch, and let
+    // `Replace` pop and push under one lock once the player has answered.
+    //
+    // `Replace` and not `Deeper` for a second reason: `Deeper` discards the
+    // crumb's query, so refreshing a screen of search results stopped it
+    // counting as results and the next search stacked instead of replacing.
+    let Some((id, uri, query)) = ({
+        let browsing = backend.browsing.lock().unwrap();
+        browsing.trail.last().and_then(|crumb| {
+            browsing
+                .device
+                .map(|id| (id, crumb.uri.clone(), crumb.query.clone()))
+        })
     }) else {
         return;
     };
-    open_screen(backend, id, uri, Arrive::Deeper).await;
+    open_screen(backend, id, uri, Arrive::Replace(query)).await;
 }
 
 /// Fetch the icons and cover art for the screen on show.
-async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
+/// Fetch the pictures the browse screen needs.
+///
+/// `done` is how many items at the front of the screen a previous run already
+/// walked. Paging appends to the screen rather than replacing it, so without
+/// this the second page re-derived every URL on the first, the third re-derived
+/// the first two, and a library page fetched forty times over — each one a
+/// cache lookup rather than a request, but the memory cache is bounded, and on
+/// a list long enough to page the early entries have been evicted by the time
+/// the walk reaches them again. Skipping them is also what stops the header's
+/// cover being re-queued ahead of the rows that actually just arrived.
+async fn load_browse_thumbnails(backend: Backend, id: DeviceId, done: usize) {
     // Registry first and released, then the browse state: never both at once.
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
+
+    // The screen this was started for. Nothing here checked it was still on
+    // show, so walking away from a long list left its loader running: it kept
+    // its share of the four artwork permits and rebuilt the whole model every
+    // 400ms for a screen nobody could see. Its sibling `load_cover` has
+    // checked the equivalent from the start.
+    let era = backend.browsing.lock().unwrap().era;
 
     let urls: Vec<(String, u32)> = {
         let browsing = backend.browsing.lock().unwrap();
@@ -3944,9 +4053,11 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
         let mut seen = std::collections::BTreeSet::new();
         // The header's cover first: it is the largest thing on the screen and
         // the one the eye lands on, so it should not queue behind forty rows.
+        // Only on the first walk — it has not changed since.
         let header = screen
             .header
             .as_ref()
+            .filter(|_| done == 0)
             .and_then(|header| header.image.as_deref())
             .filter(|src| !src.is_empty())
             .map(|src| (client.image_url(src), COVER_SIZE))
@@ -3968,6 +4079,10 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
                         };
                         section.items.iter().map(move |item| (item, size))
                     })
+                    // Before the filter, so it counts items and not pictures:
+                    // the caller knows how many items it had, not how many of
+                    // them turned out to want one.
+                    .skip(done)
                     .filter_map(|(item, size)| {
                         // A menu row is drawn as a glyph whatever picture came with it,
                         // so fetching TuneIn's logo for "Sports" would be a request for
@@ -4016,6 +4131,9 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId) {
 
     let mut last_publish = Instant::now();
     while fetches.join_next().await.is_some() {
+        if backend.browsing.lock().unwrap().era != era {
+            return;
+        }
         if let Some((url, size)) = urls.next() {
             let artwork = backend.artwork.clone();
             fetches.spawn(async move {
@@ -4514,45 +4632,57 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                // The player says which screens it has; the app does not have a
-                // list of its own.
-                let config = client.ui_configuration().await.ok();
-                let screens = config.as_ref().map(user_screens).unwrap_or_default();
-                let root = screens
-                    .first()
-                    .map(|(_, uri)| uri.clone())
-                    .unwrap_or_else(|| "/ui/Sources".to_owned());
 
-                // The sidebar's lower half is the Sources screen's own rows,
-                // so it is read once here rather than every time the sidebar
-                // is redrawn.
-                let sources_uri = config
-                    .as_ref()
-                    .and_then(|c| c.uri("sources"))
-                    .unwrap_or("/ui/Sources")
-                    .to_owned();
-                let sources = client.screen(&sources_uri).await.ok();
+                // Off the loop from here. Two round trips follow, and awaiting
+                // them here stopped the loop reading its channel at all: on a
+                // player that has gone away that is twenty seconds of a window
+                // that still paints and answers nothing, once per press.
+                //
+                // Nothing below has to run in order with anything else — it
+                // ends by taking the locks it needs — so it spawns, the way
+                // `Rescan` and the transport commands already do.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    // The player says which screens it has; the app does not have a
+                    // list of its own.
+                    let config = client.ui_configuration().await.ok();
+                    let screens = config.as_ref().map(user_screens).unwrap_or_default();
+                    let root = screens
+                        .first()
+                        .map(|(_, uri)| uri.clone())
+                        .unwrap_or_else(|| "/ui/Sources".to_owned());
 
-                {
-                    let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.queue_uri = config
+                    // The sidebar's lower half is the Sources screen's own rows,
+                    // so it is read once here rather than every time the sidebar
+                    // is redrawn.
+                    let sources_uri = config
                         .as_ref()
-                        .and_then(|c| c.uri("queue"))
-                        .map(str::to_owned);
-                    browsing.now_playing_menu = config
-                        .as_ref()
-                        .and_then(|c| c.uri("nowPlayingContextMenu"))
-                        .map(str::to_owned);
-                    browsing.queue_menu_uri = config
-                        .as_ref()
-                        .and_then(|c| c.uri("queueItemContextMenu"))
-                        .map(str::to_owned);
-                    browsing.screens = screens;
-                    browsing.sources = sources;
-                    browsing.highlighted = Some((0, 0));
-                }
-                backend.publish_sidebar();
-                tokio::spawn(open_screen(backend.clone(), id, root, Arrive::Root));
+                        .and_then(|c| c.uri("sources"))
+                        .unwrap_or("/ui/Sources")
+                        .to_owned();
+                    let sources = client.screen(&sources_uri).await.ok();
+
+                    {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.queue_uri = config
+                            .as_ref()
+                            .and_then(|c| c.uri("queue"))
+                            .map(str::to_owned);
+                        browsing.now_playing_menu = config
+                            .as_ref()
+                            .and_then(|c| c.uri("nowPlayingContextMenu"))
+                            .map(str::to_owned);
+                        browsing.queue_menu_uri = config
+                            .as_ref()
+                            .and_then(|c| c.uri("queueItemContextMenu"))
+                            .map(str::to_owned);
+                        browsing.screens = screens;
+                        browsing.sources = sources;
+                        browsing.highlighted = Some((0, 0));
+                    }
+                    backend.publish_sidebar();
+                    open_screen(backend.clone(), id, root, Arrive::Root).await;
+                });
                 continue;
             }
 
@@ -4600,6 +4730,7 @@ async fn run_commands(
                             let deeper = browsing.trail.len() > 1;
                             if deeper {
                                 browsing.trail.pop();
+                                browsing.moved_on();
                             }
                             deeper
                         }
@@ -4649,7 +4780,11 @@ async fn run_commands(
                 tokio::spawn(async move {
                     match client.screen(&uri).await {
                         Ok(menu) => {
-                            backend.browsing.lock().unwrap().queue_menu = Some(menu);
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                browsing.queue_menu = Some(menu);
+                                browsing.queue_menu_owner = Some(id);
+                            }
                             backend.publish_queue_menu();
                         }
                         Err(e) => {
@@ -4681,7 +4816,11 @@ async fn run_commands(
                 tokio::spawn(async move {
                     match client.screen(&format!("{base}?id={song}")).await {
                         Ok(menu) => {
-                            backend.browsing.lock().unwrap().queue_menu = Some(menu);
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                browsing.queue_menu = Some(menu);
+                                browsing.queue_menu_owner = Some(id);
+                            }
                             backend.publish_queue_menu();
                         }
                         Err(e) => {
@@ -4772,20 +4911,24 @@ async fn run_commands(
                     bluos::client::PlaylistTarget::Existing { name, .. } => name.clone(),
                 };
 
-                match client
-                    .add_to_playlist(&options, service.as_deref(), &target)
-                    .await
-                {
-                    Ok(()) => {
-                        backend.browsing.lock().unwrap().pane = Pane::Browse;
-                        backend.publish_pane();
-                        say(&backend.ui, format!("Added to {named}"));
+                // Off the loop, for the reason spelled out on `BrowseHome`.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client
+                        .add_to_playlist(&options, service.as_deref(), &target)
+                        .await
+                    {
+                        Ok(()) => {
+                            backend.browsing.lock().unwrap().pane = Pane::Browse;
+                            backend.publish_pane();
+                            say(&backend.ui, format!("Added to {named}"));
+                        }
+                        Err(e) => {
+                            tracing::warn!(%id, "could not add to {named}: {e}");
+                            say(&backend.ui, format!("Could not add to {named}"));
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(%id, "could not add to {named}: {e}");
-                        say(&backend.ui, format!("Could not add to {named}"));
-                    }
-                }
+                });
                 continue;
             }
 
@@ -4800,7 +4943,9 @@ async fn run_commands(
             }
 
             Command::QueueMenuAction(at) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // The player the menu came from, not whichever is selected
+                // now: the lines on it carry that player's own paths.
+                let Some(id) = backend.browsing.lock().unwrap().queue_menu_owner else {
                     continue;
                 };
                 let action = backend
@@ -4831,33 +4976,42 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.settings(page.as_deref()).await {
-                    Ok(page) => {
-                        let mut browsing = backend.browsing.lock().unwrap();
-                        match (&mut browsing.pane, step) {
-                            // Deeper and reload both keep whatever is under
-                            // them; only the top of the trail differs.
-                            (Pane::Settings(trail), Step::Deeper) => trail.push(page),
-                            (Pane::Settings(trail), Step::Reload) if !trail.is_empty() => {
-                                let top = trail.len() - 1;
-                                trail[top] = page;
+                // Off the loop, for the reason spelled out on `BrowseHome`:
+                // awaiting the round trip here stops the loop reading its
+                // channel, so a player that has gone away takes the whole
+                // timeout with the window still painting and answering
+                // nothing. Two presses in flight at once can now land out of
+                // order, which is worth less than a window that responds.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.settings(page.as_deref()).await {
+                        Ok(page) => {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            match (&mut browsing.pane, step) {
+                                // Deeper and reload both keep whatever is under
+                                // them; only the top of the trail differs.
+                                (Pane::Settings(trail), Step::Deeper) => trail.push(page),
+                                (Pane::Settings(trail), Step::Reload) if !trail.is_empty() => {
+                                    let top = trail.len() - 1;
+                                    trail[top] = page;
+                                }
+                                _ => browsing.pane = Pane::Settings(vec![page]),
                             }
-                            _ => browsing.pane = Pane::Settings(vec![page]),
+                            // Settings and Help are rows of their own below the
+                            // list, so nothing in the list is where you are any
+                            // more. Leaving the last screen lit says you are on a
+                            // screen you are not looking at.
+                            browsing.highlighted = None;
+                            drop(browsing);
+                            backend.publish_sidebar();
+                            backend.publish_settings();
                         }
-                        // Settings and Help are rows of their own below the
-                        // list, so nothing in the list is where you are any
-                        // more. Leaving the last screen lit says you are on a
-                        // screen you are not looking at.
-                        browsing.highlighted = None;
-                        drop(browsing);
-                        backend.publish_sidebar();
-                        backend.publish_settings();
+                        Err(e) => {
+                            tracing::warn!(%id, "could not read settings: {e}");
+                            say(&backend.ui, format!("could not read settings: {e}"));
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(%id, "could not read settings: {e}");
-                        say(&backend.ui, format!("could not read settings: {e}"));
-                    }
-                }
+                });
                 continue;
             }
 
@@ -4934,29 +5088,36 @@ async fn run_commands(
                     Some(Chosen::Write(setting, value)) => {
                         let page = backend.browsing.lock().unwrap().pane.settings().cloned();
                         if let Some(page) = page {
-                            match client.write_setting(&page, &setting, &value).await {
-                                Ok(()) => {
-                                    // A button leaves nothing behind on the
-                                    // page it was pressed on — no toggle moves,
-                                    // no value changes — so without a word it
-                                    // is indistinguishable from a dead control.
-                                    // Reindexing takes minutes before the
-                                    // player admits it started.
-                                    if setting.kind == Kind::Button {
-                                        say(&backend.ui, format!("{}…", setting.label()));
+                            // Off the loop and in order, for the reason on
+                            // `SettingEdit`.
+                            let mut ticket = backend.writes.enter();
+                            let backend = backend.clone();
+                            tokio::spawn(async move {
+                                ticket.wait().await;
+                                match client.write_setting(&page, &setting, &value).await {
+                                    Ok(()) => {
+                                        // A button leaves nothing behind on the
+                                        // page it was pressed on — no toggle moves,
+                                        // no value changes — so without a word it
+                                        // is indistinguishable from a dead control.
+                                        // Reindexing takes minutes before the
+                                        // player admits it started.
+                                        if setting.kind == Kind::Button {
+                                            say(&backend.ui, format!("{}…", setting.label()));
+                                        }
+                                        // Re-read rather than guess: a write can
+                                        // change more than the one value, and the
+                                        // player is the only one who knows.
+                                        let _ = backend.commands.send(Command::OpenSettings(
+                                            page.page_id.clone(),
+                                            Step::Reload,
+                                        ));
                                     }
-                                    // Re-read rather than guess: a write can
-                                    // change more than the one value, and the
-                                    // player is the only one who knows.
-                                    let _ = backend.commands.send(Command::OpenSettings(
-                                        page.page_id.clone(),
-                                        Step::Reload,
-                                    ));
+                                    Err(e) => {
+                                        say(&backend.ui, format!("{}: {e}", setting.label()));
+                                    }
                                 }
-                                Err(e) => {
-                                    say(&backend.ui, format!("{}: {e}", setting.label()));
-                                }
-                            }
+                            });
                         }
                     }
                     None => {}
@@ -4986,58 +5147,68 @@ async fn run_commands(
                     .unwrap()
                     .and_then(|id| backend.with_entry(id, |e| e.client.clone()));
 
-                match kind {
-                    HelpKind::Web(target) => {
-                        // Absolute for Lenbrook's own site, relative for the
-                        // pages the player serves; image_url knows which.
-                        let url = match &client {
-                            Some(client) => client.image_url(target),
-                            None => (*target).to_owned(),
-                        };
-                        open_in_browser(&backend.ui, url).await;
-                    }
-                    HelpKind::Diagnostics => {
-                        let Some(client) = client else { continue };
-                        match client.diagnostics().await {
-                            Ok(facts) if !facts.is_empty() => {
-                                backend.browsing.lock().unwrap().pane =
-                                    Pane::HelpDetail("Diagnostics".to_owned(), facts, Whence::Help);
-                                backend.publish_help();
-                            }
-                            // The page is the player's own HTML, so it can
-                            // change under us; offer it rather than nothing.
-                            _ => {
-                                let url = client.image_url("/redirectToCp?href=/diagnostics");
-                                open_in_browser(&backend.ui, url).await;
-                            }
+                // Off the loop, for the reason spelled out on `BrowseHome`.
+                // Two of the three below ask the player something, and the
+                // upgrade check in particular is the slowest request it
+                // answers.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match kind {
+                        HelpKind::Web(target) => {
+                            // Absolute for Lenbrook's own site, relative for the
+                            // pages the player serves; image_url knows which.
+                            let url = match &client {
+                                Some(client) => client.image_url(target),
+                                None => (*target).to_owned(),
+                            };
+                            open_in_browser(&backend.ui, url).await;
                         }
-                    }
-                    HelpKind::Upgrade => {
-                        let Some(client) = client else { continue };
-                        match client.upgrade_check().await {
-                            Ok((status, action)) => {
-                                let mut facts = vec![(
-                                    "Status".to_owned(),
-                                    status.unwrap_or_else(|| {
-                                        "The player did not answer clearly".to_owned()
-                                    }),
-                                )];
-                                // Only present when the player itself offers
-                                // one; see reports::upgrade_action.
-                                if let Some((label, href)) = action {
-                                    facts.push((label, client.image_url(&href)));
+                        HelpKind::Diagnostics => {
+                            let Some(client) = client else { return };
+                            match client.diagnostics().await {
+                                Ok(facts) if !facts.is_empty() => {
+                                    backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
+                                        "Diagnostics".to_owned(),
+                                        facts,
+                                        Whence::Help,
+                                    );
+                                    backend.publish_help();
                                 }
-                                backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
-                                    "Upgrade Check".to_owned(),
-                                    facts,
-                                    Whence::Help,
-                                );
-                                backend.publish_help();
+                                // The page is the player's own HTML, so it can
+                                // change under us; offer it rather than nothing.
+                                _ => {
+                                    let url = client.image_url("/redirectToCp?href=/diagnostics");
+                                    open_in_browser(&backend.ui, url).await;
+                                }
                             }
-                            Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
+                        }
+                        HelpKind::Upgrade => {
+                            let Some(client) = client else { return };
+                            match client.upgrade_check().await {
+                                Ok((status, action)) => {
+                                    let mut facts = vec![(
+                                        "Status".to_owned(),
+                                        status.unwrap_or_else(|| {
+                                            "The player did not answer clearly".to_owned()
+                                        }),
+                                    )];
+                                    // Only present when the player itself offers
+                                    // one; see reports::upgrade_action.
+                                    if let Some((label, href)) = action {
+                                        facts.push((label, client.image_url(&href)));
+                                    }
+                                    backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
+                                        "Upgrade Check".to_owned(),
+                                        facts,
+                                        Whence::Help,
+                                    );
+                                    backend.publish_help();
+                                }
+                                Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
+                            }
                         }
                     }
-                }
+                });
                 continue;
             }
 
@@ -5066,35 +5237,44 @@ async fn run_commands(
                     "Reading the page…".to_owned(),
                 );
 
-                match client.web_form(&path).await {
-                    Ok(Some(form)) => {
-                        show_form(&backend, title, form, String::new());
-                    }
-                    // No form on it, or a shape this crate cannot read. The
-                    // page itself still works, so offer that rather than
-                    // nothing.
-                    other => {
-                        if let Err(e) = other {
-                            tracing::debug!(%id, "could not read {path}: {e}");
+                // Off the loop, for the reason spelled out on `BrowseHome`:
+                // awaiting the round trip here stops the loop reading its
+                // channel, so a player that has gone away takes the whole
+                // timeout with the window still painting and answering
+                // nothing. Two presses in flight at once can now land out of
+                // order, which is worth less than a window that responds.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.web_form(&path).await {
+                        Ok(Some(form)) => {
+                            show_form(&backend, title, form, String::new());
                         }
-                        // Nothing here to draw, so put the page itself up and
-                        // leave the placeholder behind.
-                        backend.browsing.lock().unwrap().pane = Pane::Browse;
-                        backend.publish_pane();
-                        match client.web_url(&path) {
-                            Ok(url) => {
-                                open_in_browser(&backend.ui, url).await;
+                        // No form on it, or a shape this crate cannot read. The
+                        // page itself still works, so offer that rather than
+                        // nothing.
+                        other => {
+                            if let Err(e) = other {
+                                tracing::debug!(%id, "could not read {path}: {e}");
                             }
-                            // The player named somewhere that is not the
-                            // player. Handing that to the desktop's browser is
-                            // the one thing this app must not do on its say-so.
-                            Err(e) => {
-                                tracing::warn!(%id, "refusing to open {path}: {e}");
-                                say(&backend.ui, "That page is not on this player");
+                            // Nothing here to draw, so put the page itself up and
+                            // leave the placeholder behind.
+                            backend.browsing.lock().unwrap().pane = Pane::Browse;
+                            backend.publish_pane();
+                            match client.web_url(&path) {
+                                Ok(url) => {
+                                    open_in_browser(&backend.ui, url).await;
+                                }
+                                // The player named somewhere that is not the
+                                // player. Handing that to the desktop's browser is
+                                // the one thing this app must not do on its say-so.
+                                Err(e) => {
+                                    tracing::warn!(%id, "refusing to open {path}: {e}");
+                                    say(&backend.ui, "That page is not on this player");
+                                }
                             }
                         }
                     }
-                }
+                });
                 continue;
             }
 
@@ -5157,33 +5337,41 @@ async fn run_commands(
                     continue;
                 };
 
-                match client.submit_form(&form, &values, &submit).await {
-                    Ok(body) => {
-                        // The answer is another page: the same form with a
-                        // message when something was wrong, the next step's
-                        // form when it was right. Following it is what lets one
-                        // screen lead to another without knowing the route.
-                        match bluos::forms::parse(&body).into_iter().next() {
-                            Some(next) => {
-                                show_form(&backend, title, next, bluos::reports::message(&body))
-                            }
-                            None => {
-                                let said = bluos::reports::message(&body);
-                                say(
-                                    &backend.ui,
-                                    if said.is_empty() {
-                                        format!("{} done", submit.label)
-                                    } else {
-                                        said
-                                    },
-                                );
-                                backend.browsing.lock().unwrap().pane = Pane::Browse;
-                                backend.publish_pane();
+                // Off the loop, but in order: a form is a sequence of steps,
+                // and step two is submitted against what step one left on the
+                // player. See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.submit_form(&form, &values, &submit).await {
+                        Ok(body) => {
+                            // The answer is another page: the same form with a
+                            // message when something was wrong, the next step's
+                            // form when it was right. Following it is what lets one
+                            // screen lead to another without knowing the route.
+                            match bluos::forms::parse(&body).into_iter().next() {
+                                Some(next) => {
+                                    show_form(&backend, title, next, bluos::reports::message(&body))
+                                }
+                                None => {
+                                    let said = bluos::reports::message(&body);
+                                    say(
+                                        &backend.ui,
+                                        if said.is_empty() {
+                                            format!("{} done", submit.label)
+                                        } else {
+                                            said
+                                        },
+                                    );
+                                    backend.browsing.lock().unwrap().pane = Pane::Browse;
+                                    backend.publish_pane();
+                                }
                             }
                         }
+                        Err(e) => say(&backend.ui, format!("{}: {e}", submit.label)),
                     }
-                    Err(e) => say(&backend.ui, format!("{}: {e}", submit.label)),
-                }
+                });
                 continue;
             }
 
@@ -5224,17 +5412,27 @@ async fn run_commands(
                 };
                 let Some(value) = value else { continue };
 
-                match client.write_setting(&page, &setting, &value).await {
-                    Ok(()) => {
-                        // Re-read rather than assume: a write can move more
-                        // than the one value — turning tone controls on brings
-                        // treble and bass to life — and only the player knows.
-                        let _ = backend
-                            .commands
-                            .send(Command::OpenSettings(page.page_id.clone(), Step::Reload));
+                // Off the loop, but in order: dragging a slider sends a write
+                // per step, and the value the player is left holding has to be
+                // the last one asked for, not whichever reply came back last.
+                // See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.write_setting(&page, &setting, &value).await {
+                        Ok(()) => {
+                            // Re-read rather than assume: a write can move more
+                            // than the one value — turning tone controls on
+                            // brings treble and bass to life — and only the
+                            // player knows.
+                            let _ = backend
+                                .commands
+                                .send(Command::OpenSettings(page.page_id.clone(), Step::Reload));
+                        }
+                        Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
                     }
-                    Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
-                }
+                });
                 continue;
             }
 
@@ -5384,16 +5582,22 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.move_queue_item(from, to).await {
-                    // The player does not announce a reorder — the queue's own
-                    // id does not change — so the list is re-read rather than
-                    // waited for.
-                    Ok(()) => tokio::spawn(fetch_queue(backend.clone(), id)),
-                    Err(e) => {
-                        say(&backend.ui, format!("could not move the track: {e}"));
-                        continue;
+                // Off the loop, but in order: `from` and `to` are positions
+                // in a list each of these requests rewrites, so two of them
+                // overtaking each other move the wrong track. See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.move_queue_item(from, to).await {
+                        // The player does not announce a reorder — the queue's
+                        // own id does not change — so the list is re-read
+                        // rather than waited for. Awaited rather than spawned,
+                        // so the next reorder sees the list this one made.
+                        Ok(()) => fetch_queue(backend.clone(), id).await,
+                        Err(e) => say(&backend.ui, format!("could not move the track: {e}")),
                     }
-                };
+                });
                 continue;
             }
 
@@ -5404,13 +5608,17 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.delete_queue_item(index).await {
-                    Ok(()) => tokio::spawn(fetch_queue(backend.clone(), id)),
-                    Err(e) => {
-                        say(&backend.ui, format!("could not remove the track: {e}"));
-                        continue;
+                // Off the loop, but in order: `index` is a position in a list
+                // each removal shortens. See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.delete_queue_item(index).await {
+                        Ok(()) => fetch_queue(backend.clone(), id).await,
+                        Err(e) => say(&backend.ui, format!("could not remove the track: {e}")),
                     }
-                };
+                });
                 continue;
             }
 
@@ -5425,13 +5633,20 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.save_queue(&name).await {
-                    Ok(()) => {
-                        say(&backend.ui, format!("Saved as \"{name}\""));
-                        tokio::spawn(fetch_queue(backend.clone(), id));
+                // Off the loop, and in the same line as the edits above: a
+                // save has to see the queue those left behind. See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.save_queue(&name).await {
+                        Ok(()) => {
+                            say(&backend.ui, format!("Saved as \"{name}\""));
+                            fetch_queue(backend.clone(), id).await;
+                        }
+                        Err(e) => say(&backend.ui, format!("could not save the queue: {e}")),
                     }
-                    Err(e) => say(&backend.ui, format!("could not save the queue: {e}")),
-                }
+                });
                 continue;
             }
 
@@ -5494,28 +5709,37 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.services().await {
-                    Ok(services) if !services.is_empty() => {
-                        let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.pane = Pane::Web(WebPage::Services(services));
-                        browsing.highlighted = None;
-                        drop(browsing);
-                        backend.publish_sidebar();
-                        backend.publish_web();
-                    }
-                    // The page is the player's own HTML and a firmware update
-                    // could change its shape. Falling back to opening it beats
-                    // showing an empty list and claiming there are no services.
-                    other => {
-                        if let Err(e) = other {
-                            tracing::debug!(%id, "could not read the services page: {e}");
+                // Off the loop, for the reason spelled out on `BrowseHome`:
+                // awaiting the round trip here stops the loop reading its
+                // channel, so a player that has gone away takes the whole
+                // timeout with the window still painting and answering
+                // nothing. Two presses in flight at once can now land out of
+                // order, which is worth less than a window that responds.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.services().await {
+                        Ok(services) if !services.is_empty() => {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            browsing.pane = Pane::Web(WebPage::Services(services));
+                            browsing.highlighted = None;
+                            drop(browsing);
+                            backend.publish_sidebar();
+                            backend.publish_web();
                         }
-                        // A constant, so this cannot be off-player.
-                        if let Ok(url) = client.web_url("/services?noheader=1") {
-                            open_in_browser(&backend.ui, url).await;
+                        // The page is the player's own HTML and a firmware update
+                        // could change its shape. Falling back to opening it beats
+                        // showing an empty list and claiming there are no services.
+                        other => {
+                            if let Err(e) = other {
+                                tracing::debug!(%id, "could not read the services page: {e}");
+                            }
+                            // A constant, so this cannot be off-player.
+                            if let Ok(url) = client.web_url("/services?noheader=1") {
+                                open_in_browser(&backend.ui, url).await;
+                            }
                         }
                     }
-                }
+                });
                 continue;
             }
 
@@ -5526,23 +5750,32 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                match client.shares().await {
-                    Ok((action, shares)) => {
-                        let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.pane = Pane::Web(WebPage::Shares { action, shares });
-                        browsing.highlighted = None;
-                        drop(browsing);
-                        backend.publish_sidebar();
-                        backend.publish_web();
-                    }
-                    Err(e) => {
-                        tracing::debug!(%id, "could not read the shares page: {e}");
-                        // A constant, so this cannot be off-player.
-                        if let Ok(url) = client.web_url("/sharecfg?noheader=1") {
-                            open_in_browser(&backend.ui, url).await;
+                // Off the loop, for the reason spelled out on `BrowseHome`:
+                // awaiting the round trip here stops the loop reading its
+                // channel, so a player that has gone away takes the whole
+                // timeout with the window still painting and answering
+                // nothing. Two presses in flight at once can now land out of
+                // order, which is worth less than a window that responds.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.shares().await {
+                        Ok((action, shares)) => {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            browsing.pane = Pane::Web(WebPage::Shares { action, shares });
+                            browsing.highlighted = None;
+                            drop(browsing);
+                            backend.publish_sidebar();
+                            backend.publish_web();
+                        }
+                        Err(e) => {
+                            tracing::debug!(%id, "could not read the shares page: {e}");
+                            // A constant, so this cannot be off-player.
+                            if let Ok(url) = client.web_url("/sharecfg?noheader=1") {
+                                open_in_browser(&backend.ui, url).await;
+                            }
                         }
                     }
-                }
+                });
                 continue;
             }
 
@@ -5582,24 +5815,34 @@ async fn run_commands(
                     }
                 };
 
-                match press {
-                    Some(Press::Form(title, path)) => {
-                        let _ = backend.commands.send(Command::OpenForm { title, path });
-                    }
-                    Some(Press::Remove(action, field)) => {
-                        match client
-                            .remove_shares(&action, std::slice::from_ref(&field))
-                            .await
-                        {
-                            Ok(()) => {
-                                say(&backend.ui, "Share removed");
-                                let _ = backend.commands.send(Command::OpenShares);
-                            }
-                            Err(e) => say(&backend.ui, format!("could not remove {field}: {e}")),
+                // Off the loop, but in order: unmounting two shares one after
+                // the other sends the second against the list the first left.
+                // See `lane`.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match press {
+                        Some(Press::Form(title, path)) => {
+                            let _ = backend.commands.send(Command::OpenForm { title, path });
                         }
+                        Some(Press::Remove(action, field)) => {
+                            match client
+                                .remove_shares(&action, std::slice::from_ref(&field))
+                                .await
+                            {
+                                Ok(()) => {
+                                    say(&backend.ui, "Share removed");
+                                    let _ = backend.commands.send(Command::OpenShares);
+                                }
+                                Err(e) => {
+                                    say(&backend.ui, format!("could not remove {field}: {e}"))
+                                }
+                            }
+                        }
+                        None => {}
                     }
-                    None => {}
-                }
+                });
                 continue;
             }
 
@@ -5621,22 +5864,30 @@ async fn run_commands(
                     .clone()
                     .unwrap_or_else(|| "/ui/nowPlayingCM".to_owned());
 
-                match client.screen(&uri).await {
-                    Ok(menu) => {
-                        let action = menu.items().find_map(|item| {
-                            let action = item.action.as_ref()?;
-                            (action.result_type.as_deref() == Some("BriefInfo"))
-                                .then(|| action.clone())
-                        });
-                        match action {
-                            Some(action) => {
-                                run_action(backend.clone(), id, action, Arrive::Deeper).await;
+                // Off the loop, for the reason spelled out on `BrowseHome`.
+                // This one is two round trips deep — the menu, then whatever
+                // it points at — so it is the worst of them to await here.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.screen(&uri).await {
+                        Ok(menu) => {
+                            let action = menu.items().find_map(|item| {
+                                let action = item.action.as_ref()?;
+                                (action.result_type.as_deref() == Some("BriefInfo"))
+                                    .then(|| action.clone())
+                            });
+                            match action {
+                                Some(action) => {
+                                    run_action(backend.clone(), id, action, Arrive::Deeper).await;
+                                }
+                                None => {
+                                    say(&backend.ui, "The player offers nothing about this track")
+                                }
                             }
-                            None => say(&backend.ui, "The player offers nothing about this track"),
                         }
+                        Err(e) => tracing::debug!(%id, "no now-playing menu: {e}"),
                     }
-                    Err(e) => tracing::debug!(%id, "no now-playing menu: {e}"),
-                }
+                });
                 continue;
             }
 
@@ -5652,27 +5903,53 @@ async fn run_commands(
                     if browsing.fetching_more {
                         continue;
                     }
+                    let era = browsing.era;
                     let next = browsing
                         .current()
                         .and_then(|screen| screen.next.clone())
-                        .zip(browsing.device);
+                        .zip(browsing.device)
+                        .map(|(next, id)| (next, id, era));
                     if next.is_some() {
                         browsing.fetching_more = true;
                     }
                     next
                 };
-                let Some((next, id)) = asking else { continue };
+                let Some((next, id, era)) = asking else {
+                    continue;
+                };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     backend.browsing.lock().unwrap().fetching_more = false;
                     continue;
                 };
 
-                match client.screen(&next).await {
-                    Ok(more) => {
-                        {
-                            let mut browsing = backend.browsing.lock().unwrap();
-                            browsing.fetching_more = false;
-                            if let Some(crumb) = browsing.trail.last_mut() {
+                // Off the loop, for the reason spelled out on `BrowseHome`.
+                // `fetching_more` already keeps two of these from being in
+                // flight at once, and `era` throws away a page that outlived
+                // the screen it belonged to.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.screen(&next).await {
+                        Ok(more) => {
+                            // The screen this page belongs to may be gone: the
+                            // request went out off the loop, and a press or a
+                            // staleness refresh in the meantime pushes a crumb of
+                            // its own. Grafted on regardless, page two of the
+                            // artists appeared under an album, and the album's
+                            // own cursor was replaced by the artists' next one, so
+                            // scrolling it kept paging the wrong list in.
+                            // How much of the screen was already there, so the
+                            // artwork walk below can start where this page does.
+                            let had;
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                browsing.fetching_more = false;
+                                if browsing.era != era {
+                                    return;
+                                }
+                                let Some(crumb) = browsing.trail.last_mut() else {
+                                    return;
+                                };
+                                had = crumb.screen.items().count();
                                 // Added to the section already on screen rather
                                 // than as one of its own: it is the same list,
                                 // continued, and a heading between page one and
@@ -5688,15 +5965,15 @@ async fn run_commands(
                                 }
                                 crumb.screen.next = more.next;
                             }
+                            backend.publish_browse();
+                            tokio::spawn(load_browse_thumbnails(backend.clone(), id, had));
                         }
-                        backend.publish_browse();
-                        tokio::spawn(load_browse_thumbnails(backend.clone(), id));
+                        Err(e) => {
+                            backend.browsing.lock().unwrap().fetching_more = false;
+                            tracing::debug!(%id, "could not read {next}: {e}");
+                        }
                     }
-                    Err(e) => {
-                        backend.browsing.lock().unwrap().fetching_more = false;
-                        tracing::debug!(%id, "could not read {next}: {e}");
-                    }
-                }
+                });
                 continue;
             }
 
@@ -5850,14 +6127,20 @@ async fn run_commands(
             }
 
             Command::CustomiseSave => {
-                let saved = {
+                // One lock after the other rather than one inside the other:
+                // nothing here needs both at once, so this need not join the
+                // `arrangement` exception noted on `Backend`.
+                let arranged = {
                     let browsing = backend.browsing.lock().unwrap();
                     let Pane::Customise(page) = &browsing.pane else {
                         continue;
                     };
                     let ids: Vec<String> = page.rows.iter().map(|(id, _)| id.clone()).collect();
+                    (page.screen.clone(), ids)
+                };
+                let saved = {
                     let mut orders = backend.orders.lock().unwrap();
-                    orders.insert(page.screen.clone(), ids);
+                    orders.insert(arranged.0, arranged.1);
                     orders.clone()
                 };
                 // Written on the spot rather than at exit: the app is a
