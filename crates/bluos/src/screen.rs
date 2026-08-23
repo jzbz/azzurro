@@ -1720,4 +1720,41 @@ mod tests {
         assert_eq!(stream_url("/Play?url="), None);
         assert_eq!(stream_url("/Add?playnow=1&file=%2Fx.flac"), None);
     }
+    #[test]
+    fn a_source_may_carry_its_name_only_on_its_action() {
+        // Home's Most Used shelf, exactly as a Powernode writes it: the inputs
+        // and the library are titled, the two radio services are not, and
+        // their names live on the action instead. Anything choosing an icon
+        // from the label alone sees nothing for those two.
+        let xml = r##"<screen version="1" id="screen-home">
+  <row id="mostUsed" title="Most Used">
+    <source icon="/images/LibraryIcon.png" title="Library">
+      <action type="browse" URI="/ui/browseMenuGroup?service=LocalMusic" title="Library"></action>
+    </source>
+    <source icon="/images/ui/Source/RadioParadiseLogo.png">
+      <action type="browse" URI="/ui/browseMenuGroup?service=RadioParadise" title="Radio Paradise"></action>
+    </source>
+    <source icon="/images/ui/Source/TuneInLogo.png">
+      <action type="browse" URI="/ui/browseMenuGroup?service=TuneIn" title="TuneIn"></action>
+    </source>
+  </row>
+</screen>"##;
+        let screen = parse(xml).expect("parses");
+        let named: Vec<&str> = screen
+            .items()
+            .map(|item| {
+                item.label().unwrap_or_else(|| {
+                    item.action
+                        .as_ref()
+                        .and_then(|a| a.title.as_deref())
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        assert_eq!(named, ["Library", "Radio Paradise", "TuneIn"]);
+
+        // The half that makes the fallback necessary.
+        let labels: Vec<Option<&str>> = screen.items().map(|item| item.label()).collect();
+        assert_eq!(labels, [Some("Library"), None, None]);
+    }
 }

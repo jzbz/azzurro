@@ -2437,19 +2437,35 @@ impl Backend {
                         .or(item.icon.as_deref())
                         .filter(|src| !src.is_empty());
 
+                    // What the row is called, for the purpose of choosing an
+                    // icon for it.
+                    //
+                    // Not always the item's own label: Home's Most Used shelf
+                    // writes Radio Paradise and TuneIn as `<source>` elements
+                    // with no title at all, and the name comes from the action
+                    // instead — which is where the caption gets it too. With
+                    // only the label to go on there was nothing to match and
+                    // both kept their logos.
+                    let named = item.label().unwrap_or_else(|| {
+                        item.action
+                            .as_ref()
+                            .and_then(|a| a.title.as_deref())
+                            .unwrap_or_default()
+                    });
+
                     // A service picker is a row of names in the app's own
                     // chrome, so it gets the app's own icons; everywhere else
                     // the player's picture wins when it is content.
                     let glyph = if kind == 2 {
-                        Some(glyphs::service_glyph(item.label().unwrap_or_default()))
+                        Some(glyphs::service_glyph(named))
                     } else if item
                         .action
                         .as_ref()
                         .is_some_and(bluos::Action::is_browse_menu)
                     {
-                        Some(glyphs::menu_glyph(item.label().unwrap_or_default()))
+                        Some(glyphs::menu_glyph(named))
                     } else {
-                        glyphs::glyph_for(item.label().unwrap_or_default(), source)
+                        glyphs::glyph_for(named, source)
                     };
                     // A glyph makes the picture beside it redundant, and not
                     // fetching it saves a request the player would have served.

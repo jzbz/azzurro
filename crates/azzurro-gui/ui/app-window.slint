@@ -1129,6 +1129,29 @@ component BrowseTile inherits Rectangle {
     background: touch.has-hover ? Theme.hover : transparent;
     animate background { duration: 120ms; easing: ease-out; }
 
+    // Declared before the contents on purpose. A later sibling sits
+    // above an earlier one for hit-testing as well as drawing, so with
+    // this last the dots over the artwork were covered by it and a
+    // left-click on them opened the album instead of its menu.
+    touch := TouchArea {
+        // A tile with a menu but nowhere to go is still worth pressing.
+        enabled: root.entry.actionable || root.entry.has-menu;
+        clicked => {
+            if (root.entry.actionable) {
+                root.activate();
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up
+                && event.button == PointerEventButton.right
+                && root.entry.has-menu) {
+                root.open-menu(
+                    root.absolute-position.y,
+                    root.absolute-position.x + root.width);
+            }
+        }
+    }
+
     VerticalLayout {
         padding: 6px;
         spacing: 7px;
@@ -1226,24 +1249,6 @@ component BrowseTile inherits Rectangle {
         }
     }
 
-    touch := TouchArea {
-        // A tile with a menu but nowhere to go is still worth pressing.
-        enabled: root.entry.actionable || root.entry.has-menu;
-        clicked => {
-            if (root.entry.actionable) {
-                root.activate();
-            }
-        }
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.up
-                && event.button == PointerEventButton.right
-                && root.entry.has-menu) {
-                root.open-menu(
-                    root.absolute-position.y,
-                    root.absolute-position.x + root.width);
-            }
-        }
-    }
 }
 
 // One service in a selector menu. Favourites and Search are per-service on a
