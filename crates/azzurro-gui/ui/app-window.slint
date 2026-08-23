@@ -2337,6 +2337,137 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // Inside the pane, like Now Playing beside it, and not a
+                // column of the row those two sit in. As a sibling of the
+                // browse pane it was fine while an `if` kept it out of the
+                // tree, but once it was always present to carry a fade it
+                // claimed a share of the row for good — the pane and an
+                // invisible overlay splitting the width between them, which
+                // is why the middle of the window stopped halfway.
+                customise-fade := Rectangle {
+                    opacity: root.customising ? 1.0 : 0.0;
+                    visible: self.opacity > 0.0;
+
+                    animate opacity {
+                        duration: 220ms;
+                        easing: ease-out;
+                    }
+
+                    if customise-fade.visible: Rectangle {
+                    background: Theme.bg;
+                    clip: true;
+
+                    VerticalLayout {
+                        padding: Theme.pad;
+                        spacing: Theme.pad;
+
+                        HorizontalLayout {
+                            spacing: Theme.gap;
+
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    glyph: Icons.close;
+                                    size: 30px;
+                                    glyph-size: 16px;
+                                    clicked => { root.browse-back(); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: root.customise-title;
+                                    font-size: Theme.title-size + 2px;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                PillButton {
+                                    label: "SAVE";
+                                    primary: true;
+                                    clicked => { root.customise-save(); }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Drag the sections into the order you want them on this screen. "
+                                + "Sections the player pins in place are not listed.";
+                            font-size: Theme.small-size;
+                            color: Theme.dim;
+                            wrap: word-wrap;
+                        }
+
+                        order-list := ListView {
+                            vertical-stretch: 1;
+
+                            property <length> row-height: 58px;
+                            // Where a drag started and where it would land. Both
+                            // -1 when nothing is being dragged.
+                            property <int> from-row: -1;
+                            property <int> to-row: -1;
+                            property <bool> dragging: self.from-row >= 0;
+
+                            for section-name[i] in root.customise-rows: VerticalLayout {
+                                place := Rectangle {
+                                    height: order-list.row-height;
+
+                                    // The same shuffle the queue does: everything
+                                    // between the grabbed row and the drop steps
+                                    // aside so the gap opens where it will land.
+                                    property <length> lift: order-list.from-row == i
+                                        ? (order-list.to-row - order-list.from-row) * order-list.row-height
+                                        : (order-list.dragging
+                                            && i > order-list.from-row
+                                            && i <= order-list.to-row
+                                            ? -order-list.row-height
+                                            : (order-list.dragging
+                                                && i < order-list.from-row
+                                                && i >= order-list.to-row
+                                                ? order-list.row-height
+                                                : 0px));
+
+                                    CustomiseRow {
+                                        label: section-name;
+                                        lifted: order-list.from-row == i;
+                                        y: place.lift;
+                                        lift: place.lift;
+                                        drag-moved(offset) => {
+                                            if (order-list.from-row < 0) {
+                                                order-list.from-row = i;
+                                            }
+                                            order-list.to-row = Math.clamp(
+                                                order-list.from-row
+                                                    + Math.round(offset / order-list.row-height),
+                                                0, root.customise-rows.length - 1);
+                                        }
+                                        drag-done => {
+                                            if (order-list.to-row != order-list.from-row) {
+                                                root.customise-move(order-list.from-row, order-list.to-row);
+                                            }
+                                            order-list.from-row = -1;
+                                            order-list.to-row = -1;
+                                        }
+                                        drag-cancelled => {
+                                            order-list.from-row = -1;
+                                            order-list.to-row = -1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+                }
+
             }
 
             // Rearranging the sections of a screen.
@@ -2347,130 +2478,6 @@ export component AppWindow inherits Window {
             // Faded like Now Playing, and for the same reason — these two are
             // siblings covering the same pane, and only one of them arriving
             // gently was the odd thing.
-            customise-fade := Rectangle {
-                opacity: root.customising ? 1.0 : 0.0;
-                visible: self.opacity > 0.0;
-
-                animate opacity {
-                    duration: 220ms;
-                    easing: ease-out;
-                }
-
-                if customise-fade.visible: Rectangle {
-                background: Theme.bg;
-                clip: true;
-
-                VerticalLayout {
-                    padding: Theme.pad;
-                    spacing: Theme.pad;
-
-                    HorizontalLayout {
-                        spacing: Theme.gap;
-
-                        VerticalLayout {
-                            alignment: center;
-                            IconButton {
-                                glyph: Icons.close;
-                                size: 30px;
-                                glyph-size: 16px;
-                                clicked => { root.browse-back(); }
-                            }
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-
-                            Text {
-                                text: root.customise-title;
-                                font-size: Theme.title-size + 2px;
-                                font-weight: 600;
-                                color: Theme.text;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                label: "SAVE";
-                                primary: true;
-                                clicked => { root.customise-save(); }
-                            }
-                        }
-                    }
-
-                    Text {
-                        text: "Drag the sections into the order you want them on this screen. "
-                            + "Sections the player pins in place are not listed.";
-                        font-size: Theme.small-size;
-                        color: Theme.dim;
-                        wrap: word-wrap;
-                    }
-
-                    order-list := ListView {
-                        vertical-stretch: 1;
-
-                        property <length> row-height: 58px;
-                        // Where a drag started and where it would land. Both
-                        // -1 when nothing is being dragged.
-                        property <int> from-row: -1;
-                        property <int> to-row: -1;
-                        property <bool> dragging: self.from-row >= 0;
-
-                        for section-name[i] in root.customise-rows: VerticalLayout {
-                            place := Rectangle {
-                                height: order-list.row-height;
-
-                                // The same shuffle the queue does: everything
-                                // between the grabbed row and the drop steps
-                                // aside so the gap opens where it will land.
-                                property <length> lift: order-list.from-row == i
-                                    ? (order-list.to-row - order-list.from-row) * order-list.row-height
-                                    : (order-list.dragging
-                                        && i > order-list.from-row
-                                        && i <= order-list.to-row
-                                        ? -order-list.row-height
-                                        : (order-list.dragging
-                                            && i < order-list.from-row
-                                            && i >= order-list.to-row
-                                            ? order-list.row-height
-                                            : 0px));
-
-                                CustomiseRow {
-                                    label: section-name;
-                                    lifted: order-list.from-row == i;
-                                    y: place.lift;
-                                    lift: place.lift;
-                                    drag-moved(offset) => {
-                                        if (order-list.from-row < 0) {
-                                            order-list.from-row = i;
-                                        }
-                                        order-list.to-row = Math.clamp(
-                                            order-list.from-row
-                                                + Math.round(offset / order-list.row-height),
-                                            0, root.customise-rows.length - 1);
-                                    }
-                                    drag-done => {
-                                        if (order-list.to-row != order-list.from-row) {
-                                            root.customise-move(order-list.from-row, order-list.to-row);
-                                        }
-                                        order-list.from-row = -1;
-                                        order-list.to-row = -1;
-                                    }
-                                    drag-cancelled => {
-                                        order-list.from-row = -1;
-                                        order-list.to-row = -1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                }
-            }
-
             // The queue, with the record it is playing behind it. Hidden by
             // the button beside the volume: on a narrow window it is a third
             // of the width spent on a list you may not be using.
