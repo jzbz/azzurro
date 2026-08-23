@@ -2030,6 +2030,13 @@ export component AppWindow inherits Window {
                     // bottom of the pane.
                     if !root.in-settings && root.browse-empty == "": ListView {
                         vertical-stretch: 1;
+                        // A ListView is a Flickable, and a Flickable sizes its
+                        // viewport to what the content would like to be — so
+                        // rows stopped at their own preferred width and left
+                        // the rest of the pane empty. Invisible while the
+                        // window opened at 1100 and the pane was narrower than
+                        // that preference; plain at 1440.
+                        viewport-width: self.width;
 
                         // A library's Artists page answers thirty of four
                         // hundred and hands over the request for the next
@@ -2162,6 +2169,10 @@ export component AppWindow inherits Window {
 
                     if root.in-settings: ListView {
                         vertical-stretch: 1;
+                        // As above: without this the settings, Help and
+                        // technical-info rows are as wide as they would like
+                        // rather than as wide as the pane.
+                        viewport-width: self.width;
 
                         for item in root.settings: SettingRow {
                             item: item;
