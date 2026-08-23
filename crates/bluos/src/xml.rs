@@ -65,6 +65,39 @@ pub(crate) fn attributes(e: &BytesStart<'_>) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The text an entity reference stands for.
+///
+/// quick-xml hands `&amp;` back as its own `GeneralRef` event rather than as
+/// part of the text, so a parser collecting text has to resolve them itself.
+/// The five named ones XML defines, plus numeric references — `&#38;` and
+/// `&#x26;` — which were being dropped silently.
+///
+/// Anything else comes back as it was written. A name this does not know is
+/// more likely a real ampersand the document failed to escape than an entity
+/// worth deleting, and deleting it loses characters out of the middle of a
+/// title with nothing to show for it.
+pub(crate) fn entity(name: &str) -> String {
+    match name {
+        "amp" => "&".to_owned(),
+        "lt" => "<".to_owned(),
+        "gt" => ">".to_owned(),
+        "quot" => "\"".to_owned(),
+        "apos" => "'".to_owned(),
+        _ => {
+            let number =
+                name.strip_prefix('#')
+                    .and_then(|digits| match digits.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => digits.parse().ok(),
+                    });
+            match number.and_then(char::from_u32) {
+                Some(c) => c.to_string(),
+                None => format!("&{name};"),
+            }
+        }
+    }
+}
+
 /// An attribute read as a boolean.
 ///
 /// The player writes `"true"` in most places and `"1"` in a few, and an absent

@@ -26,7 +26,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 
 use crate::error::{Error, Result};
-use crate::xml::{attributes, flag, local_name};
+use crate::xml::{attributes, entity, flag, local_name};
 
 /// Everything needed to put one track on a playlist.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -80,7 +80,11 @@ impl AddToPlaylist {
 /// something else back means the player and this app disagree.
 pub fn parse(xml: &str) -> Result<AddToPlaylist> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Not trimmed per fragment. A name containing an entity arrives as three
+    // events — "Rock ", the `&`, " Roll" — and trimming each one on the way in
+    // eats the spaces around the ampersand before they can be joined up.
+    // Trimmed once when the element closes instead.
+    reader.config_mut().trim_text(false);
 
     let mut out = AddToPlaylist::default();
     let mut seen_root = false;
@@ -137,24 +141,67 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                 };
                 let text = e.decode().unwrap_or_default().into_owned();
                 match what {
+                    // Appended, not assigned: a name with an entity in it
+                    // arrives as several events and has to be joined up.
                     "playlistName" => {
                         if let Some(playlist) =
                             out.groups.last_mut().and_then(|g| g.playlists.last_mut())
-                            && playlist.name.is_empty()
                         {
-                            playlist.name = text;
+                            playlist.name.push_str(&text);
                         }
                     }
-                    "urlPath" => out.url_path = text,
+                    "urlPath" => out.url_path.push_str(&text),
                     "requestParameter" => {
-                        if let Some(pair) = decode_parameter(&text) {
+                        if let Some(pair) = decode_parameter(text.trim()) {
                             out.parameters.push(pair);
                         }
                     }
                     _ => {}
                 }
             }
-            Ok(Event::End(_)) => collecting = None,
+            // quick-xml delivers `&amp;` as an event of its own rather than
+            // as part of the text around it, so a parser that only handles
+            // `Text` loses everything from the entity onwards: a playlist
+            // called "Rock & Roll" arrived as "Rock", and that truncated name
+            // is what got posted back, since BluOS files by name and not by
+            // id. `screen.rs` has handled this from the start; this did not.
+            Ok(Event::GeneralRef(e)) => {
+                let Some(what) = collecting.as_deref() else {
+                    continue;
+                };
+                let Ok(name) = e.decode() else { continue };
+                let resolved = entity(name.as_ref());
+                match what {
+                    "playlistName" => {
+                        if let Some(playlist) =
+                            out.groups.last_mut().and_then(|g| g.playlists.last_mut())
+                        {
+                            playlist.name.push_str(&resolved);
+                        }
+                    }
+                    "urlPath" => out.url_path.push_str(&resolved),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                // Now that the whole value is in hand.
+                match collecting.as_deref() {
+                    Some("playlistName") => {
+                        if let Some(playlist) =
+                            out.groups.last_mut().and_then(|g| g.playlists.last_mut())
+                        {
+                            let trimmed = playlist.name.trim().to_owned();
+                            playlist.name = trimmed;
+                        }
+                    }
+                    Some("urlPath") => {
+                        let trimmed = out.url_path.trim().to_owned();
+                        out.url_path = trimmed;
+                    }
+                    _ => {}
+                }
+                collecting = None;
+            }
             Ok(_) => {}
             Err(e) => return Err(Error::Screen(format!("{e}"))),
         }
@@ -299,5 +346,26 @@ mod tests {
     fn some_other_document_is_refused() {
         assert!(parse("<screen><row/></screen>").is_err());
         assert!(parse("not xml at all").is_err());
+    }
+    #[test]
+    fn a_name_with_an_ampersand_in_it_survives_whole() {
+        // The name is what gets posted back — BluOS files by name, not by id —
+        // so losing everything after the entity filed the track under a
+        // playlist nobody had.
+        let xml = r#"<addToPlaylistOptions service="LocalMusic">
+  <urlPath>/AddToPlaylist</urlPath>
+  <playlists service="LocalMusic" create="1">
+    <name>Rock &amp; Roll</name>
+    <name>Drum &#38; Bass</name>
+    <name>&amp;</name>
+  </playlists>
+</addToPlaylistOptions>"#;
+        let options = parse(xml).expect("parses");
+        let names: Vec<&str> = options.groups[0]
+            .playlists
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["Rock & Roll", "Drum & Bass", "&"]);
     }
 }
