@@ -1384,6 +1384,12 @@ component Indeterminate inherits Rectangle {
 
     property <bool> swung: false;
 
+    // The bar it lives in is always built — it animates its own collapse, so
+    // it cannot be an `if` — which left this timer waking the whole event loop
+    // every 1.1 seconds for the life of the process, to slide a rectangle
+    // nobody could see. The owner says when there is something to show.
+    in property <bool> sweeping: true;
+
     Rectangle {
         width: parent.width * 0.32;
         height: parent.height;
@@ -1395,7 +1401,7 @@ component Indeterminate inherits Rectangle {
 
     Timer {
         interval: 1100ms;
-        running: true;
+        running: root.sweeping;
         triggered => { root.swung = !root.swung; }
     }
 }
@@ -1682,7 +1688,13 @@ export component AppWindow inherits Window {
     // read was barely wider than the two edges put together.
     preferred-width: 1440px;
     preferred-height: 920px;
-    min-width: 900px;
+    // No min-width. This said 900px, which the window could not honour: the
+    // transport bar's own minimum measures 948px, so dragging down to 900 did
+    // not shrink the bar, it pushed the last control in it — the button that
+    // hides the queue — off the right edge where nothing could reach it.
+    // Letting the layout state its own minimum keeps that from happening
+    // again the next time something joins that row. Height still needs saying,
+    // since nothing in the window is tall enough to insist on one.
     min-height: 560px;
     background: Theme.bg;
 
@@ -2307,7 +2319,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                Indeterminate {}
+                                Indeterminate { sweeping: root.indexing != ""; }
                             }
                         }
                     }
@@ -2334,6 +2346,18 @@ export component AppWindow inherits Window {
                     animate opacity {
                         duration: 220ms;
                         easing: ease-out;
+                    }
+
+                    // Takes the pointer while it is up. Neither fade declared
+                    // an input item, so presses and the wheel went straight
+                    // through to the browse rows underneath — a menu opening
+                    // for a row nobody could see, and scrolling asking the
+                    // player for more of a list that was not on screen. The
+                    // scroll handler is separate from the touch area: a
+                    // `TouchArea` alone does not stop a wheel.
+                    TouchArea {
+                        enabled: root.now-playing;
+                        scroll-event(e) => { return accept; }
                     }
 
                     if fade.visible: Rectangle {
@@ -2479,6 +2503,18 @@ export component AppWindow inherits Window {
                     animate opacity {
                         duration: 220ms;
                         easing: ease-out;
+                    }
+
+                    // Takes the pointer while it is up. Neither fade declared
+                    // an input item, so presses and the wheel went straight
+                    // through to the browse rows underneath — a menu opening
+                    // for a row nobody could see, and scrolling asking the
+                    // player for more of a list that was not on screen. The
+                    // scroll handler is separate from the touch area: a
+                    // `TouchArea` alone does not stop a wheel.
+                    TouchArea {
+                        enabled: root.customising;
+                        scroll-event(e) => { return accept; }
                     }
 
                     if customise-fade.visible: Rectangle {
@@ -2672,6 +2708,15 @@ export component AppWindow inherits Window {
                     // is waiting on a name.
                     property <int> asking: -1;
                     property <int> naming: -1;
+                    // The button being asked about, kept whole rather than
+                    // looked up again by position. The buttons are drawn from
+                    // two models — three across, the rest below — and the
+                    // index from the second was being read against the first,
+                    // so a confirmation raised from the lower row showed a
+                    // blank question and confirmed whatever was first in the
+                    // top row instead. Which is Save, on every document
+                    // captured.
+                    property <QueueButton> asked;
 
                     // Where a drag started and where it would land, both as
                     // rows of the model. A row's height is a constant because
@@ -2690,6 +2735,7 @@ export component AppWindow inherits Window {
                         if (button.mode == 1) {
                             self.editing = true;
                         } else if (button.mode == 2) {
+                            self.asked = button;
                             self.asking = at;
                         } else if (button.mode == 3) {
                             self.naming = at;
@@ -2727,11 +2773,31 @@ export component AppWindow inherits Window {
                             // its place in the player's queue. Anything said to
                             // the player goes through `id`, anything that is
                             // geometry goes through `i`.
-                            if i == root.queue-cursor && !pane.dragging && !pane.editing:
-                                QueueBand { label: "CURRENTLY PLAYING"; }
+                            // Which row has a band stays an `if` — otherwise
+                            // every row would carry two of them and grow by
+                            // their height. Whether it is *drawn* during a
+                            // drag is `visible`, because an `if` takes it out
+                            // of the layout, and removing 26px from above the
+                            // grabbed row moves that row after `pressed-y` was
+                            // captured. Every drag carried the difference as
+                            // bias and landed a row further than it was
+                            // dropped; left in the layout and merely not
+                            // drawn, the arithmetic that divides the offset by
+                            // a constant row height is true again.
+                            if root.queue-cursor >= 0 && i == root.queue-cursor:
+                                QueueBand {
+                                    label: "CURRENTLY PLAYING";
+                                    visible: !pane.dragging && !pane.editing;
+                                }
 
-                            if i == root.queue-cursor + 1 && !pane.dragging && !pane.editing:
-                                QueueBand { label: "UP NEXT"; }
+                            // Guarded on the cursor too: at -1 the test below
+                            // read `i == 0` and put UP NEXT over the first row
+                            // of a queue with nothing playing.
+                            if root.queue-cursor >= 0 && i == root.queue-cursor + 1:
+                                QueueBand {
+                                    label: "UP NEXT";
+                                    visible: !pane.dragging && !pane.editing;
+                                }
 
                             // The row sits in a slot of its own so that a drag
                             // can move it: a layout owns its children's `y`,
@@ -2798,7 +2864,7 @@ export component AppWindow inherits Window {
                         spacing: Theme.gap;
 
                         Text {
-                            text: root.queue-buttons[pane.asking].question;
+                            text: pane.asked.question;
                             font-size: Theme.small-size;
                             color: Theme.dim;
                             horizontal-alignment: center;
@@ -2810,10 +2876,10 @@ export component AppWindow inherits Window {
                             spacing: Theme.gap;
 
                             PillButton {
-                                label: root.queue-buttons[pane.asking].label;
+                                label: pane.asked.label;
                                 primary: true;
                                 clicked => {
-                                    root.queue-button(root.queue-buttons[pane.asking].index);
+                                    root.queue-button(pane.asked.index);
                                     pane.asking = -1;
                                 }
                             }
