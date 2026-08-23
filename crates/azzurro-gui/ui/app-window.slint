@@ -835,7 +835,7 @@ component TrackRow inherits Rectangle {
         // Centred by its own layout, like the badge beside it. Left as a
         // direct child of the row it filled the row's height instead, which
         // put the dots above the middle of everything they sit next to.
-        if !root.editing: VerticalLayout {
+        if !root.editing && !root.lifted: VerticalLayout {
             alignment: center;
 
             IconButton {
@@ -860,16 +860,28 @@ component TrackRow inherits Rectangle {
         // In Edit mode the row trades what it says for what can be done to it,
         // which is what the official controller does too: the menu and the
         // running time give way to a delete and a grip.
-        if root.editing: IconButton {
-            glyph: Icons.clear;
-            size: 26px;
-            glyph-size: 15px;
-            tint: Theme.dim;
-            clicked => { root.remove(); }
-        }
-
+        // Centred by its own layout, like the grip beside it. As a direct
+        // child it filled the row's height instead and sat above the middle of
+        // everything next to it — the same thing the menu button used to do.
         if root.editing: VerticalLayout {
             alignment: center;
+
+            IconButton {
+                glyph: Icons.clear;
+                size: 26px;
+                glyph-size: 15px;
+                tint: Theme.dim;
+                clicked => { root.remove(); }
+            }
+        }
+
+        // The grip: always there while editing, and while a row is actually
+        // being dragged outside it. Shown in the menu button's place rather
+        // than beside it, and at the same width, so picking a row up does not
+        // shuffle everything on that end of it.
+        if root.editing || root.lifted: VerticalLayout {
+            alignment: center;
+            width: root.editing ? 15px : 30px;
 
             Icon {
                 glyph: Icons.grip;
