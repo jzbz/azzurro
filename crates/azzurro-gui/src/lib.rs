@@ -504,6 +504,91 @@ struct Backend {
     orders: Arc<Mutex<order::Orders>>,
 }
 
+/// The player's own words, in American spelling.
+///
+/// BluOS writes British: "Favourites", "Customise Home", "Added to
+/// favourites". Those are chrome — the app's furniture, which happens to be
+/// authored by the speaker — and they read oddly beside this app's own text.
+///
+/// **Only ever call this on chrome.** Screen and section titles, menu labels,
+/// button captions. Never on an item's title, subtitle or artist: those are
+/// content, and a pass over them renames *Favourite Worst Nightmare*. The
+/// boundary is the whole reason this is a function called at a handful of
+/// sites rather than a filter over everything on its way to the window — and
+/// why the list below is three words rather than a dictionary.
+///
+/// Whole words only, and case preserved on the first letter, so "Favourites"
+/// and "favourites" both come out right and "Colourbox" is left alone.
+fn american(text: &str) -> String {
+    // Three words, and only because the player was seen writing all three:
+    // "Favourites" and "My Favourites" as screen and section titles,
+    // "Favourite" and "Remove favourite" in context menus, "Customise Home"
+    // and "Customise" on buttons. Nothing else British has turned up in its
+    // chrome.
+    //
+    // The list stays this short on purpose. A screen's title is chrome when it
+    // says "Favourites" and content when it is an album's name, and there is
+    // nothing in the document that tells them apart — so the only protection
+    // against renaming a record is that the words being replaced are ones no
+    // record is likely to be called. "Colour" and "Centre" were in an earlier
+    // draft and came out again for exactly that reason.
+    const PAIRS: &[(&str, &str)] = &[
+        ("favourite", "favorite"),
+        ("favourites", "favorites"),
+        ("customise", "customize"),
+    ];
+
+    // Split on word boundaries so a substring cannot be caught: `is_alphabetic`
+    // rather than whitespace, since "Add to playlist…" and "Favourites," both
+    // end a word on punctuation.
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        let lower = word.to_lowercase();
+        match PAIRS.iter().find(|(from, _)| *from == lower) {
+            Some((_, to)) => {
+                // Match the case of what was written. Three shapes and no
+                // more, because that is all these labels use: a section
+                // heading is upper — "FAVOURITES" — a title is capitalized,
+                // and a word inside a sentence is lower.
+                let upper = word.chars().filter(|c| c.is_alphabetic()).count() > 1
+                    && word
+                        .chars()
+                        .filter(|c| c.is_alphabetic())
+                        .all(char::is_uppercase);
+                if upper {
+                    out.extend(to.chars().flat_map(char::to_uppercase));
+                } else if word.chars().next().is_some_and(char::is_uppercase) {
+                    let mut chars = to.chars();
+                    if let Some(first) = chars.next() {
+                        out.extend(first.to_uppercase());
+                        out.push_str(chars.as_str());
+                    }
+                } else {
+                    out.push_str(to);
+                }
+            }
+            None => out.push_str(word),
+        }
+        word.clear();
+    };
+
+    for c in text.chars() {
+        if c.is_alphabetic() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 /// What to print on a format badge.
 ///
 /// The player says `hd` for anything above CD, and the official controller
@@ -1378,14 +1463,17 @@ impl Backend {
                     // `<item text="Favourite">` and leaves `title` empty, so
                     // reading `title` here dropped every line and the menu
                     // reported that the player had offered nothing.
-                    let label = item.label()?.to_owned();
-                    let glyph = glyphs::menu_glyph(&label);
+                    // The glyph is chosen from the player's own word and the
+                    // label drawn in ours: the matcher reads what was written,
+                    // the screen shows what this app would have written.
+                    let glyph = glyphs::menu_glyph(item.label()?);
+                    let label = american(item.label()?);
                     Some((at as i32, label, glyph))
                 })
                 .collect();
 
             (
-                menu.heading().unwrap_or_default().to_owned(),
+                american(menu.heading().unwrap_or_default()),
                 menu.subtitle.clone().unwrap_or_default(),
                 menu.image.clone(),
                 rows,
@@ -1694,7 +1782,8 @@ impl Backend {
                             action: section
                                 .menu_actions
                                 .first()
-                                .and_then(|menu| menu.text.clone())
+                                .and_then(|menu| menu.text.as_deref())
+                                .map(american)
                                 .unwrap_or_default(),
                             cover: None,
                             glyph: None,
@@ -2400,8 +2489,8 @@ impl Backend {
                 // "Presets" from "Recently Played" when both are a line of
                 // covers. Chips need no heading; they are self-evident.
                 let heading = match (kind, &section.title) {
-                    (1, Some(title)) => title.clone(),
-                    (0, Some(title)) if listed > 1 => title.clone(),
+                    (1, Some(title)) => american(title),
+                    (0, Some(title)) if listed > 1 => american(title),
                     _ => String::new(),
                 };
                 let size = if kind == 1 { TILE_SIZE } else { THUMB_SIZE };
@@ -2515,7 +2604,7 @@ impl Backend {
                     if let (Some(title), true) = (&section.title, section.action.is_some()) {
                         blocks.push(BlockData {
                             kind: 3,
-                            title: title.clone(),
+                            title: american(title),
                             action: String::new(),
                             section: ordinal as i32,
                             rows: Vec::new(),
@@ -2547,8 +2636,10 @@ impl Backend {
             }
 
             let title = match (screen.heading(), screen.subtitle.as_deref()) {
-                (Some(heading), Some(sub)) => format!("{heading} — {sub}"),
-                (Some(heading), None) => heading.to_owned(),
+                // The heading only. A screen's subtitle is the artist on an
+                // album page — content, not chrome.
+                (Some(heading), Some(sub)) => format!("{} — {sub}", american(heading)),
+                (Some(heading), None) => american(heading),
                 _ => "Browse".to_owned(),
             };
             let search = screen
@@ -3709,8 +3800,9 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                             screen: screen.id.clone()?,
                             title: action
                                 .title
-                                .clone()
-                                .unwrap_or_else(|| "Customise".to_owned()),
+                                .as_deref()
+                                .map(american)
+                                .unwrap_or_else(|| "Customize".to_owned()),
                             rows,
                         })
                     })
@@ -5927,6 +6019,42 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_players_chrome_reads_american() {
+        assert_eq!(american("Favourites"), "Favorites");
+        assert_eq!(american("Customise Home"), "Customize Home");
+        assert_eq!(american("Added to favourites"), "Added to favorites");
+        assert_eq!(american("My Favourites"), "My Favorites");
+        assert_eq!(american("Remove favourite"), "Remove favorite");
+    }
+
+    #[test]
+    fn a_word_that_merely_contains_one_is_left_alone() {
+        // The reason this matches whole words: a band, an album, a label.
+        assert_eq!(american("Colourbox"), "Colourbox");
+        assert_eq!(american("Favouritism"), "Favouritism");
+        // Not on the list at all, because a record is far likelier to be
+        // called one of these than the player is to write it.
+        assert_eq!(american("Colour Haze"), "Colour Haze");
+        assert_eq!(american("The Centre Cannot Hold"), "The Centre Cannot Hold");
+        // And nothing to do at all.
+        assert_eq!(american("Radio Paradise"), "Radio Paradise");
+        assert_eq!(american(""), "");
+    }
+
+    #[test]
+    fn punctuation_and_case_survive() {
+        assert_eq!(american("Favourites,"), "Favorites,");
+        assert_eq!(american("Add to playlist…"), "Add to playlist…");
+        assert_eq!(american("FAVOURITES"), "FAVORITES");
+        assert_eq!(american("Café favourite"), "Café favorite");
+        // Content that happens to look like chrome is the accepted cost.
+        assert_eq!(
+            american("Favourite Worst Nightmare"),
+            "Favorite Worst Nightmare"
+        );
+    }
 
     #[test]
     fn a_picker_action_names_its_service() {
