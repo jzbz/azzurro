@@ -4460,9 +4460,29 @@ async fn run_commands(
                             .and_then(|action| action.uri.clone()),
                     )
                 };
-                if let Some((id, uri)) = opened {
-                    tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Deeper));
-                }
+                let Some((id, uri)) = opened else { continue };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+
+                // The same panel the queue's rows open, rather than a screen
+                // pushed onto the browse trail. One gesture, one answer: a
+                // menu that replaced the page you were reading was how the
+                // queue's dots used to behave, and it read as nothing having
+                // happened.
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.screen(&uri).await {
+                        Ok(menu) => {
+                            backend.browsing.lock().unwrap().queue_menu = Some(menu);
+                            backend.publish_queue_menu();
+                        }
+                        Err(e) => {
+                            tracing::debug!(%id, "no menu for that row: {e}");
+                            say(&backend.ui, "The player offers nothing for that");
+                        }
+                    }
+                });
                 continue;
             }
 

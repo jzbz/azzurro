@@ -710,8 +710,10 @@ component TrackRow inherits Rectangle {
     // a drag converges instead of tracking.
     in property <length> lift: 0px;
     callback play();
-    // Carries the row's position so the menu can open against it.
-    callback open-menu(length);
+    // Where the row is: its top, and its right edge. The menu opens against
+    // both, so it lands beside the row that asked for it rather than always in
+    // the same corner.
+    callback open-menu(length, length);
     callback remove();
     callback drag-moved(length);
     callback drag-done();
@@ -755,7 +757,9 @@ component TrackRow inherits Rectangle {
                 // is what a right button means everywhere else. Anywhere on
                 // the row, so it does not need the dots to be hit.
                 if (event.button == PointerEventButton.right) {
-                    root.open-menu(root.absolute-position.y);
+                    root.open-menu(
+                        root.absolute-position.y,
+                        root.absolute-position.x + root.width);
                 } else if (root.held) {
                     root.drag-done();
                 // Not while editing. The row is a target for a bin and a grip
@@ -849,7 +853,11 @@ component TrackRow inherits Rectangle {
                 glyph-size: 15px;
                 opacity: touch.has-hover ? 1.0 : 0.45;
                 animate opacity { duration: 120ms; }
-                clicked => { root.open-menu(root.absolute-position.y); }
+                clicked => {
+                    root.open-menu(
+                        root.absolute-position.y,
+                        root.absolute-position.x + root.width);
+                }
             }
         }
 
@@ -921,7 +929,7 @@ component QueueBand inherits HorizontalLayout {
 component BrowseRowView inherits Rectangle {
     in property <BrowseRow> entry;
     callback activate();
-    callback open-menu();
+    callback open-menu(length, length);
 
     height: root.entry.heading ? 30px : 52px;
     border-radius: Theme.radius-small;
@@ -1055,7 +1063,11 @@ component BrowseRowView inherits Rectangle {
                 glyph-size: 16px;
                 opacity: touch.has-hover ? 1.0 : 0.5;
                 animate opacity { duration: 120ms; }
-                clicked => { root.open-menu(); }
+                clicked => {
+                    root.open-menu(
+                        root.absolute-position.y,
+                        root.absolute-position.x + root.width);
+                }
             }
         }
 
@@ -1314,7 +1326,7 @@ component Indeterminate inherits Rectangle {
 component BrowseBlockView inherits VerticalLayout {
     in property <BrowseBlock> block;
     callback activate(int);
-    callback open-menu(int);
+    callback open-menu(int, length, length);
     callback section-action(int);
 
     if root.block.kind == 2: HorizontalLayout {
@@ -1437,7 +1449,7 @@ component BrowseBlockView inherits VerticalLayout {
         for entry in root.block.rows: BrowseRowView {
             entry: entry;
             activate => { root.activate(entry.index); }
-            open-menu => { root.open-menu(entry.index); }
+            open-menu(y, right) => { root.open-menu(entry.index, y, right); }
         }
     }
 }
@@ -1555,8 +1567,12 @@ export component AppWindow inherits Window {
     in property <string> queue-menu-subtitle;
     in property <image> queue-menu-cover;
     in-out property <bool> queue-menu-open: false;
-    // Where the row that opened it sits, in window coordinates.
+    // Where the row that opened it sits, in window coordinates: its top, and
+    // its right edge. The queue's rows sit against the window's right side and
+    // a browse row's dots are further in, so the panel follows rather than
+    // always opening in the same corner.
     in-out property <length> queue-menu-y: 0px;
+    in-out property <length> queue-menu-right: 0px;
     callback queue-menu(int, length);
     callback queue-menu-activate(int);
     // The input waiting to be confirmed, by name. Empty when nothing is.
@@ -2074,7 +2090,11 @@ export component AppWindow inherits Window {
                         for block in root.browse-blocks: BrowseBlockView {
                             block: block;
                             activate(i) => { root.browse-activate(i); }
-                            open-menu(i) => { root.browse-menu(i); }
+                            open-menu(i, y, right) => {
+                                root.queue-menu-y = y;
+                                root.queue-menu-right = right;
+                                root.browse-menu(i);
+                            }
                             section-action(i) => { root.browse-section(i); }
                         }
                     }
@@ -2663,9 +2683,10 @@ export component AppWindow inherits Window {
                                 y: slot.lift;
                                 lift: slot.lift;
                                 play => { root.play-track(root.current.id, track.id); }
-                                open-menu(at) => {
-                                    root.queue-menu-y = at;
-                                    root.queue-menu(track.id, at);
+                                open-menu(y, right) => {
+                                    root.queue-menu-y = y;
+                                    root.queue-menu-right = right;
+                                    root.queue-menu(track.id, y);
                                 }
                                 remove => { root.queue-remove(track.id); }
                                 drag-moved(offset) => {
@@ -3273,7 +3294,10 @@ export component AppWindow inherits Window {
         }
 
         Rectangle {
-            x: parent.width - self.width - Theme.room;
+            x: Math.clamp(
+                root.queue-menu-right - self.width,
+                Theme.room,
+                Math.max(Theme.room, parent.width - self.width - Theme.room));
             // Rises the last few pixels into place rather than appearing at
             // rest, which is what makes it read as coming from the row.
             y: Math.clamp(root.queue-menu-y + 34px,
@@ -3304,7 +3328,10 @@ export component AppWindow inherits Window {
                     padding-bottom: Theme.tight;
                     spacing: Theme.gap;
 
-                    Artwork {
+                    // Only where the menu came with one. A browse row's menu
+                    // often has no artwork at all, and a placeholder note
+                    // beside the title is worse than the title on its own.
+                    if root.queue-menu-cover.width > 0: Artwork {
                         source: root.queue-menu-cover;
                         corner: Theme.radius-small;
                         width: 44px;

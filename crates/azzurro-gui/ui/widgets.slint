@@ -242,6 +242,14 @@ export component Scrubber inherits Rectangle {
         background: Theme.accent;
         opacity: root.enabled && (touch.has-hover || root.dragging) ? 1.0 : 0.0;
         animate opacity { duration: 100ms; }
+
+        // The same glide the fill has. Without it the handle stepped once a
+        // second while the line beside it slid, so hovering a playing track
+        // showed the two coming apart and catching up over and over.
+        animate x {
+            duration: root.dragging ? 0ms : root.glide;
+            easing: linear;
+        }
     }
 
     touch := TouchArea {
