@@ -31,6 +31,20 @@ use quick_xml::events::{BytesStart, Event};
 use crate::error::{Error, Result};
 use crate::xml::{attributes, flag, local_name};
 
+/// How deep a settings document may nest its groups.
+///
+/// `Entry::Group` holds a `Group` directly, so the tree this builds is walked
+/// recursively by four separate things: this crate's own `walk`, the GUI's
+/// `walk_settings`, `Clone`, and the compiler's `Drop` glue. A document
+/// nesting forty thousand deep is about a megabyte — well inside the body cap
+/// — and overflows the stack on the way *out* of the parse, where nothing
+/// could catch it; with `panic = "abort"` that ends the process. Refusing the
+/// document costs a settings page that would not have been readable anyway.
+///
+/// The deepest a player has been seen to write is two: the Audio page holds a
+/// group per output. Sixteen is far past that and far short of a stack.
+const MAX_NESTING: usize = 16;
+
 /// One settings page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -296,6 +310,11 @@ pub fn parse(xml: &str, base: &str) -> Result<Settings> {
             Event::Start(e) => {
                 let qname = e.name();
                 let name = local_name(qname.as_ref());
+                if name == "menuGroup" && groups.len() >= MAX_NESTING {
+                    return Err(Error::Screen(format!(
+                        "settings nested more than {MAX_NESTING} deep"
+                    )));
+                }
                 open(
                     name,
                     &e,
@@ -664,5 +683,26 @@ mod tests {
         .unwrap();
         assert_eq!(page.settings().len(), 1);
         assert_eq!(page.settings()[0].label(), "Go");
+    }
+
+    #[test]
+    fn a_document_nested_past_all_reason_is_refused_not_built() {
+        // Forty thousand deep is about a megabyte — inside the body cap, and
+        // enough to overflow the stack when the tree is dropped. Refused at
+        // the door, nothing is built and nothing has to be unwound.
+        let deep = format!(
+            "<settings>{}{}</settings>",
+            "<menuGroup id=\"g\">".repeat(40_000),
+            "</menuGroup>".repeat(40_000)
+        );
+        assert!(parse(&deep, "http://player").is_err());
+
+        // The depth a real page uses still parses.
+        let ordinary = format!(
+            "<settings>{}{}</settings>",
+            "<menuGroup id=\"g\">".repeat(2),
+            "</menuGroup>".repeat(2)
+        );
+        assert!(parse(&ordinary, "http://player").is_ok());
     }
 }
