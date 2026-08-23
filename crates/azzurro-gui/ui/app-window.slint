@@ -751,7 +751,12 @@ component TrackRow inherits Rectangle {
             // scrubber does the same: `clicked` cannot tell a tap from the end
             // of a drag.
             if (event.kind == PointerEventKind.up) {
-                if (root.held) {
+                // The right button asks what can be done with the row, which
+                // is what a right button means everywhere else. Anywhere on
+                // the row, so it does not need the dots to be hit.
+                if (event.button == PointerEventButton.right) {
+                    root.open-menu(root.absolute-position.y);
+                } else if (root.held) {
                     root.drag-done();
                 // Not while editing. The row is a target for a bin and a grip
                 // then, and a finger that misses both should not start the
@@ -1041,13 +1046,17 @@ component BrowseRowView inherits Rectangle {
         // Always there, not only under the pointer. It is how a whole album
         // gets played, and hunting for a control that appears when you are
         // already on top of it is a poor way to find one.
-        if root.entry.has-menu: IconButton {
-            glyph: Icons.menu;
-            size: 34px;
-            glyph-size: 16px;
-            opacity: touch.has-hover ? 1.0 : 0.5;
-            animate opacity { duration: 120ms; }
-            clicked => { root.open-menu(); }
+        if root.entry.has-menu: VerticalLayout {
+            alignment: center;
+
+            IconButton {
+                glyph: Icons.menu;
+                size: 34px;
+                glyph-size: 16px;
+                opacity: touch.has-hover ? 1.0 : 0.5;
+                animate opacity { duration: 120ms; }
+                clicked => { root.open-menu(); }
+            }
         }
 
         // The chevron says "this opens something" and the dots say "this has a
