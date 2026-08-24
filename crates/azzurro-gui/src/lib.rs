@@ -167,6 +167,18 @@ enum Command {
     QueueMenuAction(usize),
     /// Show what the playing track actually is: format, rate, bit depth.
     NowPlayingInfo,
+    /// Open the alarms screen.
+    OpenAlarms,
+    /// Arm or disarm one from the list.
+    AlarmArm(u32, bool),
+    /// Open the editor: `Some(id)` for one that exists, `None` for a new one.
+    AlarmOpen(Option<u32>),
+    /// Change a field of the alarm being edited. Nothing reaches the player.
+    AlarmEdit(AlarmField),
+    /// Send the working copy to the player.
+    AlarmSave,
+    /// Delete the one being edited.
+    AlarmDelete,
     /// Answer the player's question by pressing one of its buttons. The index
     /// is into the dialog's own list, and out of range means dismissed.
     DialogPress(usize),
@@ -330,6 +342,8 @@ enum Pane {
     /// The record, large. Reached by pressing the artwork on the transport bar,
     /// which is where the official controller puts it too.
     NowPlaying,
+    /// The player's alarms, and the one being edited if any.
+    Alarms(Box<AlarmsPage>),
     /// Rearranging the sections of a screen — "Customise Home".
     Customise(CustomisePage),
     /// Choosing where to file a track.
@@ -347,6 +361,20 @@ struct PlaylistPage {
 }
 
 /// A screen being rearranged.
+/// The alarms screen: the list as the player last gave it, and the alarm being
+/// edited when one is open.
+///
+/// `editing` holds a whole [`bluos::alarms::Alarm`] rather than a handful of
+/// fields, so the editor is a working copy: nothing reaches the player until
+/// Save, and Back throws the copy away. A new alarm is the same thing with
+/// `id` still zero, which is also what tells `save_alarm` to create rather
+/// than replace.
+#[derive(Debug, Clone, Default)]
+struct AlarmsPage {
+    list: bluos::alarms::Alarms,
+    editing: Option<bluos::alarms::Alarm>,
+}
+
 struct CustomisePage {
     /// Whose order is being edited, which is the key the preference is filed
     /// under.
@@ -681,6 +709,147 @@ fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
 /// It arrives as an `<item>` only because that is how the document carries it.
 fn is_chrome_row(kind: ItemKind) -> bool {
     matches!(kind, ItemKind::Customise | ItemKind::Footer)
+}
+
+/// What a press on the alarms screen means.
+///
+/// The screen borrows the settings pane's rows, so its presses arrive as
+/// settings presses. Which alarm command they stand for depends on the row's
+/// index and on whether the editor is open — the list numbers its rows by
+/// position, the editor by the fixed constants above, and the two never
+/// overlap because the editor's are negative.
+fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<Command> {
+    let browsing = backend.browsing.lock().unwrap();
+    let Pane::Alarms(page) = &browsing.pane else {
+        return None;
+    };
+    let at = index as i32;
+
+    let Some(alarm) = page.editing.as_ref() else {
+        // The list. A toggle arms the alarm at that position; anything else
+        // opens it, and the last row makes a new one.
+        if at == NEW_ALARM {
+            return Some(Command::AlarmOpen(None));
+        }
+        let found = page.list.alarms.get(index)?;
+        return Some(match edit {
+            Some(Edit::Toggle) => Command::AlarmArm(found.id, !found.enabled),
+            _ => Command::AlarmOpen(Some(found.id)),
+        });
+    };
+
+    // The editor.
+    let field = match (at, edit) {
+        (ALARM_SAVE, _) => return Some(Command::AlarmSave),
+        (ALARM_DELETE, _) => return Some(Command::AlarmDelete),
+        (ALARM_VOLUME, Some(Edit::Number(v))) => AlarmField::Volume(v.max(0.0) as u32),
+        (ALARM_FADE, Some(Edit::Toggle)) => AlarmField::FadeIn(!alarm.fade_in),
+        (ALARM_SHUFFLE, Some(Edit::Toggle)) => AlarmField::Shuffle(!alarm.shuffle),
+        (ALARM_BACKUP, Some(Edit::Toggle)) => AlarmField::Backup(!alarm.use_backup),
+        // The last option on the Stops chooser is "At a set time"; the rest
+        // are the durations, in the order they were published.
+        (ALARM_KIND, Some(Edit::Choose(n))) => match DURATIONS.get(n) {
+            Some(minutes) => AlarmField::Duration(*minutes),
+            None => AlarmField::Schedule(true),
+        },
+        _ => return None,
+    };
+    Some(Command::AlarmEdit(field))
+}
+
+/// Put the player's answer back on the alarms page, if it is still up.
+fn replace_alarms(backend: &Backend, list: bluos::alarms::Alarms) {
+    if let Pane::Alarms(page) = &mut backend.browsing.lock().unwrap().pane {
+        page.list = list;
+    }
+}
+
+/// The row indices the alarms editor uses.
+///
+/// Fixed rather than positional. `walk_settings` numbers settings rows by
+/// walking them, which is right where the rows are always the same ones; here
+/// Stops, Fall back and Delete each come and go, so a positional index would
+/// renumber the rows below them and send a volume drag to the wrong field.
+const ALARM_KIND: i32 = -10;
+const ALARM_VOLUME: i32 = -11;
+const ALARM_FADE: i32 = -12;
+const ALARM_SHUFFLE: i32 = -13;
+const ALARM_BACKUP: i32 = -14;
+const ALARM_SAVE: i32 = -15;
+const ALARM_DELETE: i32 = -16;
+/// The last row of the list, which is not an alarm.
+const NEW_ALARM: i32 = -17;
+
+/// How long an alarm plays for, in minutes.
+///
+/// The official controller's own ladder. Offering a free number would be
+/// truer to the wire — the player takes any — but a ladder is what anyone
+/// setting an alarm actually wants, and it is the list the player's users
+/// already know.
+const DURATIONS: &[u32] = &[15, 30, 45, 60, 90, 120];
+
+/// The letters under the day chips, Sunday first, matching the order the
+/// player writes `days` in.
+const DAY_LETTERS: [&str; bluos::alarms::DAYS] = ["S", "M", "T", "W", "T", "F", "S"];
+
+/// A time as the list and the header show it.
+fn clock(hour: u8, minute: u8) -> String {
+    format!("{hour:02}:{minute:02}")
+}
+
+/// A schedule's finishing time, split out of the `"HHmm"` the player writes.
+///
+/// Nine in the morning where there is none, which is only reached on an alarm
+/// being turned into a schedule for the first time: the field has to open on
+/// something, and the official controller opens it an hour after the default
+/// start.
+fn schedule_end(alarm: &bluos::alarms::Alarm) -> (u8, u8) {
+    let parsed = alarm.end.as_deref().and_then(|end| {
+        let (hour, minute) = end.split_at_checked(2)?;
+        Some((hour.parse().ok()?, minute.parse().ok()?))
+    });
+    parsed.unwrap_or((9, 0))
+}
+
+/// The days in words, which is what the list row and the editor both show.
+///
+/// "Once" and not "Never" for no day at all: the player treats an empty `days`
+/// as a single firing rather than as an alarm that never goes off, and reading
+/// seven dark chips as "once" is not something anyone would guess.
+fn repeat_summary(days: &[bool; bluos::alarms::DAYS]) -> String {
+    const NAMES: [&str; bluos::alarms::DAYS] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let set: Vec<&str> = days
+        .iter()
+        .zip(NAMES)
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+
+    match set.len() {
+        0 => "Once".to_owned(),
+        7 => "Every day".to_owned(),
+        _ if days[1..6].iter().all(|on| *on) && !days[0] && !days[6] => "Weekdays".to_owned(),
+        _ if days[0] && days[6] && days[1..6].iter().all(|on| !*on) => "Weekends".to_owned(),
+        _ => set.join(", "),
+    }
+}
+
+/// What one alarm says under its time on the list.
+fn alarm_detail(alarm: &bluos::alarms::Alarm) -> String {
+    let mut parts = vec![repeat_summary(&alarm.days)];
+    parts.push(match alarm.source.as_deref().filter(|s| !s.is_empty()) {
+        Some(source) => source.to_owned(),
+        // What the player falls back to, and what it plays when nothing was
+        // ever chosen.
+        None => "The player's own tone".to_owned(),
+    });
+    match &alarm.end {
+        Some(_) => {
+            let (hour, minute) = schedule_end(alarm);
+            parts.push(format!("until {}", clock(hour, minute)));
+        }
+        None => parts.push(format!("{} min", alarm.duration)),
+    }
+    parts.join(" · ")
 }
 
 /// One browse row on its way to the window, for the same reason as
@@ -1070,6 +1239,27 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_pause_all(move || {
         let _ = tx.send(Command::PauseAll);
+    });
+
+    let tx = commands.clone();
+    ui.on_alarm_start_changed(move |hour, minute| {
+        let _ = tx.send(Command::AlarmEdit(AlarmField::Start(
+            hour.clamp(0, 23) as u8,
+            minute.clamp(0, 59) as u8,
+        )));
+    });
+
+    let tx = commands.clone();
+    ui.on_alarm_end_changed(move |hour, minute| {
+        let _ = tx.send(Command::AlarmEdit(AlarmField::End(
+            hour.clamp(0, 23) as u8,
+            minute.clamp(0, 59) as u8,
+        )));
+    });
+
+    let tx = commands.clone();
+    ui.on_alarm_day_toggled(move |at| {
+        let _ = tx.send(Command::AlarmEdit(AlarmField::Day(at.max(0) as usize)));
     });
 
     let tx = commands.clone();
@@ -1525,6 +1715,196 @@ impl Backend {
     /// The artwork is asked for at thumbnail size and only from what is
     /// already decoded — the same cover is in the row underneath, so a menu
     /// that waited on a fetch would open blank for no reason.
+    /// The alarms screen: either the list, or one alarm open for editing.
+    ///
+    /// Both go out as settings rows, so the pane, its scrolling, its title and
+    /// its back arrow are the ones every other page uses. What settings rows
+    /// cannot express — a time and seven days — is a strip of its own above
+    /// them, published through the properties below.
+    fn publish_alarms(&self) {
+        let page = {
+            let browsing = self.browsing.lock().unwrap();
+            match &browsing.pane {
+                Pane::Alarms(page) => (**page).clone(),
+                _ => return,
+            }
+        };
+
+        let mut rows: Vec<SettingData> = Vec::new();
+        let title;
+
+        match &page.editing {
+            None => {
+                title = "Alarms".to_owned();
+                if !page.list.alarms.is_empty() {
+                    rows.push(SettingData {
+                        label: "ALARMS".to_owned(),
+                        heading: true,
+                        ..SettingData::blank()
+                    });
+                }
+                for (at, alarm) in page.list.alarms.iter().enumerate() {
+                    rows.push(SettingData {
+                        // The list is addressed by position; the arm below
+                        // carries the player's own id, which is what it needs.
+                        index: at as i32,
+                        label: clock(alarm.hour, alarm.minute),
+                        detail: alarm_detail(alarm),
+                        glyph: Some(if alarm.is_schedule() {
+                            Glyph::Recent
+                        } else {
+                            Glyph::Alarm
+                        }),
+                        control: "boolean",
+                        on: alarm.enabled,
+                        // Both a switch and a door: arming is the commonest
+                        // thing anyone does to an alarm, and making that cost
+                        // a page would be the wrong trade.
+                        opens: true,
+                        ..SettingData::blank()
+                    });
+                }
+                rows.push(SettingData {
+                    index: NEW_ALARM,
+                    label: "New alarm…".to_owned(),
+                    glyph: Some(Glyph::Add),
+                    control: "link",
+                    ..SettingData::blank()
+                });
+            }
+            Some(alarm) => {
+                title = if alarm.id == 0 {
+                    "New alarm".to_owned()
+                } else if alarm.is_schedule() {
+                    "Schedule".to_owned()
+                } else {
+                    "Alarm".to_owned()
+                };
+
+                // Only where the player says it can: `supportsEndTime` is its
+                // answer, not a preference.
+                if page.list.supports_end_time {
+                    rows.push(SettingData {
+                        index: ALARM_KIND,
+                        label: "Stops".to_owned(),
+                        detail: if alarm.is_schedule() {
+                            "At a set time".to_owned()
+                        } else {
+                            format!("After {} minutes", alarm.duration)
+                        },
+                        glyph: Some(Glyph::Recent),
+                        control: "list",
+                        options: DURATIONS
+                            .iter()
+                            .map(|m| format!("After {m} minutes"))
+                            .chain(std::iter::once("At a set time".to_owned()))
+                            .collect(),
+                        option_index: if alarm.is_schedule() {
+                            DURATIONS.len() as i32
+                        } else {
+                            DURATIONS
+                                .iter()
+                                .position(|m| *m == alarm.duration)
+                                .unwrap_or(0) as i32
+                        },
+                        ..SettingData::blank()
+                    });
+                }
+
+                rows.push(SettingData {
+                    index: ALARM_VOLUME,
+                    label: "Volume".to_owned(),
+                    glyph: Some(Glyph::Volume),
+                    control: "range",
+                    number: alarm.volume as f32,
+                    minimum: 0.0,
+                    maximum: 100.0,
+                    step: 1.0,
+                    ..SettingData::blank()
+                });
+                rows.push(SettingData {
+                    index: ALARM_FADE,
+                    label: "Fade in".to_owned(),
+                    detail: "Come up gradually rather than starting at once".to_owned(),
+                    glyph: Some(Glyph::Volume),
+                    control: "boolean",
+                    on: alarm.fade_in,
+                    ..SettingData::blank()
+                });
+                rows.push(SettingData {
+                    index: ALARM_SHUFFLE,
+                    label: "Shuffle".to_owned(),
+                    glyph: Some(Glyph::Shuffle),
+                    control: "boolean",
+                    on: alarm.shuffle,
+                    // The source's answer, not the user's — a stream cannot be
+                    // shuffled, and the row says so by being dimmed.
+                    available: alarm.can_shuffle,
+                    ..SettingData::blank()
+                });
+                if !alarm.is_schedule() {
+                    rows.push(SettingData {
+                        index: ALARM_BACKUP,
+                        label: "Fall back to a tone".to_owned(),
+                        detail: "If the source cannot be reached".to_owned(),
+                        glyph: Some(Glyph::Alarm),
+                        control: "boolean",
+                        on: alarm.use_backup,
+                        ..SettingData::blank()
+                    });
+                }
+
+                rows.push(SettingData {
+                    index: ALARM_SAVE,
+                    label: if alarm.id == 0 { "Create" } else { "Save" }.to_owned(),
+                    glyph: Some(Glyph::Save),
+                    control: "button",
+                    value: "Save".to_owned(),
+                    ..SettingData::blank()
+                });
+                if alarm.id != 0 {
+                    rows.push(SettingData {
+                        index: ALARM_DELETE,
+                        label: "Delete this alarm".to_owned(),
+                        glyph: Some(Glyph::Clear),
+                        control: "button",
+                        value: "Delete".to_owned(),
+                        ..SettingData::blank()
+                    });
+                }
+            }
+        }
+
+        // The strip above the rows, which is the part settings rows cannot do.
+        let editing = page.editing.clone();
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            match &editing {
+                Some(alarm) => {
+                    let (end_hour, end_minute) = schedule_end(alarm);
+                    ui.set_alarm_editing(true);
+                    ui.set_alarm_schedule(alarm.is_schedule());
+                    ui.set_alarm_hour(alarm.hour as i32);
+                    ui.set_alarm_minute(alarm.minute as i32);
+                    ui.set_alarm_end_hour(end_hour as i32);
+                    ui.set_alarm_end_minute(end_minute as i32);
+                    ui.set_alarm_days(ModelRc::new(VecModel::from(alarm.days.to_vec())));
+                    ui.set_alarm_repeat(repeat_summary(&alarm.days).into());
+                    ui.set_alarm_letters(ModelRc::new(VecModel::from(
+                        DAY_LETTERS
+                            .iter()
+                            .map(|d| slint::SharedString::from(*d))
+                            .collect::<Vec<_>>(),
+                    )));
+                }
+                None => ui.set_alarm_editing(false),
+            }
+        });
+
+        self.send_settings(rows, title);
+    }
+
     /// Put the player's question in front of the user, or take it away.
     ///
     /// The buttons are the player's, in its order and with its wording — the
@@ -2323,6 +2703,7 @@ impl Backend {
             Form,
             NowPlaying,
             Customise,
+            Alarms,
         }
         let showing = match self.browsing.lock().unwrap().pane {
             Pane::Browse => Showing::Browse,
@@ -2332,6 +2713,7 @@ impl Backend {
             Pane::Form(_) => Showing::Form,
             Pane::NowPlaying => Showing::NowPlaying,
             Pane::Customise(_) => Showing::Customise,
+            Pane::Alarms(_) => Showing::Alarms,
             // Drawn with the settings rows, which already have a line that is
             // a link and a line that is a text field.
             Pane::Playlists(_) => Showing::Settings,
@@ -2367,6 +2749,9 @@ impl Backend {
             // Nothing to send: it is drawn from what the transport already
             // publishes. Only the settings rows have to be taken down.
             Showing::Customise => self.publish_customise(),
+            // Its rows go out through the settings pane like Help's do; the
+            // editor's time and days are their own strip above them.
+            Showing::Alarms => self.publish_alarms(),
             Showing::NowPlaying => self.publish_settings(),
         }
     }
@@ -2492,6 +2877,7 @@ impl Backend {
                     )),
                     option_index: row.option_index,
                     available: row.available,
+                    opens: row.opens,
                 })
                 .collect();
 
@@ -3211,6 +3597,8 @@ enum HelpKind {
 /// One settings row on its way to the window.
 struct SettingData {
     index: i32,
+    /// Whether the row opens something as well as carrying its control.
+    opens: bool,
     label: String,
     detail: String,
     glyph: Option<Glyph>,
@@ -3291,7 +3679,8 @@ fn walk_settings(
                         // controller's own page, and there is nothing here for
                         // one to open. The row says how many there are instead
                         // of pretending to lead somewhere.
-                        Kind::Alarms => "none",
+                        // A door now that there is a screen behind it.
+                        Kind::Alarms => "link",
                         // Including dual-range, which needs a control of its
                         // own and gets its value shown instead.
                         _ => "none",
@@ -3306,6 +3695,7 @@ fn walk_settings(
 
                 rows.push(SettingData {
                     index: *index,
+                    opens: false,
                     // Falls back rather than leaving a hole; see Icons.tweak.
                     glyph: glyphs::glyph_for(setting.label(), None).or(Some(Glyph::Tweak)),
                     label: setting.label().to_owned(),
@@ -3380,6 +3770,7 @@ impl SettingData {
             options: Vec::new(),
             option_index: 0,
             available: true,
+            opens: false,
         }
     }
 }
@@ -3415,6 +3806,22 @@ fn setting_at(page: &SettingsPage, index: usize) -> Option<bluos::settings::Sett
 }
 
 /// What activating a settings row means.
+/// One change to the alarm being edited.
+#[derive(Debug, Clone)]
+enum AlarmField {
+    Start(u8, u8),
+    End(u8, u8),
+    /// Whether it runs to a finishing time rather than for a length.
+    Schedule(bool),
+    Day(usize),
+    /// One of the durations the official controller offers, in minutes.
+    Duration(u32),
+    Volume(u32),
+    FadeIn(bool),
+    Shuffle(bool),
+    Backup(bool),
+}
+
 enum Chosen {
     /// Another page, by id.
     Page(String),
@@ -3422,6 +3829,9 @@ enum Chosen {
     Web(String),
     /// A value to write.
     Write(Box<bluos::settings::Setting>, String),
+    /// The alarms screen, which is this app's own rather than a page the
+    /// player describes.
+    Alarms,
     /// One more step along the sleep timer's ladder. Not a write: the setting
     /// carries no value and no options, because the player owns the ladder and
     /// hands out the next rung on request.
@@ -3457,6 +3867,7 @@ fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
                                 .toggled()
                                 .map(|value| Chosen::Write(setting.clone(), value)),
                             Kind::Sleep => Some(Chosen::Sleep),
+                            Kind::Alarms => Some(Chosen::Alarms),
                             // A button has no value; the player wants its name
                             // sent back at it.
                             Kind::Button => Some(Chosen::Write(
@@ -4812,6 +5223,16 @@ async fn run_commands(
                 let moved = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     match &mut browsing.pane {
+                        // Out of the editor before out of the screen: the
+                        // editor is a page over the list, not beside it.
+                        Pane::Alarms(page) if page.editing.is_some() => {
+                            page.editing = None;
+                            true
+                        }
+                        Pane::Alarms(_) => {
+                            browsing.pane = Pane::Browse;
+                            true
+                        }
                         Pane::HelpDetail(_, _, whence) => {
                             browsing.pane = match whence {
                                 Whence::Help => Pane::Help,
@@ -5050,6 +5471,221 @@ async fn run_commands(
                 continue;
             }
 
+            Command::OpenAlarms => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.alarms().await {
+                        Ok(list) => {
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                browsing.pane = Pane::Alarms(Box::new(AlarmsPage {
+                                    list,
+                                    editing: None,
+                                }));
+                                browsing.highlighted = None;
+                            }
+                            backend.publish_sidebar();
+                            backend.publish_pane();
+                        }
+                        Err(e) => {
+                            tracing::warn!(%id, "could not read the alarms: {e}");
+                            say(&backend.ui, format!("could not read the alarms: {e}"));
+                        }
+                    }
+                });
+                continue;
+            }
+
+            Command::AlarmArm(alarm, on) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                // In order, for the reason on the queue's edits: two of these
+                // in flight at once are two writes to one list.
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.arm_alarm(alarm, on).await {
+                        // The reply is the whole list, so the screen is redrawn
+                        // from what the player now holds rather than from what
+                        // was asked for.
+                        Ok(list) => {
+                            replace_alarms(&backend, list);
+                            backend.publish_pane();
+                        }
+                        Err(e) => say(&backend.ui, format!("could not change the alarm: {e}")),
+                    }
+                });
+                continue;
+            }
+
+            Command::AlarmOpen(which) => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Alarms(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    page.editing = Some(match which {
+                        Some(alarm) => match page.list.alarms.iter().find(|a| a.id == alarm) {
+                            Some(found) => found.clone(),
+                            None => continue,
+                        },
+                        // The controller's own defaults for a new one: seven in
+                        // the morning, a quarter of an hour, and a volume that
+                        // does not depend on where the speaker was left.
+                        None => bluos::alarms::Alarm {
+                            hour: 7,
+                            minute: 0,
+                            duration: DURATIONS[0],
+                            volume: 25,
+                            enabled: true,
+                            use_backup: true,
+                            ..Default::default()
+                        },
+                    });
+                }
+                backend.publish_pane();
+                continue;
+            }
+
+            Command::AlarmEdit(change) => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Alarms(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    let Some(alarm) = page.editing.as_mut() else {
+                        continue;
+                    };
+                    match change {
+                        AlarmField::Start(hour, minute) => {
+                            alarm.hour = hour;
+                            alarm.minute = minute;
+                        }
+                        AlarmField::End(hour, minute) => {
+                            alarm.end = Some(format!("{hour:02}{minute:02}"));
+                        }
+                        // The two are exclusive on the wire, so switching is
+                        // giving one of them up.
+                        AlarmField::Schedule(on) => {
+                            alarm.end = on.then(|| {
+                                let (hour, minute) = schedule_end(alarm);
+                                format!("{hour:02}{minute:02}")
+                            });
+                        }
+                        AlarmField::Day(at) => {
+                            if let Some(day) = alarm.days.get_mut(at) {
+                                *day = !*day;
+                            }
+                        }
+                        AlarmField::Duration(minutes) => {
+                            alarm.end = None;
+                            alarm.duration = minutes;
+                        }
+                        AlarmField::Volume(v) => alarm.volume = v.min(100),
+                        AlarmField::FadeIn(on) => alarm.fade_in = on,
+                        AlarmField::Shuffle(on) => alarm.shuffle = on,
+                        AlarmField::Backup(on) => alarm.use_backup = on,
+                    }
+                }
+                backend.publish_pane();
+                continue;
+            }
+
+            Command::AlarmSave => {
+                let editing = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    match &browsing.pane {
+                        Pane::Alarms(page) => page.editing.clone(),
+                        _ => None,
+                    }
+                };
+                let Some(alarm) = editing else { continue };
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.save_alarm(&alarm).await {
+                        Ok(list) => {
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                if let Pane::Alarms(page) = &mut browsing.pane {
+                                    page.list = list;
+                                    // Back to the list: the alarm is the
+                                    // player's now, not the copy's.
+                                    page.editing = None;
+                                }
+                            }
+                            say(&backend.ui, "Alarm saved");
+                            backend.publish_pane();
+                        }
+                        Err(e) => say(&backend.ui, format!("could not save the alarm: {e}")),
+                    }
+                });
+                continue;
+            }
+
+            Command::AlarmDelete => {
+                let editing = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    match &browsing.pane {
+                        Pane::Alarms(page) => page.editing.as_ref().map(|a| a.id),
+                        _ => None,
+                    }
+                };
+                // Nothing to delete on one that was never saved; closing the
+                // editor is the whole of it.
+                let Some(alarm) = editing.filter(|id| *id != 0) else {
+                    if let Pane::Alarms(page) = &mut backend.browsing.lock().unwrap().pane {
+                        page.editing = None;
+                    }
+                    backend.publish_pane();
+                    continue;
+                };
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let mut ticket = backend.writes.enter();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    ticket.wait().await;
+                    match client.delete_alarm(alarm).await {
+                        Ok(list) => {
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                if let Pane::Alarms(page) = &mut browsing.pane {
+                                    page.list = list;
+                                    page.editing = None;
+                                }
+                            }
+                            say(&backend.ui, "Alarm deleted");
+                            backend.publish_pane();
+                        }
+                        Err(e) => say(&backend.ui, format!("could not delete the alarm: {e}")),
+                    }
+                });
+                continue;
+            }
+
             Command::DialogPress(at) => {
                 // Taken, not read: the question is answered either way, and
                 // leaving it up while its action runs would let it be pressed
@@ -5164,6 +5800,22 @@ async fn run_commands(
                 continue;
             }
 
+            // While the alarms screen is up, its rows are alarms rather than
+            // settings, so the presses the settings pane produces are turned
+            // into alarm commands before the settings arm ever sees them.
+            Command::SettingAction(index) | Command::SettingEdit(index, _)
+                if matches!(backend.browsing.lock().unwrap().pane, Pane::Alarms(_)) =>
+            {
+                let edit = match command {
+                    Command::SettingEdit(_, edit) => Some(edit),
+                    _ => None,
+                };
+                if let Some(next) = alarm_command(&backend, index, edit) {
+                    let _ = backend.commands.send(next);
+                }
+                continue;
+            }
+
             Command::SettingAction(index) => {
                 // Three panes are drawn with these rows, so the press goes to
                 // whichever one is actually on screen.
@@ -5205,6 +5857,9 @@ async fn run_commands(
                         let _ = backend
                             .commands
                             .send(Command::OpenSettings(Some(id), Step::Deeper));
+                    }
+                    Some(Chosen::Alarms) => {
+                        let _ = backend.commands.send(Command::OpenAlarms);
                     }
                     Some(Chosen::Sleep) => {
                         let _ = backend.commands.send(Command::Player(id, Action::Sleep));
@@ -6451,6 +7106,55 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The one string on the alarms list that is not the player's wording.
+    #[test]
+    fn a_week_in_words() {
+        let days = |on: [bool; 7]| repeat_summary(&on);
+        assert_eq!(days([false; 7]), "Once", "no day set is once, not never");
+        assert_eq!(days([true; 7]), "Every day");
+        assert_eq!(
+            days([false, true, true, true, true, true, false]),
+            "Weekdays"
+        );
+        assert_eq!(
+            days([true, false, false, false, false, false, true]),
+            "Weekends"
+        );
+        // Anything else is spelled out, Sunday first.
+        assert_eq!(
+            days([false, true, false, true, false, true, false]),
+            "Mon, Wed, Fri"
+        );
+        assert_eq!(
+            days([true, false, false, false, false, false, false]),
+            "Sun"
+        );
+        // Weekdays plus one is not weekdays.
+        assert_eq!(
+            days([true, true, true, true, true, true, false]),
+            "Sun, Mon, Tue, Wed, Thu, Fri"
+        );
+    }
+
+    /// A schedule's finishing time is `"HHmm"` with no separator.
+    #[test]
+    fn an_end_time_read_back_out_of_the_wire() {
+        let at = |end: Option<&str>| {
+            schedule_end(&bluos::alarms::Alarm {
+                end: end.map(str::to_owned),
+                ..Default::default()
+            })
+        };
+        assert_eq!(at(Some("1730")), (17, 30));
+        assert_eq!(at(Some("0005")), (0, 5));
+        // Nothing set yet: the field still has to open on something.
+        assert_eq!(at(None), (9, 0));
+        // Not a time. Better a visible nine o'clock than a panic.
+        assert_eq!(at(Some("")), (9, 0));
+        assert_eq!(at(Some("abcd")), (9, 0));
+        assert_eq!(at(Some("7")), (9, 0));
+    }
 
     #[test]
     fn the_players_chrome_reads_american() {

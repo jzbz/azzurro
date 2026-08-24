@@ -1,6 +1,6 @@
 import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
-import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton } from "widgets.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker } from "widgets.slint";
 
 // A bare file import is how Slint registers a custom font: the family the
 // file declares becomes usable as a font-family anywhere, and the file is
@@ -180,6 +180,12 @@ export struct SettingItem {
     options: [string],
     option-index: int,
     available: bool,
+    // Whether the row is a door as well as a control. A settings row is
+    // normally one or the other; an alarm is both, because arming it is the
+    // commonest thing anyone does to one and having to open it first would put
+    // a page in the way. `touch` is declared before `body`, so the control in
+    // the body takes its own press and the rest of the row opens.
+    opens: bool,
 }
 
 component SectionLabel inherits Text {
@@ -212,7 +218,8 @@ component SettingRow inherits Rectangle {
     border-radius: Theme.radius-small;
     background: (root.item.control == "link"
             || root.item.control == "button"
-            || root.item.control == "cycle")
+            || root.item.control == "cycle"
+            || root.item.opens)
             && touch.has-hover
         ? Theme.hover
         : transparent;
@@ -226,7 +233,8 @@ component SettingRow inherits Rectangle {
         // the control, and it has to be pressable for that to mean anything.
         enabled: root.item.control == "link"
             || root.item.control == "cycle"
-            || root.item.control == "button";
+            || root.item.control == "button"
+            || root.item.opens;
         clicked => { root.opened(); }
     }
 
@@ -1736,6 +1744,24 @@ export component AppWindow inherits Window {
     callback queue-menu(int, length);
     callback queue-menu-activate(int);
     // The input waiting to be confirmed, by name. Empty when nothing is.
+    // The alarms editor's own strip, which is the part settings rows cannot
+    // draw: a time, a finishing time where the player supports one, and seven
+    // days. Everything else on the page is an ordinary settings row.
+    in property <bool> alarm-editing: false;
+    in property <bool> alarm-schedule: false;
+    in property <int> alarm-hour;
+    in property <int> alarm-minute;
+    in property <int> alarm-end-hour;
+    in property <int> alarm-end-minute;
+    in property <[bool]> alarm-days;
+    // Sunday first, because that is the end of the week the player writes
+    // `days` from. Sent with the data so the two cannot disagree.
+    in property <[string]> alarm-letters;
+    in property <string> alarm-repeat;
+    callback alarm-start-changed(int, int);
+    callback alarm-end-changed(int, int);
+    callback alarm-day-toggled(int);
+
     in-out property <string> confirm-input: "";
 
     // The player's own question — "Playing replaces Play Queue" and its like.
@@ -2313,6 +2339,79 @@ export component AppWindow inherits Window {
                             color: Theme.faint;
                             horizontal-alignment: center;
                             wrap: word-wrap;
+                        }
+                    }
+
+                    // Pinned above the list rather than scrolling inside it.
+                    // Two reasons: a wheel over the time must not also scroll
+                    // the page, and a virtualised row can carry the focused
+                    // field away with it when it goes off screen.
+                    if root.alarm-editing: Panel {
+                        VerticalLayout {
+                            padding: Theme.room;
+                            spacing: Theme.pad;
+
+                            HorizontalLayout {
+                                spacing: Theme.room;
+                                alignment: start;
+
+                                VerticalLayout {
+                                    spacing: Theme.tight;
+                                    alignment: start;
+
+                                    SectionLabel { text: "STARTS"; }
+
+                                    TimeField {
+                                        hour: root.alarm-hour;
+                                        minute: root.alarm-minute;
+                                        changed(h, m) => { root.alarm-start-changed(h, m); }
+                                    }
+                                }
+
+                                // Only on a schedule, and only where the
+                                // player said it can do them at all — the
+                                // Stops row below is what turns one into the
+                                // other.
+                                if root.alarm-schedule: VerticalLayout {
+                                    spacing: Theme.tight;
+                                    alignment: start;
+
+                                    SectionLabel { text: "STOPS"; }
+
+                                    TimeField {
+                                        hour: root.alarm-end-hour;
+                                        minute: root.alarm-end-minute;
+                                        changed(h, m) => { root.alarm-end-changed(h, m); }
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: Theme.gap;
+
+                                HorizontalLayout {
+                                    spacing: Theme.gap;
+                                    alignment: start;
+
+                                    SectionLabel { text: "REPEAT"; }
+
+                                    // Read back in words. Seven dark chips do
+                                    // not say "once", and that is what no day
+                                    // set actually means to the player.
+                                    Text {
+                                        text: root.alarm-repeat;
+                                        font-size: Theme.micro-size;
+                                        color: Theme.dim;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                DayPicker {
+                                    letters: root.alarm-letters;
+                                    days: root.alarm-days;
+                                    toggled(i) => { root.alarm-day-toggled(i); }
+                                }
+                            }
                         }
                     }
 

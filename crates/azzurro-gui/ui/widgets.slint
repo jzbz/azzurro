@@ -513,3 +513,228 @@ export component WideButton inherits Rectangle {
         clicked => { root.clicked(); }
     }
 }
+
+// A time, set three ways.
+//
+// The official controller spins two drums under a thumb. The gesture a drum
+// exists for is changing a number without having to hit a target, and on a
+// desktop that gesture is the wheel, which is already under the hand — so the
+// drums go and the wheel stays. What a drum cannot do at all is typed entry,
+// which is how anyone with a keyboard sets 07:05, so that is here too. Three
+// ways in, one `step`: the wheel over a group, the chevrons, and the keys.
+export component TimeField inherits Rectangle {
+    in property <int> hour;
+    in property <int> minute;
+    in property <bool> enabled: true;
+    // Both together. A minute can carry into an hour, and a change that
+    // applied one without the other would show a time nobody asked for.
+    callback changed(int, int);
+
+    // Which group the keys and the chevrons act on: 0 hours, 1 minutes.
+    property <int> group: 0;
+    // The first of two typed digits, or -1 when nothing is half-entered.
+    property <int> half: -1;
+
+    height: 52px;
+    width: 168px;
+    border-radius: Theme.radius-small;
+    background: Theme.sunken;
+    border-width: 1px;
+    border-color: keys.has-focus ? Theme.accent : Theme.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    function step(by: int) {
+        root.half = -1;
+        if (root.group == 0) {
+            // Wraps rather than clamping: a clock has no ends, and stopping
+            // at 23 makes getting to 00 a twenty-three step journey.
+            root.changed(Math.mod(root.hour + by + 24, 24), root.minute);
+        } else {
+            root.changed(root.hour, Math.mod(root.minute + by + 60, 60));
+        }
+    }
+
+    // A digit at a time, the way a clock is read out loud. The first sets the
+    // value, the second completes it where the pair is a legal time and
+    // starts again where it is not — so 9 then 9 on the hours lands on 9,
+    // not on nothing.
+    function digit(d: int) {
+        if (root.group == 0) {
+            if (root.half < 0) {
+                root.half = d;
+                root.changed(d, root.minute);
+            } else {
+                root.half = -1;
+                root.changed(root.half * 10 + d <= 23 ? root.half * 10 + d : d, root.minute);
+            }
+        } else {
+            if (root.half < 0) {
+                root.half = d;
+                root.changed(root.hour, d);
+            } else {
+                root.half = -1;
+                root.changed(root.hour, root.half * 10 + d <= 59 ? root.half * 10 + d : d);
+            }
+        }
+    }
+
+    keys := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) { root.step(1); return accept; }
+            if (event.text == Key.DownArrow) { root.step(-1); return accept; }
+            if (event.text == Key.LeftArrow || event.text == Key.RightArrow) {
+                root.group = root.group == 0 ? 1 : 0;
+                root.half = -1;
+                return accept;
+            }
+            if (event.text == Key.Tab) { return reject; }
+            if (event.text >= "0" && event.text <= "9") {
+                // Slint gives the character; the arithmetic wants the number.
+                root.digit(
+                    event.text == "0" ? 0 : event.text == "1" ? 1 : event.text == "2" ? 2
+                    : event.text == "3" ? 3 : event.text == "4" ? 4 : event.text == "5" ? 5
+                    : event.text == "6" ? 6 : event.text == "7" ? 7 : event.text == "8" ? 8 : 9);
+                return accept;
+            }
+            return reject;
+        }
+
+        HorizontalLayout {
+            padding-left: Theme.pad;
+            padding-right: Theme.tight;
+            spacing: 0px;
+
+            // Each group is a fixed box with the text centred in it. Slint has
+            // no tabular figures, so without one 09 → 10 shifts the colon
+            // sideways on every turn of the wheel.
+            hours := Rectangle {
+                width: 52px;
+                border-radius: Theme.radius-small - 2px;
+                background: root.group == 0 && keys.has-focus ? Theme.selected : transparent;
+
+                Text {
+                    text: (root.hour < 10 ? "0" : "") + root.hour;
+                    font-size: Theme.display-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    enabled: root.enabled;
+                    clicked => { root.group = 0; root.half = -1; keys.focus(); }
+                    scroll-event(e) => {
+                        root.group = 0;
+                        root.step(e.delta-y > 0 ? 1 : -1);
+                        return accept;
+                    }
+                }
+            }
+
+            Text {
+                text: ":";
+                font-size: Theme.display-size;
+                font-weight: 600;
+                color: Theme.faint;
+                vertical-alignment: center;
+            }
+
+            minutes := Rectangle {
+                width: 52px;
+                border-radius: Theme.radius-small - 2px;
+                background: root.group == 1 && keys.has-focus ? Theme.selected : transparent;
+
+                Text {
+                    text: (root.minute < 10 ? "0" : "") + root.minute;
+                    font-size: Theme.display-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    enabled: root.enabled;
+                    clicked => { root.group = 1; root.half = -1; keys.focus(); }
+                    scroll-event(e) => {
+                        root.group = 1;
+                        root.step(e.delta-y > 0 ? 1 : -1);
+                        return accept;
+                    }
+                }
+            }
+
+            // So the field says out loud that it is a spinner, rather than
+            // waiting for the wheel to be discovered.
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+
+                IconButton {
+                    glyph: Icons.expand;
+                    size: 22px;
+                    glyph-size: 12px;
+                    enabled: root.enabled;
+                    clicked => { root.step(1); keys.focus(); }
+                }
+
+                IconButton {
+                    glyph: Icons.collapse;
+                    size: 22px;
+                    glyph-size: 12px;
+                    enabled: root.enabled;
+                    clicked => { root.step(-1); keys.focus(); }
+                }
+            }
+        }
+    }
+}
+
+// Which days a thing repeats on.
+//
+// Seven round chips is what the official controller draws, and it is a touch
+// idiom that needs no translating: it is already seven targets a mouse can
+// hit. Round rather than the squared-off `PillButton` because they are a set
+// of seven equals rather than separate labelled actions.
+//
+// The letters and their order arrive from Rust with the data, so nothing here
+// has to know what a week is or which end of it the player writes first.
+export component DayPicker inherits HorizontalLayout {
+    in property <[string]> letters;
+    in property <[bool]> days;
+    in property <bool> enabled: true;
+    callback toggled(int);
+
+    spacing: Theme.gap;
+    alignment: start;
+
+    for letter[i] in root.letters: Rectangle {
+        width: 32px;
+        height: 32px;
+        border-radius: self.height / 2;
+        background: root.days[i]
+            ? (day.pressed ? Theme.accent-hover : Theme.accent)
+            : (day.pressed ? Theme.pressed : (day.has-hover ? Theme.hover : Theme.raised));
+        border-width: 1px;
+        border-color: root.days[i] ? transparent : Theme.border;
+        opacity: root.enabled ? 1.0 : 0.45;
+        animate background { duration: 120ms; easing: ease-out; }
+
+        Text {
+            text: letter;
+            font-size: Theme.small-size;
+            font-weight: 600;
+            color: root.days[i] ? Theme.accent-ink : Theme.dim;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        day := TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: pointer;
+            clicked => { root.toggled(i); }
+        }
+    }
+}
