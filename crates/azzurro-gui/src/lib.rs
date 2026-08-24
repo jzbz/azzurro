@@ -14,6 +14,7 @@ mod artwork;
 mod glyphs;
 mod known;
 mod lane;
+#[cfg(target_os = "linux")]
 mod mpris;
 mod order;
 
@@ -4953,6 +4954,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
     // wrongly, or a player that has since been unplugged — would otherwise sit
     // in the desktop's media controls forever, claiming to be a player nobody
     // can reach. The bus name is claimed on the first real status instead.
+    #[cfg(target_os = "linux")]
     let mut mpris: Option<mpris::Bridge> = None;
 
     let mut watch = client.watch();
@@ -5102,21 +5104,24 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     backend.publish_transport();
                 }
 
-                if mpris.is_none() {
-                    let name = backend
-                        .with_entry(id, |e| e.view.name.to_string())
-                        .unwrap_or_else(|| name.clone());
-                    mpris = mpris::Bridge::attach(
-                        mpris_index,
-                        id,
-                        name,
-                        backend.registry.clone(),
-                        backend.commands.clone(),
-                    )
-                    .await;
-                }
-                if let Some(bridge) = &mpris {
-                    bridge.publish(&status).await;
+                #[cfg(target_os = "linux")]
+                {
+                    if mpris.is_none() {
+                        let name = backend
+                            .with_entry(id, |e| e.view.name.to_string())
+                            .unwrap_or_else(|| name.clone());
+                        mpris = mpris::Bridge::attach(
+                            mpris_index,
+                            id,
+                            name,
+                            backend.registry.clone(),
+                            backend.commands.clone(),
+                        )
+                        .await;
+                    }
+                    if let Some(bridge) = &mpris {
+                        bridge.publish(&status).await;
+                    }
                 }
             }
             Err(e) => {
@@ -5146,6 +5151,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                     // The last known track stays on the bus — a blip should
                     // not wipe the desktop's media widget — but it stops
                     // claiming to be playing something it can no longer see.
+                    #[cfg(target_os = "linux")]
                     if let Some(bridge) = &mpris {
                         bridge.publish_offline().await;
                     }

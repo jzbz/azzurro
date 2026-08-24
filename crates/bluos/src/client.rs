@@ -175,32 +175,35 @@ pub enum PlaylistTarget {
 
 /// The IANA zone this machine keeps its clocks in, for the alarm routes.
 ///
-/// No crate for it. The three places it can be read are all files, and inside
-/// the Flatpak sandbox all three are present — verified: `TZ` unset,
-/// `/etc/timezone` reading `US/Eastern`, and `/etc/localtime` a symlink into
-/// `/usr/share/zoneinfo`. A dependency would cost a regeneration of the
-/// offline source list the Flatpak build reads, for fifteen lines.
+/// This read `TZ`, `/etc/timezone` and the `/etc/localtime` symlink by hand,
+/// on the reasoning that a crate would cost a regeneration of the offline
+/// source list the Flatpak build reads. That was true and it was still the
+/// wrong trade: none of those three exist on Windows, so it fell through to
+/// `UTC` and an alarm set for seven in the morning would have gone off in the
+/// small hours, with nothing on screen to say so. Windows keeps its zone in
+/// the registry under a name of Microsoft's own, and turning that into an IANA
+/// name needs the CLDR mapping table — which is the whole of what this crate
+/// does, and it was already in the tree by way of chrono.
 ///
-/// `UTC` where nothing answers. It is wrong for most of the world, but it is a
-/// zone the player will certainly accept, and an alarm an hour out is better
-/// than a request it refuses.
+/// `UTC` only where the machine will not say. It is wrong for most of the
+/// world, but the player will accept it, and one bad hour beats a refused
+/// request.
 fn time_zone() -> String {
+    // `TZ` first, which the crate does not consult on Unix. Someone who has
+    // set it means it, and honouring it is what this did before. A POSIX rule
+    // like `EST5EDT,M3.2.0` names no zone the player could look up, so
+    // `zone_name` refuses it and the machine is asked instead.
     if let Ok(tz) = std::env::var("TZ")
         && let Some(named) = zone_name(&tz)
     {
         return named.to_owned();
     }
-    if let Ok(text) = std::fs::read_to_string("/etc/timezone")
-        && let Some(named) = zone_name(&text)
-    {
-        return named.to_owned();
-    }
-    if let Ok(target) = std::fs::read_link("/etc/localtime")
-        && let Some(named) = zone_name(&target.to_string_lossy())
-    {
-        return named.to_owned();
-    }
-    "UTC".to_owned()
+    iana_time_zone::get_timezone()
+        .ok()
+        .as_deref()
+        .and_then(zone_name)
+        .unwrap_or("UTC")
+        .to_owned()
 }
 
 /// The zone out of whatever form it was written in.

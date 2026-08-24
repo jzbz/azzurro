@@ -16,6 +16,7 @@ quick-xml.workspace = true
 serde.workspace = true
 socket2.workspace = true
 percent-encoding.workspace = true
+iana-time-zone.workspace = true
 if-addrs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

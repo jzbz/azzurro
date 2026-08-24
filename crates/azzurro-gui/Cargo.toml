@@ -50,6 +50,12 @@ slint = { version = "1.17", default-features = false, features = [
 # connection on the Slint event-loop thread, where there is none. Enabling it
 # trades working accessibility for nothing: zbus's default async-io reactor
 # drives the MPRIS server perfectly well from a tokio task.
+# Linux only. MPRIS is a D-Bus interface: there is no session bus to claim a
+# name on under Windows, and macOS has its own Now Playing centre instead. Left
+# unconditional it stayed in the dependency graph for both — `cargo tree
+# --target x86_64-pc-windows-msvc` pulled zbus in — for a bridge that could
+# never do anything there.
+[target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = "0.10"
 
 [build-dependencies]

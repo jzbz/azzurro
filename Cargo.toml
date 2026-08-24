@@ -74,6 +74,10 @@ if-addrs = "0.15"
 
 # Only for putting a user's search text into a query string safely.
 percent-encoding = "2"
+# Already in the tree by way of chrono, which slint pulls, and already in
+# packaging/cargo-sources.json — so naming it directly costs no download and no
+# regeneration of the offline source list the Flatpak build reads.
+iana-time-zone = "0.1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
