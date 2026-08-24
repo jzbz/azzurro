@@ -755,6 +755,61 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
     Some(Command::AlarmEdit(field))
 }
 
+/// Whether pressing this is a switch of input.
+///
+/// An input is the one thing on a screen that stops the music: a service opens
+/// a screen, a track replaces the queue and says so itself, but an input takes
+/// the speaker away from whatever it was doing with no way back to where it
+/// was. It is a `player-link` whose command plays directly rather than through
+/// the player's own `/ui/prf` wrapper — which is how a station is written, and
+/// a station is not an input.
+fn switches_input(action: &bluos::screen::Action) -> bool {
+    action.kind == bluos::screen::ActionKind::PlayerLink
+        && action
+            .uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("/Play"))
+}
+
+/// Ask before an input stops the music, and say whether the question went up.
+///
+/// `false` means there was nothing to ask and the caller should get on with it.
+/// Shared rather than living where it was first needed: the sidebar is not the
+/// only way to reach an input — Home's Sources shelf and its Most Used row
+/// carry the same items — and having the question on one path and not the
+/// others meant the same press warned or did not depending on where it was
+/// made.
+fn ask_before_input(
+    backend: &Backend,
+    id: DeviceId,
+    action: &bluos::screen::Action,
+    label: &str,
+) -> bool {
+    if !switches_input(action) {
+        return false;
+    }
+    // Only worth asking while something is playing. Switching a silent
+    // speaker costs nothing, and a dialog for it is just one more press.
+    let playing = backend
+        .with_entry(id, |e| {
+            e.status.as_ref().is_some_and(bluos::Status::is_playing)
+        })
+        .unwrap_or(false);
+    if !playing {
+        return false;
+    }
+
+    backend.browsing.lock().unwrap().pending_input = Some(action.clone());
+    let ui = backend.ui.clone();
+    let label = label.to_owned();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui.upgrade() {
+            ui.set_confirm_input(label.into());
+        }
+    });
+    true
+}
+
 /// Put the player's answer back on the alarms page, if it is still up.
 fn replace_alarms(backend: &Backend, list: bluos::alarms::Alarms) {
     if let Pane::Alarms(page) = &mut backend.browsing.lock().unwrap().pane {
@@ -4074,7 +4129,7 @@ fn item_at<'a>(
 
 /// Do whatever row `index` of the current screen says to do.
 async fn activate(backend: Backend, index: usize) {
-    let (id, action, arrive, worth_keeping, switch_to) = {
+    let (id, action, named, arrive, worth_keeping, switch_to) = {
         let browsing = backend.browsing.lock().unwrap();
         let Some(id) = browsing.device else { return };
         let Some(crumb) = browsing.trail.last() else {
@@ -4121,6 +4176,7 @@ async fn activate(backend: Backend, index: usize) {
         (
             id,
             item.action.clone().or_else(|| item.play_action.clone()),
+            item.label().unwrap_or("that input").to_owned(),
             arrive,
             worth_keeping,
             switch_to,
@@ -4140,6 +4196,14 @@ async fn activate(backend: Backend, index: usize) {
     }
 
     let Some(action) = action else { return };
+
+    // The same question the sidebar asks. An input reaches this path too —
+    // Home draws the sources as a shelf, and Most Used puts the ones you
+    // reach for at the top — and warning on one path but not the others made
+    // the same press behave differently depending on where it was made.
+    if ask_before_input(&backend, id, &action, &named) {
+        return;
+    }
     run_action(backend, id, action, arrive).await;
 }
 
@@ -6307,61 +6371,24 @@ async fn run_commands(
                     // service opens a screen, an input sends a play command
                     // that takes the speaker away from whatever it was doing.
                     // The two are told apart by which action the item carries.
-                    let (action, is_input, label) = {
+                    let (action, label) = {
                         let browsing = backend.browsing.lock().unwrap();
                         browsing
                             .sources
                             .as_ref()
                             .and_then(|screen| screen.items().nth(index.max(0) as usize))
                             .map(|item| {
-                                let action =
-                                    item.action.clone().or_else(|| item.play_action.clone());
-                                // An input is a `player-link` that starts
-                                // playing something. Not the absence of a
-                                // browse action, which is what this used to
-                                // test and why it never once fired: the
-                                // player writes an input as
-                                // `<action type="player-link" URI="/Play?…">`,
-                                // so `item.action` is always there and the
-                                // question was never asked. A service's action
-                                // is a browse and opens a screen; anything
-                                // here that plays takes the speaker away from
-                                // what it was doing.
-                                let is_input = action.as_ref().is_some_and(|a| {
-                                    a.kind == bluos::screen::ActionKind::PlayerLink
-                                        && a.uri
-                                            .as_deref()
-                                            .is_some_and(|uri| uri.starts_with("/Play"))
-                                });
                                 (
-                                    action,
-                                    is_input,
+                                    item.action.clone().or_else(|| item.play_action.clone()),
                                     item.label().unwrap_or("that input").to_owned(),
                                 )
                             })
-                            .unwrap_or((None, false, String::new()))
+                            .unwrap_or((None, String::new()))
                     };
 
                     let Some(action) = action else { continue };
 
-                    // Only worth asking while something is playing. Switching
-                    // a silent speaker costs nothing, and a dialog for it is
-                    // just one more press.
-                    let playing = backend
-                        .with_entry(id, |e| {
-                            e.status.as_ref().is_some_and(bluos::Status::is_playing)
-                        })
-                        .unwrap_or(false);
-
-                    if is_input && playing {
-                        backend.browsing.lock().unwrap().pending_input = Some(action);
-                        let ui = backend.ui.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui.upgrade() {
-                                ui.set_confirm_input(label.into());
-                            }
-                        });
-                    } else {
+                    if !ask_before_input(&backend, id, &action, &label) {
                         tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                     }
                 }
@@ -7111,6 +7138,53 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Which presses take the speaker away from what it was doing.
+    ///
+    /// Every URI here came off a Powernode. The distinction is not "does it
+    /// play" — a track and a station both play — but "does it leave no way
+    /// back to what was on", which is only true of an input.
+    #[test]
+    fn only_an_input_is_worth_asking_about() {
+        let action = |uri: &str, kind| bluos::screen::Action {
+            kind,
+            uri: Some(uri.to_owned()),
+            ..Default::default()
+        };
+        let link = bluos::screen::ActionKind::PlayerLink;
+
+        // The physical inputs, as Home and the sidebar both write them.
+        assert!(switches_input(&action(
+            "/Play?url=Capture%3Ahw%3Aimxspdif%2C0%2F1%2F25%2F2%3Fid%3Dinput4",
+            link
+        )));
+        assert!(switches_input(&action(
+            "/Play?url=Capture%3Abluez%3Abluetooth",
+            link
+        )));
+
+        // A station plays, but through the player's own wrapper, and pressing
+        // one is not giving up what you were listening to in the same way.
+        assert!(!switches_input(&action(
+            "/ui/prf?u=%2FPlay%3Furl%3DAirable%253Aradio%253Ahttps%253A%252F%252Fx.io%252Fs%252F1",
+            link
+        )));
+        // A track, same shape.
+        assert!(!switches_input(&action(
+            "/ui/prf?u=%2FAdd%3Fplaynow%3D1%26file%3D%252Fvar%252Fx.flac",
+            link
+        )));
+        // An album opens a screen.
+        assert!(!switches_input(&action(
+            "/ui/browseContext?service=LocalMusic&type=Album",
+            bluos::screen::ActionKind::Browse
+        )));
+        // The right shape of URI but the wrong kind of action.
+        assert!(!switches_input(&action(
+            "/Play?url=Capture%3Abluez%3Abluetooth",
+            bluos::screen::ActionKind::Browse
+        )));
+    }
 
     /// The one string on the alarms list that is not the player's wording.
     #[test]
