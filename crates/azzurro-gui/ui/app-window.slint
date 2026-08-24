@@ -115,6 +115,10 @@ export struct BrowseRow {
     // Whether `cover` is one of our own glyphs rather than a picture: a line
     // icon has to be centered and tinted, not cropped to fill a tile.
     is-glyph: bool,
+    // Whether pressing this starts music, as opposed to opening a screen. An
+    // album and the track on it look alike on a shelf and do opposite things,
+    // so the one that plays says so under the pointer.
+    plays: bool,
 }
 
 // One section of a screen, with the rows it holds.
@@ -1008,34 +1012,64 @@ component BrowseRowView inherits Rectangle {
         VerticalLayout {
             alignment: center;
 
-            // `if`, not `visible`: a hidden element still takes its space in a
-            // layout, so using visibility here gave every glyph row a second
-            // 36px of invisible artwork and pushed the rows below it down.
-            if root.entry.is-glyph: Rectangle {
+            // A box of a fixed size holding whichever of the two the row has,
+            // so the play badge can sit on top of either. Sized here rather
+            // than by its contents: the box is what keeps the row's height
+            // steady whichever branch is taken.
+            Rectangle {
                 width: 36px;
                 height: 36px;
-                border-radius: 5px;
-                background: Theme.raised;
 
-                Icon {
-                    glyph: root.entry.cover;
-                    tint: root.entry.playing ? Theme.accent : Theme.dim;
-                    width: 19px;
-                    height: 19px;
+                // `if`, not `visible`: a hidden element still takes its space
+                // in a layout, so using visibility here gave every glyph row a
+                // second 36px of invisible artwork and pushed the rows below
+                // it down.
+                if root.entry.is-glyph: Rectangle {
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 5px;
+                    background: Theme.raised;
+
+                    Icon {
+                        glyph: root.entry.cover;
+                        tint: root.entry.playing ? Theme.accent : Theme.dim;
+                        width: 19px;
+                        height: 19px;
+                    }
                 }
-            }
 
-            if !root.entry.is-glyph: Artwork {
-                source: root.entry.cover;
-                // A note rather than a radio: most of what reaches this
-                // fallback is a library row whose art has not arrived, and an
-                // artist with a radio beside their name reads as a station.
-                fallback: Icons.track;
-                corner: 5px;
-                width: 36px;
-                height: 36px;
-                // A browse row shows covers and service logos alike.
-                crop: false;
+                if !root.entry.is-glyph: Artwork {
+                    source: root.entry.cover;
+                    // A note rather than a radio: most of what reaches this
+                    // fallback is a library row whose art has not arrived, and
+                    // an artist with a radio beside their name reads as a
+                    // station.
+                    fallback: Icons.track;
+                    corner: 5px;
+                    width: 36px;
+                    height: 36px;
+                    // A browse row shows covers and service logos alike.
+                    crop: false;
+                }
+
+                // What pressing the row will do, said before it is pressed.
+                // The cover is too small here for a disc the way a tile has
+                // one, so the whole of it dims and the glyph sits on that.
+                if root.entry.plays && !root.entry.playing: Rectangle {
+                    border-radius: 5px;
+                    background: #000000b8;
+                    opacity: touch.has-hover ? 1.0 : 0.0;
+                    animate opacity { duration: 120ms; easing: ease-out; }
+
+                    Icon {
+                        // See the tile: a triangle looks off in a centred box.
+                        x: (parent.width - self.width) / 2 + 1px;
+                        glyph: Icons.play;
+                        tint: Theme.text;
+                        width: 15px;
+                        height: 15px;
+                    }
+                }
             }
         }
 
@@ -1216,6 +1250,38 @@ component BrowseTile inherits Rectangle {
                             root.absolute-position.y,
                             root.absolute-position.x + root.width);
                     }
+                }
+            }
+
+            // What pressing the tile will do, said before it is pressed.
+            //
+            // An album and a track look identical on a shelf and do opposite
+            // things — one opens, one starts playing — and the only way to
+            // find out was to press. Shown on hover for the same reason the
+            // dots are: a play badge on every tile at rest would read as a
+            // shelf of buttons rather than a shelf of records.
+            //
+            // Not on the one already playing: the accent marker below says
+            // that, and two discs on one sleeve is noise.
+            if root.entry.plays && !root.entry.playing: Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 42px;
+                height: 42px;
+                border-radius: self.height / 2;
+                background: #000000b8;
+                opacity: touch.has-hover ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+
+                Icon {
+                    // Nudged right by an eighth of its width: a triangle's
+                    // visual centre is left of its bounding box, so centring
+                    // the box leaves it looking off.
+                    x: (parent.width - self.width) / 2 + 1px;
+                    glyph: Icons.play;
+                    tint: Theme.text;
+                    width: 18px;
+                    height: 18px;
                 }
             }
 

@@ -687,6 +687,8 @@ fn is_chrome_row(kind: ItemKind) -> bool {
 /// [`TrackData`]: the pixels are `Send` and the `Image` is not.
 struct BrowseData {
     index: i32,
+    /// Whether pressing it starts music rather than opening a screen.
+    plays: bool,
     title: String,
     subtitle: String,
     /// Its place on the record, and what the player says it is encoded as.
@@ -1860,6 +1862,8 @@ impl Backend {
 
             for (index, (label, _)) in browsing.screens.iter().enumerate() {
                 rows.push(BrowseData {
+                    // The sidebar opens screens; nothing in it starts music.
+                    plays: false,
                     track: String::new(),
                     quality: String::new(),
                     index: index as i32,
@@ -1885,6 +1889,7 @@ impl Backend {
                         // page, "Manage" opens the music-services page. The
                         // player supplies both the wording and the target.
                         rows.push(BrowseData {
+                            plays: false,
                             track: String::new(),
                             quality: String::new(),
                             index: ordinal as i32,
@@ -1908,6 +1913,7 @@ impl Backend {
                     for item in &section.items {
                         let label = item.label().unwrap_or_default().to_owned();
                         rows.push(BrowseData {
+                            plays: false,
                             track: String::new(),
                             quality: String::new(),
                             index,
@@ -2728,6 +2734,16 @@ impl Backend {
                         });
 
                     rows.push(BrowseData {
+                        // Resolved the way `activate` resolves it — its own
+                        // action first, the play action only as a fallback —
+                        // so this says what pressing *this* row would do and
+                        // not what the row is capable of.
+                        plays: item
+                            .action
+                            .as_ref()
+                            .or(item.play_action.as_ref())
+                            .and_then(|action| action.uri.as_deref())
+                            .is_some_and(bluos::screen::starts_playing),
                         track: item.extra.get("track").cloned().unwrap_or_default(),
                         quality: quality_label(item.quality.as_deref().unwrap_or_default()),
                         index: at,
@@ -2892,6 +2908,7 @@ impl Backend {
                                 playing: row.playing,
                                 selected: row.selected,
                                 has_menu: row.has_menu,
+                                plays: row.plays,
                             })
                             .collect::<Vec<_>>(),
                     )),
@@ -2930,6 +2947,9 @@ impl Backend {
                         playing: false,
                         selected: row.selected,
                         has_menu: false,
+                        // A service picker chooses which service a screen is
+                        // about; it never starts anything.
+                        plays: false,
                     })
                     .collect::<Vec<_>>(),
             )));

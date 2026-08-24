@@ -969,6 +969,52 @@ pub fn appending(uri: &str) -> Option<String> {
 /// `%26`; the same query unwrapped uses `=` and `&`. Both spellings are
 /// handled rather than decoding and re-encoding, which would rewrite every
 /// other parameter on the way through and risk changing a file name.
+/// Whether pressing this action makes the player start making sound.
+///
+/// Not the same question as [`appending`], which asks whether an action can be
+/// turned into a queue append — only a track can. A radio station plays and
+/// cannot be appended, so the two answers differ and using the append test to
+/// decide what to badge left every station looking unplayable.
+///
+/// The player writes two commands that start audio, either bare or wrapped in
+/// its own `/ui/prf?…&u=<command>`:
+///
+/// * `/Add?playnow=1&file=…` — a track. Without `playnow` the same command
+///   only grows the queue, which is what Queue Builder Mode turns it into.
+/// * `/Play?url=…` — a stream. Radio stations, Radio Paradise channels, and
+///   the physical inputs, which are `Capture:` URLs and do start audio.
+///
+/// Everything else is false, including the wrapped commands that merely change
+/// something: `/DeleteFavourite`, service switches, clearing the queue.
+pub fn starts_playing(uri: &str) -> bool {
+    let Some((_, query)) = uri.split_once('?') else {
+        return false;
+    };
+
+    // The wrapper carries the real command percent-encoded in `u`; the other
+    // parameters repeat it for the player's own bookkeeping and are not it.
+    match query.split('&').find_map(|pair| pair.strip_prefix("u=")) {
+        Some(encoded) => {
+            let inner = percent_encoding::percent_decode_str(encoded).decode_utf8_lossy();
+            is_play_command(&inner)
+        }
+        None => is_play_command(uri),
+    }
+}
+
+/// One unwrapped command, judged.
+fn is_play_command(command: &str) -> bool {
+    let Some((path, query)) = command.split_once('?') else {
+        return false;
+    };
+    match path {
+        "/Play" => true,
+        // `playnow` is the whole difference between playing it and queueing it.
+        "/Add" => query.split('&').any(|pair| pair == "playnow=1"),
+        _ => false,
+    }
+}
+
 fn without_playnow(query: &str) -> (String, bool) {
     let mut out = query.to_owned();
     let mut dropped = false;
@@ -1011,6 +1057,62 @@ impl Configuration {
             .iter()
             .find(|i| i.id == id)
             .map(|i| i.uri.as_str())
+    }
+}
+
+#[cfg(test)]
+mod starts_playing_tests {
+    use super::starts_playing;
+
+    /// Every one of these came off a Powernode on BluOS 4.16.6, verbatim.
+    #[test]
+    fn what_makes_a_sound_and_what_does_not() {
+        // A track on the Recently Played shelf.
+        assert!(starts_playing(
+            "/ui/prf?u=%2FAdd%3Fplaynow%3D1%26file%3D%252Fvar%252Fmnt%252Fx.flac"
+        ));
+        // A track inside an album, which carries the shelf's bookkeeping too.
+        assert!(starts_playing(
+            "/ui/prf?a=album%3DX%26playnow%3D1&t=1&u=%2FAdd%3Fplaynow%3D1%26file%3D%252Fvar%252Fx.flac"
+        ));
+        // A TuneIn/Airable station: /Play, and no `playnow` anywhere. This is
+        // the case the append test got wrong.
+        assert!(starts_playing(
+            "/ui/prf?u=%2FPlay%3Furl%3DAirable%253Aradio%253Ahttps%253A%252F%252Fx.io%252Fs%252F1%26title1%3DCBC"
+        ));
+        // A Radio Paradise channel.
+        assert!(starts_playing(
+            "/ui/prf?u=%2FPlay%3Furl%3DRadioParadise%253A%252F42%253A20%252FSerenity"
+        ));
+        // A physical input, unwrapped.
+        assert!(starts_playing("/Play?url=Capture%3Abluez%3Abluetooth"));
+
+        // An album and the library: these open a screen.
+        assert!(!starts_playing(
+            "/ui/browseContext?service=LocalMusic&type=Album"
+        ));
+        assert!(!starts_playing("/ui/browseMenuGroup?service=LocalMusic"));
+        // A wrapped command that changes something rather than playing it.
+        assert!(!starts_playing(
+            "/ui/prf?cgsc=1&u=%2FDeleteFavourite%3Ffn%3Dx"
+        ));
+        // The same track command with `playnow` dropped, which is what Queue
+        // Builder Mode sends: it grows the queue and plays nothing.
+        assert!(!starts_playing("/Add?where=last&file=%2Fvar%2Fx.flac"));
+        // Nothing to judge.
+        assert!(!starts_playing("/Play"));
+        assert!(!starts_playing(""));
+    }
+
+    /// The two questions are genuinely different, and a station is the proof.
+    #[test]
+    fn it_is_not_the_same_question_as_appending() {
+        let station = "/ui/prf?u=%2FPlay%3Furl%3DRadioParadise%253A%252F42%253A20%252FSerenity";
+        assert!(starts_playing(station));
+        assert!(
+            super::appending(station).is_none(),
+            "a stream cannot be put at the end of a queue"
+        );
     }
 }
 
