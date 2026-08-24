@@ -155,6 +155,11 @@ export global Icons {
     out property <image> reset: @image-url("icons/rotate-ccw.svg");
     out property <image> server: @image-url("icons/server.svg");
     out property <image> tone: @image-url("icons/audio-waveform.svg");
+    // What is making the sound right now. Deliberately not `play`: that glyph
+    // means "press this and it will start", which is what the hover badge on a
+    // cover says, and a tile wearing both was two different claims in the same
+    // shape.
+    out property <image> sounding: @image-url("icons/audio-lines.svg");
     out property <image> gauge: @image-url("icons/gauge.svg");
     out property <image> service: @image-url("icons/music.svg");
     out property <image> edit: @image-url("icons/pencil.svg");

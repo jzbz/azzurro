@@ -1175,7 +1175,11 @@ component BrowseTile inherits Rectangle {
     callback open-menu(length, length);
 
     width: 128px;
-    height: 176px;
+    // Sized from the caption rather than fixed. At a fixed height the caption
+    // was stretched to swallow whatever was left over — measured at 41px for a
+    // caption that wanted 30 — so a tile with no subtitle carried the gap
+    // twice: once for the line it did not need and once for the slack.
+    height: 6px + 116px + 7px + caption.preferred-height + 6px;
     border-radius: Theme.radius-small;
     background: touch.has-hover ? Theme.hover : transparent;
     animate background { duration: 120ms; easing: ease-out; }
@@ -1294,7 +1298,9 @@ component BrowseTile inherits Rectangle {
             }
 
             // Marked in the corner rather than across the middle: the cover is
-            // the point of the tile.
+            // the point of the tile. Not a play triangle — that is what the
+            // hover badge above uses to say "press this and it will start",
+            // and the same shape cannot also mean "this is already playing".
             if root.entry.playing: Rectangle {
                 x: parent.width - self.width - 6px;
                 y: parent.height - self.height - 6px;
@@ -1304,7 +1310,7 @@ component BrowseTile inherits Rectangle {
                 background: Theme.accent;
 
                 Icon {
-                    glyph: Icons.play;
+                    glyph: Icons.sounding;
                     tint: Theme.accent-ink;
                     width: 11px;
                     height: 11px;
@@ -1312,8 +1318,10 @@ component BrowseTile inherits Rectangle {
             }
         }
 
-        VerticalLayout {
+        caption := VerticalLayout {
             spacing: 1px;
+
+
 
             Text {
                 text: root.entry.title;
@@ -1323,7 +1331,10 @@ component BrowseTile inherits Rectangle {
                 overflow: elide;
             }
 
-            Text {
+            // `if`, not an empty Text: an empty one still occupies its line
+            // height, which on a shelf of inputs — none of which carry a
+            // subtitle — left a band of nothing under every caption.
+            if root.entry.subtitle != "": Text {
                 text: root.entry.subtitle;
                 font-size: Theme.micro-size;
                 color: Theme.faint;
@@ -1595,20 +1606,33 @@ component BrowseBlockView inherits VerticalLayout {
     // controller: the alternative is a wall of covers that pushes everything
     // below it off the screen.
     if root.block.kind == 1: Flickable {
-        height: 176px;
+        // As tall as the tiles need, not a fixed figure. A shelf of inputs has
+        // no subtitles and so wants less than one of records; asking the tiles
+        // is how the two stay right without the number being written twice.
+        height: tiles.preferred-height;
         viewport-width: root.block.rows.length * 128px + 2 * Theme.pad;
         viewport-height: self.height;
 
-        HorizontalLayout {
+        tiles := HorizontalLayout {
             x: Theme.pad;
             width: root.block.rows.length * 128px;
-            height: parent.height;
+            height: self.preferred-height;
             alignment: start;
 
-            for entry in root.block.rows: BrowseTile {
-                entry: entry;
-                activate => { root.activate(entry.index); }
-                open-menu(y, right) => { root.open-menu(entry.index, y, right); }
+            // Top-aligned rather than left to the layout's own cross-axis
+            // placement. A shelf can mix a tile that has a subtitle with one
+            // that has not — Recently Played holds both records and artists —
+            // and those are now different heights, so without this the shorter
+            // one could sit centred and its cover would ride below its
+            // neighbours'.
+            for entry in root.block.rows: VerticalLayout {
+                alignment: start;
+
+                BrowseTile {
+                    entry: entry;
+                    activate => { root.activate(entry.index); }
+                    open-menu(y, right) => { root.open-menu(entry.index, y, right); }
+                }
             }
         }
     }
