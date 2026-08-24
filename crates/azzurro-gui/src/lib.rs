@@ -2781,11 +2781,21 @@ impl Backend {
 
         let large = matches!(showing, Showing::NowPlaying);
         let customising = matches!(showing, Showing::Customise);
+        // Cleared here rather than only by `publish_alarms`, which is the one
+        // publisher that can set it and only runs while the alarms pane is up.
+        // Left to that alone, walking out of a half-made alarm — to Search, to
+        // Home, anywhere — left its time and days strip pinned across the
+        // bottom of whatever came next. Every flag that says "this pane is
+        // showing" has to be answered by whichever pane actually is.
+        //
+        // Safe to set false unconditionally: `publish_alarms` runs after this
+        // in the same queue and puts the real value back.
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui.upgrade() {
                 ui.set_now_playing(large);
                 ui.set_customising(customising);
+                ui.set_alarm_editing(false);
             }
         });
 
