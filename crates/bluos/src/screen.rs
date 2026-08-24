@@ -885,7 +885,7 @@ fn in_section(stack: &[Ctx]) -> bool {
     matches!(stack.last(), Some(Ctx::Section | Ctx::NestedList))
 }
 
-fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
+pub(crate) fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
     let declared = a.remove("type").unwrap_or_default();
     let kind = match declared.as_str() {
         "browse" => ActionKind::Browse,

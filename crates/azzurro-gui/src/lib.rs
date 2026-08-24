@@ -167,6 +167,9 @@ enum Command {
     QueueMenuAction(usize),
     /// Show what the playing track actually is: format, rate, bit depth.
     NowPlayingInfo,
+    /// Answer the player's question by pressing one of its buttons. The index
+    /// is into the dialog's own list, and out of range means dismissed.
+    DialogPress(usize),
     /// Move a section from one place in the Customise list to another.
     CustomiseMove(usize, usize),
     /// Keep the arrangement and go back to the screen it describes.
@@ -226,6 +229,9 @@ struct Browsing {
     /// An input waiting to be confirmed, because switching to it stops
     /// whatever is playing.
     pending_input: Option<bluos::screen::Action>,
+    /// The question the player asked instead of doing what it was told. See
+    /// [`bluos::dialog`]; `None` whenever there is nothing to answer.
+    dialog: Option<bluos::dialog::Dialog>,
     /// Where to ask for a queue item's context menu, also from the player.
     queue_menu_uri: Option<String>,
     /// And the menu for whatever is playing, which is where the technical
@@ -1065,6 +1071,14 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    // Dismissing sends -1, which becomes an index no dialog has: the arm
+    // still takes the question down, it just presses nothing.
+    ui.on_dialog_press(move |at| {
+        let at = usize::try_from(at).unwrap_or(usize::MAX);
+        let _ = tx.send(Command::DialogPress(at));
+    });
+
+    let tx = commands.clone();
     ui.on_now_playing_info(move || {
         let _ = tx.send(Command::NowPlayingInfo);
     });
@@ -1509,6 +1523,39 @@ impl Backend {
     /// The artwork is asked for at thumbnail size and only from what is
     /// already decoded — the same cover is in the row underneath, so a menu
     /// that waited on a fetch would open blank for no reason.
+    /// Put the player's question in front of the user, or take it away.
+    ///
+    /// The buttons are the player's, in its order and with its wording — the
+    /// one it colours is the one it considers destructive, and nothing here
+    /// decides which that is.
+    fn publish_dialog(&self) {
+        let asked = self.browsing.lock().unwrap().dialog.clone();
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let Some(asked) = asked else {
+                ui.set_dialog_open(false);
+                return;
+            };
+            let buttons: Vec<DialogButton> = asked
+                .choices
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| DialogButton {
+                    index: index as i32,
+                    label: choice.text.as_str().into(),
+                    // Coloured means "this is the one that throws something
+                    // away", which is what the primary styling is for here.
+                    destructive: choice.color.is_some(),
+                })
+                .collect();
+            ui.set_dialog_title(asked.title.unwrap_or_default().into());
+            ui.set_dialog_body(asked.body.unwrap_or_default().into());
+            ui.set_dialog_buttons(ModelRc::new(VecModel::from(buttons)));
+            ui.set_dialog_open(true);
+        });
+    }
+
     fn publish_queue_menu(&self) {
         let (title, subtitle, cover, rows) = {
             let browsing = self.browsing.lock().unwrap();
@@ -3852,7 +3899,14 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             };
 
             match client.follow(&uri).await {
-                Ok(()) => {
+                // The player asked something instead of acting. Put the
+                // question up; nothing has happened yet, and pressing one of
+                // its buttons is what runs the action it carries.
+                Ok(Some(dialog)) => {
+                    backend.browsing.lock().unwrap().dialog = Some(dialog);
+                    backend.publish_dialog();
+                }
+                Ok(None) => {
                     // The player has no phrase for this one, because it does
                     // not know the mode exists.
                     if appended {
@@ -4973,6 +5027,37 @@ async fn run_commands(
                         }
                     }
                 });
+                continue;
+            }
+
+            Command::DialogPress(at) => {
+                // Taken, not read: the question is answered either way, and
+                // leaving it up while its action runs would let it be pressed
+                // twice.
+                let chosen = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .dialog
+                        .take()
+                        .and_then(|d| d.choices.into_iter().nth(at))
+                };
+                backend.publish_dialog();
+
+                // Dismissed, or a button that only closes. The player writes
+                // Cancel as an action of type `nil`, so there is nothing to
+                // send and nothing to report.
+                let Some(choice) = chosen.filter(|c| !c.is_cancel()) else {
+                    continue;
+                };
+                let Some(action) = choice.action else {
+                    continue;
+                };
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // Off the loop, like everything else that talks to a player.
+                let backend = backend.clone();
+                tokio::spawn(run_action(backend, id, action, Arrive::Deeper));
                 continue;
             }
 

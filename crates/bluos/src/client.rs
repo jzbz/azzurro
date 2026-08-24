@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 
 use crate::device::DeviceId;
+use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::queue::Queue;
 use crate::screen::{Configuration, Screen};
@@ -697,8 +698,17 @@ impl Client {
     /// whole job is to fetch it. Deliberately generic, because the point of the
     /// server-driven screens is that the client does not know what the player
     /// will ask for next.
-    pub async fn follow(&self, path: &str) -> Result<()> {
-        self.get_text(path, &[], REQUEST_TIMEOUT).await.map(drop)
+    /// Run an action, and hand back the question if the player asks one.
+    ///
+    /// The body used to be dropped. It cannot be: a player-link that would
+    /// discard something answers 200 with a [`Dialog`] *instead of* acting —
+    /// "Playing replaces Play Queue" is the one every track press meets once
+    /// the queue has anything in it — so throwing the reply away meant the
+    /// press did nothing and said nothing. `Ok(None)` is the ordinary case,
+    /// where the action simply happened.
+    pub async fn follow(&self, path: &str) -> Result<Option<Dialog>> {
+        let body = self.get_text(path, &[], REQUEST_TIMEOUT).await?;
+        crate::dialog::parse(&body)
     }
 
     /// The whole play queue.

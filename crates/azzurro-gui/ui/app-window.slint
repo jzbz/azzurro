@@ -71,6 +71,15 @@ export struct ActionButton {
 // Save, Edit, Clear, and — to a client declaring a new enough schema — Queue
 // Builder Mode. Which of them exist is the player's business, not this app's:
 // the row is drawn from whatever it sends.
+// One answer to a question the player asked. See `bluos::dialog`.
+export struct DialogButton {
+    index: int,
+    label: string,
+    // The player coloured this one, which is how it marks the answer that
+    // discards something. Drawn as the emphasised button.
+    destructive: bool,
+}
+
 export struct QueueButton {
     index: int,
     label: string,
@@ -1662,6 +1671,14 @@ export component AppWindow inherits Window {
     callback queue-menu-activate(int);
     // The input waiting to be confirmed, by name. Empty when nothing is.
     in-out property <string> confirm-input: "";
+
+    // The player's own question — "Playing replaces Play Queue" and its like.
+    // Its wording and its buttons are the player's; this only draws them.
+    in property <bool> dialog-open: false;
+    in property <string> dialog-title;
+    in property <string> dialog-body;
+    in property <[DialogButton]> dialog-buttons;
+    callback dialog-press(int);
     callback answer-input(bool);
     callback sidebar-activate(int, int);
     callback open-settings();
@@ -3567,6 +3584,65 @@ export component AppWindow inherits Window {
     //
     // Only raised while something is actually playing; the backend decides
     // that, and a silent speaker switches without being asked.
+    // The player's own question, drawn the same way as the one above but with
+    // nothing of ours in it: the title, the sentence and every button come off
+    // the wire. Dismissing runs no action, which is what its `closeAction` of
+    // type `nil` asks for.
+    if root.dialog-open: Rectangle {
+        background: #00000080;
+
+        TouchArea {
+            clicked => { root.dialog-press(-1); }
+        }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 400px;
+            height: asked.preferred-height;
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            // Its own, so a press inside the card does not reach the
+            // dismissing area behind it.
+            TouchArea {}
+
+            asked := VerticalLayout {
+                padding: Theme.room;
+                spacing: Theme.gap;
+
+                Text {
+                    text: root.dialog-title;
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                if root.dialog-body != "": Text {
+                    text: root.dialog-body;
+                    font-size: Theme.body-size;
+                    color: Theme.dim;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.gap;
+                    padding-top: Theme.tight;
+
+                    for button in root.dialog-buttons: PillButton {
+                        label: button.label;
+                        primary: button.destructive;
+                        clicked => { root.dialog-press(button.index); }
+                    }
+                }
+            }
+        }
+    }
+
     if root.confirm-input != "": Rectangle {
         background: #00000080;
 

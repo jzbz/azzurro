@@ -30,6 +30,7 @@
 
 pub mod client;
 pub mod device;
+pub mod dialog;
 pub mod discovery;
 pub mod error;
 pub mod forms;
