@@ -723,12 +723,10 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
     let Pane::Alarms(page) = &browsing.pane else {
         return None;
     };
-    let at = index as i32;
-
     let Some(alarm) = page.editing.as_ref() else {
         // The list. A toggle arms the alarm at that position; anything else
         // opens it, and the last row makes a new one.
-        if at == NEW_ALARM {
+        if index == NEW_ALARM {
             return Some(Command::AlarmOpen(None));
         }
         let found = page.list.alarms.get(index)?;
@@ -739,7 +737,7 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
     };
 
     // The editor.
-    let field = match (at, edit) {
+    let field = match (index, edit) {
         (ALARM_SAVE, _) => return Some(Command::AlarmSave),
         (ALARM_DELETE, _) => return Some(Command::AlarmDelete),
         (ALARM_VOLUME, Some(Edit::Number(v))) => AlarmField::Volume(v.max(0.0) as u32),
@@ -770,15 +768,21 @@ fn replace_alarms(backend: &Backend, list: bluos::alarms::Alarms) {
 /// walking them, which is right where the rows are always the same ones; here
 /// Stops, Fall back and Delete each come and go, so a positional index would
 /// renumber the rows below them and send a volume drag to the wrong field.
-const ALARM_KIND: i32 = -10;
-const ALARM_VOLUME: i32 = -11;
-const ALARM_FADE: i32 = -12;
-const ALARM_SHUFFLE: i32 = -13;
-const ALARM_BACKUP: i32 = -14;
-const ALARM_SAVE: i32 = -15;
-const ALARM_DELETE: i32 = -16;
+/// Above any real row, and positive. Negative would read better — nothing
+/// could mistake it for a position — but the window's callbacks clamp a row
+/// index at zero on the way in, so a negative constant arrives as row zero and
+/// every one of these becomes "the first alarm in the list". Settings rows are
+/// numbered by walking a page, so they run to tens; nine thousand is clear.
+const ALARM_ROW_BASE: usize = 9000;
+const ALARM_KIND: usize = ALARM_ROW_BASE;
+const ALARM_VOLUME: usize = ALARM_ROW_BASE + 1;
+const ALARM_FADE: usize = ALARM_ROW_BASE + 2;
+const ALARM_SHUFFLE: usize = ALARM_ROW_BASE + 3;
+const ALARM_BACKUP: usize = ALARM_ROW_BASE + 4;
+const ALARM_SAVE: usize = ALARM_ROW_BASE + 5;
+const ALARM_DELETE: usize = ALARM_ROW_BASE + 6;
 /// The last row of the list, which is not an alarm.
-const NEW_ALARM: i32 = -17;
+const NEW_ALARM: usize = ALARM_ROW_BASE + 7;
 
 /// How long an alarm plays for, in minutes.
 ///
@@ -838,9 +842,10 @@ fn alarm_detail(alarm: &bluos::alarms::Alarm) -> String {
     let mut parts = vec![repeat_summary(&alarm.days)];
     parts.push(match alarm.source.as_deref().filter(|s| !s.is_empty()) {
         Some(source) => source.to_owned(),
-        // What the player falls back to, and what it plays when nothing was
-        // ever chosen.
-        None => "The player's own tone".to_owned(),
+        // Only reached if the player sends none. It fills this in itself on
+        // a save with nothing chosen — observed as "Current play queue or
+        // station" — so this is a backstop, not the usual case.
+        None => "Whatever the player is set to".to_owned(),
     });
     match &alarm.end {
         Some(_) => {
@@ -1765,7 +1770,7 @@ impl Backend {
                     });
                 }
                 rows.push(SettingData {
-                    index: NEW_ALARM,
+                    index: NEW_ALARM as i32,
                     label: "New alarm…".to_owned(),
                     glyph: Some(Glyph::Add),
                     control: "link",
@@ -1785,7 +1790,7 @@ impl Backend {
                 // answer, not a preference.
                 if page.list.supports_end_time {
                     rows.push(SettingData {
-                        index: ALARM_KIND,
+                        index: ALARM_KIND as i32,
                         label: "Stops".to_owned(),
                         detail: if alarm.is_schedule() {
                             "At a set time".to_owned()
@@ -1812,7 +1817,7 @@ impl Backend {
                 }
 
                 rows.push(SettingData {
-                    index: ALARM_VOLUME,
+                    index: ALARM_VOLUME as i32,
                     label: "Volume".to_owned(),
                     glyph: Some(Glyph::Volume),
                     control: "range",
@@ -1823,7 +1828,7 @@ impl Backend {
                     ..SettingData::blank()
                 });
                 rows.push(SettingData {
-                    index: ALARM_FADE,
+                    index: ALARM_FADE as i32,
                     label: "Fade in".to_owned(),
                     detail: "Come up gradually rather than starting at once".to_owned(),
                     glyph: Some(Glyph::Volume),
@@ -1832,7 +1837,7 @@ impl Backend {
                     ..SettingData::blank()
                 });
                 rows.push(SettingData {
-                    index: ALARM_SHUFFLE,
+                    index: ALARM_SHUFFLE as i32,
                     label: "Shuffle".to_owned(),
                     glyph: Some(Glyph::Shuffle),
                     control: "boolean",
@@ -1844,7 +1849,7 @@ impl Backend {
                 });
                 if !alarm.is_schedule() {
                     rows.push(SettingData {
-                        index: ALARM_BACKUP,
+                        index: ALARM_BACKUP as i32,
                         label: "Fall back to a tone".to_owned(),
                         detail: "If the source cannot be reached".to_owned(),
                         glyph: Some(Glyph::Alarm),
@@ -1855,7 +1860,7 @@ impl Backend {
                 }
 
                 rows.push(SettingData {
-                    index: ALARM_SAVE,
+                    index: ALARM_SAVE as i32,
                     label: if alarm.id == 0 { "Create" } else { "Save" }.to_owned(),
                     glyph: Some(Glyph::Save),
                     control: "button",
@@ -1864,7 +1869,7 @@ impl Backend {
                 });
                 if alarm.id != 0 {
                     rows.push(SettingData {
-                        index: ALARM_DELETE,
+                        index: ALARM_DELETE as i32,
                         label: "Delete this alarm".to_owned(),
                         glyph: Some(Glyph::Clear),
                         control: "button",
