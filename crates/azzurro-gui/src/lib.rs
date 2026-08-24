@@ -1433,13 +1433,21 @@ async fn run(
         Err(e) => return say(&ui, format!("could not start HTTP: {e}")),
     };
 
+    // Not fatal. This used to return, which took the command loop with it: the
+    // message told the user to add a player by address and then nothing was
+    // listening for one, because `run_commands` is spawned further down. A
+    // window that paints and answers nothing is worse than one that cannot
+    // find players by itself — remembered addresses and add-by-address are
+    // both still perfectly good ways in.
     let discovery = match Discovery::bind() {
-        Ok(d) => Arc::new(d),
+        Ok(found) => Some(Arc::new(found)),
         Err(e) => {
-            return say(
+            tracing::warn!("could not bind the discovery port: {e}");
+            say(
                 &ui,
                 format!("could not bind the discovery port: {e}. Add players by address instead."),
             );
+            None
         }
     };
 
@@ -1468,18 +1476,22 @@ async fn run(
     ));
     tokio::spawn(tick_position(backend.clone()));
 
-    say(
-        &ui,
-        format!(
-            "looking for players on {}",
-            discovery
-                .targets()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    );
+    // Only where there is a socket to look on. Everything below runs either
+    // way: remembered addresses do not need discovery.
+    if let Some(discovery) = &discovery {
+        say(
+            &ui,
+            format!(
+                "looking for players on {}",
+                discovery
+                    .targets()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
 
     // Remembered players first: one that was asleep when the app opened will
     // never announce itself, and a broadcast does not always arrive. Addresses
@@ -1510,6 +1522,10 @@ async fn run(
     // The sweep is only the cold start. Players announce themselves unprompted
     // when they wake, so the same socket keeps listening afterwards and a
     // player switched on an hour later still appears.
+    // Without a socket there is nothing to sweep and nothing to listen to, so
+    // this task simply ends. The window and its command loop carry on.
+    let Some(discovery) = discovery else { return };
+
     sweep(backend.clone(), discovery.clone(), http.clone()).await;
 
     loop {
@@ -5176,15 +5192,24 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
 async fn run_commands(
     mut commands: mpsc::UnboundedReceiver<Command>,
     backend: Backend,
-    discovery: Arc<Discovery>,
+    discovery: Option<Arc<Discovery>>,
     http: reqwest::Client,
 ) {
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
             Command::Rescan => {
+                // Nothing to sweep with where the port could not be bound, and
+                // saying so beats a button that looks like it did something.
+                let Some(discovery) = discovery.clone() else {
+                    say(
+                        &backend.ui,
+                        "discovery is not running — add players by address",
+                    );
+                    continue;
+                };
                 // Spawned rather than awaited: a sweep runs for twelve seconds
                 // and this loop is what carries every other command.
-                tokio::spawn(sweep(backend.clone(), discovery.clone(), http.clone()));
+                tokio::spawn(sweep(backend.clone(), discovery, http.clone()));
                 continue;
             }
             Command::Select(id) => {
