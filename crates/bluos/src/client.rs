@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
+use crate::alarms::{Alarm, Alarms};
 use crate::device::DeviceId;
 use crate::dialog::Dialog;
 use crate::error::{Error, Result};
@@ -170,6 +171,57 @@ pub enum PlaylistTarget {
         name: String,
         id: Option<String>,
     },
+}
+
+/// The IANA zone this machine keeps its clocks in, for the alarm routes.
+///
+/// No crate for it. The three places it can be read are all files, and inside
+/// the Flatpak sandbox all three are present — verified: `TZ` unset,
+/// `/etc/timezone` reading `US/Eastern`, and `/etc/localtime` a symlink into
+/// `/usr/share/zoneinfo`. A dependency would cost a regeneration of the
+/// offline source list the Flatpak build reads, for fifteen lines.
+///
+/// `UTC` where nothing answers. It is wrong for most of the world, but it is a
+/// zone the player will certainly accept, and an alarm an hour out is better
+/// than a request it refuses.
+fn time_zone() -> String {
+    if let Ok(tz) = std::env::var("TZ")
+        && let Some(named) = zone_name(&tz)
+    {
+        return named.to_owned();
+    }
+    if let Ok(text) = std::fs::read_to_string("/etc/timezone")
+        && let Some(named) = zone_name(&text)
+    {
+        return named.to_owned();
+    }
+    if let Ok(target) = std::fs::read_link("/etc/localtime")
+        && let Some(named) = zone_name(&target.to_string_lossy())
+    {
+        return named.to_owned();
+    }
+    "UTC".to_owned()
+}
+
+/// The zone out of whatever form it was written in.
+///
+/// A path keeps only what follows `zoneinfo/`, since that is the zone's name;
+/// `TZ` may carry a leading colon by convention. Anything that does not look
+/// like a zone name comes back as nothing rather than being sent as one.
+fn zone_name(raw: &str) -> Option<&str> {
+    let raw = raw.trim().trim_start_matches(':');
+    let name = match raw.split_once("zoneinfo/") {
+        Some((_, zone)) => zone,
+        None => raw,
+    };
+    // A zone is `Area/Place`, sometimes with a third part, and never empty.
+    // `UTC` on its own is the exception the tz database itself makes.
+    let plausible = !name.is_empty()
+        && !name.starts_with('/')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
+    (plausible && (name.contains('/') || name == "UTC")).then_some(name)
 }
 
 impl Client {
@@ -711,6 +763,95 @@ impl Client {
         crate::dialog::parse(&body)
     }
 
+    /// Every alarm and schedule the player holds.
+    ///
+    /// The time zone travels with the request. The player stores an alarm as a
+    /// wall-clock time and has to know whose wall — without it, one set on a
+    /// laptop in another zone goes off at the wrong hour. The official
+    /// controller sends it on the read as well as the write, so this does too.
+    pub async fn alarms(&self) -> Result<Alarms> {
+        self.alarms_request(&[("tz", time_zone().as_str())]).await
+    }
+
+    /// Save one, creating it when `alarm.id` is zero.
+    ///
+    /// Everything goes out on every save: this route is a replace, not a
+    /// patch, and the reply is the whole list back. `enable` is always 1
+    /// because the official controller has no way to save a disarmed alarm —
+    /// switching one off is [`Self::arm_alarm`] afterwards.
+    pub async fn save_alarm(&self, alarm: &Alarm) -> Result<Alarms> {
+        let hour = format!("{:02}", alarm.hour);
+        let minute = format!("{:02}", alarm.minute);
+        let days = alarm.days_field();
+        let volume = alarm.volume.to_string();
+        let duration = alarm.duration.to_string();
+        let id = alarm.id.to_string();
+        let tz = time_zone();
+
+        let mut query: Vec<(&str, &str)> = vec![
+            ("hour", &hour),
+            ("minute", &minute),
+            ("days", &days),
+            ("volume", &volume),
+            ("fadein", if alarm.fade_in { "1" } else { "0" }),
+            ("enable", "1"),
+            ("tz", &tz),
+            ("shuffle", if alarm.shuffle { "true" } else { "false" }),
+            (
+                "canShuffle",
+                if alarm.can_shuffle { "true" } else { "false" },
+            ),
+            ("useBackup", if alarm.use_backup { "true" } else { "false" }),
+        ];
+
+        // Absent, not empty: a new alarm has no id yet and the player
+        // allocates one. Sending `id=0` would address an alarm that is not
+        // there.
+        if alarm.id != 0 {
+            query.push(("id", &id));
+        }
+        // The two are exclusive — a length for an alarm, a finishing time for
+        // a schedule — and sending both asks the player two questions at once.
+        match alarm.end.as_deref() {
+            Some(end) => query.push(("end", end)),
+            None => query.push(("duration", &duration)),
+        }
+        for (key, value) in [
+            ("source", alarm.source.as_deref()),
+            ("service", alarm.service.as_deref()),
+            ("url", alarm.url.as_deref()),
+            ("image", alarm.image.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                query.push((key, value));
+            }
+        }
+
+        self.alarms_request(&query).await
+    }
+
+    /// Remove one.
+    pub async fn delete_alarm(&self, id: u32) -> Result<Alarms> {
+        self.alarms_request(&[("delete", "1"), ("id", &id.to_string())])
+            .await
+    }
+
+    /// Arm or disarm one without losing it.
+    pub async fn arm_alarm(&self, id: u32, on: bool) -> Result<Alarms> {
+        self.alarms_request(&[
+            ("id", &id.to_string()),
+            ("enable", if on { "1" } else { "0" }),
+        ])
+        .await
+    }
+
+    /// The one route behind all four. Every one of them answers with the whole
+    /// list, so nothing here ever has to re-read after a change.
+    async fn alarms_request(&self, query: &[(&str, &str)]) -> Result<Alarms> {
+        let body = self.get_text("/Alarms", query, REQUEST_TIMEOUT).await?;
+        crate::alarms::parse(&body)
+    }
+
     /// The whole play queue.
     ///
     /// One document however long the queue is. Worth re-reading whenever
@@ -995,6 +1136,34 @@ impl StatusWatch {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_zone_out_of_every_form_it_is_written_in() {
+        // What the Flatpak sandbox actually holds, both of them.
+        assert_eq!(zone_name("US/Eastern"), Some("US/Eastern"));
+        assert_eq!(
+            zone_name("../usr/share/zoneinfo/US/Eastern"),
+            Some("US/Eastern")
+        );
+        assert_eq!(
+            zone_name("/usr/share/zoneinfo/America/Argentina/Ushuaia"),
+            Some("America/Argentina/Ushuaia"),
+            "a three-part zone keeps all of it"
+        );
+        // `TZ` may be written with a leading colon.
+        assert_eq!(zone_name(":Europe/Rome"), Some("Europe/Rome"));
+        assert_eq!(zone_name(" Europe/Rome\n"), Some("Europe/Rome"));
+        // The one zone with no area in front of it.
+        assert_eq!(zone_name("UTC"), Some("UTC"));
+
+        // Not zones. `TZ` also takes a POSIX rule like `EST5EDT,M3.2.0`, which
+        // names no zone the player could look up, so it is refused rather than
+        // sent.
+        assert_eq!(zone_name(""), None);
+        assert_eq!(zone_name("EST5EDT,M3.2.0"), None);
+        assert_eq!(zone_name("Eastern"), None);
+        assert_eq!(zone_name("/"), None);
+    }
     use super::*;
 
     fn client() -> Client {

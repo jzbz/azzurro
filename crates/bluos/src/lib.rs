@@ -28,6 +28,7 @@
 //! # }
 //! ```
 
+pub mod alarms;
 pub mod client;
 pub mod device;
 pub mod dialog;
