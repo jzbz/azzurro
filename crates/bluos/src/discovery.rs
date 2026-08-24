@@ -34,14 +34,36 @@ pub struct Discovery {
 impl Discovery {
     /// Bind the LSDP port and work out where to broadcast.
     ///
-    /// The port is shared: `SO_REUSEADDR`, plus `SO_REUSEPORT` on Linux, so
-    /// that this can run alongside the official controller instead of one of
-    /// them failing to start. That is what the official app does too, and it
-    /// makes debugging against a known-good client possible.
+    /// The port is shared: `SO_REUSEADDR`, plus `SO_REUSEPORT` wherever there
+    /// is one, so that this can run alongside the official controller instead
+    /// of one of them failing to start. That is what the official app does
+    /// too, and it makes debugging against a known-good client possible.
+    ///
+    /// `SO_REUSEPORT` was gated to Linux, which was too narrow. On the BSDs —
+    /// macOS among them — `SO_REUSEADDR` alone does not let two sockets
+    /// wildcard-bind one UDP port; only a multicast address gets that
+    /// exemption, and this binds a unicast wildcard. Without it the second
+    /// controller to start gets `EADDRINUSE`, and since the option has to be
+    /// set on *both* sockets for either to share, whichever of the two came up
+    /// first would lock the other out. Windows has no such option at all and
+    /// does not need one: its `SO_REUSEADDR` already permits the duplicate
+    /// bind.
+    ///
+    /// The gate mirrors socket2's own for `set_reuse_port` rather than naming
+    /// platforms, so this compiles exactly where the method is defined.
     pub fn bind() -> Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "solaris",
+                target_os = "illumos",
+                target_os = "cygwin",
+                target_os = "nuttx",
+                target_os = "wasi"
+            ))
+        ))]
         socket.set_reuse_port(true)?;
         socket.set_broadcast(true)?;
         socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, lsdp::PORT).into())?;
