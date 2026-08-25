@@ -573,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "bluos",
  "dirs",
+ "i-slint-backend-testing",
  "image",
  "lru",
  "mpris-server",

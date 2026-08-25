@@ -7353,6 +7353,100 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 #[cfg(test)]
 mod tests {
 
+    /// The window, driven the way a hand drives it.
+    ///
+    /// One test rather than several: the testing backend may only be installed
+    /// once in a process, and `cargo test` runs each `#[test]` on its own
+    /// thread, so a second `init_no_event_loop` would panic.
+    ///
+    /// What this covers is the seam nothing else does — the callbacks between
+    /// a press and a `Command`. Three of the regressions found by hand on
+    /// 2026-08-23/24 lived exactly there and were invisible to every other
+    /// test in this repo, because they were reached only by pressing
+    /// something.
+    #[test]
+    fn a_press_becomes_the_command_it_should() {
+        i_slint_backend_testing::init_no_event_loop();
+
+        let ui = AppWindow::new().expect("a window");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        wire(&ui, tx);
+
+        // A settings-shaped page, numbered the way the alarms editor numbers
+        // its rows. The exact value is the point: these are deliberately far
+        // above any real row, because the callback used to clamp its argument
+        // at zero and every one of them arrived as "the first row".
+        let rows = vec![
+            SettingItem {
+                index: ALARM_SAVE as i32,
+                label: "Create".into(),
+                control: "button".into(),
+                value: "Save".into(),
+                available: true,
+                ..Default::default()
+            },
+            SettingItem {
+                index: NEW_ALARM as i32,
+                label: "New alarm…".into(),
+                control: "link".into(),
+                available: true,
+                ..Default::default()
+            },
+        ];
+        ui.set_settings(ModelRc::new(VecModel::from(rows)));
+        ui.set_in_settings(true);
+
+        // Pressing the second row must say the second row, not row zero.
+        let row =
+            i_slint_backend_testing::ElementHandle::find_by_accessible_label(&ui, "New alarm…")
+                .next()
+                .or_else(|| {
+                    i_slint_backend_testing::ElementQuery::from_root(&ui)
+                        .match_descendants()
+                        .match_predicate(|e| {
+                            e.accessible_label().is_some_and(|l| l == "New alarm…")
+                        })
+                        .find_first()
+                });
+
+        match row {
+            Some(row) => {
+                row.invoke_accessible_default_action();
+                let sent = rx.try_recv();
+                assert!(
+                    matches!(sent, Ok(Command::BrowseActivate(at)) if at == NEW_ALARM),
+                    "a press on the last row must carry its own index, got {sent:?}"
+                );
+            }
+            // The rows are drawn by a component that does not publish an
+            // accessible label. Rather than assert nothing, drive the callback
+            // the window itself would: this still crosses the boundary that
+            // clamped the index, which is the thing under test.
+            None => {
+                ui.invoke_browse_activate(NEW_ALARM as i32);
+                let sent = rx.try_recv();
+                assert!(
+                    matches!(sent, Ok(Command::BrowseActivate(at)) if at == NEW_ALARM),
+                    "the callback must not clamp a high row index, got {sent:?}"
+                );
+
+                ui.invoke_browse_activate(ALARM_SAVE as i32);
+                assert!(matches!(
+                    rx.try_recv(),
+                    Ok(Command::BrowseActivate(at)) if at == ALARM_SAVE
+                ));
+            }
+        }
+
+        // And a negative one — which is what the window sends to dismiss a
+        // dialog — must not become row zero either.
+        ui.invoke_dialog_press(-1);
+        assert!(
+            matches!(rx.try_recv(), Ok(Command::DialogPress(at)) if at == usize::MAX),
+            "a dismissal must not read as pressing the first button"
+        );
+    }
+
     /// Which presses take the speaker away from what it was doing.
     ///
     /// Every URI here came off a Powernode. The distinction is not "does it

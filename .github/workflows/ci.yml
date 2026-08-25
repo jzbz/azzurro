@@ -1,0 +1,62 @@
+# Build and test on all three platforms.
+#
+# This is the first thing in the project that runs the code anywhere but a
+# Linux desktop. Everything claimed about macOS and Windows so far came from
+# `cargo check --target` and reading `cfg` gates, which proves a thing compiles
+# and nothing about whether it works. A red run here is worth more than any
+# amount of that.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build that warns is a build that will eventually break; there are none
+  # today and that is worth keeping.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide what the others would have said.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Slint draws through wgpu and winit. Nothing here opens a window — the
+      # tests use Slint's headless backend — but the crates still want these
+      # present to build.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libxkbcommon-dev
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Build
+        run: cargo build --workspace
+
+      # The fake player binds a loopback port and the window is headless, so
+      # the whole suite runs unattended. Nothing here needs a speaker.
+      - name: Test
+        run: cargo test --workspace

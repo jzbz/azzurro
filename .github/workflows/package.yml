@@ -1,0 +1,63 @@
+# Unsigned bundles for macOS and Windows.
+#
+# Deliberately stops short of signing. Notarising a .app needs an Apple
+# Developer account and an app-specific password; an installer Windows will run
+# without a warning needs a code-signing certificate. Both are credentials that
+# belong to whoever ships the thing, not to a workflow file in the repository,
+# and adding them is a decision with a bill attached. What this produces is the
+# part that can be made without either: a bundle that runs on a machine where
+# the user has said it may.
+#
+# The Linux build is not here. That is the Flatpak, which has its own manifest
+# and its own repository of record.
+name: package
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both architectures, so one bundle serves an Intel Mac and an Apple
+          # Silicon one. A Mac will not run the wrong slice.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release -p azzurro-gui --target aarch64-apple-darwin
+          cargo build --release -p azzurro-gui --target x86_64-apple-darwin
+
+      - name: Assemble the bundle
+        run: bash packaging/macos-bundle.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azzurro-macos-unsigned
+          path: dist/Azzurro.app
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p azzurro-gui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: azzurro-windows-unsigned
+          path: target/release/azzurro.exe
+          if-no-files-found: error
