@@ -25,4 +25,6 @@ tracing.workspace = true
 # the tests can install the provider that workspace feature unification makes
 # reqwest insist on. See the note on `Client::new`.
 [dev-dependencies]
+fake-player.path = "../fake-player"
 rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

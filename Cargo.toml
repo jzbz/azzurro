@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/bluos", "crates/bluos-cli", "crates/azzurro-gui"]
+members = ["crates/bluos", "crates/bluos-cli", "crates/azzurro-gui", "crates/fake-player"]
 
 [workspace.package]
 version = "0.1.0"

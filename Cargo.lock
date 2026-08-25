@@ -702,6 +702,7 @@ dependencies = [
 name = "bluos"
 version = "0.1.0"
 dependencies = [
+ "fake-player",
  "iana-time-zone",
  "if-addrs",
  "percent-encoding",
@@ -1476,6 +1477,14 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
+]
+
+[[package]]
+name = "fake-player"
+version = "0.1.0"
+dependencies = [
+ "bluos",
+ "tokio",
 ]
 
 [[package]]

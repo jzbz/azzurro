@@ -1,0 +1,14 @@
+[package]
+name = "fake-player"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# A test double, not part of the product. It exists so the protocol and the
+# window can be driven without a speaker on the network.
+
+[dependencies]
+bluos.workspace = true
+tokio.workspace = true
