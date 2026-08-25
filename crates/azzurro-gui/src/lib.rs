@@ -491,6 +491,14 @@ impl Browsing {
 
 /// Deliberately coarse: a caller names an intent, and the backend owns every
 /// decision about how to reach the player.
+///
+/// `Play`, `Pause` and `Stop` are only ever constructed by the MPRIS bridge —
+/// the window's own transport button sends `Toggle`, because it is one button
+/// — so off Linux, where that bridge is not built, nothing makes them. The
+/// arms that handle them stay either way: they cost nothing, and deleting a
+/// third of an intent enum to please a lint on one platform would be the tail
+/// wagging the dog.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 enum Action {
     Play,
@@ -5050,6 +5058,15 @@ async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
 
 /// Keep one player's row, its queue and its MPRIS object current for as long as
 /// the app runs.
+///
+/// `mpris_index` and the name read below are both for the bridge, so off Linux
+/// they are gathered and not used. Kept rather than gated so the signature and
+/// the body read the same on every platform; the caller should not have to
+/// know which one it is compiling for.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unused_variables, unused_assignments, unused_mut)
+)]
 async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
