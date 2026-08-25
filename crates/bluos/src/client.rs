@@ -1208,6 +1208,29 @@ mod tests {
     /// shape of request is less code than wiring a server in, and this needs
     /// to speak a *deliberately* malformed conversation — an endless body —
     /// which a well-behaved server would not offer to produce.
+    /// Read the request before answering it.
+    ///
+    /// Windows sends RST rather than FIN when a socket is closed with unread
+    /// data still in its receive buffer, and the client then loses the reply it
+    /// had already been sent — WSAECONNABORTED, code 10053, in place of the
+    /// body. These servers wrote and dropped, which is invisible on Linux and
+    /// failed every one of these tests on a Windows runner.
+    async fn drain(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1024];
+        while let Ok(read) = socket.read(&mut byte).await {
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&byte[..read]);
+            // The whole of a GET is its head; nothing here sends a body.
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
     async fn serve(body: &'static str, flood: usize) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1217,6 +1240,7 @@ mod tests {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            drain(&mut socket).await;
 
             let head = if flood == 0 {
                 format!(
@@ -1275,6 +1299,7 @@ mod tests {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            drain(&mut socket).await;
             // Claims a gigabyte and sends almost none of it.
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nxxxx",
@@ -1358,6 +1383,7 @@ mod tests {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let to = to.clone();
                     tokio::spawn(async move {
+                        drain(&mut socket).await;
                         let head = format!(
                             "HTTP/1.1 301 Moved Permanently\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n"
                         );

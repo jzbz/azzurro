@@ -127,11 +127,30 @@ impl Player {
 
 /// One request, one reply.
 async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Result<()> {
-    // Enough for a request line and headers. Nothing here reads a body: every
-    // route a player offers is a GET, including the ones that change something.
-    let mut buffer = vec![0u8; 8192];
-    let read = stream.read(&mut buffer).await?;
-    let head = String::from_utf8_lossy(&buffer[..read]).into_owned();
+    // Read to the end of the head before answering, and not merely once.
+    //
+    // Windows sends RST rather than FIN when a socket is closed with unread
+    // data still in its receive buffer, and the client then loses the reply it
+    // was already sent — WSAECONNABORTED in place of the body. A single read
+    // usually takes the whole of a GET and sometimes does not, and "usually"
+    // is how a test earns a reputation for being flaky on one platform.
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..read]);
+        // Nothing a player offers sends a body, so the head is the request.
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
 
     let target = head
         .split_whitespace()
@@ -160,5 +179,8 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
     };
 
     stream.write_all(reply.as_bytes()).await?;
-    stream.flush().await
+    stream.flush().await?;
+    // Close the writing half deliberately rather than letting the drop do it,
+    // so the client sees an orderly end to the body.
+    stream.shutdown().await
 }
