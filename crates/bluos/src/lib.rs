@@ -41,6 +41,7 @@ pub mod queue;
 pub mod reports;
 pub mod screen;
 pub mod settings;
+pub mod stations;
 pub mod status;
 
 /// Shared by the two HTML scrapers; not part of the crate's surface.

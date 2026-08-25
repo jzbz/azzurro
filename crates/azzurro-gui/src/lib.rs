@@ -176,6 +176,10 @@ enum Command {
     AlarmOpen(Option<u32>),
     /// Change a field of the alarm being edited. Nothing reaches the player.
     AlarmEdit(AlarmField),
+    /// Open the source picker at the top of the tree.
+    AlarmPick,
+    /// Follow or choose the picker's row at this position.
+    AlarmPickRow(usize),
     /// Send the working copy to the player.
     AlarmSave,
     /// Delete the one being edited.
@@ -374,6 +378,17 @@ struct PlaylistPage {
 struct AlarmsPage {
     list: bluos::alarms::Alarms,
     editing: Option<bluos::alarms::Alarm>,
+    /// The source picker, while it is open over the editor. A trail rather
+    /// than one level, so Back walks out the way it walked in — the tree is
+    /// several deep on a player with services on it.
+    picking: Vec<PickerLevel>,
+}
+
+/// One level of the source tree, and what it is called.
+#[derive(Debug, Clone)]
+struct PickerLevel {
+    title: String,
+    rows: bluos::stations::Stations,
 }
 
 struct CustomisePage {
@@ -712,6 +727,23 @@ fn is_chrome_row(kind: ItemKind) -> bool {
     matches!(kind, ItemKind::Customise | ItemKind::Footer)
 }
 
+/// Fetch one level of the source tree and push it onto the picker's trail.
+async fn open_picker(backend: &Backend, client: &Client, title: String, path: String) {
+    match client.stations(&path).await {
+        Ok(rows) => {
+            {
+                let mut browsing = backend.browsing.lock().unwrap();
+                let Pane::Alarms(page) = &mut browsing.pane else {
+                    return;
+                };
+                page.picking.push(PickerLevel { title, rows });
+            }
+            backend.publish_pane();
+        }
+        Err(e) => say(&backend.ui, format!("could not read that list: {e}")),
+    }
+}
+
 /// What a press on the alarms screen means.
 ///
 /// The screen borrows the settings pane's rows, so its presses arrive as
@@ -724,6 +756,12 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
     let Pane::Alarms(page) = &browsing.pane else {
         return None;
     };
+    // The picker owns the presses while it is open, and its rows are
+    // positional like the list's.
+    if !page.picking.is_empty() {
+        return Some(Command::AlarmPickRow(index));
+    }
+
     let Some(alarm) = page.editing.as_ref() else {
         // The list. A toggle arms the alarm at that position; anything else
         // opens it, and the last row makes a new one.
@@ -739,6 +777,7 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
 
     // The editor.
     let field = match (index, edit) {
+        (ALARM_SOURCE, _) => return Some(Command::AlarmPick),
         (ALARM_SAVE, _) => return Some(Command::AlarmSave),
         (ALARM_DELETE, _) => return Some(Command::AlarmDelete),
         (ALARM_VOLUME, Some(Edit::Number(v))) => AlarmField::Volume(v.max(0.0) as u32),
@@ -837,6 +876,7 @@ const ALARM_SHUFFLE: usize = ALARM_ROW_BASE + 3;
 const ALARM_BACKUP: usize = ALARM_ROW_BASE + 4;
 const ALARM_SAVE: usize = ALARM_ROW_BASE + 5;
 const ALARM_DELETE: usize = ALARM_ROW_BASE + 6;
+const ALARM_SOURCE: usize = ALARM_ROW_BASE + 8;
 /// The last row of the list, which is not an alarm.
 const NEW_ALARM: usize = ALARM_ROW_BASE + 7;
 
@@ -1810,6 +1850,54 @@ impl Backend {
         let mut rows: Vec<SettingData> = Vec::new();
         let title;
 
+        // The picker sits over everything else on this pane: while it is open
+        // it is what the page is, and Back walks it rather than the editor.
+        if let Some(level) = page.picking.last() {
+            title = level.title.clone();
+            let mut group: Option<String> = None;
+            for (at, row) in level.rows.rows.iter().enumerate() {
+                // Some services group their rows — Radio Paradise by quality —
+                // and the heading is drawn once, where it changes.
+                if row.group.is_some() && row.group != group {
+                    group = row.group.clone();
+                    rows.push(SettingData {
+                        label: group.clone().unwrap_or_default().to_uppercase(),
+                        heading: true,
+                        ..SettingData::blank()
+                    });
+                }
+                rows.push(SettingData {
+                    index: at as i32,
+                    label: row.text.clone(),
+                    glyph: Some(if row.playable {
+                        Glyph::Play
+                    } else {
+                        Glyph::Folder
+                    }),
+                    control: "link",
+                    ..SettingData::blank()
+                });
+            }
+            if level.rows.rows.is_empty() {
+                rows.push(SettingData {
+                    label: "Nothing here".to_owned(),
+                    detail: "This service offers nothing an alarm can play".to_owned(),
+                    glyph: Some(Glyph::Info),
+                    available: false,
+                    ..SettingData::blank()
+                });
+            }
+
+            // The time and days strip belongs to the editor, not to this.
+            let ui = self.ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_alarm_editing(false);
+                }
+            });
+            return self.send_settings(rows, title);
+        }
+
         match &page.editing {
             None => {
                 title = "Alarms".to_owned();
@@ -1888,6 +1976,17 @@ impl Backend {
                     });
                 }
 
+                rows.push(SettingData {
+                    index: ALARM_SOURCE as i32,
+                    label: "Plays".to_owned(),
+                    detail: match alarm.source.as_deref().filter(|s| !s.is_empty()) {
+                        Some(source) => source.to_owned(),
+                        None => "Whatever the player is set to".to_owned(),
+                    },
+                    glyph: Some(Glyph::Radio),
+                    control: "link",
+                    ..SettingData::blank()
+                });
                 rows.push(SettingData {
                     index: ALARM_VOLUME as i32,
                     label: "Volume".to_owned(),
@@ -5333,6 +5432,13 @@ async fn run_commands(
                 let moved = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     match &mut browsing.pane {
+                        // The picker is a page over the editor, so it is the
+                        // first thing Back takes away — one level at a time,
+                        // the way it was walked in.
+                        Pane::Alarms(page) if !page.picking.is_empty() => {
+                            page.picking.pop();
+                            true
+                        }
                         // Out of the editor before out of the screen: the
                         // editor is a page over the list, not beside it.
                         Pane::Alarms(page) if page.editing.is_some() => {
@@ -5597,6 +5703,7 @@ async fn run_commands(
                                 browsing.pane = Pane::Alarms(Box::new(AlarmsPage {
                                     list,
                                     editing: None,
+                                    picking: Vec::new(),
                                 }));
                                 browsing.highlighted = None;
                             }
@@ -5709,6 +5816,72 @@ async fn run_commands(
                     }
                 }
                 backend.publish_pane();
+                continue;
+            }
+
+            Command::AlarmPick => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    let path = bluos::client::Client::station_root().to_owned();
+                    open_picker(&backend, &client, "Plays".to_owned(), path).await;
+                });
+                continue;
+            }
+
+            Command::AlarmPickRow(at) => {
+                let chosen = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    match &browsing.pane {
+                        Pane::Alarms(page) => page
+                            .picking
+                            .last()
+                            .and_then(|level| level.rows.rows.get(at).cloned()),
+                        _ => None,
+                    }
+                };
+                let Some(row) = chosen else { continue };
+
+                // A leaf is the answer: it goes into the working copy and the
+                // picker comes down, all of it in the app. Nothing is sent to
+                // the player until the alarm itself is saved.
+                let Some(path) = row.into_path() else {
+                    {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        if let Pane::Alarms(page) = &mut browsing.pane {
+                            if let Some(alarm) = page.editing.as_mut() {
+                                alarm.source = Some(row.text.clone());
+                                alarm.service = row.service.clone();
+                                alarm.url = row.url.clone();
+                                alarm.image = row.image.clone();
+                                // The player decides what can be shuffled, and
+                                // a source that cannot must not stay switched
+                                // on from whatever was picked before.
+                                alarm.can_shuffle = false;
+                                alarm.shuffle = false;
+                            }
+                            page.picking.clear();
+                        }
+                    }
+                    backend.publish_pane();
+                    continue;
+                };
+
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    open_picker(&backend, &client, row.text.clone(), path).await;
+                });
                 continue;
             }
 

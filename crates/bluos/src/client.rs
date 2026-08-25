@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::queue::Queue;
 use crate::screen::{Configuration, Screen};
 use crate::settings::{Setting, Settings};
+use crate::stations::Stations;
 use crate::status::{Status, SyncStatus};
 
 /// Ordinary requests are answered from memory, so this is generous already;
@@ -764,6 +765,23 @@ impl Client {
     pub async fn follow(&self, path: &str) -> Result<Option<Dialog>> {
         let body = self.get_text(path, &[], REQUEST_TIMEOUT).await?;
         crate::dialog::parse(&body)
+    }
+
+    /// One level of the tree an alarm's source is chosen from.
+    ///
+    /// `path` is `/RadioBrowse?…` — the top comes from `service=Alarms`, and
+    /// every level below is whatever [`Station::into_path`] built from the row
+    /// that was followed.
+    ///
+    /// [`Station::into_path`]: crate::stations::Station::into_path
+    pub async fn stations(&self, path: &str) -> Result<Stations> {
+        let body = self.get_text(path, &[], REQUEST_TIMEOUT).await?;
+        crate::stations::parse(&body)
+    }
+
+    /// Where the choosing starts.
+    pub fn station_root() -> &'static str {
+        "/RadioBrowse?service=Alarms"
     }
 
     /// Every alarm and schedule the player holds.
