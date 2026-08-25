@@ -172,8 +172,13 @@ enum Command {
     OpenAlarms,
     /// Arm or disarm one from the list.
     AlarmArm(u32, bool),
-    /// Open the editor: `Some(id)` for one that exists, `None` for a new one.
-    AlarmOpen(Option<u32>),
+    /// Open the editor on one that already exists.
+    AlarmOpen(u32),
+    /// Start a new one. `true` makes a schedule — an alarm that runs to a
+    /// finishing time rather than for a length.
+    AlarmNew {
+        schedule: bool,
+    },
     /// Change a field of the alarm being edited. Nothing reaches the player.
     AlarmEdit(AlarmField),
     /// Open the source picker at the top of the tree.
@@ -774,12 +779,15 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
         // The list. A toggle arms the alarm at that position; anything else
         // opens it, and the last row makes a new one.
         if index == NEW_ALARM {
-            return Some(Command::AlarmOpen(None));
+            return Some(Command::AlarmNew { schedule: false });
+        }
+        if index == NEW_SCHEDULE {
+            return Some(Command::AlarmNew { schedule: true });
         }
         let found = page.list.alarms.get(index)?;
         return Some(match edit {
             Some(Edit::Toggle) => Command::AlarmArm(found.id, !found.enabled),
-            _ => Command::AlarmOpen(Some(found.id)),
+            _ => Command::AlarmOpen(found.id),
         });
     };
 
@@ -887,6 +895,7 @@ const ALARM_DELETE: usize = ALARM_ROW_BASE + 6;
 const ALARM_SOURCE: usize = ALARM_ROW_BASE + 8;
 /// The last row of the list, which is not an alarm.
 const NEW_ALARM: usize = ALARM_ROW_BASE + 7;
+const NEW_SCHEDULE: usize = ALARM_ROW_BASE + 9;
 
 /// How long an alarm plays for, in minutes.
 ///
@@ -1940,10 +1949,30 @@ impl Backend {
                 rows.push(SettingData {
                     index: NEW_ALARM as i32,
                     label: "New alarm…".to_owned(),
-                    glyph: Some(Glyph::Add),
+                    detail: "Plays for a while and stops".to_owned(),
+                    glyph: Some(Glyph::Alarm),
                     control: "link",
                     ..SettingData::blank()
                 });
+                // Only where the player can do them. `supportsEndTime` is its
+                // answer about itself, and offering the row on a player that
+                // says no would be offering something that cannot be saved.
+                //
+                // A row of its own rather than a choice buried in the editor's
+                // Stops chooser, which is where this lived and why it read as
+                // missing: the official controller asks "alarm or schedule"
+                // before anything else, and a thing nobody can find is not a
+                // thing the app has.
+                if page.list.supports_end_time {
+                    rows.push(SettingData {
+                        index: NEW_SCHEDULE as i32,
+                        label: "New schedule…".to_owned(),
+                        detail: "Plays between two times".to_owned(),
+                        glyph: Some(Glyph::Recent),
+                        control: "link",
+                        ..SettingData::blank()
+                    });
+                }
             }
             Some(alarm) => {
                 title = if alarm.id == 0 {
@@ -5769,23 +5798,46 @@ async fn run_commands(
                     let Pane::Alarms(page) = &mut browsing.pane else {
                         continue;
                     };
-                    page.editing = Some(match which {
-                        Some(alarm) => match page.list.alarms.iter().find(|a| a.id == alarm) {
-                            Some(found) => found.clone(),
-                            None => continue,
-                        },
-                        // The controller's own defaults for a new one: seven in
-                        // the morning, a quarter of an hour, and a volume that
-                        // does not depend on where the speaker was left.
-                        None => bluos::alarms::Alarm {
+                    let Some(found) = page.list.alarms.iter().find(|a| a.id == which) else {
+                        continue;
+                    };
+                    page.editing = Some(found.clone());
+                }
+                backend.publish_pane();
+                continue;
+            }
+
+            Command::AlarmNew { schedule } => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Alarms(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    page.editing = Some({
+                        // The controller's own defaults: seven in the morning,
+                        // a quarter of an hour, and a volume that does not
+                        // depend on where the speaker was left.
+                        let mut fresh = bluos::alarms::Alarm {
                             hour: 7,
                             minute: 0,
                             duration: DURATIONS[0],
                             volume: 25,
                             enabled: true,
-                            use_backup: true,
+                            // Falling back to a tone is for an alarm, which has
+                            // one job. A schedule that cannot reach its source
+                            // should stay quiet rather than start beeping in
+                            // the middle of the afternoon.
+                            use_backup: !schedule,
                             ..Default::default()
-                        },
+                        };
+                        if schedule {
+                            // An hour after it starts, which is where the
+                            // official controller opens the field. It is only
+                            // a starting point; the second time field is the
+                            // first thing on the page.
+                            fresh.end = Some(format!("{:02}00", (fresh.hour + 1).min(23)));
+                        }
+                        fresh
                     });
                 }
                 backend.publish_pane();
@@ -7538,6 +7590,39 @@ mod tests {
         assert_eq!(
             days([true, true, true, true, true, true, false]),
             "Sun, Mon, Tue, Wed, Thu, Fri"
+        );
+    }
+
+    /// The two kinds an alarm comes in, and what tells them apart.
+    ///
+    /// Only `end` does. The player derives a duration from it — a schedule
+    /// saved for 07:00 to 17:30 came back carrying `duration="630"` — so
+    /// sending both would be asking it two questions at once.
+    #[test]
+    fn a_schedule_is_an_alarm_with_a_finishing_time() {
+        let alarm = bluos::alarms::Alarm {
+            hour: 7,
+            duration: 15,
+            ..Default::default()
+        };
+        assert!(!alarm.is_schedule());
+
+        let schedule = bluos::alarms::Alarm {
+            end: Some("1730".to_owned()),
+            ..alarm.clone()
+        };
+        assert!(schedule.is_schedule());
+        assert_eq!(schedule_end(&schedule), (17, 30));
+
+        // An empty string is not a finishing time, and must not make one.
+        let neither = bluos::alarms::Alarm {
+            end: Some(String::new()),
+            ..alarm
+        };
+        assert_eq!(
+            schedule_end(&neither),
+            (9, 0),
+            "unreadable falls back rather than panicking"
         );
     }
 
