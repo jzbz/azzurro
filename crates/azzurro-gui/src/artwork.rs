@@ -80,6 +80,70 @@ const PRUNE_EVERY: usize = 100;
 /// it. Guards against a redirect to something that is not an image at all.
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// How many redirects a cover may take before it is not worth following.
+///
+/// The same figure the protocol client uses, and for the same reason: a chain
+/// longer than this is not a CDN doing its job.
+pub const MAX_HOPS: usize = 5;
+
+/// Whether art may be fetched from this URL.
+///
+/// A player names the address cover art is fetched from, and an adopted player
+/// is only ever as trustworthy as the subnet it announced itself on. Naming
+/// `http://192.168.1.1/…` or a loopback port would have this app issue that
+/// request from inside the network, where the caller cannot reach — a request
+/// whose body it never sees, but whose side effects still happen.
+///
+/// So: the player's own art is fine, a CDN's is fine, and an address in
+/// private, loopback or link-local space that is *not* a player is not. The
+/// host is only inspected when it is written as an address; a name is left to
+/// the resolver, which is the gap in this — a name that resolves into private
+/// space still passes. Closing that needs a connect-time hook rather than a
+/// check here, and the hop limit above bounds how far a redirect can walk
+/// toward one.
+pub fn permitted(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    // A name, which this does not resolve. See the note above.
+    let Some(addr) = literal_address(host) else {
+        return true;
+    };
+
+    !(addr.is_loopback() || addr.is_unspecified() || is_private(addr))
+}
+
+/// The host as an address, if it is written as one rather than as a name.
+///
+/// A URL writes IPv6 in brackets — `http://[::1]/x` — and those are not part
+/// of the address.
+fn literal_address(host: &str) -> Option<std::net::IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// Address space that is reachable from this machine but not from the internet.
+fn is_private(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
+        }
+        // `is_unique_local` and `is_unicast_link_local` are still unstable, so
+        // the prefixes are written out: fc00::/7 and fe80::/10.
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// How long one cover may take to arrive.
 ///
 /// Without it a CDN that accepts the connection and then says nothing holds
@@ -127,6 +191,14 @@ pub struct Artwork {
     /// buys a look at the directory; see [`DISK_CACHE_FILES`].
     written: std::sync::atomic::AtomicUsize,
     limit: Semaphore,
+    /// The addresses of players this app has adopted.
+    ///
+    /// A player serves its own cover art from its own address, which is on the
+    /// user's subnet and so is exactly the private space [`permitted`] refuses
+    /// by default. Recording the players separates "this speaker's own art"
+    /// from "some other machine on the LAN a player pointed us at", which is
+    /// the whole distinction that check exists to make.
+    players: Mutex<std::collections::HashSet<std::net::IpAddr>>,
 }
 
 impl Artwork {
@@ -146,6 +218,7 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
+            players: Mutex::new(std::collections::HashSet::new()),
             memory: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
@@ -176,6 +249,29 @@ impl Artwork {
             size,
         };
         self.memory.lock().unwrap().peek(&key).cloned()
+    }
+
+    /// Note that this player's own address serves art that is allowed.
+    ///
+    /// Called as players are adopted. Nothing is ever removed: a player that
+    /// goes away does not make the art it already served dangerous, and the
+    /// set is bounded by `MAX_TRACKED` adoptions either way.
+    pub fn remember_player(&self, host: std::net::IpAddr) {
+        self.players.lock().unwrap().insert(host);
+    }
+
+    /// Whether art may be fetched from here, given the players adopted so far.
+    fn may_fetch(&self, url: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if permitted(&url) {
+            return true;
+        }
+        match url.host_str().and_then(literal_address) {
+            Some(addr) => self.players.lock().unwrap().contains(&addr),
+            None => false,
+        }
     }
 
     /// The color to tint a panel with behind this artwork, if it has been
@@ -234,6 +330,14 @@ impl Artwork {
             if let Some(bytes) = cached.filter(|b| !b.is_empty()) {
                 return Some(bytes);
             }
+        }
+
+        // The player chose this address, so it is checked before it is dialled
+        // rather than trusted because a player said it. Redirects are checked
+        // per hop by the policy on the client itself.
+        if !self.may_fetch(url) {
+            tracing::debug!(url, "artwork refused: not the player's own host, and not public");
+            return None;
         }
 
         // Held across the request, not the decode: the point is to bound
@@ -532,6 +636,59 @@ mod tests {
 
         let out = decode(&png, 360).expect("a real cover was refused");
         assert_eq!(out.width(), 360, "not scaled to the size asked for");
+    }
+
+    /// A player names the address art is fetched from, so "the player said so"
+    /// is not on its own a reason to dial somewhere.
+    #[test]
+    fn art_may_come_from_a_cdn_but_not_from_inside_the_network() {
+        let allow = |u: &str| permitted(&reqwest::Url::parse(u).expect(u));
+
+        // A CDN, which is the whole reason this client exists.
+        assert!(allow("https://cdn.example.com/cover.jpg"));
+        assert!(allow("http://93.184.216.34/cover.jpg"));
+
+        // Somewhere only this machine can reach.
+        assert!(!allow("http://127.0.0.1:8080/probe"));
+        assert!(!allow("http://[::1]/probe"), "IPv6 loopback is bracketed");
+        assert!(!allow("http://192.168.1.1/cgi-bin/reboot"));
+        assert!(!allow("http://10.0.0.155:11000/Artwork"));
+        assert!(!allow("http://169.254.169.254/latest/meta-data/"));
+        assert!(!allow("http://[fe80::1]/probe"), "IPv6 link-local");
+        assert!(!allow("http://[fd00::1]/probe"), "IPv6 unique-local");
+        assert!(!allow("http://0.0.0.0/probe"));
+
+        // Not a fetchable scheme at all.
+        assert!(!allow("file:///etc/passwd"));
+    }
+
+    /// The player's own art is served from its own address, which is in the
+    /// space the check above refuses — so adoption is what allows it.
+    #[test]
+    fn a_players_own_address_is_allowed_once_it_is_adopted() {
+        // `run_app` does this for the real binary; a test builds a client
+        // without going through it. Idempotent, so several tests may call it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let art = Artwork::new(reqwest::Client::new());
+        let own = "http://10.0.0.155:11000/Artwork?service=LocalMusic";
+
+        assert!(
+            !art.may_fetch(own),
+            "before adoption it is just another address on the subnet"
+        );
+
+        art.remember_player("10.0.0.155".parse().expect("an address"));
+
+        assert!(art.may_fetch(own), "its own art is the point of the app");
+        assert!(
+            !art.may_fetch("http://10.0.0.156:11000/Artwork"),
+            "adopting one player does not open the rest of the subnet"
+        );
+        assert!(
+            art.may_fetch("https://cdn.example.com/cover.jpg"),
+            "and a CDN still works"
+        );
     }
 
     #[test]
