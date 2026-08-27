@@ -83,7 +83,10 @@ enum Command {
     /// Mute or unmute.
     Mute {
         device: DeviceId,
-        #[arg(value_parser = clap::value_parser!(bool))]
+        // `value_parser` alone is not enough: clap takes the *action* from
+        // the type, so a `bool` is still SetTrue and a positional with that
+        // action trips an assertion before any command runs.
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
         on: bool,
     },
     Play {
@@ -118,8 +121,11 @@ enum Command {
     Shuffle {
         device: DeviceId,
         // Spelled out because a bare `bool` is a flag to clap, and a flag
-        // cannot be positional.
-        #[arg(value_parser = clap::value_parser!(bool))]
+        // cannot be positional. `value_parser` alone is not enough either:
+        // clap takes the *action* from the type, so a `bool` is still SetTrue
+        // and a positional with that action trips an assertion before any
+        // command runs.
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
         on: bool,
     },
     /// all, one or off.
