@@ -7471,8 +7471,22 @@ async fn run_commands(
 /// complaint the queue menu used to draw.
 async fn open_in_browser(ui: &slint::Weak<AppWindow>, url: String) {
     tracing::info!("opening {url} in a browser");
+
+    // Named in the message rather than left to the user to guess. Two of these
+    // call sites carry a URL the player chose, unfiltered — the Info link and
+    // the webpage action — and a controller sending a browser somewhere on an
+    // adopted player's say-so should at least say where. Sign-in pages are
+    // genuinely on someone else's site, so refusing off-player destinations
+    // outright would break what this is for; showing them costs nothing.
+    let host = reqwest::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned));
+
     match tokio::task::spawn_blocking(move || open::that_detached(url)).await {
-        Ok(Ok(())) => say(ui, "Opened in your browser"),
+        Ok(Ok(())) => match host {
+            Some(host) => say(ui, format!("Opened {host} in your browser")),
+            None => say(ui, "Opened in your browser"),
+        },
         Ok(Err(e)) => {
             tracing::warn!("could not open a browser: {e}");
             say(ui, "Could not open your browser");
