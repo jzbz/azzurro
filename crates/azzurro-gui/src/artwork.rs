@@ -69,6 +69,15 @@ const CONCURRENT_FETCHES: usize = 4;
 /// started.
 const DISK_CACHE_FILES: usize = 512;
 
+/// And how much they may come to, whatever the count.
+///
+/// The file limit alone bounds the directory only if the files are the size a
+/// cover is. Each one may be up to [`MAX_BYTES`], so 512 of them is nearly
+/// five gigabytes — a ceiling set by what a player chose to serve rather than
+/// by anything this app decided. Real covers are tens of kilobytes, so this is
+/// far above a full cache of them and far below what the count alone allows.
+const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// How many covers may be written before the directory is checked again.
 ///
 /// Often enough that it cannot run far past the limit, rarely enough that the
@@ -401,7 +410,19 @@ impl Artwork {
 
             tokio::spawn(async move {
                 let written = tokio::task::spawn_blocking(move || {
-                    let out = std::fs::write(path, copy);
+                    // Written beside the target and renamed onto it. A rename
+                    // within one filesystem is atomic, so a reader sees either
+                    // the old file or the whole new one — where writing in
+                    // place could leave a truncated file that every later read
+                    // accepts, since the read only checks the file is not
+                    // empty. `panic = "abort"` makes dying mid-write an
+                    // ordinary event rather than an exotic one.
+                    let temp = path.with_extension("part");
+                    let out = std::fs::write(&temp, copy)
+                        .and_then(|()| std::fs::rename(&temp, &path))
+                        .inspect_err(|_| {
+                            let _ = std::fs::remove_file(&temp);
+                        });
                     if let Some(dir) = sweep {
                         prune(&dir);
                     }
@@ -568,20 +589,36 @@ fn prune(dir: &PathBuf) {
     let mut files: Vec<_> = entries
         .flatten()
         .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((modified, e.path()))
+            let meta = e.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), e.path()))
         })
         .collect();
 
-    if files.len() <= DISK_CACHE_FILES {
+    let total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    if files.len() <= DISK_CACHE_FILES && total <= DISK_CACHE_BYTES {
         return;
     }
 
-    files.sort_unstable_by_key(|(modified, _)| *modified);
-    let excess = files.len() - DISK_CACHE_FILES;
-    tracing::debug!("pruning {excess} cached artwork files");
-    for (_, path) in files.into_iter().take(excess) {
+    // Oldest first, dropping until both limits are met. The byte total is what
+    // stops a run of maximum-size responses filling the disk inside a count
+    // that looks generous for real covers.
+    files.sort_unstable_by_key(|(modified, _, _)| *modified);
+
+    let mut count = files.len();
+    let mut bytes = total;
+    let mut dropped = 0usize;
+    for (_, len, path) in &files {
+        if count <= DISK_CACHE_FILES && bytes <= DISK_CACHE_BYTES {
+            break;
+        }
         let _ = std::fs::remove_file(path);
+        count -= 1;
+        bytes = bytes.saturating_sub(*len);
+        dropped += 1;
+    }
+
+    if dropped > 0 {
+        tracing::debug!("pruning {dropped} cached artwork files");
     }
 }
 
@@ -591,19 +628,19 @@ mod tests {
 
     /// A valid 24-bit BMP header declaring `w` by `h`, with almost no pixel
     /// data behind it — the shape a header bomb takes.
-    fn header_claiming(w: i32, h: i32) -> Vec<u8> {
-        let mut bmp = Vec::new();
-        bmp.extend_from_slice(b"BM");
-        bmp.extend_from_slice(&0u32.to_le_bytes()); // file size, unchecked
-        bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel offset
-        bmp.extend_from_slice(&40u32.to_le_bytes()); // DIB header size
-        bmp.extend_from_slice(&w.to_le_bytes());
-        bmp.extend_from_slice(&h.to_le_bytes());
-        bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
-        bmp.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
-        bmp.resize(54 + 16, 0);
-        bmp
+    /// A real PNG of the given size, encoded.
+    ///
+    /// PNG rather than the BMP this used to build: the workspace compiles the
+    /// `image` crate with `default-features = false` and only jpeg, png and
+    /// webp, so a BMP was refused for being a format nobody here can read.
+    /// The assertion below passed for that reason and would have passed with
+    /// no dimension limit at all.
+    fn png_of(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::RgbaImage::new(w, h)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encodes");
+        out
     }
 
     #[test]
@@ -614,8 +651,16 @@ mod tests {
         // square — a square large enough to breach 512 MB would be refused
         // either way and would prove nothing about this change.
         const { assert!(MAX_SIDE < 9000, "the test no longer exceeds the limit") };
+
+        // The control comes first, and is the point of it: it proves this
+        // build can decode the format at all, so the refusal below is the
+        // dimension limit doing its job rather than an unreadable format.
         assert!(
-            decode(&header_claiming(9000, 100), 360).is_none(),
+            decode(&png_of(100, 100), 360).is_some(),
+            "the control must decode, or the refusal below proves nothing"
+        );
+        assert!(
+            decode(&png_of(9000, 100), 360).is_none(),
             "a cover 9000 wide was accepted"
         );
     }
@@ -692,6 +737,50 @@ mod tests {
             art.may_fetch("https://cdn.example.com/cover.jpg"),
             "and a CDN still works"
         );
+    }
+
+    /// The file count alone bounds the directory only if the files are the
+    /// size a cover is. Each may be up to MAX_BYTES, so the count that looks
+    /// generous for real covers allows nearly five gigabytes of whatever a
+    /// player chose to serve.
+    #[test]
+    fn the_cache_is_bounded_by_bytes_as_well_as_by_count() {
+        let dir = std::env::temp_dir().join(format!("azzurro-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+
+        // Well inside the file count, well past the byte budget.
+        let each = vec![0u8; 4 * 1024 * 1024];
+        let wanted = (DISK_CACHE_BYTES / each.len() as u64) as usize + 8;
+        for n in 0..wanted {
+            std::fs::write(dir.join(format!("{n:016x}")), &each).expect("writes");
+        }
+
+        let total = |d: &PathBuf| -> u64 {
+            std::fs::read_dir(d)
+                .expect("reads")
+                .flatten()
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        };
+        let count = |d: &PathBuf| std::fs::read_dir(d).expect("reads").count();
+
+        assert!(
+            count(&dir) < DISK_CACHE_FILES,
+            "the count is not what is over"
+        );
+        assert!(total(&dir) > DISK_CACHE_BYTES, "but the bytes are");
+
+        prune(&dir);
+
+        assert!(
+            total(&dir) <= DISK_CACHE_BYTES,
+            "prune left {} bytes, over the {DISK_CACHE_BYTES} budget",
+            total(&dir)
+        );
+        assert!(count(&dir) > 0, "and it did not empty the directory");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
