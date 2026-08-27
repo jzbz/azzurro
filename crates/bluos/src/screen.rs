@@ -104,9 +104,18 @@ impl Screen {
     /// drawing is only valid while `sid` is still 8", so the screen wants
     /// re-fetching once that stops being true.
     pub fn is_stale(&self, status: &crate::Status) -> bool {
-        self.refresh_on
-            .iter()
-            .any(|(key, value)| status.field(key).as_deref() != Some(value.as_str()))
+        // A key the status cannot answer for — one [`crate::Status::field`]
+        // does not model, or one the player left out — is "cannot tell", not
+        // "changed". Reading it as changed made the screen permanently stale:
+        // no reply could ever satisfy the comparison, so every status tick
+        // spawned another refetch of the same screen, once a second, for as
+        // long as it stayed open. `is_playing` on the same field already takes
+        // the cautious reading; this now matches it.
+        self.refresh_on.iter().any(|(key, value)| {
+            status
+                .field(key)
+                .is_some_and(|actual| actual != *value)
+        })
     }
 }
 
@@ -1168,6 +1177,37 @@ mod tests {
   </selectorMenu>
   <infoPanel icon="/images/ui/ic_info_favourites.png" text="You don&#39;t have any Favourites on Library" subText="You can add any content within Library as a favourite."></infoPanel>
 </screen>"##;
+
+    /// A key the status does not model used to read as "changed", which no
+    /// reply could ever satisfy — so the screen refetched once a second for
+    /// as long as it was open.
+    #[test]
+    fn a_refresh_key_the_status_cannot_answer_is_not_a_reason_to_refetch() {
+        let status = crate::Status {
+            prid: Some(8),
+            ..Default::default()
+        };
+
+        let mut screen = Screen::default();
+
+        screen.refresh_on = vec![("prid".to_owned(), "8".to_owned())];
+        assert!(!screen.is_stale(&status), "the value matches");
+
+        screen.refresh_on = vec![("prid".to_owned(), "9".to_owned())];
+        assert!(screen.is_stale(&status), "a modelled key that moved is stale");
+
+        screen.refresh_on = vec![("nosuchkey".to_owned(), "1".to_owned())];
+        assert!(
+            !screen.is_stale(&status),
+            "an unmodelled key cannot be satisfied, so it must not mean stale"
+        );
+
+        screen.refresh_on = vec![("sid".to_owned(), "3".to_owned())];
+        assert!(
+            !screen.is_stale(&status),
+            "a modelled key the player left out is 'cannot tell', not 'changed'"
+        );
+    }
 
     #[test]
     fn reads_a_real_sources_screen() {
