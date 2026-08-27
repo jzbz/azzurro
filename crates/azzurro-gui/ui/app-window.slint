@@ -618,6 +618,10 @@ component DeviceCard inherits Rectangle {
         Level {
             value: root.device.volume;
             muted: root.device.muted;
+            // A player that is not answering — upgrading, or simply gone —
+            // takes no presses. Faded rather than absent, so the row does not
+            // reshuffle itself the moment a speaker drops off.
+            enabled: root.device.reachable;
             changed(v) => { root.volume-changed(v); }
             toggle-mute => { root.toggle-mute(); }
         }
@@ -3228,7 +3232,7 @@ export component AppWindow inherits Window {
                 // where it reads as the state of the whole window rather than
                 // as one more control in a row of them.
                 Scrubber {
-                    enabled: root.seekable && root.duration > 0;
+                    enabled: root.current.reachable && root.seekable && root.duration > 0;
                     value: root.position / Math.max(root.duration, 1);
                     glide: 1s;
                     height: 12px;
@@ -3348,7 +3352,7 @@ export component AppWindow inherits Window {
                                 IconButton {
                                     glyph: Icons.shuffle;
                                     active: root.shuffle;
-                                    enabled: root.has-selection;
+                                    enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.toggle-shuffle(root.current.id); }
                                 }
                             }
@@ -3358,7 +3362,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.previous;
-                                    enabled: root.has-selection;
+                                    enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.back(root.current.id); }
                                 }
                             }
@@ -3368,7 +3372,7 @@ export component AppWindow inherits Window {
                                 primary: true;
                                 size: 44px;
                                 glyph-size: 19px;
-                                enabled: root.has-selection;
+                                enabled: root.has-selection && root.current.reachable;
                                 clicked => { root.toggle(root.current.id); }
                             }
 
@@ -3377,7 +3381,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.next;
-                                    enabled: root.has-selection;
+                                    enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.skip(root.current.id); }
                                 }
                             }
@@ -3388,7 +3392,7 @@ export component AppWindow inherits Window {
                                 IconButton {
                                     glyph: root.repeat == 1 ? Icons.repeat-one : Icons.repeat;
                                     active: root.repeat != 2;
-                                    enabled: root.has-selection;
+                                    enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.cycle-repeat(root.current.id); }
                                 }
                             }
@@ -3606,6 +3610,7 @@ export component AppWindow inherits Window {
                             Level {
                                 value: root.current.volume;
                                 muted: root.current.muted;
+                                enabled: root.current.reachable;
                                 changed(v) => { root.set-volume(root.current.id, v); }
                                 toggle-mute => { root.toggle-mute(root.current.id); }
                             }

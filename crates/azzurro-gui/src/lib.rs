@@ -8005,6 +8005,9 @@ async fn run_commands(
                     .lock()
                     .unwrap()
                     .values()
+                    // An upgrading player is not paused, for the same reason
+                    // it is not played: it is not listening.
+                    .filter(|e| !e.upgrading)
                     .map(|e| e.client.clone())
                     .collect();
 
@@ -8021,7 +8024,21 @@ async fn run_commands(
             Command::Player(id, action) => (id, action),
         };
 
-        let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        // Every transport, volume, mute, shuffle, repeat, seek and sleep press
+        // resolves its player here, which is why the check is here and not on
+        // each of them. A player rewriting its own firmware answers none of
+        // them: the request either times out against a rebooting speaker or is
+        // refused, and either way the press did nothing while looking as
+        // though it had.
+        //
+        // The official controller reaches the same end by keeping an upgrading
+        // player out of the group list, so its `currentGroup` goes undefined
+        // and every control reading it dies. This app has one funnel rather
+        // than that structure, so the funnel is where it goes.
+        let Some(client) = backend
+            .with_entry(id, |e| (!e.upgrading).then(|| e.client.clone()))
+            .flatten()
+        else {
             continue;
         };
 
