@@ -14,7 +14,11 @@
 //! or `/images/ui/Source/`, and the rest of `/images/` is chrome.
 
 /// A Lucide glyph to draw instead of the player's own picture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` so it can go into the memo fingerprints: a glyph is drawn, and a
+/// field that is drawn but not hashed is a cell that stops redrawing when it
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Glyph {
     Play,
     Bluetooth,

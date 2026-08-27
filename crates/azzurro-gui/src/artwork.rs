@@ -89,11 +89,52 @@ const PRUNE_EVERY: usize = 100;
 /// it. Guards against a redirect to something that is not an image at all.
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Whether these bytes begin like an image this build can read.
+///
+/// A player answers an artwork request it cannot satisfy with `200 OK` and an
+/// XML error document — observed on a Powernode, where every `/Artwork` for a
+/// capture input comes back as `application/xml`. Those bytes were written
+/// into the disk cache, and the read path accepts any file that is not empty,
+/// so one such reply meant that cover was permanently undecodable: the cache
+/// answered before the network could ever be tried again.
+///
+/// Only the three formats the workspace compiles are recognised; anything else
+/// would be undecodable regardless.
+fn looks_like_an_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+}
+
 /// How many redirects a cover may take before it is not worth following.
 ///
 /// The same figure the protocol client uses, and for the same reason: a chain
 /// longer than this is not a CDN doing its job.
 pub const MAX_HOPS: usize = 5;
+
+/// The player addresses art may be fetched from, shared with the HTTP client.
+///
+/// Shared because the redirect policy needs the same answer this does, and it
+/// is built with the client before there is an [`Artwork`] to ask. A player
+/// answers `/Artwork` with a 301 to its own library service on another port —
+/// 11004 on a Powernode — so a policy that only knew the public-address rule
+/// stopped every cover the player served.
+pub type Players = std::sync::Arc<Mutex<std::collections::HashSet<std::net::IpAddr>>>;
+
+/// Whether art may be fetched from `url`, given the players adopted so far.
+///
+/// [`permitted`] alone is the rule for somewhere this app has never spoken to;
+/// this adds the players themselves, whose own addresses are exactly the
+/// private space that rule refuses.
+pub fn allowed_by(players: &Players, url: &reqwest::Url) -> bool {
+    if permitted(url) {
+        return true;
+    }
+    match url.host_str().and_then(literal_address) {
+        Some(addr) => players.lock().unwrap().contains(&addr),
+        None => false,
+    }
+}
 
 /// Whether art may be fetched from this URL.
 ///
@@ -207,11 +248,11 @@ pub struct Artwork {
     /// by default. Recording the players separates "this speaker's own art"
     /// from "some other machine on the LAN a player pointed us at", which is
     /// the whole distinction that check exists to make.
-    players: Mutex<std::collections::HashSet<std::net::IpAddr>>,
+    players: Players,
 }
 
 impl Artwork {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new(http: reqwest::Client, players: Players) -> Self {
         let disk = dirs::cache_dir().map(|d| d.join("azzurro").join("artwork"));
 
         // `new` is called once, before the window opens, so this one is
@@ -227,7 +268,7 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
-            players: Mutex::new(std::collections::HashSet::new()),
+            players,
             memory: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
@@ -271,15 +312,9 @@ impl Artwork {
 
     /// Whether art may be fetched from here, given the players adopted so far.
     fn may_fetch(&self, url: &str) -> bool {
-        let Ok(url) = reqwest::Url::parse(url) else {
-            return false;
-        };
-        if permitted(&url) {
-            return true;
-        }
-        match url.host_str().and_then(literal_address) {
-            Some(addr) => self.players.lock().unwrap().contains(&addr),
-            None => false,
+        match reqwest::Url::parse(url) {
+            Ok(url) => allowed_by(&self.players, &url),
+            Err(_) => false,
         }
     }
 
@@ -331,13 +366,23 @@ impl Artwork {
         // disk and rather more when the cache directory turns out to live on a
         // network mount, which is exactly the case that would otherwise stall a
         // runtime thread.
-        if let Some(path) = path.clone() {
-            let cached = tokio::task::spawn_blocking(move || std::fs::read(path).ok())
+        if let Some(cache) = path.clone() {
+            let reading = cache.clone();
+            let cached = tokio::task::spawn_blocking(move || std::fs::read(reading).ok())
                 .await
                 .ok()
                 .flatten();
-            if let Some(bytes) = cached.filter(|b| !b.is_empty()) {
-                return Some(bytes);
+            match cached.filter(|b| !b.is_empty()) {
+                Some(bytes) if looks_like_an_image(&bytes) => return Some(bytes),
+                // Written before the check above existed, or truncated by a
+                // crash mid-write. Dropped rather than returned, so the fetch
+                // below gets its turn instead of the cache answering wrongly
+                // forever.
+                Some(_) => {
+                    tracing::debug!("dropping a cached cover that is not an image");
+                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(cache)).await;
+                }
+                None => {}
             }
         }
 
@@ -396,6 +441,11 @@ impl Artwork {
                 }
             }
         }
+        if !looks_like_an_image(&bytes) {
+            tracing::debug!(url, "not caching a reply that is not an image");
+            return Some(bytes);
+        }
+
         if let Some(path) = path {
             let copy = bytes.clone();
             // Every so often, check the directory has not run away. Counted
@@ -718,7 +768,7 @@ mod tests {
         // without going through it. Idempotent, so several tests may call it.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let art = Artwork::new(reqwest::Client::new());
+        let art = Artwork::new(reqwest::Client::new(), Players::default());
         let own = "http://10.0.0.155:11000/Artwork?service=LocalMusic";
 
         assert!(
@@ -736,6 +786,16 @@ mod tests {
         assert!(
             art.may_fetch("https://cdn.example.com/cover.jpg"),
             "and a CDN still works"
+        );
+
+        // The case that matters most, and the one this got wrong first: a
+        // Powernode answers /Artwork on 11000 with a 301 to its own library
+        // service on 11004. The redirect is judged by the same rule as the
+        // first request, so a rule that knew only the public-address test
+        // stopped every cover the player served.
+        assert!(
+            art.may_fetch("http://10.0.0.155:11004/library/v1/Artwork?album=x"),
+            "a player's other ports are the same player"
         );
     }
 

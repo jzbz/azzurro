@@ -621,6 +621,13 @@ struct Backend {
     /// every row instance, which throws away whatever was being typed into
     /// one and jumps the scroll on a page of mixed heights.
     sent_settings: Arc<AtomicU64>,
+    /// And the browse model, which is the largest of them.
+    ///
+    /// It was the only one published with no memo at all, so every republish
+    /// replaced every row — the cost the four above exist to avoid, on the
+    /// model with the most rows in it. A screen is republished whenever a
+    /// thumbnail lands, on every page of a paged screen, and on every refresh.
+    sent_browse: Arc<AtomicU64>,
     /// Whether a stale-screen refresh is already in flight.
     ///
     /// Staleness is decided by comparing the screen's `refreshOnStatusChange`
@@ -737,9 +744,16 @@ fn quality_label(raw: &str) -> String {
 /// Whether this is the same thing the window already has.
 ///
 /// Hashed rather than compared, because the rows carry decoded artwork and
-/// comparing that is more expensive than the redraw it would save. Every field
-/// that is drawn goes in; the artwork only as whether it has arrived, which is
-/// the only thing about it that can change once it has.
+/// comparing that is more expensive than the redraw it would save. The
+/// artwork goes in only as whether it has arrived, which is the only thing
+/// about it that can change once it has.
+///
+/// Every field that is drawn has to go in, and that is an obligation on each
+/// caller rather than something this can enforce: a field the window draws but
+/// the fingerprint omits is a cell that silently stops redrawing when it
+/// changes. Adding a field to a row means adding it here too. `Device.model`
+/// is the known exception — drawn, deliberately not hashed, because it is read
+/// once when a player is adopted and never changes after.
 fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
     // Zero is the "nothing sent yet" value, so a fingerprint that happens to
     // be zero simply sends once more than it needs to.
@@ -1004,6 +1018,7 @@ fn alarm_detail(alarm: &bluos::alarms::Alarm) -> String {
 
 /// One browse row on its way to the window, for the same reason as
 /// [`TrackData`]: the pixels are `Send` and the `Image` is not.
+#[derive(Clone)]
 struct BrowseData {
     index: i32,
     /// Whether pressing it starts music rather than opening a screen.
@@ -1066,6 +1081,29 @@ struct BlockData {
     /// empty sections and the service picker never become blocks.
     section: i32,
     rows: Vec<BrowseData>,
+}
+
+/// Everything about a browse row that the window draws.
+///
+/// Split out because the browse memo hashes rows from two places — the
+/// selector strip and each block — and a field added to one and not the other
+/// is a row that stops redrawing when it changes.
+fn browse_row_fingerprint(row: &BrowseData, hash: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    row.index.hash(hash);
+    row.plays.hash(hash);
+    row.title.hash(hash);
+    row.subtitle.hash(hash);
+    row.track.hash(hash);
+    row.quality.hash(hash);
+    row.action.hash(hash);
+    row.cover.is_some().hash(hash);
+    row.glyph.hash(hash);
+    row.heading.hash(hash);
+    row.actionable.hash(hash);
+    row.playing.hash(hash);
+    row.selected.hash(hash);
+    row.has_menu.hash(hash);
 }
 
 /// The Lucide glyph for a [`Glyph`], out of the set the .slint file holds.
@@ -1522,14 +1560,23 @@ async fn run(
     // on `Client::http_client`. It still does not get to follow a redirect
     // wherever a player points it: the hop limit and the per-hop address check
     // in `artwork::permitted` apply to every destination, not just the first.
+    // Shared with the client below, because a redirect has to be judged by the
+    // same rule the fetch was: a player answers /Artwork with a 301 to its own
+    // library service on another port, and a policy that only knew the
+    // public-address rule stopped every cover the player served.
+    let players: artwork::Players = Default::default();
+
     let art = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= artwork::MAX_HOPS {
-                return attempt.stop();
-            }
-            match artwork::permitted(attempt.url()) {
-                true => attempt.follow(),
-                false => attempt.stop(),
+        .redirect(reqwest::redirect::Policy::custom({
+            let players = players.clone();
+            move |attempt| {
+                if attempt.previous().len() >= artwork::MAX_HOPS {
+                    return attempt.stop();
+                }
+                match artwork::allowed_by(&players, attempt.url()) {
+                    true => attempt.follow(),
+                    false => attempt.stop(),
+                }
             }
         }))
         .build()
@@ -1561,7 +1608,7 @@ async fn run(
         selected: Arc::new(Mutex::new(None)),
         commands,
         ui: ui.clone(),
-        artwork: Arc::new(Artwork::new(art)),
+        artwork: Arc::new(Artwork::new(art, players)),
         browsing: Arc::new(Mutex::new(Browsing::default())),
         known: Arc::new(Mutex::new(Vec::new())),
         writes: Arc::new(lane::Lane::default()),
@@ -1570,6 +1617,7 @@ async fn run(
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
+        sent_browse: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
     };
@@ -3095,9 +3143,15 @@ impl Backend {
         // The press did nothing at all, and went on doing nothing for the rest
         // of the session.
         //
-        // What was expensive is still skipped — building a row per setting,
-        // each with an image. Asserting three properties that are already at
-        // the value asked for costs a comparison each.
+        // What this skips is the model replacement and the property writes —
+        // which is the expensive half, because replacing a model re-creates
+        // every row instance and restarts its transitions. It does not skip
+        // building the rows: they are already built by the time the
+        // fingerprint can be taken over them, so a tick that changes nothing
+        // still pays for the walk. Moving the memo above that would mean
+        // fingerprinting the settings document instead of the rows, which is
+        // a larger change than it looks — the rows also carry state from
+        // outside the document, the sleep timer among it.
         let unchanged = already_sent(&self.sent_settings, {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -3539,6 +3593,42 @@ impl Backend {
         can_go_back: bool,
         search: Option<String>,
     ) {
+        // Everything drawn goes in, and the artwork as whether it has arrived
+        // — the same rule the queue's memo follows, for the same reason: a
+        // decoded cover is more expensive to compare than the redraw it would
+        // save, and its arrival is the only thing about it that changes.
+        if already_sent(&self.sent_browse, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            title.hash(&mut hash);
+            can_go_back.hash(&mut hash);
+            search.hash(&mut hash);
+            recent.hash(&mut hash);
+            empty.as_ref().map(|(a, b, g)| (a, b, *g)).hash(&mut hash);
+            for row in &selector {
+                browse_row_fingerprint(row, &mut hash);
+            }
+            for block in &blocks {
+                block.kind.hash(&mut hash);
+                block.title.hash(&mut hash);
+                block.action.hash(&mut hash);
+                block.section.hash(&mut hash);
+                for row in &block.rows {
+                    browse_row_fingerprint(row, &mut hash);
+                }
+            }
+            if let Some(header) = &header {
+                header.title.hash(&mut hash);
+                header.subtitle.hash(&mut hash);
+                header.detail.hash(&mut hash);
+                header.cover.is_some().hash(&mut hash);
+                header.buttons.hash(&mut hash);
+            }
+            hash.finish()
+        }) {
+            return;
+        }
+
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -7866,6 +7956,142 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The browse memo skips a redraw when the fingerprint matches, so a field
+    /// the window draws but the fingerprint omits is a cell that stops
+    /// updating. This is the guard on that: change one field at a time and the
+    /// fingerprint has to move.
+    #[test]
+    fn every_drawn_browse_field_is_in_the_fingerprint() {
+        use std::hash::Hasher;
+
+        let print = |row: &BrowseData| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            browse_row_fingerprint(row, &mut hash);
+            hash.finish()
+        };
+
+        let base = BrowseData {
+            index: 1,
+            plays: false,
+            title: "Title".to_owned(),
+            subtitle: "Sub".to_owned(),
+            track: "3".to_owned(),
+            quality: "FLAC".to_owned(),
+            action: "Manage".to_owned(),
+            cover: None,
+            glyph: None,
+            heading: false,
+            actionable: true,
+            playing: false,
+            selected: false,
+            has_menu: false,
+        };
+        let baseline = print(&base);
+
+        let variants: Vec<(&str, BrowseData)> = vec![
+            (
+                "index",
+                BrowseData {
+                    index: 2,
+                    ..base.clone()
+                },
+            ),
+            (
+                "plays",
+                BrowseData {
+                    plays: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "title",
+                BrowseData {
+                    title: "Other".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "subtitle",
+                BrowseData {
+                    subtitle: "Other".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "track",
+                BrowseData {
+                    track: "4".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "quality",
+                BrowseData {
+                    quality: "MQA".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "action",
+                BrowseData {
+                    action: "Customise".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "glyph",
+                BrowseData {
+                    glyph: Some(Glyph::Play),
+                    ..base.clone()
+                },
+            ),
+            (
+                "heading",
+                BrowseData {
+                    heading: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "actionable",
+                BrowseData {
+                    actionable: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "playing",
+                BrowseData {
+                    playing: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "selected",
+                BrowseData {
+                    selected: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "has_menu",
+                BrowseData {
+                    has_menu: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, row) in variants {
+            assert_ne!(
+                print(&row),
+                baseline,
+                "changing {field} did not change the fingerprint, so the row \
+                 would stop redrawing when it changes"
+            );
+        }
+    }
 
     #[test]
     fn hd_is_shown_as_hr_and_the_rest_are_left_alone() {
