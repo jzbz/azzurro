@@ -92,6 +92,27 @@ const RECENT_SEARCHES: usize = 8;
 /// Adding a player by hand ignores it — that is a decision, not a broadcast.
 const MAX_TRACKED: usize = 256;
 
+/// How often to ask a player how its upgrade is going.
+///
+/// The same interval the official controller uses. Frequent enough that the
+/// bar moves, slow enough that a player busy writing its own flash is not
+/// answering a request every second while it does it.
+const UPGRADE_POLL: Duration = Duration::from_secs(5);
+
+/// How long to keep asking before giving up on watching.
+///
+/// Covers the whole of it — check, download, install, reboot and coming back —
+/// which is what the official controller allows for the same span.
+const UPGRADE_PATIENCE: Duration = Duration::from_secs(20 * 60);
+
+/// How long a player may be unreachable mid-upgrade before that is worth
+/// saying. It reboots in the middle, so silence is expected for a stretch.
+const UPGRADE_SILENCE: Duration = Duration::from_secs(90);
+
+/// How long an upgrade must have been running before an ordinary SyncStatus
+/// counts as "finished" rather than "the player has not started yet".
+const UPGRADE_SETTLE: Duration = Duration::from_secs(20);
+
 /// The longest label that shares a line with the others under the queue.
 ///
 /// Which buttons the player sends varies — Edit only appears once there is
@@ -105,6 +126,13 @@ const QUEUE_BUTTON_SHORT: usize = 8;
 enum Command {
     /// Broadcast for players again.
     Rescan,
+    /// Ask whether to install the firmware the player says it has, naming it.
+    ///
+    /// Two steps on purpose. This one only puts the question up; nothing is
+    /// sent to the player until [`Command::UpgradeAnswer`] says yes.
+    UpgradeAsk,
+    /// The answer to that question.
+    UpgradeAnswer(bool),
     /// Track a player at an address typed in by hand.
     AddPlayer(String),
     /// Show this player's queue. The window's selection is the backend's cue
@@ -248,6 +276,12 @@ struct Browsing {
     /// Queue Builder Mode: pressing a track adds it to the end of the queue
     /// instead of playing it.
     queue_building: bool,
+    /// Whether the open Upgrade Check page found something to install.
+    ///
+    /// Kept rather than recomputed: the button is only offered where the check
+    /// has already said yes, and asking again on every republish would put a
+    /// sixty-second request on the draw path.
+    can_upgrade: bool,
     /// An input waiting to be confirmed, because switching to it stops
     /// whatever is playing.
     pending_input: Option<bluos::screen::Action>,
@@ -543,6 +577,12 @@ enum Action {
 /// One player as the backend tracks it.
 struct Entry {
     client: Client,
+    /// Whether this player is rewriting its own firmware.
+    ///
+    /// While it is, it answers nothing useful and will reboot; the window
+    /// takes its transport and volume away rather than offering controls that
+    /// quietly do nothing. Cleared when it comes back.
+    upgrading: bool,
     /// What the window shows in the player list.
     view: Device,
     /// The last status the poller received, which is more than the list needs
@@ -796,6 +836,76 @@ async fn open_picker(backend: &Backend, client: &Client, title: String, path: St
     }
 }
 
+/// Watch an upgrade through to the end, and tell the window what it is doing.
+///
+/// Polled bare, every few seconds, rather than through the long poll the rest
+/// of the app uses. Two reasons, both learned from the official controller:
+/// the etag poll holds a connection open for up to a hundred seconds and the
+/// player stops answering partway through to reboot, so a held poll waits for
+/// a reply that is never coming; and `/SyncStatus` answers with a different
+/// root element while upgrading, which the ordinary reader treats as a
+/// malformed player.
+///
+/// Gives up after [`UPGRADE_PATIENCE`]. That is not a failure of the upgrade —
+/// nothing here can stop one — only of this app's willingness to keep asking.
+async fn follow_upgrade(backend: Backend, id: DeviceId) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    // A player mid-reboot refuses connections for a while; that is the normal
+    // middle of an upgrade, not a reason to stop watching.
+    let mut quiet_since: Option<std::time::Instant> = None;
+
+    loop {
+        if started.elapsed() > UPGRADE_PATIENCE {
+            backend.clear_upgrade();
+            say(
+                &backend.ui,
+                "Still updating after twenty minutes — check the player itself",
+            );
+            return;
+        }
+
+        match client.sync_or_upgrade().await {
+            Ok(bluos::client::Sync::Upgrading(progress)) => {
+                quiet_since = None;
+                backend.show_upgrade(id, &progress);
+                if progress.error {
+                    backend.clear_upgrade();
+                    say(&backend.ui, "The update failed — the player will say more");
+                    return;
+                }
+            }
+            // Back to answering as itself: the upgrade is over and the player
+            // has rebooted into whatever it now runs.
+            Ok(bluos::client::Sync::Status(_)) => {
+                if quiet_since.is_some() || started.elapsed() > UPGRADE_SETTLE {
+                    backend.clear_upgrade();
+                    say(&backend.ui, "Update finished");
+                    return;
+                }
+            }
+            // Unreachable, or answering with its bootloader's idea of HTML.
+            // Expected in the middle; only worth reporting if it lasts.
+            Err(_) => {
+                let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > UPGRADE_SILENCE {
+                    backend.clear_upgrade();
+                    say(
+                        &backend.ui,
+                        "Lost the player while it was updating — it may still be working",
+                    );
+                    return;
+                }
+            }
+        }
+
+        tokio::time::sleep(UPGRADE_POLL).await;
+    }
+}
+
 /// Whose alarms the open pane belongs to.
 ///
 /// The alarms pane outlives a change of selection, so every write it drives
@@ -937,6 +1047,12 @@ fn replace_alarms(backend: &Backend, list: bluos::alarms::Alarms) {
 /// index at zero on the way in, so a negative constant arrives as row zero and
 /// every one of these becomes "the first alarm in the list". Settings rows are
 /// numbered by walking a page, so they run to tens; nine thousand is clear.
+/// The Upgrade Check page's one pressable row.
+///
+/// Far above any position a help page reaches, for the same reason the alarm
+/// constants below are: these rows share one index space with positional ones.
+const UPGRADE_ROW: usize = 9100;
+
 const ALARM_ROW_BASE: usize = 9000;
 const ALARM_KIND: usize = ALARM_ROW_BASE;
 const ALARM_VOLUME: usize = ALARM_ROW_BASE + 1;
@@ -1378,6 +1494,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_answer_upgrade(move |go| {
+        let _ = tx.send(Command::UpgradeAnswer(go));
+    });
+
+    let tx = commands.clone();
     ui.on_sidebar_activate(move |kind, index| {
         let _ = tx.send(Command::Sidebar(kind, index));
     });
@@ -1771,6 +1892,7 @@ impl Backend {
                 id,
                 Entry {
                     client: Client::with_http(id, http.clone()),
+                    upgrading: false,
                     view: Device {
                         id: id.to_string().into(),
                         name: name.unwrap_or("BluOS player").into(),
@@ -1964,6 +2086,96 @@ impl Backend {
     /// its back arrow are the ones every other page uses. What settings rows
     /// cannot express — a time and seven days — is a strip of its own above
     /// them, published through the properties below.
+    /// Tell the window a player is upgrading, and how far along.
+    ///
+    /// Also marks the entry, which is what takes the player's controls away:
+    /// a speaker rewriting its own firmware will not answer a volume change,
+    /// and offering one invites a person to keep pressing while it does not.
+    fn show_upgrade(&self, id: DeviceId, progress: &bluos::upgrade::Progress) {
+        let stage = progress.stage().label().to_owned();
+
+        {
+            let mut registry = self.registry.lock().unwrap();
+            if let Some(entry) = registry.get_mut(&id) {
+                entry.upgrading = true;
+            }
+        }
+
+        // Said on the player's own row as well as in the banner, and marked
+        // unreachable so the row reads as something that will not answer.
+        // Note this dims the row rather than disabling its controls: taking
+        // them away properly means keeping an upgrading player out of the
+        // selection altogether, which is how the official controller does it
+        // and is a larger change than this.
+        let line = if progress.total > 0 {
+            format!("{stage} — {}%", progress.percent)
+        } else {
+            stage.clone()
+        };
+        self.update(id, |view| {
+            view.role = line.clone().into();
+            view.reachable = false;
+        });
+
+        // Stage one reports no numbers at all, so there is genuinely nothing
+        // to draw a bar from; the words carry it until stage two starts.
+        let percent = if progress.total > 0 {
+            progress.percent as f32
+        } else {
+            0.0
+        };
+        let name = progress
+            .name
+            .clone()
+            .or_else(|| self.with_entry(id, |e| e.view.name.to_string()))
+            .unwrap_or_else(|| "The player".to_owned());
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_upgrading_player(name.into());
+                ui.set_upgrading_stage(stage.into());
+                ui.set_upgrading_percent(percent);
+            }
+        });
+        self.publish();
+    }
+
+    /// Put every player's controls back.
+    fn clear_upgrade(&self) {
+        let was: Vec<DeviceId> = {
+            let mut registry = self.registry.lock().unwrap();
+            let ids = registry
+                .iter()
+                .filter(|(_, e)| e.upgrading)
+                .map(|(id, _)| *id)
+                .collect();
+            for entry in registry.values_mut() {
+                entry.upgrading = false;
+            }
+            ids
+        };
+
+        // The next status puts the real role back; this only stops the
+        // upgrade's words outliving it.
+        for id in was {
+            self.update(id, |view| {
+                view.role = slint::SharedString::new();
+                view.reachable = true;
+            });
+        }
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_upgrading_player(slint::SharedString::new());
+                ui.set_upgrading_stage(slint::SharedString::new());
+                ui.set_upgrading_percent(0.0);
+            }
+        });
+        self.publish();
+    }
+
     fn publish_alarms(&self) {
         let page = {
             let browsing = self.browsing.lock().unwrap();
@@ -2786,9 +2998,18 @@ impl Backend {
 
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
-        if let Pane::HelpDetail(title, facts, _) = &self.browsing.lock().unwrap().pane {
-            let (title, facts) = (title.clone(), facts.clone());
-            let rows = facts
+        let (page, offer) = {
+            let browsing = self.browsing.lock().unwrap();
+            match &browsing.pane {
+                Pane::HelpDetail(title, facts, _) => {
+                    (Some((title.clone(), facts.clone())), browsing.can_upgrade)
+                }
+                _ => (None, false),
+            }
+        };
+
+        if let Some((title, facts)) = page {
+            let mut rows: Vec<SettingData> = facts
                 .into_iter()
                 .map(|(label, value)| SettingData {
                     index: -1,
@@ -2800,6 +3021,22 @@ impl Backend {
                     ..SettingData::blank()
                 })
                 .collect();
+
+            // Only where the check said there is something to install. A
+            // button offering to rewrite a player's firmware is not something
+            // to leave lying about on a page that is otherwise all facts.
+            if offer {
+                rows.push(SettingData {
+                    index: UPGRADE_ROW as i32,
+                    label: "Install update".to_owned(),
+                    detail: "Restarts the player. Takes a few minutes.".to_owned(),
+                    glyph: Some(Glyph::Rescan),
+                    control: "link",
+                    available: true,
+                    ..SettingData::blank()
+                });
+            }
+
             return self.send_settings(rows, title);
         }
 
@@ -5562,6 +5799,49 @@ async fn run_commands(
 ) {
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
+            // Only puts the question up. Nothing reaches the player here.
+            Command::UpgradeAsk => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let name = backend
+                    .with_entry(id, |e| e.view.name.to_string())
+                    .unwrap_or_else(|| "this player".to_owned());
+                let ui = backend.ui.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.set_confirm_upgrade(name.into());
+                    }
+                });
+                continue;
+            }
+
+            Command::UpgradeAnswer(go) => {
+                if !go {
+                    continue;
+                }
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    // `start_upgrade` checks again before it sends anything:
+                    // the answer here may be minutes old, and the player may
+                    // have started one of its own in between.
+                    match client.start_upgrade().await {
+                        Ok(()) => {
+                            say(&backend.ui, "Update started — leave the player powered on");
+                            follow_upgrade(backend.clone(), id).await;
+                        }
+                        Err(e) => say(&backend.ui, format!("could not start the update: {e}")),
+                    }
+                });
+                continue;
+            }
+
             Command::Rescan => {
                 // Nothing to sweep with where the port could not be bound, and
                 // saying so beats a button that looks like it did something.
@@ -6527,6 +6807,11 @@ async fn run_commands(
                 continue;
             }
 
+            Command::HelpAction(index) if index == UPGRADE_ROW => {
+                let _ = backend.commands.send(Command::UpgradeAsk);
+                continue;
+            }
+
             Command::HelpAction(index) => {
                 let Some((_, kind, _, _)) = HELP_ENTRIES.get(index) else {
                     // The About row, which is text rather than a link.
@@ -6573,28 +6858,60 @@ async fn run_commands(
                         }
                         HelpKind::Upgrade => {
                             let Some(client) = client else { return };
-                            match client.upgrade_check().await {
-                                Ok((status, action)) => {
-                                    let mut facts = vec![(
-                                        "Status".to_owned(),
-                                        status.unwrap_or_else(|| {
-                                            "The player did not answer clearly".to_owned()
-                                        }),
-                                    )];
-                                    // Only present when the player itself offers
-                                    // one; see reports::upgrade_action.
-                                    if let Some((label, href)) = action {
-                                        facts.push((label, client.image_url(&href)));
-                                    }
-                                    backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
-                                        "Upgrade Check".to_owned(),
-                                        facts,
-                                        Whence::Help,
-                                    );
-                                    backend.publish_help();
+
+                            // Two answers, from two routes. The page is the
+                            // player's own words and is what a person reads;
+                            // the check is the machine-readable one, and is
+                            // what decides whether installing is offered.
+                            let page = client.upgrade_check().await;
+                            let ready = client.upgrade_available().await;
+
+                            let mut facts = match &page {
+                                Ok((status, _)) => vec![(
+                                    "Status".to_owned(),
+                                    status.clone().unwrap_or_else(|| {
+                                        "The player did not answer clearly".to_owned()
+                                    }),
+                                )],
+                                Err(e) => {
+                                    vec![("Status".to_owned(), format!("could not ask: {e}"))]
                                 }
-                                Err(e) => say(&backend.ui, format!("upgrade check failed: {e}")),
+                            };
+
+                            match &ready {
+                                Ok(ready) if ready.in_progress => {
+                                    facts.push((
+                                        "Installing".to_owned(),
+                                        "An upgrade is running on this player now".to_owned(),
+                                    ));
+                                }
+                                Ok(ready) if ready.available => {
+                                    facts.push((
+                                        "Update".to_owned(),
+                                        "Available — see the button below".to_owned(),
+                                    ));
+                                }
+                                Ok(_) => facts.push((
+                                    "Update".to_owned(),
+                                    "The player is up to date".to_owned(),
+                                )),
+                                Err(e) => {
+                                    facts.push(("Update".to_owned(), format!("could not ask: {e}")))
+                                }
                             }
+
+                            let offer = matches!(&ready, Ok(r) if r.available && !r.in_progress);
+
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                browsing.pane = Pane::HelpDetail(
+                                    "Upgrade Check".to_owned(),
+                                    facts,
+                                    Whence::Help,
+                                );
+                                browsing.can_upgrade = offer;
+                            }
+                            backend.publish_help();
                         }
                     }
                 });

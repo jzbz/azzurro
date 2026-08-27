@@ -43,6 +43,7 @@ pub mod screen;
 pub mod settings;
 pub mod stations;
 pub mod status;
+pub mod upgrade;
 
 /// Shared by the two HTML scrapers; not part of the crate's surface.
 mod html;

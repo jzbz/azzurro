@@ -1788,6 +1788,17 @@ export component AppWindow inherits Window {
 
     in-out property <string> confirm-input: "";
 
+    // The firmware question. Named separately from `confirm-input` because the
+    // two are not the same kind of question: one stops the music, the other
+    // rewrites the player and cannot be taken back.
+    in-out property <string> confirm-upgrade: "";
+    callback answer-upgrade(bool);
+
+    // What a player is doing while it upgrades itself. Empty when none is.
+    in property <string> upgrading-player: "";
+    in property <string> upgrading-stage: "";
+    in property <float> upgrading-percent: 0;
+
     // The player's own question — "Playing replaces Play Queue" and its like.
     // Its wording and its buttons are the player's; this only draws them.
     in property <bool> dialog-open: false;
@@ -3826,6 +3837,75 @@ export component AppWindow inherits Window {
                         label: button.label;
                         primary: button.destructive;
                         clicked => { root.dialog-press(button.index); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.confirm-upgrade != "": Rectangle {
+        background: #00000080;
+
+        // No dismiss-by-scrim here, unlike the input question below. Answering
+        // this one by clicking past it is not a thing to make easy.
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: firmware.preferred-height;
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #000000a6;
+
+            TouchArea { }
+
+            firmware := VerticalLayout {
+                padding: Theme.room;
+                spacing: Theme.pad;
+
+                Text {
+                    text: "Update " + root.confirm-upgrade + "?";
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "This installs new firmware and restarts the player. "
+                        + "It takes a few minutes and cannot be stopped once it "
+                        + "starts. Do not power the player off while it runs.";
+                    font-size: Theme.small-size;
+                    color: Theme.dim;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: Theme.gap;
+
+                    PillButton {
+                        label: "Update";
+                        primary: true;
+                        clicked => {
+                            root.confirm-upgrade = "";
+                            root.answer-upgrade(true);
+                        }
+                    }
+
+                    PillButton {
+                        label: "Not now";
+                        clicked => {
+                            root.confirm-upgrade = "";
+                            root.answer-upgrade(false);
+                        }
                     }
                 }
             }

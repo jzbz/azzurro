@@ -29,6 +29,14 @@ use crate::status::{Status, SyncStatus};
 /// the long-poll below sets its own.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longer, for the two upgrade routes.
+///
+/// A player asked to check for firmware goes and asks somebody else, over a
+/// connection this app knows nothing about, so it is slower than anything
+/// answered from memory. Sixty seconds is what the official controller allows,
+/// against its own thirty-second default.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The largest reply worth reading from a player.
 ///
 /// The timeout above bounds how *long* a body may take to arrive, not how
@@ -36,6 +44,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// are different limits: a body that never ends still costs a gigabyte before
 /// a ten-second timeout fires on a fast link, and the status poll — which
 /// waits up to 115 seconds by design — costs proportionally more, on repeat,
+/// What a player answers on `/SyncStatus`, which is not always a status.
+///
+/// A firmware upgrade replaces the root element, so a reader that expects only
+/// one shape sees a broken player at the moment it most needs watching.
+#[derive(Debug, Clone)]
+pub enum Sync {
+    Status(Box<SyncStatus>),
+    /// An upgrade is running. The player is not controllable, and it will
+    /// reboot before it is.
+    Upgrading(crate::upgrade::Progress),
+}
+
 /// for every player adopted.
 ///
 /// A hundredfold headroom over anything a real player sends. Measured on an
@@ -449,6 +469,30 @@ impl Client {
         self.get_xml("/SyncStatus", &[], REQUEST_TIMEOUT).await
     }
 
+    /// The same route, allowing for the player being mid-upgrade.
+    ///
+    /// While a firmware upgrade runs, `/SyncStatus` answers with
+    /// `<UpgradeStatusStage1>` or `<UpgradeStatusStage2>` instead of
+    /// `<SyncStatus>`. [`Self::sync_status`] reads that as a malformed reply,
+    /// which is the wrong answer at the one moment the player most needs
+    /// watching — so anything following an upgrade asks through here.
+    ///
+    /// Note for the caller: do not long-poll this with an etag while an
+    /// upgrade is running. The player stops answering partway through to
+    /// reboot, and a held-open poll waits for a reply that is never coming.
+    /// The official controller drops to a bare five-second poll for exactly
+    /// this reason.
+    pub async fn sync_or_upgrade(&self) -> Result<Sync> {
+        let body = self.get_text("/SyncStatus", &[], REQUEST_TIMEOUT).await?;
+
+        match crate::upgrade::in_sync_status(&body)? {
+            Some(progress) => Ok(Sync::Upgrading(progress)),
+            None => quick_xml::de::from_str(&body)
+                .map(|status| Sync::Status(Box::new(status)))
+                .map_err(|e| Error::Screen(format!("SyncStatus: {e}"))),
+        }
+    }
+
     /// Which screens this player offers.
     ///
     /// The starting point for browsing: everything else is reached by
@@ -541,9 +585,12 @@ impl Client {
 
     /// Ask the player whether there is firmware to install.
     ///
-    /// Reading only. Starting an upgrade is deliberately not offered here:
-    /// it is the one operation where getting it wrong leaves somebody with a
-    /// brick, and the player's own page does it perfectly well.
+    /// What the player says about firmware, as the page a browser would see.
+    ///
+    /// Kept for the Help entry, which shows the player's own words. It is not
+    /// how an upgrade is started or watched — see [`Self::upgrade_available`]
+    /// and [`Self::start_upgrade`] — and the official controller does not read
+    /// this page either: it loads it in a webview and lets the person click.
     /// Returns what the player says, and the action it offers if any.
     #[allow(clippy::type_complexity)]
     pub async fn upgrade_check(&self) -> Result<(Option<String>, Option<(String, String)>)> {
@@ -554,6 +601,61 @@ impl Client {
             crate::reports::upgrade_status(&body),
             crate::reports::upgrade_action(&body),
         ))
+    }
+
+    /// Whether the player has an upgrade waiting, and whether one is running.
+    ///
+    /// Non-destructive: the official controller polls this every fifteen
+    /// seconds while it waits for a player to come up. See
+    /// [`crate::upgrade`] for where the shape of this comes from.
+    pub async fn upgrade_available(&self) -> Result<crate::upgrade::Availability> {
+        let body = self
+            .get_text("/upgrade", &[("upgrade", "check")], UPGRADE_TIMEOUT)
+            .await?;
+        crate::upgrade::availability(&body)
+    }
+
+    /// Start a firmware upgrade on this player, and only this player.
+    ///
+    /// **This rewrites the firmware of somebody's speaker.** It cannot be
+    /// undone, there is no route for stopping it once it has begun — the
+    /// player reports an `abortable` flag and neither this crate nor the
+    /// official controller has anywhere to send an abort — and a player that
+    /// does not come back needs whatever recovery its manufacturer offers. A
+    /// caller must have asked the person first.
+    ///
+    /// Refuses unless the player says an upgrade is available and none is
+    /// already running. That check is the one precondition the official
+    /// controller enforces before it starts one, and starting a second
+    /// upgrade over a running one is the way to turn a working speaker into a
+    /// brick.
+    ///
+    /// Scope is `this`, the player addressed and nothing else. The official
+    /// controller has an `all` — master plus zone members — which it uses only
+    /// for players too old to talk to and for its retry button. Nothing here
+    /// offers it: upgrading a room full of speakers on one press is not a
+    /// thing to do by accident, and the effect of `all` is not documented
+    /// anywhere I could find.
+    pub async fn start_upgrade(&self) -> Result<()> {
+        let ready = self.upgrade_available().await?;
+
+        if ready.in_progress {
+            return Err(Error::Screen(
+                "an upgrade is already running on this player".to_owned(),
+            ));
+        }
+        if !ready.available {
+            return Err(Error::Screen(
+                "the player says it has no upgrade to install".to_owned(),
+            ));
+        }
+
+        // The reply is the same document the check answers with, and is not
+        // read: by the time it arrives the player is already going, and what
+        // it is doing is watched through `/SyncStatus` from here on.
+        self.get_text("/upgrade", &[("upgrade", "this")], UPGRADE_TIMEOUT)
+            .await?;
+        Ok(())
     }
 
     /// A page of the player's own web UI, which is a different server.

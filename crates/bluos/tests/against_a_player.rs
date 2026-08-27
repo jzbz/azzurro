@@ -186,3 +186,77 @@ async fn a_route_the_player_does_not_have_is_an_error() {
 
     assert!(client.alarms().await.is_err());
 }
+
+/// Starting a firmware upgrade is the one call in this crate that cannot be
+/// undone, so what it refuses matters more than what it does.
+#[tokio::test]
+async fn an_upgrade_is_refused_unless_the_player_says_it_is_ready() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+
+    // Nothing to install.
+    player.serve(
+        "/upgrade",
+        r#"<upgrade inProgress="false" available="false"/>"#,
+    );
+    let refused = client.start_upgrade().await;
+    assert!(refused.is_err(), "an upgrade nobody has must not start");
+    assert!(
+        !player.asked_for("upgrade=this"),
+        "and the trigger must not have been sent at all"
+    );
+
+    // One already running: starting a second is the way to brick a player.
+    player.serve(
+        "/upgrade",
+        r#"<upgrade inProgress="true" available="true"/>"#,
+    );
+    let refused = client.start_upgrade().await;
+    assert!(refused.is_err(), "a second upgrade must not start");
+    assert!(!player.asked_for("upgrade=this"));
+
+    // Ready: available, and nothing running.
+    player.serve(
+        "/upgrade",
+        r#"<upgrade inProgress="false" available="true"/>"#,
+    );
+    client.start_upgrade().await.expect("starts");
+    assert!(
+        player.asked_for("upgrade=this"),
+        "the scope is this player alone, never all"
+    );
+    assert!(
+        !player.asked_for("upgrade=all"),
+        "nothing here may upgrade a whole zone"
+    );
+    assert!(player.asked_for("upgrade=check"), "and it checked first");
+}
+
+/// While an upgrade runs the player stops answering with `<SyncStatus>`, which
+/// a reader that insists on it would call a broken player.
+#[tokio::test]
+async fn an_upgrading_player_is_read_as_upgrading_and_not_as_broken() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+
+    player.serve(
+        "/SyncStatus",
+        r#"<UpgradeStatusStage2 name="Kitchen" model="N330" step="2" total="4"
+             percent="55" error="0" abortable="0"/>"#,
+    );
+
+    let progress = match client.sync_or_upgrade().await.expect("reads") {
+        bluos::client::Sync::Upgrading(progress) => progress,
+        bluos::client::Sync::Status(_) => panic!("read an upgrade as an ordinary status"),
+    };
+
+    assert_eq!(progress.percent, 55);
+    assert_eq!(progress.stage(), bluos::upgrade::Stage::Installing);
+
+    // And the ordinary shape still reads as one.
+    player.serve("/SyncStatus", fixtures::sync_status());
+    assert!(matches!(
+        client.sync_or_upgrade().await.expect("reads"),
+        bluos::client::Sync::Status(_)
+    ));
+}
