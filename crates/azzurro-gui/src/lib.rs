@@ -494,6 +494,13 @@ enum Arrive {
     /// In place of the screen it came from, which is what a service picker
     /// marked `replaceScreen` asks for.
     Replace(Option<String>),
+    /// In place of one particular screen, if that is still the one on top.
+    ///
+    /// A refresh reads the crumb, waits for the player, and comes back to a
+    /// trail the user may have moved in the meantime. `Replace` pops whatever
+    /// it finds, so a refresh that lost that race deleted the level the user
+    /// had just opened and put the old one back in its place.
+    Refresh { query: Option<String>, was: String },
 }
 
 impl Browsing {
@@ -2300,12 +2307,20 @@ impl Backend {
         }
 
         let art = self.artwork.clone();
-        let client = self
-            .browsing
-            .lock()
-            .unwrap()
-            .device
-            .and_then(|id| self.with_entry(id, |e| e.client.clone()));
+        // The player the menu came from, not whichever is being browsed — the
+        // same rule `QueueMenuAction` follows when it addresses the action.
+        // The two differ while a selection is settling, and the menu's image
+        // path is relative to the player that served it, so resolving it
+        // against another player's base produced a URL that missed and left
+        // the header without a thumbnail the row behind it was showing.
+        //
+        // Read out, then looked up: a guard in a method chain lives to the end
+        // of the statement, so this held `browsing` while `with_entry` took
+        // `registry`. Two of them at once is what the note on `Backend` says
+        // never to do, and `publish_browse` spells out the shape that avoids
+        // it.
+        let owner = self.browsing.lock().unwrap().queue_menu_owner;
+        let client = owner.and_then(|id| self.with_entry(id, |e| e.client.clone()));
         let cover = cover
             .as_deref()
             .zip(client.as_ref())
@@ -3099,10 +3114,10 @@ impl Backend {
             return;
         };
 
-        let sleep = self
-            .selected
-            .lock()
-            .unwrap()
+        // The selection out first, so `selected` is not still held when
+        // `with_entry` takes `registry`.
+        let selected = *self.selected.lock().unwrap();
+        let sleep = selected
             .and_then(|id| self.with_entry(id, |e| e.status.clone()))
             .flatten()
             .and_then(|status| status.sleep_minutes());
@@ -4345,6 +4360,17 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
         Ok(screen) => {
             {
                 let mut browsing = backend.browsing.lock().unwrap();
+
+                // Decided before anything is changed. A refresh that lost its
+                // race changes nothing at all — taking the pane from Settings
+                // and then dropping the screen would leave the window showing
+                // a pane nobody published.
+                if let Arrive::Refresh { was, .. } = &arrive
+                    && !browsing.trail.last().is_some_and(|c| &c.uri == was)
+                {
+                    return;
+                }
+
                 // Showing a screen means leaving Settings and Help, which
                 // otherwise keep the pane and the sidebar navigates
                 // underneath them with nothing appearing to happen.
@@ -4356,6 +4382,11 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 }
                 browsing.device = Some(id);
                 let query = match &arrive {
+                    // Still the screen it was started for; checked above.
+                    Arrive::Refresh { query, .. } => {
+                        browsing.trail.pop();
+                        query.clone()
+                    }
                     Arrive::Root => {
                         browsing.trail.clear();
                         None
@@ -4934,7 +4965,13 @@ async fn refresh_current(backend: Backend) {
     }) else {
         return;
     };
-    open_screen(backend.clone(), id, uri, Arrive::Replace(query)).await;
+    open_screen(
+        backend.clone(),
+        id,
+        uri.clone(),
+        Arrive::Refresh { query, was: uri },
+    )
+    .await;
 }
 
 /// Holds the single refresh slot, and gives it back however the refresh ends.
@@ -6491,11 +6528,9 @@ async fn run_commands(
                     // The About row, which is text rather than a link.
                     continue;
                 };
-                let client = backend
-                    .selected
-                    .lock()
-                    .unwrap()
-                    .and_then(|id| backend.with_entry(id, |e| e.client.clone()));
+                // The selection out first; see the note on `Backend`.
+                let selected = *backend.selected.lock().unwrap();
+                let client = selected.and_then(|id| backend.with_entry(id, |e| e.client.clone()));
 
                 // Off the loop, for the reason spelled out on `BrowseHome`.
                 // Two of the three below ask the player something, and the
