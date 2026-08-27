@@ -564,16 +564,23 @@ export component TimeField inherits Rectangle {
                 root.half = d;
                 root.changed(d, root.minute);
             } else {
+                // Read the first digit out before clearing it: the reset used
+                // to run first, so the expression below read -1 and every
+                // typed pair came out as `d - 10` — always negative, always
+                // inside the `<= 23` guard, and clamped back to 0 by the Rust
+                // side. Typing 07 set midnight.
+                let tens = root.half;
                 root.half = -1;
-                root.changed(root.half * 10 + d <= 23 ? root.half * 10 + d : d, root.minute);
+                root.changed(tens * 10 + d <= 23 ? tens * 10 + d : d, root.minute);
             }
         } else {
             if (root.half < 0) {
                 root.half = d;
                 root.changed(root.hour, d);
             } else {
+                let tens = root.half;
                 root.half = -1;
-                root.changed(root.hour, root.half * 10 + d <= 59 ? root.half * 10 + d : d);
+                root.changed(root.hour, tens * 10 + d <= 59 ? tens * 10 + d : d);
             }
         }
     }
