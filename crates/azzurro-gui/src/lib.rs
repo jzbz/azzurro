@@ -379,8 +379,16 @@ struct PlaylistPage {
 /// Save, and Back throws the copy away. A new alarm is the same thing with
 /// `id` still zero, which is also what tells `save_alarm` to create rather
 /// than replace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct AlarmsPage {
+    /// Whose alarms these are.
+    ///
+    /// Held rather than read from the selection at press time: the pane stays
+    /// up when the sidebar moves, so a save that resolved its target from
+    /// `selected` wrote one player's alarm onto another — and Delete did the
+    /// same. The queue menu already keeps its owner for this reason; see
+    /// `queue_menu_owner`.
+    device: DeviceId,
     list: bluos::alarms::Alarms,
     editing: Option<bluos::alarms::Alarm>,
     /// The source picker, while it is open over the editor. A trail rather
@@ -613,6 +621,16 @@ struct Backend {
     /// every row instance, which throws away whatever was being typed into
     /// one and jumps the scroll on a page of mixed heights.
     sent_settings: Arc<AtomicU64>,
+    /// Whether a stale-screen refresh is already in flight.
+    ///
+    /// Staleness is decided by comparing the screen's `refreshOnStatusChange`
+    /// pairs against the live status, and the status ticks once a second. A
+    /// pair the status cannot satisfy — a key `Status::field` does not model,
+    /// so the comparison reads `None` forever — is therefore not a screen that
+    /// refreshes once, it is a screen that refetches every second for as long
+    /// as it is open. One refresh at a time bounds that, and any future
+    /// staleness rule that gets it wrong, to a single round trip.
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
     /// Section order per screen, as set by Customise Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
 }
@@ -757,13 +775,27 @@ async fn open_picker(backend: &Backend, client: &Client, title: String, path: St
     }
 }
 
+/// Whose alarms the open pane belongs to.
+///
+/// The alarms pane outlives a change of selection, so every write it drives
+/// has to address the player it was opened for rather than whichever row the
+/// sidebar has highlighted now.
+fn alarms_owner(backend: &Backend) -> Option<DeviceId> {
+    match &backend.browsing.lock().unwrap().pane {
+        Pane::Alarms(page) => Some(page.device),
+        _ => None,
+    }
+}
+
 /// What a press on the alarms screen means.
 ///
 /// The screen borrows the settings pane's rows, so its presses arrive as
 /// settings presses. Which alarm command they stand for depends on the row's
 /// index and on whether the editor is open — the list numbers its rows by
-/// position, the editor by the fixed constants above, and the two never
-/// overlap because the editor's are negative.
+/// position, the editor by the fixed constants above. The two are kept apart
+/// by [`ALARM_ROW_BASE`], which sits far above any list a player can serve;
+/// `publish_alarms` refuses to publish a row that would reach it, so a
+/// position can never be read as an editor row.
 fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<Command> {
     let browsing = backend.browsing.lock().unwrap();
     let Pane::Alarms(page) = &browsing.pane else {
@@ -1485,7 +1517,23 @@ async fn run(
         Ok(http) => http,
         Err(e) => return say(&ui, format!("could not start HTTP: {e}")),
     };
-    let art = match reqwest::Client::builder().build() {
+    // Cover art legitimately comes from a streaming service's CDN on another
+    // host, which is why it does not share the protocol client — see the note
+    // on `Client::http_client`. It still does not get to follow a redirect
+    // wherever a player points it: the hop limit and the per-hop address check
+    // in `artwork::permitted` apply to every destination, not just the first.
+    let art = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= artwork::MAX_HOPS {
+                return attempt.stop();
+            }
+            match artwork::permitted(attempt.url()) {
+                true => attempt.follow(),
+                false => attempt.stop(),
+            }
+        }))
+        .build()
+    {
         Ok(art) => art,
         Err(e) => return say(&ui, format!("could not start HTTP: {e}")),
     };
@@ -1522,6 +1570,7 @@ async fn run(
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
+        refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
     };
 
@@ -1651,6 +1700,11 @@ impl Backend {
     /// entirely for an address typed in by hand. `/SyncStatus` replaces them
     /// with the truth a moment later.
     fn track(&self, id: DeviceId, http: &reqwest::Client, name: Option<&str>, model: Option<&str>) {
+        // A player serves its own art from its own address, which is on the
+        // user's subnet — the space `artwork::permitted` refuses to dial on a
+        // player's say-so. Recorded here, where an address becomes a player.
+        self.artwork.remember_player(id.host);
+
         {
             let mut guard = self.registry.lock().unwrap();
             if guard.contains_key(&id) {
@@ -1925,7 +1979,19 @@ impl Backend {
                         ..SettingData::blank()
                     });
                 }
-                for (at, alarm) in page.list.alarms.iter().enumerate() {
+                // Positions address list rows and the constants above address
+                // the editor's, both through one `usize`, so a list long
+                // enough to reach `ALARM_ROW_BASE` would have its rows read as
+                // editor presses — a press on row 9006 arriving as Delete. No
+                // player serves anything near this; the take is what makes
+                // that a fact rather than an assumption.
+                for (at, alarm) in page
+                    .list
+                    .alarms
+                    .iter()
+                    .take(ALARM_ROW_BASE)
+                    .enumerate()
+                {
                     rows.push(SettingData {
                         // The list is addressed by position; the arm below
                         // carries the player's own id, which is what it needs.
@@ -4768,6 +4834,12 @@ async fn refresh_current(backend: Backend) {
     // `Replace` and not `Deeper` for a second reason: `Deeper` discards the
     // crumb's query, so refreshing a screen of search results stopped it
     // counting as results and the next search stacked instead of replacing.
+    //
+    // The caller sets `refreshing` to claim the slot, and this releases it on
+    // every path out — including the early return below, which would otherwise
+    // leave the flag set and stop the screen ever refreshing again.
+    let _done = Refreshing(backend.clone());
+
     let Some((id, uri, query)) = ({
         let browsing = backend.browsing.lock().unwrap();
         browsing.trail.last().and_then(|crumb| {
@@ -4778,7 +4850,23 @@ async fn refresh_current(backend: Backend) {
     }) else {
         return;
     };
-    open_screen(backend, id, uri, Arrive::Replace(query)).await;
+    open_screen(backend.clone(), id, uri, Arrive::Replace(query)).await;
+}
+
+/// Holds the single refresh slot, and gives it back however the refresh ends.
+///
+/// A plain store at the end of [`refresh_current`] is not enough: the function
+/// returns early when there is no crumb to refresh, and a task that is dropped
+/// mid-await never reaches its last line at all. Either would strand the flag
+/// and leave the screen unable to refresh for the rest of the session.
+struct Refreshing(Backend);
+
+impl Drop for Refreshing {
+    fn drop(&mut self) {
+        self.0
+            .refreshing
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Fetch the icons and cover art for the screen on show.
@@ -5238,7 +5326,14 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                             .last()
                             .is_some_and(|crumb| crumb.screen.is_stale(&status))
                 };
-                if stale {
+                // Only one at a time: see `refreshing`. A refresh that loses
+                // this race is dropped rather than queued, because the one in
+                // flight is fetching the same screen.
+                if stale
+                    && !backend
+                        .refreshing
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
                     tokio::spawn(refresh_current(backend.clone()));
                 }
 
@@ -5747,6 +5842,7 @@ async fn run_commands(
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
                                 browsing.pane = Pane::Alarms(Box::new(AlarmsPage {
+                                    device: id,
                                     list,
                                     editing: None,
                                     picking: Vec::new(),
@@ -5766,7 +5862,7 @@ async fn run_commands(
             }
 
             Command::AlarmArm(alarm, on) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some(id) = alarms_owner(&backend) else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -5963,7 +6059,7 @@ async fn run_commands(
                     }
                 };
                 let Some(alarm) = editing else { continue };
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some(id) = alarms_owner(&backend) else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -5973,7 +6069,21 @@ async fn run_commands(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
-                    match client.save_alarm(&alarm).await {
+                    // A save always sends `enable=1`, because the route has no
+                    // way to write a disarmed alarm — [`Client::save_alarm`]
+                    // says so and names this second call as the other half.
+                    // Without it, editing an alarm the user had switched off
+                    // switched it back on again, and the first they knew was
+                    // the toggle flipping back in the refreshed list.
+                    //
+                    // A new alarm is exempt: it is created armed, and its id
+                    // is not known until the save has answered.
+                    let saved = match client.save_alarm(&alarm).await {
+                        Ok(list) if alarm.enabled || alarm.id == 0 => Ok(list),
+                        Ok(_) => client.arm_alarm(alarm.id, false).await,
+                        Err(e) => Err(e),
+                    };
+                    match saved {
                         Ok(list) => {
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
@@ -6010,7 +6120,7 @@ async fn run_commands(
                     backend.publish_pane();
                     continue;
                 };
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some(id) = alarms_owner(&backend) else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
