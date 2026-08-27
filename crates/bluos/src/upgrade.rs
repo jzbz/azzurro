@@ -52,10 +52,10 @@ pub struct Availability {
     pub available: bool,
     /// The version being offered, where the player names one.
     ///
-    /// Opportunistic. The official controller reads only the two flags above
-    /// and would discard this, so whether a player sends it at all is unknown
-    /// — it is taken when present and nothing depends on it. Both spellings
-    /// are tried because the attribute is undocumented either way.
+    /// The official controller reads only the two flags above and discards
+    /// this, so there was nothing to copy — but a Powernode on 4.16.6 does
+    /// send it, captured in the test below. Still optional: one player saying
+    /// it is not every player saying it, and nothing here depends on it.
     pub version: Option<String>,
 }
 
@@ -145,10 +145,7 @@ pub fn availability(xml: &str) -> Result<Availability> {
         return Ok(Availability {
             in_progress: flag(a.remove("inProgress")),
             available: flag(a.remove("available")),
-            version: a
-                .remove("version")
-                .or_else(|| a.remove("newVersion"))
-                .filter(|v| !v.is_empty()),
+            version: a.remove("version").filter(|v| !v.is_empty()),
         });
     }
 
@@ -246,6 +243,26 @@ mod tests {
         assert!(
             availability("<something-else/>").is_err(),
             "a document that is not an upgrade answer is an error, not a no"
+        );
+    }
+
+    /// Captured verbatim from an NAD Powernode running 4.16.6, which is where
+    /// the `version` attribute is known from — the official controller reads
+    /// past it.
+    #[test]
+    fn reads_a_real_check_from_a_powernode() {
+        let real = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<upgrade inProgress="false" version="4.16.22" available="true">check</upgrade>"#
+        );
+
+        let ready = availability(real).expect("parses");
+        assert!(ready.available);
+        assert!(!ready.in_progress);
+        assert_eq!(
+            ready.version.as_deref(),
+            Some("4.16.22"),
+            "the player names what it is offering"
         );
     }
 
