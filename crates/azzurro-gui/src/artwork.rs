@@ -336,7 +336,10 @@ impl Artwork {
         // rather than trusted because a player said it. Redirects are checked
         // per hop by the policy on the client itself.
         if !self.may_fetch(url) {
-            tracing::debug!(url, "artwork refused: not the player's own host, and not public");
+            tracing::debug!(
+                url,
+                "artwork refused: not the player's own host, and not public"
+            );
             return None;
         }
 
