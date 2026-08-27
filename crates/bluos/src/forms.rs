@@ -85,6 +85,10 @@ pub struct Submit {
 pub fn parse(html: &str) -> Vec<Form> {
     let mut forms: Vec<Form> = Vec::new();
     let mut open: Option<Form> = None;
+    // Field name to its index in `open`'s fields. Radios sharing a name are
+    // one choice, and finding the earlier one used to be a scan of everything
+    // collected so far — once per input, so quadratic in a page's field count.
+    let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
     // The tag that started the hidden region, and how deep inside it we are.
     let mut hiding: Option<(String, usize)> = None;
     // A `<label>` is written before the input it names, and its `for` is on
@@ -114,6 +118,7 @@ pub fn parse(html: &str) -> Vec<Form> {
             Piece::Tag {
                 name,
                 closing,
+                self_closing,
                 attrs,
             } => {
                 // Track the hidden region first: everything inside one is
@@ -133,8 +138,11 @@ pub fn parse(html: &str) -> Vec<Form> {
                     continue;
                 }
                 if !closing && is_hidden(&attrs) {
-                    // A self-closing tag hides nothing but itself.
-                    if !matches!(name.as_str(), "input" | "img" | "br") {
+                    // A tag that hides nothing but itself: one that closed
+                    // itself, or one of the void elements that never had a
+                    // closing tag to wait for. Anything else opens a region
+                    // that runs to its own `</…>`.
+                    if !self_closing && !matches!(name.as_str(), "input" | "img" | "br") {
                         hiding = Some((name, 0));
                     }
                     continue;
@@ -142,6 +150,7 @@ pub fn parse(html: &str) -> Vec<Form> {
 
                 match (name.as_str(), closing) {
                     ("form", false) => {
+                        by_name.clear();
                         open = Some(Form {
                             action: attrs.get("action").cloned().unwrap_or_default(),
                             post: attrs
@@ -207,7 +216,16 @@ pub fn parse(html: &str) -> Vec<Form> {
                     ("input", _) => {
                         let Some(form) = open.as_mut() else { continue };
                         let value = attrs.get("value").cloned().unwrap_or_default();
-                        let kind = attrs.get("type").map(String::as_str).unwrap_or("text");
+                        // Folded here rather than compared case-sensitively
+                        // below: an input's type is case-insensitive in HTML,
+                        // and `type="Password"` classified as Kind::Text drew
+                        // the secret with a text control and rendered the held
+                        // value back into it.
+                        let kind = attrs
+                            .get("type")
+                            .map(|t| t.to_ascii_lowercase())
+                            .unwrap_or_else(|| "text".to_owned());
+                        let kind = kind.as_str();
 
                         // A submit is the one input that does not need a name.
                         // The wireless form's Update button has none, because
@@ -246,14 +264,17 @@ pub fn parse(html: &str) -> Vec<Form> {
                                 // Radios sharing a name are one choice, so the
                                 // second one joins the first rather than
                                 // starting another field.
-                                match form.fields.iter_mut().find(|f| f.name == field) {
-                                    Some(existing) => existing.choices.push(choice),
-                                    None => form.fields.push(Field {
-                                        name: field,
-                                        kind: Kind::Choice,
-                                        choices: vec![choice],
-                                        ..Field::default()
-                                    }),
+                                match by_name.get(&field) {
+                                    Some(at) => form.fields[*at].choices.push(choice),
+                                    None => {
+                                        by_name.insert(field.clone(), form.fields.len());
+                                        form.fields.push(Field {
+                                            name: field,
+                                            kind: Kind::Choice,
+                                            choices: vec![choice],
+                                            ..Field::default()
+                                        });
+                                    }
                                 }
                             }
                             "checkbox" => form.fields.push(Field {
@@ -364,6 +385,13 @@ enum Piece<'a> {
     Tag {
         name: String,
         closing: bool,
+        /// Whether the tag closed itself: `<br/>`, not `</br>`.
+        ///
+        /// Kept apart from `closing`, which means a leading slash. A tag that
+        /// closes itself opens nothing, so it cannot start a region either —
+        /// which is what `<div hidden/>` used to do, swallowing the rest of
+        /// the page because no `</div>` was ever coming.
+        self_closing: bool,
         attrs: BTreeMap<String, String>,
     },
 }
@@ -397,12 +425,14 @@ fn pieces(html: &str) -> impl Iterator<Item = Piece<'_>> {
                 rest = &rest[(end + 1).min(rest.len())..];
 
                 let closing = raw.starts_with('/');
+                let self_closing = !closing && raw.ends_with('/');
                 let raw = raw.trim_start_matches('/').trim_end_matches('/');
                 let mut words = raw.splitn(2, |c: char| c.is_whitespace());
                 let name = words.next().unwrap_or_default().to_ascii_lowercase();
                 Some(Piece::Tag {
                     attrs: attributes(words.next().unwrap_or_default()),
                     name,
+                    self_closing,
                     closing,
                 })
             }
@@ -497,6 +527,65 @@ mod tests {
         <input type="submit" name="logoutAction" value="Logout"/>
     </span>
 </form>"#;
+
+    /// An input's type is case-insensitive in HTML. Classified as text, a
+    /// password field is drawn with a text control and the held value is
+    /// rendered back into it.
+    #[test]
+    fn a_password_is_a_password_however_it_is_spelled() {
+        for spelling in ["password", "Password", "PASSWORD", "PaSsWoRd"] {
+            let html = format!(
+                r#"<form action="/x"><input name="pw" type="{spelling}" value=""/></form>"#
+            );
+            let forms = parse(&html);
+            assert_eq!(
+                forms[0].fields[0].kind,
+                Kind::Password,
+                "type={spelling:?} should still be a password"
+            );
+        }
+
+        let forms = parse(r#"<form action="/x"><input name="t" type="TEXT"/></form>"#);
+        assert_eq!(forms[0].fields[0].kind, Kind::Text, "and text stays text");
+    }
+
+    /// A tag that closes itself has no `</…>` coming, so treating it as the
+    /// start of a hidden region swallowed the rest of the page.
+    #[test]
+    fn a_self_closing_hidden_tag_hides_only_itself() {
+        let forms = parse(
+            r#"<form action="/x">
+                 <div hidden/>
+                 <input name="after" type="text" value="v"/>
+               </form>"#,
+        );
+
+        assert_eq!(
+            forms[0]
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after"],
+            "the field after a self-closed hidden div survives"
+        );
+
+        let paired = parse(
+            r#"<form action="/x">
+                 <div hidden><input name="inside" type="text"/></div>
+                 <input name="outside" type="text"/>
+               </form>"#,
+        );
+        assert_eq!(
+            paired[0]
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["outside"],
+            "a properly paired hidden region still hides what is in it"
+        );
+    }
 
     #[test]
     fn reads_a_sign_in_form() {

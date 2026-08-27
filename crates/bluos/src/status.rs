@@ -348,11 +348,18 @@ impl Status {
     /// The best available cover art path, in the order the official controller
     /// prefers them.
     pub fn artwork(&self) -> Option<&str> {
+        // Each candidate is tested as it is considered, not after the chain
+        // has already settled on one. `or` short-circuits on the first Some,
+        // and an empty element parses to Some(""), so filtering at the end
+        // meant an empty <image/> won the chain and was then thrown away —
+        // reporting no art at all while current_image or station_image held
+        // one.
+        let usable = |s: &&str| !s.is_empty();
         self.image
             .as_deref()
-            .or(self.current_image.as_deref())
-            .or(self.station_image.as_deref())
-            .filter(|s| !s.is_empty())
+            .filter(usable)
+            .or_else(|| self.current_image.as_deref().filter(usable))
+            .or_else(|| self.station_image.as_deref().filter(usable))
     }
 
     pub fn actions(&self) -> &[Action] {
@@ -461,6 +468,38 @@ mod tests {
 
     const STATUS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <status etag="8a52c91ed3074a395d457626b80b20c2"><actions><action name="back" state="0"></action></actions><canSeek>0</canSeek><currentImage>/images/capture/ic_tvNP.png</currentImage><cursor>41</cursor><db>-30.6</db><image>/images/capture/ic_tvNP.png</image><indexing>0</indexing><inputId>input4</inputId><inputTypeIndex>arc-1</inputTypeIndex><mid>185</mid><mode>1</mode><mute>0</mute><pid>692</pid><prid>0</prid><repeat>0</repeat><secs>0</secs><service>Capture</service><serviceType>AudioInputs</serviceType><settingsGroupId>capture-input4</settingsGroupId><shuffle>0</shuffle><sid>8</sid><sleep></sleep><song>0</song><state>pause</state><stationImage>/images/capture/ic_tvNP.png</stationImage><streamUrl>Capture:hw:imxspdif,0/1/25/2?id=input4</streamUrl><syncStat>97</syncStat><title1>HDMI ARC</title1><twoline_title1>HDMI ARC</twoline_title1><volume>31</volume></status>"#;
+
+    /// An empty element is `Some("")`, not `None`, so a chain that filtered
+    /// only at the end let it win and then discarded it — reporting no art
+    /// while a usable fallback sat behind it.
+    #[test]
+    fn an_empty_image_element_does_not_hide_the_fallbacks() {
+        let art = |image: &str, current: &str, station: &str| {
+            Status {
+                image: Some(image.to_owned()),
+                current_image: Some(current.to_owned()),
+                station_image: Some(station.to_owned()),
+                ..Default::default()
+            }
+            .artwork()
+            .map(str::to_owned)
+        };
+
+        assert_eq!(art("/a.jpg", "/b.jpg", "/c.jpg").as_deref(), Some("/a.jpg"));
+        assert_eq!(
+            art("", "/b.jpg", "/c.jpg").as_deref(),
+            Some("/b.jpg"),
+            "an empty <image/> falls through to the next"
+        );
+        assert_eq!(art("", "", "/c.jpg").as_deref(), Some("/c.jpg"));
+        assert_eq!(art("", "", "").as_deref(), None, "all empty is still none");
+
+        assert_eq!(
+            Status::default().artwork(),
+            None,
+            "and absent is none as before"
+        );
+    }
 
     #[test]
     fn reads_a_real_sync_status() {

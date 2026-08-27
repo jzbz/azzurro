@@ -46,7 +46,14 @@ pub struct Station {
     /// The `<category>` this sat under, where it sat under one. Drawn as a
     /// heading; the player groups Radio Paradise's channels by quality this
     /// way.
-    pub group: Option<String>,
+    /// The heading this row sits under, shared rather than copied.
+    ///
+    /// One heading is repeated across every row beneath it, and copying it per
+    /// row made the memory a listing costs the product of the two: a document
+    /// inside the 4 MiB reply cap could name a heading of a couple of megabytes
+    /// and then a hundred thousand rows to hang under it. An `Arc` makes each
+    /// row cost a pointer.
+    pub group: Option<std::sync::Arc<str>>,
 }
 
 impl Station {
@@ -100,7 +107,7 @@ pub fn parse(xml: &str) -> Result<Stations> {
 
     let mut out = Stations::default();
     let mut seen_root = false;
-    let mut group: Option<String> = None;
+    let mut group: Option<std::sync::Arc<str>> = None;
 
     loop {
         let (e, closed) = match reader.read_event() {
@@ -133,7 +140,7 @@ pub fn parse(xml: &str) -> Result<Stations> {
                 let text = a.remove("text");
                 // A self-closing category holds nothing, so it opens nothing.
                 if !closed {
-                    group = text;
+                    group = text.map(std::sync::Arc::from);
                 }
             }
             "item" => {

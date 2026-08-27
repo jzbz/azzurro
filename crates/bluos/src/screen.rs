@@ -111,11 +111,9 @@ impl Screen {
         // spawned another refetch of the same screen, once a second, for as
         // long as it stayed open. `is_playing` on the same field already takes
         // the cautious reading; this now matches it.
-        self.refresh_on.iter().any(|(key, value)| {
-            status
-                .field(key)
-                .is_some_and(|actual| actual != *value)
-        })
+        self.refresh_on
+            .iter()
+            .any(|(key, value)| status.field(key).is_some_and(|actual| actual != *value))
     }
 }
 
@@ -1034,8 +1032,21 @@ fn without_playnow(query: &str) -> (String, bool) {
         "playnow=1&",
         "&playnow=1",
     ] {
-        while let Some(at) = out.find(pattern) {
-            out.replace_range(at..at + pattern.len(), "");
+        // `replace` builds the result in one pass; the loop that was here
+        // removed one occurrence at a time with `replace_range`, and each
+        // removal shifted the whole remaining tail down — quadratic in the
+        // length of a URI the player chose.
+        //
+        // Repeated until it settles rather than replaced once, because
+        // removing one occurrence can join its neighbours into another:
+        // "playn" + "playnow=1&" + "ow=1&" becomes a match that a single pass
+        // would leave behind. The string shrinks every round, so this ends.
+        loop {
+            let next = out.replace(pattern, "");
+            if next == out {
+                break;
+            }
+            out = next;
             dropped = true;
         }
     }
@@ -1181,6 +1192,50 @@ mod tests {
     /// A key the status does not model used to read as "changed", which no
     /// reply could ever satisfy — so the screen refetched once a second for
     /// as long as it was open.
+    /// The loop this replaced removed one occurrence at a time and shifted
+    /// the tail down for each, which is quadratic in a URI the player chose.
+    #[test]
+    fn playnow_comes_out_whole_and_only_playnow() {
+        let strip = |q: &str| without_playnow(q);
+
+        assert_eq!(
+            strip("cmd=x&playnow=1&id=3"),
+            ("cmd=x&id=3".to_owned(), true)
+        );
+        assert_eq!(strip("cmd=x&playnow=1"), ("cmd=x".to_owned(), true));
+        assert_eq!(
+            strip("cmd%3Dx%26playnow%3D1%26id%3D3"),
+            ("cmd%3Dx%26id%3D3".to_owned(), true)
+        );
+
+        assert_eq!(
+            strip("cmd=x&id=3"),
+            ("cmd=x&id=3".to_owned(), false),
+            "nothing to drop leaves the query and the flag alone"
+        );
+        assert_eq!(
+            strip("cmd=playnowish&id=3"),
+            ("cmd=playnowish&id=3".to_owned(), false),
+            "and it does not match inside a longer word"
+        );
+
+        // Removing one occurrence can join its neighbours into another, which
+        // a single pass would leave behind.
+        assert_eq!(
+            strip("aplaynplaynow=1&ow=1&b"),
+            ("ab".to_owned(), true),
+            "a match created by an earlier removal is removed too"
+        );
+
+        // Both come out: the `playnow=1&` pass takes the first, and the
+        // `&playnow=1` pass that follows takes what it left.
+        assert_eq!(
+            strip("a&playnow=1&playnow=1b"),
+            ("ab".to_owned(), true),
+            "repeated occurrences all come out"
+        );
+    }
+
     #[test]
     fn a_refresh_key_the_status_cannot_answer_is_not_a_reason_to_refetch() {
         let status = crate::Status {
@@ -1188,23 +1243,22 @@ mod tests {
             ..Default::default()
         };
 
-        let mut screen = Screen::default();
+        let with = |key: &str, value: &str| Screen {
+            refresh_on: vec![(key.to_owned(), value.to_owned())],
+            ..Screen::default()
+        };
 
-        screen.refresh_on = vec![("prid".to_owned(), "8".to_owned())];
-        assert!(!screen.is_stale(&status), "the value matches");
-
-        screen.refresh_on = vec![("prid".to_owned(), "9".to_owned())];
-        assert!(screen.is_stale(&status), "a modelled key that moved is stale");
-
-        screen.refresh_on = vec![("nosuchkey".to_owned(), "1".to_owned())];
+        assert!(!with("prid", "8").is_stale(&status), "the value matches");
         assert!(
-            !screen.is_stale(&status),
+            with("prid", "9").is_stale(&status),
+            "a modelled key that moved is stale"
+        );
+        assert!(
+            !with("nosuchkey", "1").is_stale(&status),
             "an unmodelled key cannot be satisfied, so it must not mean stale"
         );
-
-        screen.refresh_on = vec![("sid".to_owned(), "3".to_owned())];
         assert!(
-            !screen.is_stale(&status),
+            !with("sid", "3").is_stale(&status),
             "a modelled key the player left out is 'cannot tell', not 'changed'"
         );
     }

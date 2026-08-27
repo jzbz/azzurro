@@ -74,11 +74,29 @@ impl Settings {
 
     /// The value a setting currently holds, by name. Used to resolve
     /// [`Setting::depends_on`].
+    ///
+    /// Walks the tree rather than building the flat list [`Self::settings`]
+    /// returns: the caller asking this is `is_available`, which the GUI runs
+    /// once per row it draws, so allocating a vector of every setting on the
+    /// page to answer one name made drawing the page quadratic in its length.
     pub fn value_of(&self, name: &str) -> Option<&str> {
-        self.settings()
-            .into_iter()
-            .find(|s| s.name.as_deref() == Some(name))
-            .and_then(|s| s.value.as_deref())
+        fn find<'a>(entries: &'a [Entry], name: &str) -> Option<&'a Setting> {
+            for entry in entries {
+                let found = match entry {
+                    Entry::Setting(setting) if setting.name.as_deref() == Some(name) => {
+                        Some(setting.as_ref())
+                    }
+                    Entry::Setting(_) => None,
+                    Entry::Group(group) => find(&group.entries, name),
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+
+        find(&self.entries, name).and_then(|s| s.value.as_deref())
     }
 
     /// Whether a setting's precondition is met, and it should be shown.

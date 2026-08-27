@@ -1925,14 +1925,14 @@ impl Backend {
         // it is what the page is, and Back walks it rather than the editor.
         if let Some(level) = page.picking.last() {
             title = level.title.clone();
-            let mut group: Option<String> = None;
+            let mut group: Option<std::sync::Arc<str>> = None;
             for (at, row) in level.rows.rows.iter().enumerate() {
                 // Some services group their rows — Radio Paradise by quality —
                 // and the heading is drawn once, where it changes.
                 if row.group.is_some() && row.group != group {
                     group = row.group.clone();
                     rows.push(SettingData {
-                        label: group.clone().unwrap_or_default().to_uppercase(),
+                        label: group.as_deref().unwrap_or_default().to_uppercase(),
                         heading: true,
                         ..SettingData::blank()
                     });
@@ -1985,13 +1985,7 @@ impl Backend {
                 // editor presses — a press on row 9006 arriving as Delete. No
                 // player serves anything near this; the take is what makes
                 // that a fact rather than an assumption.
-                for (at, alarm) in page
-                    .list
-                    .alarms
-                    .iter()
-                    .take(ALARM_ROW_BASE)
-                    .enumerate()
-                {
+                for (at, alarm) in page.list.alarms.iter().take(ALARM_ROW_BASE).enumerate() {
                     rows.push(SettingData {
                         // The list is addressed by position; the arm below
                         // carries the player's own id, which is what it needs.

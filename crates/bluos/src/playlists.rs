@@ -90,14 +90,28 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
     let mut seen_root = false;
     // Which element's text is being collected, if any.
     let mut collecting: Option<String> = None;
+    // Built up across the events one parameter arrives as, and decoded when it
+    // closes. Entities come as their own event, so a value was otherwise read
+    // as two parameters with the entity missing between them.
+    let mut parameter = String::new();
 
     loop {
         match reader.read_event() {
             Ok(Event::Eof) => break,
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(ev @ (Event::Start(_) | Event::Empty(_))) => {
+                // An element that closes itself carries no text and gets no
+                // `End` of its own, so anything it arms below would still be
+                // armed when the next text arrived — the whitespace between
+                // elements included. `urlPath` is the request path a later
+                // call is built from, so that text ended up in a URL.
+                let closed = matches!(ev, Event::Empty(_));
+                let e = match &ev {
+                    Event::Start(e) | Event::Empty(e) => e,
+                    _ => unreachable!("matched above"),
+                };
                 let qname = e.name();
                 let name = local_name(qname.as_ref());
-                let mut a = attributes(&e);
+                let mut a = attributes(e);
 
                 match name {
                     "addToPlaylistOptions" => {
@@ -134,6 +148,10 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                     "urlPath" | "requestParameter" => collecting = Some(name.to_owned()),
                     _ => {}
                 }
+
+                if closed {
+                    collecting = None;
+                }
             }
             Ok(Event::Text(e)) => {
                 let Some(what) = collecting.as_deref() else {
@@ -151,11 +169,7 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                         }
                     }
                     "urlPath" => out.url_path.push_str(&text),
-                    "requestParameter" => {
-                        if let Some(pair) = decode_parameter(text.trim()) {
-                            out.parameters.push(pair);
-                        }
-                    }
+                    "requestParameter" => parameter.push_str(&text),
                     _ => {}
                 }
             }
@@ -180,6 +194,11 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                         }
                     }
                     "urlPath" => out.url_path.push_str(&resolved),
+                    // Handled here as well as in `Text`: a parameter carrying
+                    // an entity arrives as three events, and dropping the
+                    // middle one left the two halves to be read as separate
+                    // parameters.
+                    "requestParameter" => parameter.push_str(&resolved),
                     _ => {}
                 }
             }
@@ -198,8 +217,14 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                         let trimmed = out.url_path.trim().to_owned();
                         out.url_path = trimmed;
                     }
+                    Some("requestParameter") => {
+                        if let Some(pair) = decode_parameter(parameter.trim()) {
+                            out.parameters.push(pair);
+                        }
+                    }
                     _ => {}
                 }
+                parameter.clear();
                 collecting = None;
             }
             Ok(_) => {}
@@ -253,6 +278,43 @@ mod tests {
   <requestParameter>songid=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac</requestParameter>
   <playlists service="LocalMusic" serviceName="BluOS" serviceIcon="/images/BluOSIcon.png" create="1"></playlists>
 </addToPlaylistOptions>"#;
+
+    /// `collecting` used to be armed by a self-closing element that had no
+    /// text and no `End` to disarm it, so the next text — the indentation
+    /// between elements — was appended to whatever it had armed.
+    #[test]
+    fn a_self_closing_element_does_not_collect_the_text_after_it() {
+        let out = parse(
+            r#"<addToPlaylistOptions service="Tidal">
+                 <urlPath/>
+                 <playlists service="Tidal"><playlist id="1" name="Mine"/></playlists>
+               </addToPlaylistOptions>"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            out.url_path, "",
+            "an empty <urlPath/> leaves the path empty, not full of whitespace"
+        );
+    }
+
+    /// An entity arrives as its own event, so a parameter carrying one was
+    /// read as two parameters with the entity dropped between them.
+    #[test]
+    fn a_parameter_with_an_entity_stays_one_parameter() {
+        let out = parse(
+            r#"<addToPlaylistOptions service="Tidal">
+                 <requestParameter>token=a&amp;b</requestParameter>
+               </addToPlaylistOptions>"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            out.parameters,
+            vec![("token".to_owned(), "a&b".to_owned())],
+            "one parameter, with the ampersand still in its value"
+        );
+    }
 
     #[test]
     fn reads_where_a_track_can_go() {
