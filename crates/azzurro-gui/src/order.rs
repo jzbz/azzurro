@@ -80,6 +80,19 @@ pub fn save(orders: &Orders) {
 
     let mut text = String::from("# Section order per screen, set by Customise Home.\n");
     for (screen, rows) in orders {
+        // The ids in here come from the player's documents, and the file's
+        // structure is one line per screen with a colon and commas inside it.
+        // An id carrying any of those would be written out and read back as
+        // structure: a newline in a screen id forges a whole entry for another
+        // screen, and it persists after the player that supplied it is gone.
+        //
+        // Refused rather than escaped. These are opaque identifiers, one
+        // containing a newline is already wrong, and a format with real
+        // quoting would be a bigger change than the problem deserves.
+        if !writable(screen) || rows.iter().any(|row| !writable(row)) {
+            tracing::debug!(screen, "not saving an order with an unwritable id");
+            continue;
+        }
         text.push_str(screen);
         text.push_str(": ");
         text.push_str(&rows.join(", "));
@@ -89,6 +102,13 @@ pub fn save(orders: &Orders) {
     if let Err(e) = std::fs::write(&path, text) {
         tracing::debug!("cannot save the screen order: {e}");
     }
+}
+
+/// Whether an id survives the round trip through the file above.
+///
+/// The separators the format uses, plus anything that would split a line.
+fn writable(id: &str) -> bool {
+    !id.is_empty() && !id.contains(['\n', '\r', ':', ',', '#'])
 }
 
 /// Sections that are never drawn.
@@ -160,6 +180,40 @@ mod tests {
             .iter()
             .map(|n| (!n.is_empty()).then(|| (*n).to_owned()))
             .collect()
+    }
+
+    /// Screen and section ids come from the player's documents, and this file
+    /// is line- and comma-structured. An id carrying that structure would be
+    /// read back as structure — and would outlive the player that sent it.
+    #[test]
+    fn an_id_that_would_forge_a_line_is_not_written() {
+        let mut orders = Orders::new();
+        orders.insert("screen-home\nlibrary".to_owned(), vec!["recent".to_owned()]);
+        orders.insert("screen-real".to_owned(), vec!["ok".to_owned()]);
+        orders.insert("screen-colon:x".to_owned(), vec!["ok".to_owned()]);
+        orders.insert("screen-comma".to_owned(), vec!["a,b".to_owned()]);
+
+        let mut text = String::from("# header\n");
+        for (screen, rows) in &orders {
+            if !writable(screen) || rows.iter().any(|r| !writable(r)) {
+                continue;
+            }
+            text.push_str(screen);
+            text.push_str(": ");
+            text.push_str(&rows.join(", "));
+            text.push('\n');
+        }
+
+        let back = parse(&text);
+        assert_eq!(
+            back.keys().collect::<Vec<_>>(),
+            vec!["screen-real"],
+            "only the id that survives the format is kept"
+        );
+        assert!(
+            !back.contains_key("library"),
+            "and the forged second line never appears"
+        );
     }
 
     #[test]
