@@ -2433,7 +2433,7 @@ impl Backend {
                     let cursor = queue.cursor(&status);
                     // The cursor is where playback would resume; it is only a
                     // now-playing marker if the queue is what is playing.
-                    let live = queue.is_playing_from(&status) && status.is_playing();
+                    let live = queue.is_live(&status);
 
                     let client = selected
                         .and_then(|id| guard.get(&id))
@@ -4342,9 +4342,13 @@ fn settings_page(uri: &str) -> Option<Option<String>> {
 /// enough to matter and a player that was asleep takes a moment to reply at
 /// all.
 async fn sweep(backend: Backend, discovery: Arc<Discovery>, http: reqwest::Client) {
-    for announce in discovery.sweep(DEFAULT_SWEEP).await.unwrap_or_default() {
-        backend.adopt(&announce, &http);
-    }
+    // Adopted as each answers rather than when the whole schedule has run: a
+    // player that replies to the first broadcast used to wait out the other
+    // eleven seconds before appearing, which on a first run is the whole of
+    // what the window has to show.
+    let _ = discovery
+        .sweep_with(DEFAULT_SWEEP, |announce| backend.adopt(announce, &http))
+        .await;
 }
 
 /// Fetch a screen and show it.
@@ -6481,7 +6485,7 @@ async fn run_commands(
                             let backend = backend.clone();
                             tokio::spawn(async move {
                                 ticket.wait().await;
-                                match client.write_setting(&page, &setting, &value).await {
+                                match client.write_setting(&setting, &value).await {
                                     Ok(()) => {
                                         // A button leaves nothing behind on the
                                         // page it was pressed on — no toggle moves,
@@ -6805,7 +6809,7 @@ async fn run_commands(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
-                    match client.write_setting(&page, &setting, &value).await {
+                    match client.write_setting(&setting, &value).await {
                         Ok(()) => {
                             // Re-read rather than assume: a write can move more
                             // than the one value — turning tone controls on
