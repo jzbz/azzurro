@@ -43,13 +43,20 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 
 /// What the player says when asked about upgrades.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Availability {
     /// An upgrade is already running. Starting another is the one thing that
     /// must not happen, so this is checked before any request that starts one.
     pub in_progress: bool,
     /// The player has something newer to install.
     pub available: bool,
+    /// The version being offered, where the player names one.
+    ///
+    /// Opportunistic. The official controller reads only the two flags above
+    /// and would discard this, so whether a player sends it at all is unknown
+    /// — it is taken when present and nothing depends on it. Both spellings
+    /// are tried because the attribute is undocumented either way.
+    pub version: Option<String>,
 }
 
 /// How far along a running upgrade is.
@@ -138,6 +145,10 @@ pub fn availability(xml: &str) -> Result<Availability> {
         return Ok(Availability {
             in_progress: flag(a.remove("inProgress")),
             available: flag(a.remove("available")),
+            version: a
+                .remove("version")
+                .or_else(|| a.remove("newVersion"))
+                .filter(|v| !v.is_empty()),
         });
     }
 
@@ -211,7 +222,8 @@ mod tests {
             both,
             Availability {
                 in_progress: false,
-                available: true
+                available: true,
+                version: None,
             }
         );
 
@@ -223,6 +235,13 @@ mod tests {
         // missing attribute from starting an upgrade.
         let bare = availability("<upgrade/>").expect("parses");
         assert_eq!(bare, Availability::default());
+
+        // Taken where the player names one, and absent is not an error: no
+        // player is known to send this, so nothing may depend on it.
+        let named =
+            availability(r#"<upgrade available="true" version="4.18.2"/>"#).expect("parses");
+        assert_eq!(named.version.as_deref(), Some("4.18.2"));
+        assert_eq!(both.version, None, "and it is optional");
 
         assert!(
             availability("<something-else/>").is_err(),

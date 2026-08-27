@@ -1794,6 +1794,12 @@ export component AppWindow inherits Window {
     in-out property <string> confirm-upgrade: "";
     callback answer-upgrade(bool);
 
+    // A player that has new firmware waiting, said once when it turns up.
+    // Not the same question as `confirm-upgrade`: this one only offers to
+    // show the page, and installs nothing.
+    in-out property <string> update-notice: "";
+    callback answer-update-notice(bool);
+
     // What a player is doing while it upgrades itself. Empty when none is.
     in property <string> upgrading-player: "";
     in property <string> upgrading-stage: "";
@@ -3837,6 +3843,78 @@ export component AppWindow inherits Window {
                         label: button.label;
                         primary: button.destructive;
                         clicked => { root.dialog-press(button.index); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.update-notice != "": Rectangle {
+        background: #00000080;
+
+        // Dismissable by clicking away, unlike the install question below:
+        // this one is an offer, and ignoring an offer should be easy.
+        TouchArea {
+            clicked => {
+                root.update-notice = "";
+                root.answer-update-notice(false);
+            }
+        }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 400px;
+            height: notice.preferred-height;
+            border-radius: Theme.radius;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 32px;
+            drop-shadow-color: #000000a6;
+
+            TouchArea { }
+
+            notice := VerticalLayout {
+                padding: Theme.room;
+                spacing: Theme.pad;
+
+                Text {
+                    text: "Update available for " + root.update-notice;
+                    font-size: Theme.title-size;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "The player has newer firmware waiting.";
+                    font-size: Theme.small-size;
+                    color: Theme.dim;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: Theme.gap;
+
+                    PillButton {
+                        label: "Show me";
+                        primary: true;
+                        clicked => {
+                            root.update-notice = "";
+                            root.answer-update-notice(true);
+                        }
+                    }
+
+                    PillButton {
+                        label: "Not now";
+                        clicked => {
+                            root.update-notice = "";
+                            root.answer-update-notice(false);
+                        }
                     }
                 }
             }

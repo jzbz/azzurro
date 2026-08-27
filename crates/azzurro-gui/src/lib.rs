@@ -126,6 +126,12 @@ const QUEUE_BUTTON_SHORT: usize = 8;
 enum Command {
     /// Broadcast for players again.
     Rescan,
+    /// Offer to show the update page for a player that has firmware waiting.
+    ///
+    /// Only ever raised once per player per run — see `told_about_update`.
+    UpdateNotice(DeviceId),
+    /// The answer to that offer. `true` opens the page.
+    UpdateNoticeAnswer(bool),
     /// Ask whether to install the firmware the player says it has, naming it.
     ///
     /// Two steps on purpose. This one only puts the question up; nothing is
@@ -685,6 +691,16 @@ struct Backend {
     /// as it is open. One refresh at a time bounds that, and any future
     /// staleness rule that gets it wrong, to a single round trip.
     refreshing: Arc<std::sync::atomic::AtomicBool>,
+    /// Players already mentioned as having an update waiting.
+    ///
+    /// One offer per player per run. Not written down between runs: what
+    /// would be remembered is "this firmware was declined", and the check
+    /// answers with no version to key that on — so the choice is between
+    /// asking once a run and never asking again after the first no. Once a
+    /// run is the honest one, and it is what makes dismissing cheap.
+    told_about_update: Arc<Mutex<std::collections::HashSet<DeviceId>>>,
+    /// Which player the offer on screen is about.
+    update_offer: Arc<Mutex<Option<DeviceId>>>,
     /// Section order per screen, as set by Customise Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
 }
@@ -1499,6 +1515,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_answer_update_notice(move |show| {
+        let _ = tx.send(Command::UpdateNoticeAnswer(show));
+    });
+
+    let tx = commands.clone();
     ui.on_sidebar_activate(move |kind, index| {
         let _ = tx.send(Command::Sidebar(kind, index));
     });
@@ -1745,6 +1766,8 @@ async fn run(
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
+        told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        update_offer: Arc::new(Mutex::new(None)),
         sent_browse: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
@@ -5155,6 +5178,38 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
         entry.sync = Some(sync.clone());
     }
 
+    // Asked once, here, for the same reason the address is written down here:
+    // this is the moment an address is known to be a player. Off on its own
+    // task because the check is the slowest request the player answers — the
+    // player goes and asks somebody else — and nothing about starting up
+    // should wait on it.
+    if backend.told_about_update.lock().unwrap().insert(id) {
+        let backend = backend.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            // Logged either way. Whether an offer appears is otherwise
+            // invisible from outside, and "it did not ask me" and "it asked
+            // and the player said no" look identical without this.
+            match client.upgrade_available().await {
+                Ok(ready) => {
+                    tracing::debug!(
+                        %id,
+                        available = ready.available,
+                        in_progress = ready.in_progress,
+                        "asked the player about firmware"
+                    );
+                    if ready.available && !ready.in_progress {
+                        let _ = backend.commands.send(Command::UpdateNotice(id));
+                    }
+                }
+                // Not said out loud: a player that cannot answer this is not
+                // worth interrupting anyone over, and the Upgrade Check page
+                // reports it properly to anyone who asks.
+                Err(e) => tracing::debug!(%id, "could not ask about firmware: {e}"),
+            }
+        });
+    }
+
     // Remembered only now, not when it was adopted: answering /SyncStatus is
     // what makes an address a player, so a mistyped one is never written down.
     let newly_known = {
@@ -5799,6 +5854,49 @@ async fn run_commands(
 ) {
     while let Some(command) = commands.recv().await {
         let (id, action) = match command {
+            Command::UpdateNotice(id) => {
+                // One at a time: a second offer while one is up would replace
+                // it, and the person would answer a question they never saw.
+                if backend.update_offer.lock().unwrap().is_some() {
+                    continue;
+                }
+                let name = backend
+                    .with_entry(id, |e| e.view.name.to_string())
+                    .unwrap_or_else(|| "a player".to_owned());
+                *backend.update_offer.lock().unwrap() = Some(id);
+
+                let ui = backend.ui.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.set_update_notice(name.into());
+                    }
+                });
+                continue;
+            }
+
+            Command::UpdateNoticeAnswer(show) => {
+                let Some(id) = backend.update_offer.lock().unwrap().take() else {
+                    continue;
+                };
+                if !show {
+                    continue;
+                }
+                // Select it first: the page reads the selection, and the offer
+                // may be about a player other than the one being looked at.
+                let _ = backend.commands.send(Command::Select(id));
+                let _ = backend.commands.send(Command::OpenHelp);
+                // Found rather than written down: these rows are addressed by
+                // their position in HELP_ENTRIES, and a constant would rot the
+                // first time an entry is added above this one.
+                if let Some(row) = HELP_ENTRIES
+                    .iter()
+                    .position(|(_, kind, _, _)| *kind == HelpKind::Upgrade)
+                {
+                    let _ = backend.commands.send(Command::HelpAction(row));
+                }
+                continue;
+            }
+
             // Only puts the question up. Nothing reaches the player here.
             Command::UpgradeAsk => {
                 let Some(id) = *backend.selected.lock().unwrap() else {
@@ -6877,6 +6975,32 @@ async fn run_commands(
                                     vec![("Status".to_owned(), format!("could not ask: {e}"))]
                                 }
                             };
+
+                            // What it runs now, which the player states on
+                            // /SyncStatus and is the one version known for
+                            // certain. Useful on its own: "up to date" means
+                            // more beside a number than without one.
+                            if let Some(installed) = selected
+                                .and_then(|id| {
+                                    backend.with_entry(id, |e| {
+                                        e.sync.as_ref().and_then(|s| s.version.clone())
+                                    })
+                                })
+                                .flatten()
+                            {
+                                facts.push(("Installed".to_owned(), installed));
+                            }
+
+                            // Only where the player names one. Nothing is
+                            // known to send it — the official controller reads
+                            // the two flags and discards the rest — so this is
+                            // shown when it turns up and absent otherwise
+                            // rather than reported as missing.
+                            if let Ok(ready) = &ready
+                                && let Some(offered) = &ready.version
+                            {
+                                facts.push(("New version".to_owned(), offered.clone()));
+                            }
 
                             match &ready {
                                 Ok(ready) if ready.in_progress => {
