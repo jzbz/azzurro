@@ -35,6 +35,14 @@ use bluos::DeviceId;
 /// same reason — a large BluOS install is a few dozen zones.
 pub const MAX_REMEMBERED: usize = 256;
 
+/// And how many of those one address may account for.
+///
+/// A real machine runs one player. A handful of ports on one address is
+/// already unusual and is allowed; the whole file's worth is what this stops,
+/// since the eviction below drops the oldest and would otherwise let one host
+/// displace every speaker the user actually owns.
+const MAX_PER_HOST: usize = 4;
+
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("azzurro").join("players"))
 }
@@ -85,6 +93,18 @@ pub fn remember(players: &mut Vec<DeviceId>, id: DeviceId) -> bool {
     if players.contains(&id) {
         return false;
     }
+
+    // A player is an address *and* a port, so one machine answering on many
+    // ports is many players as far as this file is concerned — enough of them
+    // to push every real speaker out of a list that drops the oldest first.
+    // Answering /SyncStatus is what gets an address this far, which a hostile
+    // host on the subnet can do as readily as a speaker can.
+    let from_host = players.iter().filter(|kept| kept.host == id.host).count();
+    if from_host >= MAX_PER_HOST {
+        tracing::debug!(%id, "not remembering: {MAX_PER_HOST} already from that address");
+        return false;
+    }
+
     players.push(id);
     if players.len() > MAX_REMEMBERED {
         let dropping = players.len() - MAX_REMEMBERED;
@@ -124,6 +144,38 @@ mod tests {
 
     fn id(raw: &str) -> DeviceId {
         raw.parse().unwrap()
+    }
+
+    /// A player is an address and a port, so one host answering on many ports
+    /// fills a list that drops the oldest first — taking the user's real
+    /// speakers with it.
+    #[test]
+    fn one_address_cannot_fill_the_whole_file() {
+        let mut players = Vec::new();
+        let mine: DeviceId = "10.0.0.155:11000".parse().expect("an address");
+        assert!(remember(&mut players, mine));
+
+        let flood: Vec<DeviceId> = (0..MAX_REMEMBERED + 16)
+            .map(|n| {
+                format!("10.0.0.99:{}", 11000 + n)
+                    .parse()
+                    .expect("an address")
+            })
+            .collect();
+        let taken = flood
+            .into_iter()
+            .filter(|id| remember(&mut players, *id))
+            .count();
+
+        assert_eq!(taken, MAX_PER_HOST, "one host gets a handful, not the file");
+        assert!(
+            players.contains(&mine),
+            "and the speaker that was there first is still there"
+        );
+
+        // A genuinely different address is unaffected by the cap.
+        let other: DeviceId = "10.0.0.42:11000".parse().expect("an address");
+        assert!(remember(&mut players, other), "other hosts still fit");
     }
 
     #[test]
