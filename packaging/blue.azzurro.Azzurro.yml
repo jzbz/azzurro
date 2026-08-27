@@ -74,6 +74,11 @@ modules:
         url: https://github.com/jzbz/azzurro.git
         tag: v0.1.0
         # Pinned alongside the tag so a tag that is later moved cannot change
-        # what Flathub builds. Both have to be updated together on a release.
+        # what Flathub builds. Both have to be updated together on a release,
+        # and neither is set yet: no release tag exists in the repository, so
+        # this manifest is not submittable as it stands. `git rev-parse
+        # v0.1.0^{commit}` gives the value once the tag is cut. CI refuses a
+        # manifest still carrying the all-zeros placeholder, so this cannot be
+        # submitted by accident.
         commit: 0000000000000000000000000000000000000000
       - cargo-sources.json
