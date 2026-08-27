@@ -157,8 +157,22 @@ pub fn parse(xml: &str) -> Result<Alarms> {
                         *slot = c == '1';
                     }
                 }
+                // Zero is not a neutral default here: it is the sentinel for
+                // an alarm that does not exist on the player yet, which is
+                // what makes the editor offer "Create" and what makes
+                // `save_alarm` omit the id. An alarm whose id is missing or
+                // unreadable would arrive wearing that meaning, and saving it
+                // would create a duplicate instead of replacing it — so it is
+                // dropped rather than shown as something it is not.
+                let Some(id) = a
+                    .remove("id")
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .filter(|id| *id != 0)
+                else {
+                    continue;
+                };
                 out.alarms.push(Alarm {
-                    id: number(&mut a, "id"),
+                    id,
                     hour: number(&mut a, "hour"),
                     minute: number(&mut a, "minute"),
                     // Kept as written. It is a wall-clock time in the player's
@@ -205,6 +219,30 @@ mod tests {
         .expect("parses");
         assert!(out.alarms.is_empty());
         assert!(out.supports_end_time, "the player says it can do schedules");
+    }
+
+    /// Zero is how `save_alarm` is told to create rather than replace, so an
+    /// alarm that arrives wearing it by accident would be offered to the user
+    /// as "Create" and would duplicate itself on save.
+    #[test]
+    fn an_alarm_whose_id_is_unusable_is_dropped_rather_than_shown_as_new() {
+        let out = parse(
+            r#"<alarms supportsEndTime="true">
+                 <alarm hour="7" minute="0" enable="1"/>
+                 <alarm id="" hour="8" minute="0" enable="1"/>
+                 <alarm id="not-a-number" hour="9" minute="0" enable="1"/>
+                 <alarm id="0" hour="10" minute="0" enable="1"/>
+                 <alarm id="4" hour="11" minute="0" enable="1"/>
+               </alarms>"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            out.alarms.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![4],
+            "only the alarm with a usable id survives"
+        );
+        assert_eq!(out.alarms[0].hour, 11, "and it is the right one");
     }
 
     /// An alarm carrying every attribute the official controller reads.
