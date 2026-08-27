@@ -2124,29 +2124,39 @@ impl Backend {
             }
         }
 
+        // The offer was worked out when the page was built and does not
+        // revise itself, so it outlived the upgrade starting: the Install row
+        // stayed pressable, and pressing it put the confirmation up again over
+        // a player already installing. Retired here, where the first progress
+        // arrives, and the page redrawn if it happens to be the one on screen.
+        let showing = {
+            let mut browsing = self.browsing.lock().unwrap();
+            browsing.can_upgrade = false;
+            matches!(browsing.pane, Pane::HelpDetail(..))
+        };
+        if showing {
+            self.publish_help();
+        }
+
         // Said on the player's own row as well as in the banner, and marked
         // unreachable so the row reads as something that will not answer.
         // Note this dims the row rather than disabling its controls: taking
         // them away properly means keeping an upgrading player out of the
         // selection altogether, which is how the official controller does it
         // and is a larger change than this.
-        let line = if progress.total > 0 {
-            format!("{stage} — {}%", progress.percent)
-        } else {
-            stage.clone()
+        let line = match progress.bar() {
+            Some(percent) => format!("{stage} — {percent}%"),
+            None => stage.clone(),
         };
         self.update(id, |view| {
             view.role = line.clone().into();
             view.reachable = false;
         });
 
-        // Stage one reports no numbers at all, so there is genuinely nothing
-        // to draw a bar from; the words carry it until stage two starts.
-        let percent = if progress.total > 0 {
-            progress.percent as f32
-        } else {
-            0.0
-        };
+        // A Powernode sends no counters at any point, so for that player the
+        // words carry the whole thing and the bar stays at nought. `bar()` is
+        // what decides there is something worth drawing.
+        let percent = progress.bar().unwrap_or(0) as f32;
         let name = progress
             .name
             .clone()
@@ -5902,6 +5912,15 @@ async fn run_commands(
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
+                // Belt and braces with `start_upgrade`, which refuses a second
+                // upgrade on its own. This is the half that keeps the question
+                // from being asked at all, since answering yes to something
+                // that will be refused is a worse experience than not being
+                // asked.
+                if backend.with_entry(id, |e| e.upgrading).unwrap_or(false) {
+                    say(&backend.ui, "That player is already installing an update");
+                    continue;
+                }
                 let name = backend
                     .with_entry(id, |e| e.view.name.to_string())
                     .unwrap_or_else(|| "this player".to_owned());

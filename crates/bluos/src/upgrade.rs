@@ -61,17 +61,24 @@ pub struct Availability {
 
 /// How far along a running upgrade is.
 ///
-/// Fields beyond `name` and `model` are absent in stage 1; see the module
-/// note. `total` of zero means the player has not said how many steps there
-/// are, so a percentage of the whole cannot be worked out from the steps.
+/// The counters are optional because a real player leaves them out. A
+/// Powernode sends stage 2 with no `step`, `total` or `percent` at all, so
+/// absent and zero have to be told apart: read as zero, stage two looks like
+/// the very beginning of the work and is labelled as preparing while the
+/// player is installing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
+    /// Which of the two stage elements the player sent.
+    ///
+    /// The stage is what the player actually told us; the counters merely
+    /// refine it where they exist.
+    pub second_stage: bool,
     pub name: Option<String>,
     pub model: Option<String>,
-    pub step: u32,
-    pub total: u32,
+    pub step: Option<u32>,
+    pub total: Option<u32>,
     /// The player's own percentage for the step it is on, 0 to 100.
-    pub percent: u32,
+    pub percent: Option<u32>,
     pub error: bool,
     /// The player says this upgrade could be stopped.
     ///
@@ -83,17 +90,34 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// What to tell someone watching, in the words the official app uses.
+    /// What to tell someone watching.
+    ///
+    /// Taken from the element the player sent first, and only then refined by
+    /// the counters. The official controller works it out from `step` alone,
+    /// which is wrong on a player that omits `step`: every reading comes back
+    /// as the first thing in the list, and a Powernode installing an update
+    /// reads as still preparing for one.
     pub fn stage(&self) -> Stage {
         if self.error {
             return Stage::Failed;
         }
-        match self.step {
-            0 => Stage::Preparing,
-            1 => Stage::Downloading,
-            step if self.total > 1 && step >= self.total => Stage::Rebooting,
-            _ => Stage::Installing,
+        if !self.second_stage {
+            return Stage::Preparing;
         }
+        match (self.step, self.total) {
+            (Some(0), _) => Stage::Preparing,
+            (Some(1), _) => Stage::Downloading,
+            (Some(step), Some(total)) if total > 1 && step >= total => Stage::Rebooting,
+            (Some(_), _) => Stage::Installing,
+            // Stage two and saying nothing about where it is, which is what a
+            // Powernode does throughout. It is past preparing by definition.
+            (None, _) => Stage::Installing,
+        }
+    }
+
+    /// A percentage to draw, where the player gives one worth drawing.
+    pub fn bar(&self) -> Option<u32> {
+        self.percent.filter(|_| self.total.is_some_and(|t| t > 0))
     }
 }
 
@@ -183,6 +207,7 @@ pub fn in_sync_status(xml: &str) -> Result<Option<Progress>> {
 
         let mut a = attributes(&e);
         return Ok(Some(Progress {
+            second_stage: name == "UpgradeStatusStage2",
             name: a.remove("name"),
             model: a.remove("model"),
             step: number(a.remove("step")),
@@ -203,8 +228,8 @@ fn flag(raw: Option<String>) -> bool {
     matches!(raw.as_deref(), Some("1") | Some("true"))
 }
 
-fn number(raw: Option<String>) -> u32 {
-    raw.and_then(|v| v.parse().ok()).unwrap_or_default()
+fn number(raw: Option<String>) -> Option<u32> {
+    raw.and_then(|v| v.parse().ok())
 }
 
 #[cfg(test)]
@@ -284,7 +309,8 @@ mod tests {
         .expect("is an upgrade");
 
         assert_eq!(one.name.as_deref(), Some("Powernode"));
-        assert_eq!((one.step, one.total, one.percent), (0, 0, 0));
+        assert_eq!((one.step, one.total, one.percent), (None, None, None));
+        assert!(!one.second_stage);
         assert!(!one.error);
         assert!(
             one.abortable,
@@ -308,7 +334,35 @@ mod tests {
         assert_eq!(at(1, 4, 30).stage(), Stage::Downloading);
         assert_eq!(at(2, 4, 60).stage(), Stage::Installing);
         assert_eq!(at(4, 4, 100).stage(), Stage::Rebooting, "the last step");
-        assert_eq!(at(3, 4, 90).percent, 90);
+        assert_eq!(at(3, 4, 90).percent, Some(90));
+        assert_eq!(at(3, 4, 90).bar(), Some(90));
+    }
+
+    /// What a Powernode actually sends: stage two, and not one counter in it.
+    /// Read from `step` alone — which is how the official controller does it —
+    /// this comes back as `Preparing` while the player is installing.
+    #[test]
+    fn stage_two_without_counters_is_installing_not_preparing() {
+        let bare = in_sync_status(
+            r#"<UpgradeStatusStage2 name="Powernode" model="N330" class="streamer-amplifier"/>"#,
+        )
+        .expect("parses")
+        .expect("is an upgrade");
+
+        assert!(bare.second_stage);
+        assert_eq!((bare.step, bare.total, bare.percent), (None, None, None));
+        assert_eq!(
+            bare.stage(),
+            Stage::Installing,
+            "stage two is past preparing whatever the counters say"
+        );
+        assert_eq!(bare.bar(), None, "and there is no bar to draw");
+
+        // Stage one bare stays preparing, which is what it is.
+        let one = in_sync_status(r#"<UpgradeStatusStage1 name="Powernode"/>"#)
+            .expect("parses")
+            .expect("is an upgrade");
+        assert_eq!(one.stage(), Stage::Preparing);
     }
 
     #[test]

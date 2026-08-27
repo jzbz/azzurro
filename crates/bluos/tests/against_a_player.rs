@@ -250,7 +250,8 @@ async fn an_upgrading_player_is_read_as_upgrading_and_not_as_broken() {
         bluos::client::Sync::Status(_) => panic!("read an upgrade as an ordinary status"),
     };
 
-    assert_eq!(progress.percent, 55);
+    assert_eq!(progress.percent, Some(55));
+    assert_eq!(progress.bar(), Some(55));
     assert_eq!(progress.stage(), bluos::upgrade::Stage::Installing);
 
     // And the ordinary shape still reads as one.
