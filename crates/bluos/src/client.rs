@@ -509,12 +509,10 @@ impl Client {
     /// 11000, and posting a write back to where the document came from answers
     /// 404. Confirmed against a player by writing a setting the value it
     /// already held, then a different one, and watching it change and revert.
-    pub async fn write_setting(
-        &self,
-        _settings: &Settings,
-        setting: &Setting,
-        value: &str,
-    ) -> Result<()> {
+    /// The settings document is deliberately not a parameter: it is where the
+    /// page was *read* from, which is the one thing a write must not resolve
+    /// against. Taking it would suggest otherwise.
+    pub async fn write_setting(&self, setting: &Setting, value: &str) -> Result<()> {
         let (Some(url), Some(name)) = (setting.url.as_deref(), setting.name.as_deref()) else {
             return Err(Error::Screen(format!(
                 "the setting {:?} says nothing about where to write it",

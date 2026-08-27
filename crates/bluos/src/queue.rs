@@ -60,6 +60,19 @@ impl Queue {
     pub fn is_playing_from(&self, status: &Status) -> bool {
         self.describes(status) && status.is_queue_based()
     }
+
+    /// Whether the cursor is a now-playing marker rather than a bookmark.
+    ///
+    /// Two conditions, and both matter: the queue has to be what the player is
+    /// working through, *and* the player has to be playing. A paused player's
+    /// cursor is where it would resume, which is not the same as where it is.
+    ///
+    /// Here rather than at each caller because it was written out twice and
+    /// the copies had already drifted — the CLI reported a paused queue as
+    /// playing, the window did not.
+    pub fn is_live(&self, status: &Status) -> bool {
+        self.is_playing_from(status) && status.is_playing()
+    }
 }
 
 /// One track in the queue.
@@ -160,6 +173,39 @@ mod tests {
 
     fn queue() -> Queue {
         quick_xml::de::from_str(PLAYLIST).unwrap()
+    }
+
+    /// Two conditions, and the copies of this rule had already drifted: the
+    /// CLI reported a paused queue as playing because it checked only the
+    /// first.
+    #[test]
+    fn a_paused_queue_is_not_playing() {
+        let queue = Queue {
+            id: Some(7),
+            length: 3,
+            ..Default::default()
+        };
+        let playing = Status {
+            pid: Some(7),
+            state: Some("play".to_owned()),
+            ..Default::default()
+        };
+        let paused = Status {
+            state: Some("pause".to_owned()),
+            ..playing.clone()
+        };
+
+        assert!(queue.is_playing_from(&playing));
+        assert!(queue.is_live(&playing), "playing from this queue is live");
+
+        assert!(
+            queue.is_playing_from(&paused),
+            "still the queue the player is on"
+        );
+        assert!(
+            !queue.is_live(&paused),
+            "but paused, so the cursor is a bookmark and not a marker"
+        );
     }
 
     #[test]

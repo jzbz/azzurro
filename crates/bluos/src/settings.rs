@@ -50,8 +50,11 @@ const MAX_NESTING: usize = 16;
 pub struct Settings {
     pub page_id: Option<String>,
     pub schema_version: Option<u32>,
-    /// Where this document came from, so a write can be addressed relative to
-    /// it. The settings service is not on the control port.
+    /// Where this document came from. The settings service is not on the
+    /// control port, so this is not the base a write resolves against —
+    /// [`Setting::url`] does that against the control port, which is the trap
+    /// [`crate::client::Client::write_setting`] documents. Kept because
+    /// knowing which service answered is worth being able to say.
     pub base: String,
     pub entries: Vec<Entry>,
 }
@@ -192,7 +195,10 @@ pub struct Setting {
     /// The longer explanation the official app shows underneath.
     pub explanation: Option<String>,
     pub icon: Option<String>,
-    /// Where a write goes. Relative to [`Settings::base`].
+    /// Where a write goes, relative to the player's **control** port — not to
+    /// [`Settings::base`], which is where the page was read from. The two are
+    /// different services on different ports; see
+    /// [`crate::client::Client::write_setting`], which resolves this.
     pub url: Option<String>,
     pub help_url: Option<String>,
     pub kind: Kind,

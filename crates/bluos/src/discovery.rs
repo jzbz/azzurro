@@ -123,12 +123,35 @@ impl Discovery {
     /// app should call [`Discovery::query`] once and then keep [`Discovery::recv`]
     /// in a loop, so that arrivals and address changes land without another sweep.
     pub async fn sweep(&self, window: Duration) -> Result<Vec<Announce>> {
+        let mut found = Vec::new();
+        self.sweep_with(window, |announce| found.push(announce.clone()))
+            .await?;
+        Ok(found)
+    }
+
+    /// The same sweep, handing each player over as it answers.
+    ///
+    /// The schedule below spreads its broadcasts across the window because a
+    /// single one is dropped often enough to matter and a sleeping player takes
+    /// a moment to reply. That is a reason to keep listening for twelve
+    /// seconds; it is not a reason to sit on an answer that arrived in the
+    /// first tenth of one, which is what collecting into a vector and returning
+    /// it at the end did — nothing appeared in the window until the whole
+    /// schedule had run.
+    ///
+    /// Each node is handed over once. A player answering three broadcasts is
+    /// still one player.
+    pub async fn sweep_with(
+        &self,
+        window: Duration,
+        mut found_one: impl FnMut(&Announce),
+    ) -> Result<()> {
         let start = Instant::now();
         let mut pending: VecDeque<Duration> = QUERY_SCHEDULE
             .iter()
             .map(|s| Duration::from_secs(*s) + jitter())
             .collect();
-        let mut found: BTreeMap<Vec<u8>, Announce> = BTreeMap::new();
+        let mut seen: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
         loop {
             let elapsed = start.elapsed();
@@ -155,13 +178,15 @@ impl Discovery {
                 _ = tokio::time::sleep(wake) => {}
                 result = self.recv() => {
                     for announce in result? {
-                        found.insert(announce.node_id.clone(), announce);
+                        if seen.insert(announce.node_id.clone(), ()).is_none() {
+                            found_one(&announce);
+                        }
                     }
                 }
             }
         }
 
-        Ok(found.into_values().collect())
+        Ok(())
     }
 }
 

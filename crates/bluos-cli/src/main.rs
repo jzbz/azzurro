@@ -495,7 +495,7 @@ async fn queue(device: DeviceId, limit: Option<u32>) -> Result<()> {
     )?;
 
     let cursor = queue.cursor(&status);
-    let live = queue.is_playing_from(&status);
+    let live = queue.is_live(&status);
     println!("{} tracks in queue {}", queue.length, queue.id.unwrap_or(0));
     if cursor.is_some() && !live {
         println!(
