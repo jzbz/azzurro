@@ -445,6 +445,11 @@ enum Ctx {
     Index,
     /// The block at the top of a screen about one thing, which has buttons.
     Header,
+    /// The mode bar, which also has buttons. A context of its own rather than
+    /// `Other` so a button closing after it can be told from one closing
+    /// inside it — the field stays `Some` for the rest of the document either
+    /// way, and ownership has to follow what is open, not what has been seen.
+    ModeIndicator,
     /// The request for the next page of a long list, whose text is the uri.
     NextLink,
     /// Anything unrecognized, so its end tag pops the right thing.
@@ -639,7 +644,7 @@ fn start(
                 icon: a.remove("icon"),
                 buttons: Vec::new(),
             });
-            stack.push(Ctx::Other);
+            stack.push(Ctx::ModeIndicator);
         }
 
         "refreshOnStatusChange" => {
@@ -857,18 +862,27 @@ fn end(
         Some(Ctx::Button) => {
             if let Some(done) = button.take() {
                 // Innermost open context wins, the same rule `<action>` follows.
+                // Every slot is guarded by what the stack says is open, not by
+                // which field happens to be `Some`. A field stays `Some` for
+                // the rest of the document once its element has been seen, so
+                // a mode bar early in a queue document used to take the
+                // document's own button row — and, because it is tested first,
+                // a header's buttons too. Neither is rendered from there.
                 match (
                     item.as_mut(),
                     // Only a section a tag actually opened; see `Ctx::MenuAction`.
                     section.as_mut().filter(|_| in_section(stack)),
-                    screen.mode_indicator.as_mut(),
+                    screen
+                        .mode_indicator
+                        .as_mut()
+                        .filter(|_| stack.last() == Some(&Ctx::ModeIndicator)),
                 ) {
                     (Some(item), _, _) => item.buttons.push(done),
                     (None, Some(section), _) => section.buttons.push(done),
                     (None, None, Some(mode)) => mode.buttons.push(done),
                     // "Play all" and "Shuffle" belong to the thing the screen
                     // is about rather than to the screen.
-                    (None, None, None) if screen.header.is_some() => {
+                    (None, None, None) if stack.last() == Some(&Ctx::Header) => {
                         if let Some(header) = screen.header.as_mut() {
                             header.buttons.push(done);
                         }
@@ -1194,6 +1208,59 @@ mod tests {
     /// as long as it was open.
     /// The loop this replaced removed one occurrence at a time and shifted
     /// the tail down for each, which is quadratic in a URI the player chose.
+    /// Ownership followed which field was `Some` rather than what was open,
+    /// and a field stays `Some` for the rest of the document once its element
+    /// has been seen. A mode bar early in a queue therefore took the queue's
+    /// own button row into a field nothing renders.
+    #[test]
+    fn a_mode_bar_does_not_take_the_buttons_that_follow_it() {
+        let queue = parse(
+            r#"<queue offset="0" total="1">
+                 <modeIndicator text="Queue Builder"/>
+                 <button text="Save"><action type="browse" URI="/x"/></button>
+               </queue>"#,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            queue
+                .buttons
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["Save"],
+            "a button after the mode bar belongs to the document"
+        );
+        assert!(
+            queue
+                .mode_indicator
+                .as_ref()
+                .is_some_and(|m| m.buttons.is_empty()),
+            "and not to the mode bar"
+        );
+
+        // A button genuinely inside it still belongs to it.
+        let inside = parse(
+            r#"<queue offset="0" total="1">
+                 <modeIndicator text="Queue Builder">
+                   <button text="Done"><action type="browse" URI="/y"/></button>
+                 </modeIndicator>
+               </queue>"#,
+        )
+        .expect("parses");
+
+        assert!(inside.buttons.is_empty(), "not the document's");
+        assert_eq!(
+            inside.mode_indicator.as_ref().map(|m| m
+                .buttons
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>()),
+            Some(vec!["Done"]),
+            "a button inside the mode bar is the mode bar's"
+        );
+    }
+
     #[test]
     fn playnow_comes_out_whole_and_only_playnow() {
         let strip = |q: &str| without_playnow(q);
