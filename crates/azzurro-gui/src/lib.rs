@@ -6885,12 +6885,11 @@ async fn run_commands(
                                         "An upgrade is running on this player now".to_owned(),
                                     ));
                                 }
-                                Ok(ready) if ready.available => {
-                                    facts.push((
-                                        "Update".to_owned(),
-                                        "Available — see the button below".to_owned(),
-                                    ));
-                                }
+                                // Nothing said here when one is available: the
+                                // Install row below says it, and the player's
+                                // own status line above has already said it
+                                // too. A third telling is furniture.
+                                Ok(ready) if ready.available => {}
                                 Ok(_) => facts.push((
                                     "Update".to_owned(),
                                     "The player is up to date".to_owned(),
