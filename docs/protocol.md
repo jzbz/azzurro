@@ -4,8 +4,10 @@ BluOS publishes no protocol specification. Everything here was established one
 of three ways, and each claim below says which:
 
 * **Observed** — a request this project made to a real player, whose response
-  was read. The player was an NAD Powernode N330 on BluOS 4.16.6. Addresses and
-  MACs in the examples have been replaced with documentation values.
+  was read. The player was an NAD Powernode N330, on BluOS 4.16.6 and latterly
+  4.16.22 — the upgrade section below is an account of it going from one to the
+  other. Addresses and MACs in the examples have been replaced with
+  documentation values.
 * **Declared** — the player itself describes the request, in the XML it serves
   from `/Services` or `/ui/*`. As good as observed, because the device is the
   one making the claim.
@@ -15,6 +17,21 @@ of three ways, and each claim below says which:
 
 Nothing in this document came from Lenbrook, and none of their code is
 reproduced in this repository.
+
+A player is four services on four ports, and only the first is discoverable:
+
+| Port | What answers there |
+| --- | --- |
+| 11430/udp | LSDP discovery. Broadcast, unauthenticated. |
+| 11000 | The control API. Everything below unless it says otherwise. |
+| 11001 | Settings, read only — writes go back to 11000. |
+| 11004 | The library service, where `/Artwork` redirects to. |
+
+Only the first is broadcast. 11000 is named in the discovery packet's TXT
+`port` key; 11001 and 11004 are never announced at all and are found only by
+following a redirect out of 11000. So a client that does not follow redirects
+sees no artwork and no settings, and a firewall that opens only the control
+port breaks both.
 
 ## Discovery — LSDP
 
@@ -362,6 +379,98 @@ artwork URL. A 42-track queue on the test player needed 22 fetches, so
 deduplicating by URL before fetching roughly halves the work on a queue built
 from albums and does far better on one built from a single record.
 
+### Settings — a third service, on port 11001
+
+**Observed.** `/Settings` on the control port is not the settings service. It
+answers **301** to a third port:
+
+```
+GET  http://player:11000/Settings
+301  http://player:11001/Settings
+200  text/xml — <settings schemaVersion="35"> <setting id="alarms" …/> …
+```
+
+So settings are structured documents, not web pages, and a client can draw them
+itself rather than opening a browser. Each `<setting>` carries an `id`, a
+`displayName`, an `icon`, a `class` that says what kind of control it is, and
+the URL a write goes to.
+
+The trap is that reads and writes are on **different ports**. A settings
+document is read from 11001, and a write goes back to **11000** — posting it to
+where the document came from answers 404. Confirmed by writing a setting the
+value it already held, then a different one, and watching it change and revert.
+
+### Firmware upgrades
+
+**Observed.** Not on the page a browser sees. `GET /upgrade?noheader=1` on
+**port 80** is a jQuery Mobile page meant for a person, and the official
+controller does not parse it — it loads it in an embedded webview and lets the
+user click whatever the player drew. Anything read out of that page is a guess
+at someone else's HTML. The machine-readable route is on the control port:
+
+```
+GET  http://player:11000/upgrade?upgrade=check
+200  <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+     <upgrade inProgress="false" version="4.16.22" available="true">check</upgrade>
+```
+
+captured from a Powernode running 4.16.6. Three values of `upgrade=` exist:
+
+* `check` — non-destructive, and treated that way: the official app polls it
+  every 15 seconds while waiting for a player to come up;
+* `this` — starts an upgrade on the addressed player;
+* `all` — the official app uses this only for players too old to talk to and
+  for its retry button. Nothing states what it covers; that it means the master
+  plus its zone members is an **inference** from those two call sites.
+
+`&slave=<host>&port=<port>` addresses a zone member through its master.
+
+Note `version`: the player names the release it is offering, and the official
+controller reads straight past it — its parser takes `inProgress` and
+`available` and discards the rest. A client that wants to say *which* update is
+waiting can, and the app people compare against does not.
+
+The one precondition worth enforcing is the one that app enforces: send
+`this` only when a check has answered `available="true"` and
+`inProgress="false"`. Starting a second upgrade over a running one is the way
+to turn a working speaker into a brick.
+
+**Observed.** While an upgrade runs, `/SyncStatus` **stops answering with
+`<SyncStatus>`** and answers with a different root element:
+
+```
+<UpgradeStatusStage1 name="Powernode" model="N330" .../>
+<UpgradeStatusStage2 name="Powernode" model="N330" .../>
+```
+
+A parser that insists on the usual root reads this as a malformed player at
+exactly the moment it most needs watching. The elements can carry `step`,
+`total`, `percent`, `error` and `abortable` — but **a Powernode sends none of
+those, in either stage**, for the whole of an upgrade. Working the stage out
+from `step` alone, which is what the official app does, therefore reads every
+moment of the install as the first one; take the stage from *which element*
+arrived and let the counters refine it only where they exist.
+
+`abortable` is reported and there is nothing to do with it. The official app
+parses the field and never reads it again, and no route for stopping an
+upgrade appears anywhere in its bundle. Treat an upgrade as uninterruptible.
+
+Timing, from one run on a Powernode going 4.16.6 → 4.16.22:
+
+```
+   0s  upgrade=this sent
+  72s  player stops answering
+  88s  answering again, UpgradeStatusStage1
+ 104s  UpgradeStatusStage2
+ 265s  answering as SyncStatus again, version="4.16.22"
+```
+
+Two things follow for a client. Do not hold a long poll open across this: the
+player reboots partway through and an etag poll waits for a reply that is never
+coming — the official app drops to a bare five-second `/SyncStatus` while
+upgrading, and that is the right shape. And do not treat the first failed
+request as a player that has gone: silence is the normal middle of an upgrade.
+
 ## The server-driven UI
 
 **Observed.** This is the part that most changes how a third-party client has to
@@ -417,8 +526,9 @@ without runtime widget-tree construction can still render it.
   cannot reimplement it.
 * **Anything account-backed.** The official app bundles Firebase and has its own
   account flow.
-* **Player settings pages.** `/Settings?id=...` are web pages served by the
-  player, not structured documents. They can be shown in a browser.
+* **Sign-in forms behind a service.** The page a service's sign-in lives on is
+  HTML meant for a browser, asks for a password and sometimes a captcha, and is
+  the player's own. It can be opened; it should not be reimplemented.
 
 ## Method
 
