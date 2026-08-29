@@ -221,6 +221,10 @@ enum Command {
     BrowseMore,
     /// A letter of the jump bar was pressed or typed.
     BrowseJump(String),
+    /// Open the one screen the player puts a search box on.
+    OpenSearch,
+    /// Go to the very start or the very end of a paged list.
+    BrowseEnds(bool),
     /// Enough of the queue has been scrolled that the next window is wanted.
     QueueMore,
     /// Run one of the actions the service offers for what is playing, by the
@@ -403,6 +407,15 @@ struct Browsing {
     queue_menu_owner: Option<DeviceId>,
     /// The queue screen's own uri, from `/ui/Configuration`.
     queue_uri: Option<String>,
+    /// The search screen's own uri, from the same place.
+    ///
+    /// The player puts a search box on exactly one screen — measured on a
+    /// Powernode running 4.16.22: not on Artists, Albums, Songs, Genres,
+    /// Composers, Playlists, Folders or Favourites, and not on the library's
+    /// front page either. So a key that means "search" cannot focus a box on
+    /// the screen you are looking at; it has to be able to fetch the one screen
+    /// that has one.
+    search_uri: Option<String>,
     /// Whether a page of a long list is already on its way, so that scrolling
     /// past the trigger a second time does not ask for it twice.
     fetching_more: bool,
@@ -1911,6 +1924,16 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_browse_jump(move |key| {
         let _ = tx.send(Command::BrowseJump(key.to_string()));
+    });
+
+    let tx = commands.clone();
+    ui.on_open_search(move || {
+        let _ = tx.send(Command::OpenSearch);
+    });
+
+    let tx = commands.clone();
+    ui.on_browse_ends(move |to_end| {
+        let _ = tx.send(Command::BrowseEnds(to_end));
     });
 
     let tx = commands.clone();
@@ -4303,6 +4326,18 @@ impl Backend {
             // the window, headings and all — working them out a second time
             // somewhere else is how the letters and the rows drift apart.
             let mut browsing = self.browsing.lock().unwrap();
+            // Whether the window is looking at a slice of something longer.
+            // Home and End mean a fetch on one of these and a scroll on a list
+            // held whole, and only the window knows how tall its own pane is.
+            let paged = browsing
+                .current()
+                .is_some_and(|screen| !screen.index.is_empty() || screen.next.is_some());
+            let ui = self.ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_browse_paged(paged);
+                }
+            });
             browsing.derived = match browsing.current() {
                 Some(screen) if screen.index.is_empty() && screen.next.is_none() => {
                     collate(&mut blocks);
@@ -7425,6 +7460,10 @@ async fn run_commands(
                             .as_ref()
                             .and_then(|c| c.uri("queueItemContextMenu"))
                             .map(str::to_owned);
+                        browsing.search_uri = config
+                            .as_ref()
+                            .and_then(|c| c.uri("search"))
+                            .map(str::to_owned);
                         browsing.screens = screens;
                         browsing.sources = sources;
                         browsing.highlighted = Some((0, 0));
@@ -9359,6 +9398,80 @@ async fn run_commands(
                     browsing.fetching_queue = true;
                 }
                 tokio::spawn(fetch_more_queue(backend.clone(), id, held, pid));
+                continue;
+            }
+
+            Command::BrowseEnds(to_end) => {
+                // A paged list holds thirty rows of two thousand, so its end is
+                // a fetch and not a scroll — the same one request a letter is,
+                // aimed at the last window instead of a letter's. A list held
+                // whole never gets here: the window scrolls itself, because it
+                // is the only one that knows how tall the pane is.
+                let target = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let held = browsing
+                        .current()
+                        .map(|screen| screen.items().count() as u32)
+                        .unwrap_or(0);
+                    let offset = match browsing.current().and_then(|s| s.total) {
+                        // Counted lists only. A list that hands out a cursor
+                        // says nothing about how long it is, so its end cannot
+                        // be aimed at — paging forward is the only way there.
+                        Some(total) if to_end => Some(total.saturating_sub(held.max(1))),
+                        _ if !to_end => Some(0),
+                        _ => None,
+                    };
+                    match offset {
+                        None => None,
+                        Some(offset) => {
+                            let era = browsing.era;
+                            browsing.jumps += 1;
+                            let jump = browsing.jumps;
+                            browsing.trail.last().and_then(|crumb| {
+                                browsing
+                                    .device
+                                    .map(|id| (id, crumb.uri.clone(), offset, era, jump))
+                            })
+                        }
+                    }
+                };
+                let Some((id, uri, offset, era, jump)) = target else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                tokio::spawn(jump_to_letter(
+                    backend.clone(),
+                    client,
+                    uri,
+                    offset,
+                    era,
+                    jump,
+                ));
+                continue;
+            }
+
+            Command::OpenSearch => {
+                let target = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let uri = browsing.search_uri.clone();
+                    // Light its row, exactly as pressing it would. Reaching a
+                    // screen by keyboard and by hand has to leave the sidebar
+                    // saying the same thing, or it goes on pointing at Home
+                    // while Search is what is on the screen.
+                    if let Some(at) = uri
+                        .as_ref()
+                        .and_then(|uri| browsing.screens.iter().position(|(_, u)| u == uri))
+                    {
+                        browsing.highlighted = Some((0, at as i32));
+                    }
+                    uri.zip(browsing.device)
+                };
+                if let Some((uri, id)) = target {
+                    backend.publish_sidebar();
+                    tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Root));
+                }
                 continue;
             }
 

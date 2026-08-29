@@ -1623,6 +1623,23 @@ component SearchField inherits Rectangle {
     in-out property <string> text;
     callback edited(string);
     callback accepted(string);
+    /// Escape was pressed with the caret in here. The owner decides what to
+    /// hand the caret to next; this only says the box is done with it.
+    callback escaped();
+    /// Whether the caret is in here. Read by anything that would otherwise
+    /// take focus away from someone mid-word.
+    out property <bool> typing: input.has-focus;
+    /// Put the caret in here, and select what is already there.
+    ///
+    /// For the keyboard, which cannot reach inside an `if` to find this element
+    /// and has to be handed a way in. Selecting matters on the way back to a
+    /// screen that kept its query: the next keystroke replaces it, and Delete
+    /// clears it, without reaching for the mouse or holding backspace down.
+    /// Clicking in is left alone — a click is a request to edit in place.
+    public function take-focus() {
+        input.focus();
+        input.select-all();
+    }
 
     height: 38px;
     border-radius: Theme.radius-small;
@@ -1673,6 +1690,35 @@ component SearchField inherits Rectangle {
                 single-line: true;
                 edited => { root.edited(self.text); }
                 accepted => { root.accepted(self.text); }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.escaped();
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+            }
+        }
+
+        // Only with something to clear, so the box is not carrying a dead
+        // button the rest of the time.
+        if root.text != "": VerticalLayout {
+            alignment: center;
+
+            IconButton {
+                // `close`, not `clear`: the latter is a waste basket, which
+                // says the query is being thrown away rather than the box
+                // being emptied.
+                glyph: Icons.close;
+                size: 26px;
+                glyph-size: 13px;
+                clicked => {
+                    root.text = "";
+                    // The results follow the keys, so emptying it by hand has
+                    // to say so exactly as a backspace would.
+                    root.edited("");
+                    input.focus();
+                }
             }
         }
     }
@@ -1976,6 +2022,26 @@ export component AppWindow inherits Window {
     // else a collection turns up. The player works out where each one starts;
     // the window only ever sends back which was chosen.
     in property <[string]> browse-index;
+    // Whether the search box holds the caret. Only the search box writes it,
+    // and only the jump bar reads it — to keep out of the way.
+    in-out property <bool> browse-typing: false;
+    // Counters the keyboard bumps, for the three things it cannot reach
+    // directly: the search box and the list both live inside `if` blocks, and
+    // an element inside one cannot be named from outside it.
+    in-out property <int> focus-search: 0;
+    // Set when the keyboard asked for search on a screen that has no box, so
+    // the box focuses itself as soon as the screen carrying it arrives.
+    in-out property <bool> want-search: false;
+    callback open-search();
+    in-out property <int> browse-to-top: 0;
+    in-out property <int> browse-to-end: 0;
+    in-out property <int> browse-page: 0;
+    // Which way that page goes. Read only when the counter moves.
+    in-out property <bool> browse-page-down: true;
+    // Whether the list is a window on something longer, in which case its ends
+    // are a fetch rather than a scroll.
+    in property <bool> browse-paged: false;
+    callback browse-ends(bool);
     callback browse-jump(string);
     // Bumped by the backend each time a jump lands, because replacing a
     // model does not move a Flickable and the new rows would otherwise appear
@@ -2148,6 +2214,179 @@ export component AppWindow inherits Window {
     }
 
     VerticalLayout {
+        // Every key the window answers that is not typing.
+        //
+        // A sibling rather than a wrapper: Slint offers a key only to the
+        // focused element and its ancestors, so this holds the focus itself
+        // whenever no field wants it. That is also the whole guard against
+        // eating someone's typing — a focused TextInput takes the space bar and
+        // the backspace before this is ever asked.
+        //
+        // `height` and not `width`: this sits in a VerticalLayout, where height
+        // is the axis being divided and zero simply takes no share of it. A
+        // fixed size on the *cross* axis is read as a maximum for the whole
+        // row, which is how a zero-width sibling once collapsed the window.
+        keys := FocusScope {
+            height: 0px;
+
+            // What the letters belong to, so walking to another screen — or
+            // out to Settings and back — takes the focus again. A change
+            // tracker never fires on creation, hence `init` as well.
+            property <string> arrived:
+                root.browse-title + "/" + root.browse-index.length
+                + "/" + (root.browse-pane ? "browse" : "aside");
+
+            // Search is one screen, not a box on every screen: the player
+            // carries a `<search>` on `/ui/Search` and on nothing else —
+            // measured, not assumed. So the key focuses the box when there is
+            // one and otherwise goes and fetches the screen that has it.
+            function reach-search() {
+                if (root.browse-has-search) {
+                    root.focus-search += 1;
+                } else {
+                    root.want-search = true;
+                    root.open-search();
+                }
+            }
+
+            function claim() {
+                // Never out from under the caret. Backspacing a query down to
+                // empty pops the results screen, which changes the title, which
+                // fires this — and the next letter went to the jump bar instead
+                // of the box it was being typed into. `browse-typing` outlives
+                // the box that sets it, so a screen with no box has nobody
+                // typing in it.
+                // Never on a screen carrying a search box. That box takes
+                // the caret when it appears, and this fires on the same
+                // publish — whichever ran second used to win. It is also the
+                // older guard in stronger form: backspacing a query to empty
+                // pops the results crumb back to the search screen, which
+                // changed the title, which fired this, and the next letter went
+                // to the jump bar instead of the box it was typed into.
+                // The screen alone decides, and `browse-typing` deliberately
+                // does not appear here. It is set by a box that is destroyed
+                // while it still holds the caret, so it never fires false on
+                // the way out and stays true for the life of the window —
+                // which, when it was consulted, left every letter on the
+                // Artists list dead after one visit to Search.
+                if (!root.browse-has-search) {
+                    self.focus();
+                }
+            }
+
+            init => {
+                root.browse-typing = false;
+                self.claim();
+            }
+            changed arrived => { self.claim(); }
+
+            key-pressed(event) => {
+                if (event.text == "") {
+                    return EventResult.reject;
+                }
+
+                // The only chords. Ctrl with an arrow steps the queue, which
+                // is what Spotify and the rest bind it to; the plain letters
+                // that would read better are spoken for by the jump bar, and a
+                // library where "n" means "next" instead of "N" would be worse
+                // than no shortcut.
+                if (event.modifiers.control || event.modifiers.meta) {
+                    if (root.current.id != "" && event.text == Key.RightArrow) {
+                        root.skip(root.current.id);
+                        return EventResult.accept;
+                    }
+                    if (root.current.id != "" && event.text == Key.LeftArrow) {
+                        root.back(root.current.id);
+                        return EventResult.accept;
+                    }
+                    // Ctrl-F, for the hands that expect it. Some platforms send
+                    // the letter and some the control character it stands for.
+                    if (event.text == "f" || event.text == "F"
+                        || event.text == "\u{6}") {
+                        self.reach-search();
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+
+                // Straight to the search box. `/` because it costs no modifier
+                // and nothing else wants it; it is not a letter, so the jump
+                // bar was going to refuse it anyway.
+                if (event.text == "/") {
+                    self.reach-search();
+                    return EventResult.accept;
+                }
+
+                // The ends of the list. The bar stops at Z, and a library's
+                // Songs has two thousand rows after it.
+                if (root.browse-pane
+                    && (event.text == Key.Home || event.text == Key.End)) {
+                    if (root.browse-paged) {
+                        // Thirty rows of two thousand are in hand, so the end
+                        // of the list is not the end of what is loaded. The
+                        // backend fetches the last window, exactly as a letter
+                        // does.
+                        root.browse-ends(event.text == Key.End);
+                    } else if (event.text == Key.End) {
+                        root.browse-to-end += 1;
+                    } else {
+                        root.browse-to-top += 1;
+                    }
+                    return EventResult.accept;
+                }
+                if (root.browse-pane
+                    && (event.text == Key.PageUp || event.text == Key.PageDown)) {
+                    root.browse-page-down = event.text == Key.PageDown;
+                    root.browse-page += 1;
+                    return EventResult.accept;
+                }
+
+                // Play and pause. Only with a player to say it to.
+                if (event.text == " ") {
+                    if (root.current.id == "") {
+                        return EventResult.reject;
+                    }
+                    root.toggle(root.current.id);
+                    return EventResult.accept;
+                }
+
+                // Back, the two keys people reach for. Passed on when there is
+                // nowhere to go, so Escape still closes what it usually closes.
+                if (event.text == Key.Escape
+                    || event.text == Key.Backspace
+                    || event.text == Key.LeftArrow) {
+                    if (!root.browse-can-go-back || !root.browse-pane) {
+                        return EventResult.reject;
+                    }
+                    root.browse-back();
+                    return EventResult.accept;
+                }
+
+                // A cased letter, or one of the two keys the bar draws that are
+                // not letters.
+                //
+                // Slint does not send an empty `text` for a named key: Tab
+                // arrives as U+0009, the arrows as U+F700 and up. Taking those
+                // swallowed them — Tab stopped moving focus at all, because the
+                // traversal only runs once the focused element rejects the key.
+                // Everything Slint sends for a named key has no case, and so do
+                // digits, which is what this tests without naming each one.
+                if (event.text.to-uppercase() == event.text.to-lowercase()
+                    && event.text != "#" && event.text != "*") {
+                    return EventResult.reject;
+                }
+                // And nothing to jump to is nothing to take.
+                if (root.browse-index.length == 0) {
+                    return EventResult.reject;
+                }
+                // Sent exactly as typed. Matching it to a letter is the
+                // backend's job: it holds the offsets, it knows the bar may
+                // carry both "C" and "c", and it ignores a key on neither.
+                root.browse-jump(event.text);
+                return EventResult.accept;
+            }
+        }
+
         HorizontalLayout {
             vertical-stretch: 1;
 
@@ -2437,6 +2676,36 @@ export component AppWindow inherits Window {
                             // search was one worth keeping.
                             edited(text) => { root.browse-search(text); }
                             accepted(text) => { root.browse-search-done(text); }
+                            // Hoisted to the window because the jump bar has to
+                            // read it and cannot see inside this `if`.
+                            changed typing => { root.browse-typing = self.typing; }
+                            // And the way back in. A counter rather than a flag
+                            // because asking twice has to work twice.
+                            property <int> asked: root.focus-search;
+                            changed asked => { self.take-focus(); }
+                            // Escape hands the caret back to the key scope, so
+                            // the next Escape or Backspace navigates instead of
+                            // being swallowed by the box. An inner element can
+                            // name an outer one, which is the only reason this
+                            // can reach `keys` from inside the `if`.
+                            escaped => {
+                                root.browse-typing = false;
+                                keys.focus();
+                            }
+                            // Arriving on a screen with a search box means
+                            // wanting to search: the caret goes in it and any
+                            // query it kept is selected, so typing starts
+                            // straight away and replaces what was there.
+                            //
+                            // Not only for the keyboard route. Pressing Search
+                            // in the sidebar is the same intent, and the player
+                            // puts a box on that one screen and nowhere else,
+                            // so "a box exists" is the same statement as "this
+                            // is the search screen".
+                            init => {
+                                root.want-search = false;
+                                self.take-focus();
+                            }
                         }
                     }
 
@@ -2616,66 +2885,6 @@ export component AppWindow inherits Window {
                         // in the index — so Ctrl-anything, the arrow keys and a
                         // letter no artist starts with all fall through to
                         // whatever else would have had them.
-                        jump-keys := FocusScope {
-                            // Width only. A HorizontalLayout intersects its
-                            // children's *cross*-axis constraints, so a fixed
-                            // `height` here is a maximum for the whole row —
-                            // `height: 0px` collapsed the browse list and the
-                            // queue panel beside it, and dropped the player bar
-                            // into the middle of the window. Zero width costs
-                            // nothing because width is the axis being divided.
-                            width: 0px;
-                            enabled: root.browse-index.length > 0;
-
-                            // Claimed whenever a new indexed screen arrives.
-                            // A zero-sized FocusScope is never clicked, so it
-                            // has to take focus rather than be given it — and
-                            // it has to take it again on each screen, because
-                            // clicking the search box hands focus away and
-                            // nothing would hand it back.
-                            property <string> arrived:
-                                root.browse-title + "/" + root.browse-index.length;
-                            changed arrived => {
-                                if (root.browse-index.length > 0) { self.focus(); }
-                            }
-
-                            key-pressed(event) => {
-                                if (event.modifiers.control || event.modifiers.meta
-                                    || event.text == "") {
-                                    return EventResult.reject;
-                                }
-                                // A cased letter, or one of the two keys the
-                                // bar draws that are not letters.
-                                //
-                                // Slint does not send an empty `text` for a
-                                // named key: Tab arrives as U+0009, Escape as
-                                // U+001B, the arrows as U+F700 and up. Taking
-                                // those swallowed them — Tab stopped moving
-                                // focus at all, because the traversal only runs
-                                // once the focused element rejects the key.
-                                // Everything Slint sends for a named key has no
-                                // case, and so do digits, which is what this
-                                // tests without needing to know each one.
-                                if (event.text.to-uppercase() == event.text.to-lowercase()
-                                    && event.text != "#" && event.text != "*") {
-                                    return EventResult.reject;
-                                }
-                                // And nothing to jump to is nothing to take.
-                                if (root.browse-index.length == 0) {
-                                    return EventResult.reject;
-                                }
-                                // Sent exactly as typed. Matching it to a
-                                // letter is the backend's job: it holds the
-                                // offsets, it knows the bar may carry both "C"
-                                // and "c", and it ignores a key that is on
-                                // neither. Upper-casing here looked harmless
-                                // and made every lowercase letter on the bar
-                                // unreachable from the keyboard.
-                                root.browse-jump(event.text);
-                                return EventResult.accept;
-                            }
-                        }
-
                         browse-list := ListView {
                             horizontal-stretch: 1;
 
@@ -2760,6 +2969,42 @@ export component AppWindow inherits Window {
                             // FocusScope above.
                             width: 0px;
                             horizontal-stretch: 0;
+                            // Home and End. Here rather than in the key
+                            // handler because `browse-list` cannot be named
+                            // from outside the `if` that builds it.
+                            //
+                            // Both give up the settling pin: the reader has
+                            // said where they want to be, and rows growing a
+                            // moment later must not overrule them.
+                            property <int> to-top: root.browse-to-top;
+                            changed to-top => {
+                                browse-list.settling = false;
+                                browse-list.viewport-y = 0;
+                            }
+
+                            property <int> to-end: root.browse-to-end;
+                            changed to-end => {
+                                browse-list.settling = false;
+                                browse-list.viewport-y = min(0px,
+                                    browse-list.height - browse-list.viewport-height);
+                            }
+
+                            // A screenful at a time. Clamped at both ends so
+                            // it stops rather than running past them, and it
+                            // gives up the pin for the same reason Home does.
+                            property <int> paged: root.browse-page;
+                            changed paged => {
+                                browse-list.settling = false;
+                                browse-list.viewport-y = clamp(
+                                    browse-list.viewport-y
+                                        + (root.browse-page-down
+                                            ? -browse-list.height
+                                            : browse-list.height),
+                                    min(0px, browse-list.height
+                                        - browse-list.viewport-height),
+                                    0px);
+                            }
+
                             property <int> at: root.browse-jumped;
                             changed at => {
                                 browse-list.viewport-y = -root.browse-jump-y * 1px;
