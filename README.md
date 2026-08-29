@@ -42,10 +42,17 @@ Measured against the official controller, in roughly the order a user notices:
 | **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
 | **Queues past 500 tracks** | The queue is fetched as one window of 500. The header says `500 of 1234`, so nothing is hidden silently, but the tail cannot be reached. |
 | **Custom radio by stream URL** | Radio is whatever the player's browse tree offers. No endpoint for pasting a URL is documented. |
-| **Upgrading through a master** | The upgrade route takes `slave=` to reach a zone member. Not sent, so such a player cannot be upgraded from here. `upgrade=all` is refused deliberately. |
 
 Most of these are UI work over a protocol layer that already reaches the
 endpoint, rather than protocol work waiting to be done.
+
+One thing is built but unproven. A zone member that will not answer about its
+own firmware is asked about through the player leading it, using the `&slave=`
+parameter — which was read out of the official controller rather than observed,
+and has never run against a real zone, there being one speaker here to test on.
+It is reached only after a direct request has already failed, so it cannot
+change what works today. `upgrade=all`, which would upgrade a whole room on one
+press, is refused deliberately and stays that way.
 
 ## Layout
 

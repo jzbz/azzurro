@@ -232,6 +232,63 @@ async fn an_upgrade_is_refused_unless_the_player_says_it_is_ready() {
     assert!(player.asked_for("upgrade=check"), "and it checked first");
 }
 
+/// A zone member is addressed through the player that leads it.
+///
+/// `&slave=<host>&port=<port>` was read out of the official controller rather
+/// than observed against a zone — there is one speaker here. What this pins is
+/// everything that does not need a zone: that the parameters go out at all,
+/// that they carry the member and not the leader, that the check is asked over
+/// the same route as the start, and that a refusal still refuses.
+#[tokio::test]
+async fn a_member_is_upgraded_through_its_leader() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+    let member = bluos::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+
+    player.serve(
+        "/upgrade",
+        r#"<upgrade inProgress="false" available="false"/>"#,
+    );
+    let refused = client.start_upgrade_for(Some(member)).await;
+    assert!(refused.is_err(), "a member with nothing to install refuses");
+    assert!(
+        !player.asked_for("upgrade=this"),
+        "and is not sent the trigger"
+    );
+
+    player.serve(
+        "/upgrade",
+        r#"<upgrade inProgress="false" available="true"/>"#,
+    );
+    client
+        .start_upgrade_for(Some(member))
+        .await
+        .expect("starts");
+
+    assert!(
+        player.asked_for("slave=10.0.0.156"),
+        "the request names the member"
+    );
+    assert!(player.asked_for("port=11000"), "and the port it answers on");
+    assert!(
+        player.asked_for("upgrade=this"),
+        "the scope is still this and never all"
+    );
+    assert!(!player.asked_for("upgrade=all"));
+
+    // The precondition is asked over the same route it will start on: a check
+    // about the leader would answer for the wrong player entirely.
+    let asked = player.asked();
+    let checked = asked
+        .iter()
+        .find(|seen| seen.contains("upgrade=check"))
+        .expect("it checked first");
+    assert!(
+        checked.contains("slave=10.0.0.156"),
+        "the check must be about the member too, not about its leader: {checked}"
+    );
+}
+
 /// While an upgrade runs the player stops answering with `<SyncStatus>`, which
 /// a reader that insists on it would call a broken player.
 #[tokio::test]

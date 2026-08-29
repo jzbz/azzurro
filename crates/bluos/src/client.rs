@@ -609,8 +609,26 @@ impl Client {
     /// seconds while it waits for a player to come up. See
     /// [`crate::upgrade`] for where the shape of this comes from.
     pub async fn upgrade_available(&self) -> Result<crate::upgrade::Availability> {
+        self.upgrade_available_for(None).await
+    }
+
+    /// The same question, asked on behalf of a zone member.
+    ///
+    /// `member` addresses another player *through this one*, which is what
+    /// `&slave=<host>&port=<port>` is for. Passing `None` asks about the
+    /// player this client talks to and is exactly [`Self::upgrade_available`].
+    ///
+    /// **Inferred, not confirmed.** The parameter was read out of the official
+    /// controller's request builder; no zone was available to run it against.
+    /// What is confirmed is only that a player answers `check` about itself.
+    pub async fn upgrade_available_for(
+        &self,
+        member: Option<crate::DeviceId>,
+    ) -> Result<crate::upgrade::Availability> {
+        let query = upgrade_query("check", member);
+        let borrowed: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let body = self
-            .get_text("/upgrade", &[("upgrade", "check")], UPGRADE_TIMEOUT)
+            .get_text("/upgrade", &borrowed, UPGRADE_TIMEOUT)
             .await?;
         crate::upgrade::availability(&body)
     }
@@ -637,7 +655,19 @@ impl Client {
     /// thing to do by accident, and the effect of `all` is not documented
     /// anywhere I could find.
     pub async fn start_upgrade(&self) -> Result<()> {
-        let ready = self.upgrade_available().await?;
+        self.start_upgrade_for(None).await
+    }
+
+    /// The same, for a zone member addressed through this player.
+    ///
+    /// Every warning on [`Self::start_upgrade`] applies, and one more: the
+    /// `&slave=` form is **inferred from the official controller's request
+    /// builder and has never been run against a zone**. The precondition is
+    /// checked over the same route the start will use, so a member this
+    /// player cannot answer for refuses here rather than being sent an
+    /// upgrade nobody can watch.
+    pub async fn start_upgrade_for(&self, member: Option<crate::DeviceId>) -> Result<()> {
+        let ready = self.upgrade_available_for(member).await?;
 
         if ready.in_progress {
             return Err(Error::Screen(
@@ -653,7 +683,9 @@ impl Client {
         // The reply is the same document the check answers with, and is not
         // read: by the time it arrives the player is already going, and what
         // it is doing is watched through `/SyncStatus` from here on.
-        self.get_text("/upgrade", &[("upgrade", "this")], UPGRADE_TIMEOUT)
+        let query = upgrade_query("this", member);
+        let borrowed: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.get_text("/upgrade", &borrowed, UPGRADE_TIMEOUT)
             .await?;
         Ok(())
     }
@@ -1255,6 +1287,30 @@ impl StatusWatch {
     }
 }
 
+/// Build the query for `/upgrade`.
+///
+/// `scope` is `check` or `this`. A member turns the request into one asked of
+/// *this* player about *that* one, which is what the official controller does
+/// for a zone: `&slave=<host>&port=<port>`.
+///
+/// A free function so the shape can be tested without a player to send it to,
+/// which matters more here than usual — the confirmed half of this route was
+/// run against hardware and the `slave` half never has been.
+fn upgrade_query(scope: &str, member: Option<crate::DeviceId>) -> Vec<(&'static str, String)> {
+    let scope = match scope {
+        "this" => "this",
+        _ => "check",
+    };
+    let mut query = vec![("upgrade", scope.to_owned())];
+    if let Some(member) = member {
+        // Bare, the way every other host in this crate goes on a query: the
+        // player is asked for an address it can reach, not for a URL.
+        query.push(("slave", member.host.to_string()));
+        query.push(("port", member.port.to_string()));
+    }
+    query
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1543,6 +1599,54 @@ mod tests {
         assert_eq!(json_string("a\nb"), r#""a\nb""#);
         // A room name is free text and can contain anything.
         assert_eq!(json_string("Ol\u{e1} \u{1f3b5}"), "\"Ol\u{e1} \u{1f3b5}\"");
+    }
+
+    #[test]
+    fn an_upgrade_asked_about_this_player_names_no_member() {
+        assert_eq!(
+            upgrade_query("check", None),
+            vec![("upgrade", "check".to_owned())]
+        );
+        assert_eq!(
+            upgrade_query("this", None),
+            vec![("upgrade", "this".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_member_is_addressed_by_host_and_port() {
+        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+        assert_eq!(
+            upgrade_query("this", Some(member)),
+            vec![
+                ("upgrade", "this".to_owned()),
+                ("slave", "10.0.0.156".to_owned()),
+                ("port", "11000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_on_a_non_standard_port_keeps_it() {
+        // The port is part of what identifies a player, so a member is not
+        // assumed to be on 11000 just because most are.
+        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 157), 11010);
+        let query = upgrade_query("check", Some(member));
+        assert_eq!(query[2], ("port", "11010".to_owned()));
+    }
+
+    #[test]
+    fn an_unknown_scope_cannot_become_all() {
+        // `all` upgrades a master and every member on one request. Nothing in
+        // this crate offers it, and a typo must not be the way it arrives.
+        assert_eq!(
+            upgrade_query("all", None),
+            vec![("upgrade", "check".to_owned())]
+        );
+        assert_eq!(
+            upgrade_query("", None),
+            vec![("upgrade", "check".to_owned())]
+        );
     }
 
     #[test]

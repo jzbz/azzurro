@@ -4959,6 +4959,50 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
     backend.publish_form();
 }
 
+/// Ask about a player's firmware, through its leader if it will not answer.
+///
+/// Direct is the confirmed route and is always tried first, so nothing that
+/// works today is routed differently. Only a player that does not answer at
+/// all is asked about through somebody else: a follower whose leader is
+/// reachable is asked about with `&slave=`, which is what that parameter is
+/// for and is the one case where a player can be beyond reach on its own.
+///
+/// Returns whichever client answered along with the member parameter that got
+/// the answer, so starting an upgrade can repeat exactly the request that the
+/// check succeeded with rather than guessing at the route a second time.
+///
+/// The zone half of this has never run against real hardware — one speaker
+/// here, and `&slave=` was read out of the official controller rather than
+/// observed. It is reached only after a direct request has already failed, so
+/// the worst it can do is fail differently.
+async fn ask_about_firmware(
+    backend: &Backend,
+    id: DeviceId,
+) -> bluos::Result<(Client, Option<DeviceId>, bluos::upgrade::Availability)> {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return Err(bluos::Error::Screen("no such player".to_owned()));
+    };
+
+    let direct = client.upgrade_available().await;
+    let Err(e) = direct else {
+        return direct.map(|ready| (client, None, ready));
+    };
+
+    // Only a leader is worth trying, and only one this app can still reach.
+    let leader = backend
+        .with_entry(id, |entry| entry.sync.as_ref().and_then(|s| s.master_id()))
+        .flatten()
+        .and_then(|master| backend.with_entry(master, |e| e.client.clone()));
+
+    let Some(leader) = leader else { return Err(e) };
+
+    tracing::debug!(%id, "no answer about firmware; asking its leader instead");
+    leader
+        .upgrade_available_for(Some(id))
+        .await
+        .map(|ready| (leader, Some(id), ready))
+}
+
 /// Put a query at the top of the recent list, and write the list down.
 fn remember_search(backend: &Backend, query: String) {
     let keeping = {
@@ -5290,13 +5334,12 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
     // should wait on it.
     if backend.told_about_update.lock().unwrap().insert(id) {
         let backend = backend.clone();
-        let client = client.clone();
         tokio::spawn(async move {
             // Logged either way. Whether an offer appears is otherwise
             // invisible from outside, and "it did not ask me" and "it asked
             // and the player said no" look identical without this.
-            match client.upgrade_available().await {
-                Ok(ready) => {
+            match ask_about_firmware(&backend, id).await {
+                Ok((_, _, ready)) => {
                     tracing::debug!(
                         %id,
                         available = ready.available,
@@ -6088,15 +6131,21 @@ async fn run_commands(
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                    continue;
-                };
                 let backend = backend.clone();
                 tokio::spawn(async move {
-                    // `start_upgrade` checks again before it sends anything:
-                    // the answer here may be minutes old, and the player may
-                    // have started one of its own in between.
-                    match client.start_upgrade().await {
+                    // Checked again before anything is sent: the answer that
+                    // put the offer on screen may be minutes old, and the
+                    // player may have started one of its own in between. The
+                    // route is settled by that check, so the start repeats
+                    // whatever request actually got an answer.
+                    let (client, member) = match ask_about_firmware(&backend, id).await {
+                        Ok((client, member, _)) => (client, member),
+                        Err(e) => {
+                            say(&backend.ui, format!("could not start the update: {e}"));
+                            return;
+                        }
+                    };
+                    match client.start_upgrade_for(member).await {
                         Ok(()) => {
                             say(&backend.ui, "Update started — leave the player powered on");
                             follow_upgrade(backend.clone(), id).await;
@@ -7138,7 +7187,15 @@ async fn run_commands(
                             // the check is the machine-readable one, and is
                             // what decides whether installing is offered.
                             let page = client.upgrade_check().await;
-                            let ready = client.upgrade_available().await;
+                            // Routed the same way the install will be, so the
+                            // page cannot offer an Install for a player the
+                            // start would then refuse to reach.
+                            let ready = match selected {
+                                Some(id) => ask_about_firmware(&backend, id)
+                                    .await
+                                    .map(|(_, _, ready)| ready),
+                                None => client.upgrade_available().await,
+                            };
 
                             let mut facts = match &page {
                                 Ok((status, _)) => vec![(
