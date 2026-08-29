@@ -456,6 +456,20 @@ enum Pane {
     Playlists(Box<PlaylistPage>),
     /// Radio stations typed in by hand, which the player knows nothing about.
     Stations(Box<StationsPage>),
+    /// Renaming one of the player's presets.
+    EditPreset(Box<EditPresetPage>),
+}
+
+/// A preset being renamed.
+///
+/// The url and the image are carried rather than shown: `/SetPreset` replaces
+/// the whole slot, so a field left out is a field cleared, and they have to go
+/// back exactly as they came. Only the name is anybody's business to change —
+/// the stream came out of the player's own catalogue, and retyping it by hand
+/// would sever the preset from the thing it names.
+struct EditPresetPage {
+    slot: u32,
+    preset: bluos::screen::Preset,
 }
 
 /// The stations kept on this machine, as a page.
@@ -3264,6 +3278,48 @@ impl Backend {
         });
     }
 
+    /// The preset being renamed, as a settings row.
+    ///
+    /// One field, so a text row is the whole page: it commits on Enter, which
+    /// is the only thing that could mean "done" here.
+    fn publish_edit_preset(&self) {
+        let (rows, title) = {
+            let browsing = self.browsing.lock().unwrap();
+            let Pane::EditPreset(page) = &browsing.pane else {
+                return;
+            };
+
+            let mut rows = vec![SettingData {
+                index: 0,
+                label: "Name".to_owned(),
+                detail: "Type a new name and press Enter".to_owned(),
+                glyph: Some(Glyph::Preset),
+                control: "text",
+                value: page.preset.name.clone(),
+                available: true,
+                ..SettingData::blank()
+            }];
+
+            // What it plays, shown and not editable. The stream came from the
+            // player's own catalogue and is what ties the preset to the thing
+            // it names; retyping it by hand would quietly sever that.
+            if let Some(url) = page.preset.url.as_deref() {
+                rows.push(SettingData {
+                    index: -1,
+                    label: "Plays".to_owned(),
+                    detail: url.to_owned(),
+                    control: "none",
+                    available: false,
+                    ..SettingData::blank()
+                });
+            }
+
+            (rows, format!("Preset {}", page.slot))
+        };
+
+        self.send_settings(rows, title);
+    }
+
     fn publish_playlists(&self) {
         let (title, rows) = {
             let browsing = self.browsing.lock().unwrap();
@@ -3629,6 +3685,7 @@ impl Backend {
             // a link and a line that is a text field.
             Pane::Playlists(_) => Showing::Settings,
             Pane::Stations(_) => Showing::Settings,
+            Pane::EditPreset(_) => Showing::Settings,
         };
 
         let large = matches!(showing, Showing::NowPlaying);
@@ -3671,12 +3728,14 @@ impl Backend {
                     match &browsing.pane {
                         Pane::Playlists(_) => 1,
                         Pane::Stations(_) => 2,
+                        Pane::EditPreset(_) => 3,
                         _ => 0,
                     }
                 };
                 match pane {
                     1 => self.publish_playlists(),
                     2 => self.publish_stations(),
+                    3 => self.publish_edit_preset(),
                     _ => self.publish_settings(),
                 }
             }
@@ -5589,6 +5648,21 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             // fresh request: the Presets screen is where this is pressed, its
             // items carry the slot number as `counter`, and re-reading it
             // would only invite the two to disagree.
+            // Renaming a preset. The player's own menu offers it and hands
+            // over everything the slot holds, so this only has to ask for a
+            // new name and send the lot back.
+            Some(route) if bluos::screen::preset_to_edit(route).is_some() => {
+                // Decoded twice, once to choose this arm and once to use it:
+                // a match guard cannot hand its answer to the body.
+                if let Some((slot, preset)) = bluos::screen::preset_to_edit(route) {
+                    backend.browsing.lock().unwrap().pane =
+                        Pane::EditPreset(Box::new(EditPresetPage { slot, preset }));
+                    // Through publish_pane, so every "this pane is showing"
+                    // flag is answered.
+                    backend.publish_pane();
+                }
+            }
+
             Some(route) if bluos::screen::presets_to_reorder(route).is_some() => {
                 let prid = bluos::screen::presets_to_reorder(route).unwrap_or_default();
                 let page = {
@@ -6810,6 +6884,10 @@ async fn run_commands(
                             browsing.pane = Pane::Browse;
                             true
                         }
+                        Pane::EditPreset(_) => {
+                            browsing.pane = Pane::Browse;
+                            true
+                        }
                         Pane::HelpDetail(_, _, whence) => {
                             browsing.pane = match whence {
                                 Whence::Help => Pane::Help,
@@ -7685,6 +7763,41 @@ async fn run_commands(
                             ),
                         ),
                         Err(e) => say(&backend.ui, format!("could not play it: {e}")),
+                    }
+                });
+                continue;
+            }
+
+            Command::SettingEdit(_, Edit::Text(name))
+                if matches!(backend.browsing.lock().unwrap().pane, Pane::EditPreset(_)) =>
+            {
+                let asked = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Pane::EditPreset(page) = &browsing.pane else {
+                        continue;
+                    };
+                    let mut preset = page.preset.clone();
+                    preset.name = name.trim().to_owned();
+                    (page.slot, preset)
+                };
+
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+
+                backend.browsing.lock().unwrap().pane = Pane::Browse;
+                backend.publish_pane();
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.edit_preset(asked.0, &asked.1).await {
+                        Ok(()) => {
+                            say(&backend.ui, "Preset renamed");
+                            refresh_current(backend).await;
+                        }
+                        Err(e) => say(&backend.ui, format!("could not rename it: {e}")),
                     }
                 });
                 continue;

@@ -1150,6 +1150,29 @@ impl Client {
         self.command("/SetPreset", &query).await
     }
 
+    /// Rewrite the preset in `slot`, leaving the others alone.
+    ///
+    /// The same route as saving, with the slot named: `/SetPreset?id=N&…`
+    /// replaces what is there rather than appending. Confirmed on a Powernode
+    /// running 4.16.22 — renaming slot three left one, two and four untouched.
+    ///
+    /// Everything is sent, not only what changed: this is a replacement, and a
+    /// field left out is a field cleared.
+    pub async fn edit_preset(&self, slot: u32, preset: &crate::screen::Preset) -> Result<()> {
+        let Some(url) = preset.url.as_deref() else {
+            return Err(Error::Screen("a preset needs something to play".to_owned()));
+        };
+        let slot = slot.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("id", &slot), ("url", url)];
+        if !preset.name.is_empty() {
+            query.push(("name", &preset.name));
+        }
+        if let Some(image) = preset.image.as_deref() {
+            query.push(("image", image));
+        }
+        self.command("/SetPreset", &query).await
+    }
+
     /// Put the presets in a new order.
     ///
     /// **Observed, and documented nowhere.** `/Presets/edit?prid=N` answers 405

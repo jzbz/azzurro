@@ -1169,6 +1169,33 @@ pub fn preset_to_save(uri: &str) -> Option<Preset> {
     found.url.is_some().then_some(found)
 }
 
+/// The preset an `/edit-preset` deep link is about, and the slot it is in.
+///
+/// A preset's own context menu offers
+/// `/edit-preset/1?id=1&image=&name=Azzurro+test&url=http%3A%2F%2F…`, which
+/// carries the slot twice — in the path and in the query — and everything the
+/// preset currently holds. The query is what is read; the path repeats it.
+///
+/// Editing is a rewrite: `/SetPreset` with the same `id` replaces that slot
+/// and leaves the others alone. Confirmed on a Powernode running 4.16.22.
+pub fn preset_to_edit(uri: &str) -> Option<(u32, Preset)> {
+    let (path, _) = uri.split_once('?')?;
+    if !path.starts_with("/edit-preset") {
+        return None;
+    }
+    // Everything but the path is shaped like an add, so read it as one — with
+    // the `/add-preset` path swapped in, since that is what the decoder wants.
+    let query = uri.split_once('?').map(|(_, q)| q)?;
+    let preset = preset_to_save(&format!("/add-preset?{query}"))?;
+
+    let slot: u32 = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("id="))
+        .and_then(|id| id.parse().ok())?;
+
+    Some((slot, preset))
+}
+
 /// Which preset list a `/reorder-presets` deep link is about.
 ///
 /// The Presets screen's footer offers
@@ -1373,6 +1400,30 @@ mod tests {
             }],
             ..Screen::default()
         }
+    }
+
+    #[test]
+    fn an_edit_link_names_the_slot_and_what_is_in_it() {
+        let uri = "/edit-preset/3?id=3&image=&name=Groove+Salad\
+                   &url=http%3A%2F%2Fice1.somafm.com%2Fgroovesalad-128-mp3";
+        let (slot, preset) = preset_to_edit(uri).expect("an edit");
+        assert_eq!(slot, 3);
+        assert_eq!(preset.name, "Groove Salad");
+        assert_eq!(
+            preset.url.as_deref(),
+            Some("http://ice1.somafm.com/groovesalad-128-mp3")
+        );
+        // An empty image is no image, not an empty one.
+        assert_eq!(preset.image, None);
+    }
+
+    #[test]
+    fn an_edit_needs_a_slot_and_something_to_play() {
+        assert_eq!(preset_to_edit("/edit-preset/3?name=X&url=Y"), None, "no id");
+        assert_eq!(preset_to_edit("/edit-preset/3?id=3&name=X"), None, "no url");
+        assert_eq!(preset_to_edit("/edit-preset"), None);
+        // And an add is not an edit.
+        assert_eq!(preset_to_edit("/add-preset?id=1&name=X&url=Y"), None);
     }
 
     #[test]
