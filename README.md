@@ -1,6 +1,7 @@
 # Azzurro
 
-An open-source Linux controller for BluOS players — Bluesound, NAD and PSB.
+An open-source controller for BluOS players — Bluesound, NAD and PSB — for
+Linux, macOS and Windows.
 
 Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
@@ -25,8 +26,9 @@ The window lists the players it finds and drives them:
 - firmware upgrades: an offer on the way in, a confirmation, the install
   itself, and a strip that follows it stage by stage
 
-Each player is also exported over MPRIS, so the desktop's own media controls
-work.
+On Linux each player is also exported over MPRIS, so the desktop's own media
+controls work. That is the one feature that is not on all three: MPRIS is
+D-Bus, and the other two have nothing to export to.
 
 Two things are not reimplementable and are out of scope: linking a new music
 service, which happens on Lenbrook's cloud control panel, and anything else
@@ -139,9 +141,12 @@ client.
 
 ## Installing
 
-There is no published release yet. Linux is the target and the only platform
-this is used on; CI builds and tests on macOS and Windows as well, so the code
-stays honest about what is platform-specific, but neither is packaged.
+There is no published release yet. CI builds and tests all three platforms on
+every push, and packages two of them as artifacts — a universal `.app` for
+macOS and an executable for Windows — but **neither is signed or notarised**,
+so both will need to be allowed past the operating system by hand. Linux is
+where this is developed and used daily; the other two are built and tested but
+not lived in.
 
 To put it in your desktop's menu from a checkout:
 
@@ -157,6 +162,11 @@ install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-256.png \
 If `build.target-dir` is set in your Cargo config the binary is under that
 directory instead; `cargo build --release -p azzurro-gui --message-format=json`
 reports where it actually went.
+
+`packaging/macos-bundle.sh` lays out `Azzurro.app` around a universal binary;
+nothing in it needs Xcode. On Windows `cargo build --release -p azzurro-gui`
+is the whole of it — the binary sets `windows_subsystem = "windows"` in release
+so it does not open a console behind the window.
 
 `packaging/blue.azzurro.Azzurro.yml` is a Flatpak manifest for the same
 thing. It needs `packaging/cargo-sources.json`, which is generated from
