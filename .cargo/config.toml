@@ -1,0 +1,32 @@
+# Link the Visual C++ runtime into the binary rather than beside it.
+#
+# Rust's MSVC target links `vcruntime140.dll`, `vcruntime140_1.dll` and
+# `msvcp140.dll` dynamically. GitHub's windows runners have the Visual C++
+# redistributable installed, so a build there runs there — and the artifact it
+# produces exits immediately on a machine that does not, with
+# `0xC0000135` (STATUS_DLL_NOT_FOUND) and no window, no message and nothing in
+# the event log. Measured on a clean Windows 11 26200: all three absent.
+#
+# A controller people are asked to download as one .exe cannot also ask them to
+# find a Microsoft redistributable first, so the runtime goes inside it. The
+# cost is a larger binary and no security fixes arriving by way of a shared
+# library the user updates — acceptable for something distributed unsigned as a
+# single file, and reconsidered the day there is an installer to put the
+# redistributable in.
+#
+# Deliberately here rather than in the packaging workflow: CI's tests and the
+# artifact must be built the same way, or the thing that is tested is not the
+# thing that ships.
+#
+# Nothing else belongs in this file. Anything naming a path on one machine —
+# `build.target-dir` above all — breaks every other contributor, and belongs in
+# `$CARGO_HOME/config.toml` where it is nobody else's business.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

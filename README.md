@@ -182,7 +182,10 @@ reports where it actually went.
 `packaging/macos-bundle.sh` lays out `Azzurro.app` around a universal binary;
 nothing in it needs Xcode. On Windows `cargo build --release -p azzurro-gui`
 is the whole of it — the binary sets `windows_subsystem = "windows"` in release
-so it does not open a console behind the window.
+so it does not open a console behind the window, and `.cargo/config.toml` links
+the Visual C++ runtime into it. Without that the exe exits on any machine
+without the redistributable, which is most of them: `0xC0000135`, no window and
+nothing in the event log.
 
 `packaging/blue.azzurro.Azzurro.yml` is a Flatpak manifest for the same
 thing. It needs `packaging/cargo-sources.json`, which is generated from
