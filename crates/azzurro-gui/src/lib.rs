@@ -6898,7 +6898,9 @@ async fn run_commands(
                             browsing.highlighted = None;
                             drop(browsing);
                             backend.publish_sidebar();
-                            backend.publish_settings();
+                            // See the note on `OpenHelp`: the pane flags are
+                            // answered by `publish_pane` and by nothing else.
+                            backend.publish_pane();
                         }
                         Err(e) => {
                             tracing::warn!(%id, "could not read settings: {e}");
@@ -7045,7 +7047,14 @@ async fn run_commands(
                     browsing.highlighted = None;
                 }
                 backend.publish_sidebar();
-                backend.publish_help();
+                // `publish_pane`, not `publish_help`: it draws the same rows
+                // by way of `Showing::Help`, and on the way it answers the
+                // flags that say which pane is up. Calling the publisher
+                // directly left `now_playing` set, so opening Help from the
+                // sidebar while the sleeve was up changed the pane underneath
+                // an overlay that stayed on top of it — the press looked
+                // ignored when it had in fact worked.
+                backend.publish_pane();
                 continue;
             }
 
