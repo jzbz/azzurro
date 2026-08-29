@@ -34,7 +34,7 @@ export global Theme {
     // lit rim along the top edge, and a backdrop worth seeing through to.
     out property <brush> glass: dark ? #ffffff0a : #ffffffd9;
     out property <brush> glass-raised: dark ? #ffffff14 : #ffffffef;
-    out property <brush> rim: dark ? #ffffff1f : #ffffff;
+    out property <brush> rim: dark ? #ffffff33 : #ffffff;
     out property <brush> backdrop-top: dark ? #16202e : #eef2f7;
     out property <brush> backdrop-bottom: dark ? #06080b : #dfe5ec;
 
@@ -47,6 +47,14 @@ export global Theme {
     // a length even when it is nearly empty.
     out property <brush> track: dark ? #2b313a : #d2d9e2;
 
+    // What a modal lays over the window behind it.
+    //
+    // Themed, because the same black at 50% that reads as a dimmed room in
+    // dark reads as a bruise over a white one. Light gets a lighter veil with
+    // a trace of the page's own blue in it, so the dialog sits on the app
+    // rather than on a hole cut in it.
+    out property <brush> scrim: dark ? #00000080 : #1d2a3a4d;
+
     out property <brush> border: dark ? #ffffff14 : #e3e7ed;
     out property <brush> border-strong: dark ? #2f3640 : #ccd3dc;
 
@@ -54,10 +62,17 @@ export global Theme {
     // there to be found when looked for.
     out property <brush> text: dark ? #eef1f5 : #12161c;
     out property <brush> dim: dark ? #9aa4b2 : #5b6572;
-    out property <brush> faint: dark ? #5d6673 : #8d97a5;
+    // The third weight of ink. Lifted from #5d6673: it was carrying real
+    // content on about thirty call sites — durations, quality badges, the
+    // transport clock — and failing AA against the surfaces it sits on. Still
+    // clearly the quietest of the three, which is the job.
+    out property <brush> faint: dark ? #828d9c : #6e7785;
 
     // Azzurro, which is the whole reason for the name.
-    out property <brush> accent: dark ? #38bdf8 : #0284c7;
+    // Azzurro, which is the whole reason for the name. The light value is a
+    // step darker than the obvious one because #0284c7 on white is 3.9:1 —
+    // under AA for the small text that carries it.
+    out property <brush> accent: dark ? #38bdf8 : #0673ad;
     out property <brush> accent-hover: dark ? #7dd3fc : #0369a1;
     out property <brush> accent-ink: dark ? #04212e : #ffffff;
     out property <brush> accent-soft: dark ? #38bdf826 : #0284c714;
@@ -68,6 +83,20 @@ export global Theme {
     out property <length> gap: 8px;
     out property <length> pad: 12px;
     out property <length> room: 18px;
+
+    // Motion, as three durations with a rule each. The app had thirty-odd
+    // animations and twenty-one of them were the same hover fade, so what
+    // existed was a habit rather than a vocabulary.
+    //
+    // `quick` answers a pointer: hover, press, a control changing state. It
+    // must stay short — a control that lags its press feels broken, and that
+    // matters more than elegance.
+    // `settle` is for content arriving from somewhere else: art, rows, a pane
+    // changing. Long enough to be seen as motion rather than a flicker.
+    // `ambient` is for the wash and anything else nobody is looking at.
+    out property <duration> quick: 120ms;
+    out property <duration> settle: 220ms;
+    out property <duration> ambient: 600ms;
 
     out property <length> radius: 12px;
     out property <length> radius-small: 8px;
@@ -82,6 +111,10 @@ export global Theme {
     // Type. The display size is for the one line that matters — what is
     // playing — and everything else steps down from the body size.
     out property <length> display-size: 21px;
+    // A pane's own title. Discovered independently at three call sites as
+    // `title-size + 2px` before it had a name here, which is what a missing
+    // step in a scale looks like: 21 to 15 is a 1.4 jump with nothing in it.
+    out property <length> heading-size: 17px;
     out property <length> title-size: 15px;
     out property <length> body-size: 13px;
     out property <length> small-size: 11.5px;

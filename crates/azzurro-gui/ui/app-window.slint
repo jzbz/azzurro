@@ -189,12 +189,24 @@ export struct SettingItem {
 }
 
 component SectionLabel inherits Text {
+    // Whether this heading is the player's words rather than the app's.
+    //
+    // The treatment below is built for uppercase: at 10.5px, weight 700 and
+    // +0.8px of tracking say "label" only when there are no lowercase letters
+    // to be spaced apart. Four of these carry prose off the wire — "Network",
+    // "Playlists", a service's own section names — and letterspaced Title Case
+    // reads as a mistake rather than as a label. Uppercasing it here was the
+    // other option and is the wrong one: the app does not put words in the
+    // player's mouth, and a section called "BBC Sounds" is not called
+    // "BBC SOUNDS".
+    in property <bool> prose: false;
+
     font-size: Theme.micro-size;
-    font-weight: 700;
+    font-weight: root.prose ? 600 : 700;
     color: Theme.faint;
     // Small caps are not available, so the spacing does the work of saying
     // "this is a label, not content".
-    letter-spacing: 0.8px;
+    letter-spacing: root.prose ? 0px : 0.8px;
 }
 
 component SettingRow inherits Rectangle {
@@ -223,7 +235,7 @@ component SettingRow inherits Rectangle {
             && touch.has-hover
         ? Theme.hover
         : transparent;
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
     // Dimmed rather than hidden: the player put it there, and a gap where a
     // setting should be is more confusing than a grayed one.
     opacity: root.item.available ? 1.0 : 0.45;
@@ -243,6 +255,7 @@ component SettingRow inherits Rectangle {
         alignment: start;
 
         SectionLabel {
+            prose: true;
             text: root.item.label;
             vertical-alignment: bottom;
         }
@@ -439,7 +452,7 @@ component NavRow inherits Rectangle {
     background: root.entry.selected
         ? Theme.selected
         : (touch.has-hover && !root.entry.header ? Theme.hover : transparent);
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     touch := TouchArea {
         enabled: !root.entry.header;
@@ -455,7 +468,7 @@ component NavRow inherits Rectangle {
         y: 6px;
         background: Theme.accent;
         opacity: root.entry.selected ? 1.0 : 0.0;
-        animate opacity { duration: 120ms; }
+        animate opacity { duration: Theme.quick; }
     }
 
     if root.entry.header: HorizontalLayout {
@@ -466,7 +479,7 @@ component NavRow inherits Rectangle {
             alignment: center;
             horizontal-stretch: 1;
 
-            SectionLabel { text: root.entry.label; }
+            SectionLabel { prose: true; text: root.entry.label; }
         }
 
         if root.entry.action != "": VerticalLayout {
@@ -481,7 +494,7 @@ component NavRow inherits Rectangle {
                     : (menu.has-hover ? Theme.hover : transparent);
                 border-width: 1px;
                 border-color: Theme.border;
-                animate background { duration: 120ms; easing: ease-out; }
+                animate background { duration: Theme.quick; easing: ease-out; }
 
                 caption := Text {
                     text: root.entry.action;
@@ -547,7 +560,7 @@ component DeviceCard inherits Rectangle {
     background: root.selected
         ? Theme.selected
         : (touch.has-hover ? Theme.hover : transparent);
-    animate background { duration: 140ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     touch := TouchArea {
         clicked => { root.picked(); }
@@ -564,7 +577,7 @@ component DeviceCard inherits Rectangle {
         border-radius: 1.5px;
         background: Theme.accent;
         opacity: root.selected ? 1.0 : 0.0;
-        animate opacity { duration: 140ms; }
+        animate opacity { duration: Theme.quick; }
     }
 
     VerticalLayout {
@@ -673,7 +686,7 @@ component CustomiseRow inherits Rectangle {
     border-color: root.lifted ? Theme.accent : Theme.border;
     drop-shadow-blur: root.lifted ? 16px : 0px;
     drop-shadow-color: #00000066;
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     touch := TouchArea {
         mouse-cursor: grab;
@@ -767,8 +780,8 @@ component TrackRow inherits Rectangle {
     opacity: root.spent && !root.editing ? 0.5 : 1.0;
     drop-shadow-blur: root.lifted ? 16px : 0px;
     drop-shadow-color: #00000066;
-    animate background { duration: 120ms; easing: ease-out; }
-    animate opacity { duration: 120ms; }
+    animate background { duration: Theme.quick; easing: ease-out; }
+    animate opacity { duration: Theme.quick; }
 
     touch := TouchArea {
         moved => {
@@ -862,7 +875,7 @@ component TrackRow inherits Rectangle {
 
                 format := Text {
                     text: root.track.quality;
-                    font-size: Theme.micro-size - 0.5px;
+                    font-size: Theme.micro-size;
                     font-weight: 700;
                     letter-spacing: 0.4px;
                     color: Theme.faint;
@@ -883,7 +896,7 @@ component TrackRow inherits Rectangle {
                 size: 30px;
                 glyph-size: 15px;
                 opacity: touch.has-hover ? 1.0 : 0.45;
-                animate opacity { duration: 120ms; }
+                animate opacity { duration: Theme.quick; }
                 clicked => {
                     root.open-menu(
                         root.absolute-position.y,
@@ -967,7 +980,7 @@ component BrowseRowView inherits Rectangle {
     background: (root.entry.heading || !root.entry.actionable)
         ? transparent
         : (touch.has-hover ? Theme.hover : transparent);
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     touch := TouchArea {
         // Also where the row only has a menu. A row that leads nowhere but
@@ -997,6 +1010,7 @@ component BrowseRowView inherits Rectangle {
         alignment: start;
 
         SectionLabel {
+            prose: true;
             text: root.entry.title;
             vertical-alignment: bottom;
         }
@@ -1039,7 +1053,12 @@ component BrowseRowView inherits Rectangle {
                 if root.entry.is-glyph: Rectangle {
                     width: 36px;
                     height: 36px;
-                    border-radius: 5px;
+                    // The same shape and ground as the Artwork below, which is
+                    // its alternative in this slot. They were 5px on `raised`
+                    // against 6px on `sunken`, so a shelf mixing inputs with
+                    // albums drew two different tiles for the same thing —
+                    // most visible on Home, where they sit side by side.
+                    border-radius: Theme.radius-art;
                     background: Theme.raised;
 
                     Icon {
@@ -1051,6 +1070,7 @@ component BrowseRowView inherits Rectangle {
                 }
 
                 if !root.entry.is-glyph: Artwork {
+                    well: Theme.raised;
                     source: root.entry.cover;
                     // A note rather than a radio: most of what reaches this
                     // fallback is a library row whose art has not arrived, and
@@ -1071,7 +1091,7 @@ component BrowseRowView inherits Rectangle {
                     border-radius: 5px;
                     background: #000000b8;
                     opacity: touch.has-hover ? 1.0 : 0.0;
-                    animate opacity { duration: 120ms; easing: ease-out; }
+                    animate opacity { duration: Theme.quick; easing: ease-out; }
 
                     Icon {
                         // See the tile: a triangle looks off in a centred box.
@@ -1120,7 +1140,7 @@ component BrowseRowView inherits Rectangle {
 
                 grade := Text {
                     text: root.entry.quality;
-                    font-size: Theme.micro-size - 0.5px;
+                    font-size: Theme.micro-size;
                     font-weight: 700;
                     letter-spacing: 0.4px;
                     color: Theme.faint;
@@ -1141,7 +1161,7 @@ component BrowseRowView inherits Rectangle {
                 size: 34px;
                 glyph-size: 16px;
                 opacity: touch.has-hover ? 1.0 : 0.5;
-                animate opacity { duration: 120ms; }
+                animate opacity { duration: Theme.quick; }
                 clicked => {
                     root.open-menu(
                         root.absolute-position.y,
@@ -1186,7 +1206,7 @@ component BrowseTile inherits Rectangle {
     height: 6px + 116px + 7px + caption.preferred-height + 6px;
     border-radius: Theme.radius-small;
     background: touch.has-hover ? Theme.hover : transparent;
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     // Declared before the contents on purpose. A later sibling sits
     // above an earlier one for hit-testing as well as drawing, so with
@@ -1217,7 +1237,10 @@ component BrowseTile inherits Rectangle {
 
         Rectangle {
             height: 116px;
-            border-radius: 7px;
+            // Matched to the artwork it clips. At 7px against the cover's 8px
+            // the parent was the rounder of the two, so it shaved the corners
+            // off every sleeve on a shelf.
+            border-radius: 8px;
             background: Theme.raised;
             clip: true;
 
@@ -1229,9 +1252,10 @@ component BrowseTile inherits Rectangle {
             }
 
             if !root.entry.is-glyph: Artwork {
+                well: Theme.raised;
                 source: root.entry.cover;
                 fallback: Icons.track;
-                corner: 7px;
+                corner: 8px;
                 width: parent.width;
                 height: parent.height;
                 crop: false;
@@ -1250,7 +1274,7 @@ component BrowseTile inherits Rectangle {
                 border-radius: self.height / 2;
                 background: #000000a6;
                 opacity: touch.has-hover || dots.has-hover ? 1.0 : 0.0;
-                animate opacity { duration: 120ms; }
+                animate opacity { duration: Theme.quick; }
 
                 Icon {
                     glyph: Icons.menu;
@@ -1287,7 +1311,7 @@ component BrowseTile inherits Rectangle {
                 border-radius: self.height / 2;
                 background: #000000b8;
                 opacity: touch.has-hover ? 1.0 : 0.0;
-                animate opacity { duration: 120ms; easing: ease-out; }
+                animate opacity { duration: Theme.quick; easing: ease-out; }
 
                 Icon {
                     // Nudged right by an eighth of its width: a triangle's
@@ -1363,7 +1387,7 @@ component ServiceChip inherits Rectangle {
         : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : Theme.raised));
     border-width: 1px;
     border-color: root.entry.selected ? Theme.accent : Theme.border;
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     HorizontalLayout {
         alignment: center;
@@ -1419,7 +1443,7 @@ component SearchField inherits Rectangle {
     background: Theme.sunken;
     border-width: 1px;
     border-color: input.has-focus ? Theme.accent : Theme.border;
-    animate border-color { duration: 120ms; easing: ease-out; }
+    animate border-color { duration: Theme.quick; easing: ease-out; }
 
     HorizontalLayout {
         padding-left: Theme.pad;
@@ -1530,7 +1554,7 @@ component BrowseBlockView inherits VerticalLayout {
         height: 52px;
         border-radius: Theme.radius-small;
         background: into.has-hover ? Theme.hover : transparent;
-        animate background { duration: 120ms; easing: ease-out; }
+        animate background { duration: Theme.quick; easing: ease-out; }
 
         HorizontalLayout {
             padding-left: Theme.pad;
@@ -1572,7 +1596,7 @@ component BrowseBlockView inherits VerticalLayout {
             alignment: center;
             horizontal-stretch: 1;
 
-            SectionLabel { text: root.block.title; }
+            SectionLabel { prose: true; text: root.block.title; }
         }
 
         if root.block.action != "": VerticalLayout {
@@ -1587,7 +1611,7 @@ component BrowseBlockView inherits VerticalLayout {
                     : (shelf.has-hover ? Theme.hover : transparent);
                 border-width: 1px;
                 border-color: Theme.border;
-                animate background { duration: 120ms; easing: ease-out; }
+                animate background { duration: Theme.quick; easing: ease-out; }
 
                 more := Text {
                     text: root.block.action;
@@ -1878,7 +1902,7 @@ export component AppWindow inherits Window {
             root.cover-tint.with-alpha(0.10) 38%,
             transparent 72%);
         opacity: root.has-tint ? 1.0 : 0.0;
-        animate opacity { duration: 600ms; easing: ease-out; }
+        animate opacity { duration: Theme.ambient; easing: ease-out; }
     }
 
     VerticalLayout {
@@ -2001,7 +2025,7 @@ export component AppWindow inherits Window {
 
                         Text {
                             text: root.browse-title;
-                            font-size: Theme.title-size + 2px;
+                            font-size: Theme.heading-size;
                             font-weight: 600;
                             color: Theme.text;
                             horizontal-alignment: center;
@@ -2028,7 +2052,7 @@ export component AppWindow inherits Window {
                                     : (swap.has-hover ? Theme.hover : transparent);
                                 border-width: 1px;
                                 border-color: Theme.border;
-                                animate background { duration: 120ms; easing: ease-out; }
+                                animate background { duration: Theme.quick; easing: ease-out; }
 
                                 HorizontalLayout {
                                     alignment: center;
@@ -2194,7 +2218,7 @@ export component AppWindow inherits Window {
                                         : (forget.has-hover ? Theme.hover : transparent);
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    animate background { duration: 120ms; easing: ease-out; }
+                                    animate background { duration: Theme.quick; easing: ease-out; }
 
                                     wipe := Text {
                                         text: "CLEAR";
@@ -2262,7 +2286,7 @@ export component AppWindow inherits Window {
                         Artwork {
                             source: root.browse-header-cover;
                             fallback: Icons.album;
-                            corner: Theme.radius;
+                            corner: 10px;
                             width: 160px;
                             height: 160px;
                         }
@@ -2492,7 +2516,7 @@ export component AppWindow inherits Window {
                         opacity: root.indexing != "" ? 1.0 : 0.0;
 
                         animate height, opacity {
-                            duration: 200ms;
+                            duration: Theme.settle;
                             easing: ease-out;
                         }
 
@@ -2558,7 +2582,7 @@ export component AppWindow inherits Window {
                     visible: self.opacity > 0.0;
 
                     animate opacity {
-                        duration: 220ms;
+                        duration: Theme.settle;
                         easing: ease-out;
                     }
 
@@ -2613,7 +2637,7 @@ export component AppWindow inherits Window {
 
                             Text {
                                 text: "Now Playing";
-                                font-size: Theme.title-size + 2px;
+                                font-size: Theme.heading-size;
                                 font-weight: 600;
                                 color: Theme.text;
                                 horizontal-alignment: center;
@@ -2682,7 +2706,7 @@ export component AppWindow inherits Window {
                                             root.cover-tint.with-alpha(0.09) 40%,
                                             transparent 68%);
                                         opacity: root.has-tint ? 1.0 : 0.0;
-                                        animate opacity { duration: 600ms; easing: ease-out; }
+                                        animate opacity { duration: Theme.ambient; easing: ease-out; }
                                     }
 
                                     Artwork {
@@ -2777,7 +2801,7 @@ export component AppWindow inherits Window {
                     visible: self.opacity > 0.0;
 
                     animate opacity {
-                        duration: 220ms;
+                        duration: Theme.settle;
                         easing: ease-out;
                     }
 
@@ -2820,7 +2844,7 @@ export component AppWindow inherits Window {
 
                                 Text {
                                     text: root.customise-title;
-                                    font-size: Theme.title-size + 2px;
+                                    font-size: Theme.heading-size;
                                     font-weight: 600;
                                     color: Theme.text;
                                     vertical-alignment: center;
@@ -2930,7 +2954,7 @@ export component AppWindow inherits Window {
                 clip: true;
 
                 animate width {
-                    duration: 200ms;
+                    duration: Theme.settle;
                     easing: ease-in-out;
                 }
 
@@ -3286,7 +3310,7 @@ export component AppWindow inherits Window {
                     root.cover-tint.with-alpha(0.14) 0%,
                     transparent 60%);
                 opacity: root.has-tint ? 1.0 : 0.0;
-                animate opacity { duration: 400ms; easing: ease-out; }
+                animate opacity { duration: Theme.ambient; easing: ease-out; }
             }
 
             Rectangle {
@@ -3354,7 +3378,7 @@ export component AppWindow inherits Window {
                                 text: !root.has-selection
                                     ? "No player selected"
                                     : (root.current.title == "" ? "Nothing playing" : root.current.title);
-                                font-size: Theme.body-size + 1px;
+                                font-size: Theme.title-size;
                                 font-weight: 600;
                                 color: Theme.text;
                                 overflow: elide;
@@ -3385,7 +3409,7 @@ export component AppWindow inherits Window {
 
                                         format := Text {
                                             text: root.quality;
-                                            font-size: Theme.micro-size - 1px;
+                                            font-size: Theme.micro-size;
                                             font-weight: 700;
                                             letter-spacing: 0.4px;
                                             color: Theme.faint;
@@ -3532,7 +3556,7 @@ export component AppWindow inherits Window {
                                     : (pick.has-hover ? Theme.glass-raised : Theme.raised);
                                 border-width: 1px;
                                 border-color: Theme.border;
-                                animate background { duration: 120ms; easing: ease-out; }
+                                animate background { duration: Theme.quick; easing: ease-out; }
 
                                 HorizontalLayout {
                                     alignment: center;
@@ -3740,7 +3764,7 @@ export component AppWindow inherits Window {
         visible: self.opacity > 0.0;
 
         animate opacity {
-            duration: 140ms;
+            duration: Theme.quick;
             easing: ease-out;
         }
 
@@ -3763,7 +3787,7 @@ export component AppWindow inherits Window {
                 + (root.queue-menu-open ? 0px : 10px);
 
             animate y {
-                duration: 140ms;
+                duration: Theme.quick;
                 easing: ease-out;
             }
             width: 320px;
@@ -3884,7 +3908,7 @@ export component AppWindow inherits Window {
     // the wire. Dismissing runs no action, which is what its `closeAction` of
     // type `nil` asks for.
     if root.dialog-open: Rectangle {
-        background: #00000080;
+        background: Theme.scrim;
 
         TouchArea {
             clicked => { root.dialog-press(-1); }
@@ -3939,7 +3963,7 @@ export component AppWindow inherits Window {
     }
 
     if root.update-notice != "": Rectangle {
-        background: #00000080;
+        background: Theme.scrim;
 
         // Dismissable by clicking away, unlike the install question below:
         // this one is an offer, and ignoring an offer should be easy.
@@ -4011,7 +4035,7 @@ export component AppWindow inherits Window {
     }
 
     if root.confirm-upgrade != "": Rectangle {
-        background: #00000080;
+        background: Theme.scrim;
 
         // No dismiss-by-scrim here, unlike the input question below. Answering
         // this one by clicking past it is not a thing to make easy.
@@ -4080,7 +4104,7 @@ export component AppWindow inherits Window {
     }
 
     if root.confirm-input != "": Rectangle {
-        background: #00000080;
+        background: Theme.scrim;
 
         TouchArea {
             clicked => {
@@ -4178,7 +4202,7 @@ export component AppWindow inherits Window {
         visible: self.opacity > 0.0;
 
         animate opacity {
-            duration: 160ms;
+            duration: Theme.quick;
             easing: ease-out;
         }
 
@@ -4196,7 +4220,7 @@ export component AppWindow inherits Window {
             - self.height - Theme.pad;
 
         animate y {
-            duration: 200ms;
+            duration: Theme.settle;
             easing: ease-out;
         }
         width: Math.min(line.preferred-width, parent.width - 2 * Theme.room);

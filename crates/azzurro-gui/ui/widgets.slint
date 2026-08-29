@@ -51,10 +51,10 @@ export component IconButton inherits Rectangle {
 
     // Short enough not to lag the pointer, long enough not to flicker on a
     // list where the pointer crosses several rows at once.
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
 
     opacity: root.enabled ? 1.0 : (root.primary ? 0.72 : 0.35);
-    animate opacity { duration: 120ms; }
+    animate opacity { duration: Theme.quick; }
 
     Icon {
         glyph: root.glyph;
@@ -91,7 +91,7 @@ export component PillButton inherits Rectangle {
         : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent));
     border-width: root.primary ? 0px : 1px;
     border-color: Theme.border;
-    animate background { duration: 120ms; easing: ease-out; }
+    animate background { duration: Theme.quick; easing: ease-out; }
     opacity: root.enabled ? 1.0 : 0.35;
 
     content := HorizontalLayout {
@@ -154,7 +154,7 @@ export component Segmented inherits Rectangle {
             background: root.index == i
                 ? Theme.raised
                 : (segment.has-hover ? Theme.hover : transparent);
-            animate background { duration: 120ms; easing: ease-out; }
+            animate background { duration: Theme.quick; easing: ease-out; }
 
             HorizontalLayout {
                 alignment: center;
@@ -330,7 +330,7 @@ export component Scrubber inherits Rectangle {
         border-radius: self.height / 2;
         background: Theme.accent;
         opacity: root.enabled && (touch.has-hover || root.dragging) ? 1.0 : 0.0;
-        animate opacity { duration: 100ms; }
+        animate opacity { duration: Theme.quick; }
 
         // The same glide the fill has. Without it the handle stepped once a
         // second while the line beside it slid, so hovering a playing track
@@ -543,7 +543,7 @@ export component Artwork inherits Rectangle {
         // withheld — this is the difference between a picture appearing and a
         // picture being switched on.
         opacity: root.source.width > 0 ? 1.0 : 0.0;
-        animate opacity { duration: 220ms; easing: ease-out; }
+        animate opacity { duration: Theme.settle; easing: ease-out; }
     }
 }
 
@@ -843,7 +843,7 @@ export component DayPicker inherits HorizontalLayout {
         border-width: 1px;
         border-color: root.days[i] ? transparent : Theme.border;
         opacity: root.enabled ? 1.0 : 0.45;
-        animate background { duration: 120ms; easing: ease-out; }
+        animate background { duration: Theme.quick; easing: ease-out; }
 
         Text {
             text: letter;
