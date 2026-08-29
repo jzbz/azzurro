@@ -400,6 +400,56 @@ document is read from 11001, and a write goes back to **11000** — posting it t
 where the document came from answers 404. Confirmed by writing a setting the
 value it already held, then a different one, and watching it change and revert.
 
+### A grouped list continues as a document of its own
+
+**Confirmed.** A long library list — Artists, 448 of them — is served behind an
+alphabet index, and its `<nextLink>` points at `/ui/browseGrouped?…&
+listContinuation=30&…`. What comes back has **no `<screen>` around it**:
+
+```xml
+<list offset="30" total="448">
+  <index revision="223">
+    <item key="#" offset="0" length="6"></item>
+    <item key="B" offset="28" length="35"></item>
+  </index>
+  <item title="Bach">…</item>
+  <nextLink>/ui/browseGrouped?…&amp;listContinuation=60&amp;…</nextLink>
+</list>
+```
+
+So `<list>` is a root element alongside `<screen>`, `<contextMenu>` and
+`<queue>`. A parser that insists on one of those three reads every continuation
+as malformed, and such a list can never be paged at all — thirty of four
+hundred and forty-eight, with a cursor pointing at a page nothing will read.
+
+Two details worth having. The `<index>` items are somewhere to scroll to rather
+than rows to draw — no title, no action — so they must not become rows. And
+`total` is here, which most screens do not give: a grouped list is the one place
+paging has an absolute end rather than only an opaque cursor.
+
+`listContinuation` advances by the page size, and a Powernode on 4.16.22 pages
+this list in 30s: fourteen requests, the last bringing 28.
+
+**And some lists count instead of pointing.** A library's Songs answers
+
+```xml
+<list offset="0" total="2062">
+```
+
+with thirty rows and **no `<nextLink>` at all**. It is not unpaged — asking for
+the same URL with `&listContinuation=30` returns `<list offset="30"
+total="2062">` and the next thirty. The client is expected to do the
+arithmetic: `offset` plus the rows it got, until `total`.
+
+So there are two paging protocols on the same routes, and a client needs both:
+follow the cursor where there is one, count where there is not. Which a list
+uses is not something to infer from its name — Artists points and Songs counts,
+on the same `/ui/browseGrouped` endpoint.
+
+Lists the player does not page at all give neither: Genres answers all 175 in
+one `<list>` with no `offset`, no `total` and no cursor. Absence of a total is
+the signal that a list is whole, and must not be turned into a request.
+
 ### The UI context is the client's to carry
 
 **Confirmed.** A screen can offer a `selectorMenu` — Radio Paradise's is

@@ -2594,6 +2594,24 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        // And on the list's own height, the same as the queue.
+                        // A page of thirty usually overflows the pane and there
+                        // is something to scroll, which is why this was never
+                        // missed — but a page that does not fill it leaves
+                        // nothing to scroll, and a scroll-only trigger can then
+                        // never fire again. The rest of the list is stranded
+                        // with a cursor pointing straight at it.
+                        //
+                        // Safe to chain only because `next_after_page` now
+                        // stops on a page that brought nothing and on a cursor
+                        // that repeats itself. Scrolling hid both, a person
+                        // being the thing that gets bored and stops.
+                        changed viewport-height => {
+                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                root.browse-more();
+                            }
+                        }
+
                         for block in root.browse-blocks: BrowseBlockView {
                             block: block;
                             activate(i) => { root.browse-activate(i); }

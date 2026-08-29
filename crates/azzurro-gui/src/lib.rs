@@ -5004,7 +5004,14 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
     };
 
     match client.screen(&uri).await {
-        Ok(screen) => {
+        Ok(mut screen) => {
+            // A list that counts rather than points — a library's Songs, 2062
+            // of them — gives a total and no cursor. Work one out here, once,
+            // so everything downstream sees a screen that knows where the rest
+            // of itself is and nothing else has to care which kind it was.
+            if screen.next.is_none() {
+                screen.next = bluos::screen::continuation(&uri, &screen);
+            }
             {
                 let mut browsing = backend.browsing.lock().unwrap();
 
@@ -5116,6 +5123,29 @@ fn item_at<'a>(
         }
     }
     None
+}
+
+/// The cursor a screen should carry once a page has arrived.
+///
+/// `None` stops the paging. Two ways a list can say it is finished without
+/// saying so, and both are loops once anything but a scroll can ask for the
+/// next page:
+///
+/// - a page that brought no rows, still carrying a cursor. There is nothing
+///   further to graft and asking again gets the same nothing.
+/// - a page whose cursor is the one that was just asked for. That is the
+///   player repeating itself, and following it walks the same page forever.
+///
+/// Neither showed while only scrolling could ask, because a person stops
+/// scrolling. The height trigger does not get bored.
+fn next_after_page(asked: &str, arrived: Option<String>, brought: usize) -> Option<String> {
+    if brought == 0 {
+        return None;
+    }
+    match arrived {
+        Some(cursor) if cursor == asked => None,
+        other => other,
+    }
 }
 
 /// Do whatever row `index` of the current screen says to do.
@@ -8600,6 +8630,18 @@ async fn run_commands(
                                     return;
                                 };
                                 had = crumb.screen.items().count();
+
+                                // Worked out before the page is taken apart,
+                                // because it needs the page's own rows.
+                                //
+                                // A list that counts rather than points — a
+                                // library's Songs, 2062 of them — gives a
+                                // total and no cursor, so the next request is
+                                // arithmetic rather than something to follow.
+                                // One that points is left to its own cursor.
+                                let pointed = more.next.clone();
+                                let counted = bluos::screen::continuation(&crumb.uri, &more);
+
                                 // Added to the section already on screen rather
                                 // than as one of its own: it is the same list,
                                 // continued, and a heading between page one and
@@ -8610,17 +8652,48 @@ async fn run_commands(
                                     .into_iter()
                                     .flat_map(|section| section.items)
                                     .collect();
+                                let brought = arriving.len();
                                 if let Some(section) = crumb.screen.sections.last_mut() {
                                     section.items.extend(arriving);
                                 }
-                                crumb.screen.next = more.next;
+                                let onward = next_after_page(&next, pointed.or(counted), brought);
+                                tracing::debug!(
+                                    %id,
+                                    brought,
+                                    total = had + brought,
+                                    stopping = onward.is_none(),
+                                    "grew the screen"
+                                );
+                                crumb.screen.next = onward;
                             }
                             backend.publish_browse();
                             tokio::spawn(load_browse_thumbnails(backend.clone(), id, had));
                         }
                         Err(e) => {
-                            backend.browsing.lock().unwrap().fetching_more = false;
-                            tracing::debug!(%id, "could not read {next}: {e}");
+                            // Take the cursor away, or the list asks for the
+                            // same page forever.
+                            //
+                            // Clearing `fetching_more` and leaving `next` alone
+                            // was survivable while only a scroll could ask: one
+                            // gesture, one failed fetch, and a person who gives
+                            // up. Anything that re-asks on its own turns it into
+                            // a hot loop against the player — 94 requests for
+                            // one unparseable continuation, measured.
+                            //
+                            // Cleared on any error, not only a parse failure. A
+                            // timeout might have succeeded on a retry, and the
+                            // price of not retrying is that the rest of this
+                            // list waits until it is opened again; the price of
+                            // retrying blind is a loop nobody can see.
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            browsing.fetching_more = false;
+                            if browsing.era == era
+                                && let Some(crumb) = browsing.trail.last_mut()
+                            {
+                                crumb.screen.next = None;
+                            }
+                            drop(browsing);
+                            tracing::debug!(%id, "could not read {next}, so no more of it: {e}");
                         }
                     }
                 });
@@ -9530,6 +9603,39 @@ mod tests {
         assert_eq!(quality_label("mqa"), "MQA");
         assert_eq!(quality_label(""), "");
         assert_eq!(quality_label("  "), "");
+    }
+
+    #[test]
+    fn a_page_that_brought_rows_keeps_paging() {
+        assert_eq!(
+            next_after_page("/ui/x?page=2", Some("/ui/x?page=3".to_owned()), 30),
+            Some("/ui/x?page=3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_page_that_brought_nothing_is_the_end() {
+        // Even when the player hands over another cursor. Asking again gets
+        // the same nothing, and with a height trigger that is a loop.
+        assert_eq!(
+            next_after_page("/ui/x?page=9", Some("/ui/x?page=10".to_owned()), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_repeats_itself_is_the_end() {
+        // The player pointing at the page just fetched. Following it walks the
+        // same rows forever.
+        assert_eq!(
+            next_after_page("/ui/x?page=4", Some("/ui/x?page=4".to_owned()), 30),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_cursor_is_the_end_as_it_always_was() {
+        assert_eq!(next_after_page("/ui/x?page=4", None, 30), None);
     }
 
     #[test]

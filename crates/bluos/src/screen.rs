@@ -78,6 +78,14 @@ pub struct Screen {
     /// forty-eight and hands over the request for the next thirty. Without
     /// following it there is no way to reach the four hundred and eighteen.
     pub next: Option<String>,
+    /// Where this page starts and how long the whole list is, when the list
+    /// says so: `<list offset="30" total="448">`.
+    ///
+    /// Some lists count instead of pointing. A library's Songs answers
+    /// `total="2062"` and **no `<nextLink>` at all**, and expects the client to
+    /// ask for the next page by number. See [`continuation`].
+    pub offset: Option<u32>,
+    pub total: Option<u32>,
     pub sections: Vec<Section>,
 }
 
@@ -698,7 +706,25 @@ fn start(
 
         // A <list> is a section on its own, but only when it is not already
         // inside a row that is grouping it.
+        //
+        // It is also a document in its own right. The continuation of a grouped
+        // list — a library's Artists, four hundred names behind an alphabet —
+        // answers `<list offset="30" total="448">` with no `<screen>` around
+        // it, and rejecting that meant such a list could not be paged at all:
+        // thirty of four hundred and forty-eight, and a cursor pointing at a
+        // page nothing would read.
         "list" => {
+            if stack.is_empty() {
+                *seen_screen = true;
+            }
+            // Kept whichever level the list is at: a grouped list is the root
+            // of its own document, and a plain one sits inside a <screen>.
+            if let Some(offset) = a.remove("offset").and_then(|v| v.parse().ok()) {
+                screen.offset = Some(offset);
+            }
+            if let Some(total) = a.remove("total").and_then(|v| v.parse().ok()) {
+                screen.total = Some(total);
+            }
             if section.is_some() {
                 stack.push(Ctx::NestedList);
             } else {
@@ -1094,6 +1120,63 @@ impl Configuration {
     }
 }
 
+/// The request for the next page of a list that counts rather than points.
+///
+/// Most long lists hand over a `<nextLink>` and a client only has to follow
+/// it. A library's Songs does not: it answers `<list offset="0" total="2062">`
+/// with thirty rows and no cursor at all, and expects the next page to be
+/// asked for by number — the same URL with `listContinuation` set to where the
+/// last page ended.
+///
+/// `uri` is the request that produced `screen`; the continuation is that URL
+/// with `listContinuation` replaced or added.
+///
+/// `None` when there is nothing more to ask for, which is every case but the
+/// one this exists for: a list that points rather than counts, a list that
+/// gave no total, a page that reached the end, or an empty page — the last
+/// mattering because a caller that re-asks on its own would otherwise never
+/// stop.
+///
+/// This is the one place in this crate that builds a request the player did
+/// not offer. It is arithmetic on two numbers the player *did* give, on a URL
+/// the player itself supplied, which is the narrowest form that can work.
+pub fn continuation(uri: &str, screen: &Screen) -> Option<String> {
+    if screen.next.is_some() {
+        return None;
+    }
+    let total = screen.total?;
+    let offset = screen.offset.unwrap_or(0);
+    let held = screen.items().count() as u32;
+    if held == 0 {
+        return None;
+    }
+    let reached = offset.saturating_add(held);
+    if reached >= total {
+        return None;
+    }
+    Some(with_continuation(uri, reached))
+}
+
+/// `uri` with `listContinuation` set to `at`, replacing any it already has.
+fn with_continuation(uri: &str, at: u32) -> String {
+    let (path, query) = match uri.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => return format!("{uri}?listContinuation={at}"),
+    };
+
+    let mut parts: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map(|(n, _)| n).unwrap_or(pair);
+            name != "listContinuation"
+        })
+        .map(str::to_owned)
+        .collect();
+    parts.push(format!("listContinuation={at}"));
+    format!("{path}?{}", parts.join("&"))
+}
+
 #[cfg(test)]
 mod starts_playing_tests {
     use super::starts_playing;
@@ -1152,6 +1235,121 @@ mod starts_playing_tests {
 
 #[cfg(test)]
 mod tests {
+
+    fn counted(offset: u32, total: u32, rows: usize) -> Screen {
+        let items: Vec<Item> = (0..rows)
+            .map(|i| Item {
+                title: Some(format!("row {i}")),
+                ..Item::default()
+            })
+            .collect();
+        Screen {
+            offset: Some(offset),
+            total: Some(total),
+            sections: vec![Section {
+                items,
+                ..Section::default()
+            }],
+            ..Screen::default()
+        }
+    }
+
+    #[test]
+    fn a_list_that_counts_asks_for_the_next_page_by_number() {
+        // A library's Songs: 2062 of them, thirty at a time, no cursor.
+        let uri = "/ui/browseGrouped?browseIndex=2&service=LocalMusic&type=Song";
+        assert_eq!(
+            continuation(uri, &counted(0, 2062, 30)).as_deref(),
+            Some(
+                "/ui/browseGrouped?browseIndex=2&service=LocalMusic&type=Song&listContinuation=30"
+            )
+        );
+    }
+
+    #[test]
+    fn the_number_replaces_the_one_already_there() {
+        // Otherwise the second page would carry two and the player would read
+        // whichever it liked.
+        let uri = "/ui/browseGrouped?listContinuation=30&service=LocalMusic";
+        assert_eq!(
+            continuation(uri, &counted(30, 2062, 30)).as_deref(),
+            Some("/ui/browseGrouped?service=LocalMusic&listContinuation=60")
+        );
+    }
+
+    #[test]
+    fn a_list_that_points_is_left_to_its_cursor() {
+        // Artists gives a nextLink, and following that is not this function's
+        // business — building a number alongside it would ask twice.
+        let mut screen = counted(0, 448, 30);
+        screen.next = Some("/ui/browseGrouped?listContinuation=30".to_owned());
+        assert_eq!(continuation("/ui/browseGrouped", &screen), None);
+    }
+
+    #[test]
+    fn the_end_of_the_list_asks_for_nothing() {
+        assert_eq!(continuation("/ui/x", &counted(2040, 2062, 22)), None);
+        // And past it, which a total that shrank mid-walk would produce.
+        assert_eq!(continuation("/ui/x", &counted(2040, 2062, 30)), None);
+    }
+
+    #[test]
+    fn a_list_with_no_total_is_not_counted() {
+        // Genres sends all 175 in one <list> with no offset and no total. It
+        // is not paged, and must not be asked for a page.
+        let mut screen = counted(0, 0, 175);
+        screen.total = None;
+        screen.offset = None;
+        assert_eq!(continuation("/ui/browseGenres", &screen), None);
+    }
+
+    #[test]
+    fn an_empty_page_asks_for_nothing() {
+        // A caller that re-asks on its own would otherwise never stop.
+        assert_eq!(continuation("/ui/x", &counted(30, 2062, 0)), None);
+    }
+
+    /// The continuation of a grouped list, as a Powernode on 4.16.22 sends it.
+    ///
+    /// No `<screen>` anywhere: the root is the `<list>` itself. Rejecting this
+    /// meant a library's Artists stopped at thirty of four hundred and
+    /// forty-eight, with a cursor pointing at a page nothing would read — and
+    /// the caller, having no page to graft, kept the cursor and asked again.
+    #[test]
+    fn a_grouped_lists_continuation_is_a_document_of_its_own() {
+        // `r##` because the index carries key="#", which ends an `r#` string.
+        const CONTINUATION: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<list offset="30" total="448">
+  <index revision="223">
+    <item key="#" offset="0" length="6"></item>
+    <item key="B" offset="28" length="35"></item>
+  </index>
+  <item title="Bach">
+    <action type="browse" URI="/ui/browseContext?service=LocalMusic&amp;title=Bach" resultType="screen" title="Bach" service="LocalMusic"></action>
+    <contextMenu type="browse" URI="/ui/ContextMenu?artist=Bach" resultType="contextMenu"></contextMenu>
+  </item>
+  <item title="Bachman-Turner Overdrive">
+    <action type="browse" URI="/ui/browseContext?service=LocalMusic&amp;title=Bachman-Turner+Overdrive" resultType="screen" title="Bachman-Turner Overdrive" service="LocalMusic"></action>
+  </item>
+  <nextLink>/ui/browseGrouped?browseIndex=0&amp;listContinuation=60&amp;service=LocalMusic</nextLink>
+</list>"##;
+
+        let screen = parse(CONTINUATION).expect("a bare <list> is a document");
+
+        let titles: Vec<&str> = screen.items().filter_map(|i| i.label()).collect();
+        assert_eq!(
+            titles,
+            vec!["Bach", "Bachman-Turner Overdrive"],
+            "the alphabet index is somewhere to scroll to, not rows to draw"
+        );
+
+        assert_eq!(
+            screen.next.as_deref(),
+            Some("/ui/browseGrouped?browseIndex=0&listContinuation=60&service=LocalMusic"),
+            "the cursor advances, and its entities are resolved"
+        );
+    }
+
     use super::*;
     use crate::Status;
 
