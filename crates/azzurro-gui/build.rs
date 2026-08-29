@@ -28,10 +28,18 @@ fn windows_icon() {
 
     let mut res = winresource::WindowsResource::new();
     res.set_icon("desktop/blue.azzurro.Azzurro.ico");
-    // What Explorer shows under Properties. Without these it says nothing at
-    // all, which reads as something that arrived from nowhere.
+
+    // `FileDescription` is the **name** Windows shows, not a description of
+    // anything: it is what the firewall prompt asks about, what Task Manager
+    // lists under Description, and what a user is deciding to trust. Given a
+    // sentence it shows the sentence — "Windows Firewall has blocked some
+    // features of A controller for BluOS players", which names no application
+    // anybody has heard of. It gets the app's name.
+    res.set("FileDescription", "Azzurro");
     res.set("ProductName", "Azzurro");
-    res.set("FileDescription", "A controller for BluOS players");
+    // The sentence goes here, where Explorer files it under Comments and
+    // nothing mistakes it for a name.
+    res.set("Comments", "A controller for BluOS players");
     res.set("LegalCopyright", "MIT licensed");
 
     // Not fatal. A resource compiler is part of the Windows SDK and is there on

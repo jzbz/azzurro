@@ -2079,6 +2079,16 @@ export component AppWindow inherits Window {
     callback add-player(string);
 
     title: "Azzurro";
+    // The window's own icon, which is not the executable's.
+    //
+    // On Windows the .exe carries an icon resource and that is what the
+    // taskbar and Explorer read — but the one in the title bar comes from the
+    // window itself, and a window that never sets one shows nothing there. The
+    // two are separate and both have to be answered.
+    //
+    // 256px because it is scaled to whatever each place wants: 16 in a title
+    // bar at 100%, twice that at 200%, and larger again in a switcher.
+    icon: @image-url("../desktop/blue.azzurro.Azzurro-256.png");
     // Geist, bundled — see ui/fonts/LICENSE. Bundled rather than asked of the
     // system so the app looks the same however it is installed, which matters
     // more once it ships as a Flatpak with only the runtime's fonts to hand.
