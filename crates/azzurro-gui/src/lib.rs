@@ -872,11 +872,34 @@ fn american(text: &str) -> String {
 /// hi-fi. Everything else is already the abbreviation it should be: `cd`,
 /// `mqa`.
 fn quality_label(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let raw = raw.trim();
+    match raw.to_ascii_lowercase().as_str() {
         "" => String::new(),
         "hd" => "HR".to_owned(),
-        other => other.to_ascii_uppercase(),
+        _ => kilobits(raw).unwrap_or_else(|| raw.to_ascii_uppercase()),
     }
+}
+
+/// A bitrate in this field, rendered the way anyone writes one.
+///
+/// The field carries two different kinds of value. A library track gets a
+/// tier — `cd`, `hd`, `mqa` — and an HTTP stream gets its bitrate in bits per
+/// second instead, so the badge that reads CD on a file read `128000` on a
+/// station.
+///
+/// Kilobits are a thousand bits and not 1024 of them: the player's own words
+/// for the stream that produced `128000` are `MP3 128 kb/s`. Dividing by 1024
+/// would render `125k`, which is wrong in a way nobody would ever catch.
+///
+/// `None` for anything that is not a plain number large enough to be a
+/// bitrate, so a value neither this nor the player has seen before falls
+/// through to being shown as it arrived rather than as nonsense.
+fn kilobits(raw: &str) -> Option<String> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bits: u64 = raw.parse().ok()?;
+    (bits >= 1000).then(|| format!("{}k", bits / 1000))
 }
 
 /// Whether this is the same thing the window already has.
@@ -4337,6 +4360,18 @@ impl Backend {
                 .unwrap_or_default(),
         );
 
+        // The player writes its own phrase for this — "MP3 128 kb/s" for a
+        // stream, "FLAC 24/44.1" for a library track — and it says what the
+        // badge cannot: the codec, and the depth and rate behind a tier. Too
+        // long for the badge, so it goes on the line below it, where Now
+        // Playing has the room.
+        let stream_format = snapshot
+            .as_ref()
+            .and_then(|(status, _)| status.stream_format.as_deref())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+
         let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
             Some(songs) if songs > 0 => {
                 format!("Indexing the music library — {songs} songs so far")
@@ -4402,6 +4437,7 @@ impl Backend {
             ui.set_repeat(repeat);
             ui.set_indexing(indexing.as_str().into());
             ui.set_quality(quality.as_str().into());
+            ui.set_stream_format(stream_format.as_str().into());
         });
     }
 
@@ -9354,5 +9390,37 @@ mod tests {
         assert_eq!(quality_label("mqa"), "MQA");
         assert_eq!(quality_label(""), "");
         assert_eq!(quality_label("  "), "");
+    }
+
+    #[test]
+    fn a_streams_bitrate_is_shown_as_kilobits() {
+        // The same field carries a tier for a file and a bitrate for a
+        // stream, so the badge that reads CD on a track read 128000 on a
+        // station.
+        assert_eq!(quality_label("128000"), "128k");
+        assert_eq!(quality_label("320000"), "320k");
+        assert_eq!(quality_label(" 96000 "), "96k");
+        // Lossless PCM, which is a large number and still a bitrate.
+        assert_eq!(quality_label("1411000"), "1411k");
+    }
+
+    #[test]
+    fn kilobits_are_a_thousand_bits_and_not_1024() {
+        // The player's own words for the stream behind 128000 are
+        // "MP3 128 kb/s". Dividing by 1024 gives 125, which is wrong and
+        // almost impossible to notice.
+        assert_eq!(quality_label("128000"), "128k");
+        assert_ne!(quality_label("128000"), "125k");
+    }
+
+    #[test]
+    fn something_that_is_not_a_bitrate_is_left_as_it_arrived() {
+        // Anything neither this nor the player has seen before is shown as
+        // sent rather than rendered as nonsense.
+        assert_eq!(quality_label("999"), "999", "too small to be a bitrate");
+        assert_eq!(quality_label("dsd"), "DSD");
+        assert_eq!(quality_label("128kbps"), "128KBPS", "not a bare number");
+        assert_eq!(quality_label("-1"), "-1");
+        assert_eq!(quality_label("1.5"), "1.5");
     }
 }

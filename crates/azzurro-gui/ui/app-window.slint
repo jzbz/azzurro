@@ -1873,6 +1873,10 @@ export component AppWindow inherits Window {
     in property <string> indexing: "";
     // What the player says it is decoding: "cd", "hd", "mqa".
     in property <string> quality: "";
+    // The player's own phrase for what it is decoding — "MP3 128 kb/s",
+    // "FLAC 24/44.1". Says what the badge beside it cannot: the codec, and the
+    // depth and rate behind a tier. Shown only where there is room for it.
+    in property <string> stream-format: "";
     // Whether the middle pane is showing the record rather than a screen.
     in property <bool> now-playing: false;
     in property <[BrowseBlock]> browse-blocks;
@@ -3265,6 +3269,25 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+
+                            // Under the badge rather than beside it: the badge
+                            // is a token to be read across a room, and this is
+                            // a sentence to be read up close. Only where the
+                            // player has said something the badge does not
+                            // already carry on its own.
+                            if root.stream-format != "" && root.stream-format != root.quality:
+                                HorizontalLayout {
+                                    alignment: center;
+                                    padding-top: Theme.tight;
+
+                                    Text {
+                                        text: root.stream-format;
+                                        font-size: Theme.small-size;
+                                        color: Theme.faint;
+                                        horizontal-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
                         }
                     }
                     }
