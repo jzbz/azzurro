@@ -20,6 +20,8 @@ The window lists the players it finds and drives them:
 - the player's own settings, served from a second port and rendered from the
   forms the player sends
 - alarms: read, write, schedule, and choose what each one plays
+- radio stations typed in by hand, for the ones no directory carries — kept on
+  this machine, since the player has nowhere to put them
 - firmware upgrades: an offer on the way in, a confirmation, the install
   itself, and a strip that follows it stage by stage
 
@@ -41,7 +43,6 @@ Measured against the official controller, in roughly the order a user notices:
 | **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
 | **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
-| **Custom radio by stream URL** | Radio is whatever the player's browse tree offers. No endpoint for pasting a URL is documented. |
 
 Most of these are UI work over a protocol layer that already reaches the
 endpoint, rather than protocol work waiting to be done.

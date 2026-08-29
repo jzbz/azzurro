@@ -50,6 +50,12 @@ export struct Device {
     upgrade-line: string,
 }
 
+/// One hand-typed radio station.
+export struct MyStation {
+    name: string,
+    url: string,
+}
+
 // One row of the play queue.
 export struct Track {
     id: int,
@@ -706,6 +712,125 @@ component DeviceCard inherits Rectangle {
                 glyph-size: 14px;
                 active: root.device.in-group;
                 clicked => { root.toggle-group(); }
+            }
+        }
+    }
+}
+
+/// One hand-typed station.
+///
+/// Two rows in one, because a station is two different things depending on
+/// what you came here to do. Ordinarily it is a thing to play, so the whole
+/// row is the target and nothing else competes for the press. Under Edit it
+/// stops being pressable at all and becomes a handle, a name you can retype
+/// and a bin — the same three the queue's rows offer, wearing the same icons,
+/// because it is the same gesture.
+component StationRow inherits Rectangle {
+    in property <MyStation> station;
+    in property <bool> editing: false;
+    in property <bool> lifted: false;
+    in property <length> lift: 0px;
+    callback play();
+    callback renamed(string);
+    callback remove();
+    callback drag-moved(length);
+    callback drag-done();
+    callback drag-cancelled();
+
+    property <bool> held: false;
+    // A station saved without a name is shown by its address: an empty row
+    // would be unpressable and unidentifiable at once.
+    property <string> shown: root.station.name == "" ? root.station.url : root.station.name;
+
+    height: 56px;
+    border-radius: Theme.radius-small;
+    background: root.lifted
+        ? Theme.raised
+        : (touch.has-hover || play-touch.has-hover ? Theme.hover : Theme.glass);
+    border-width: 1px;
+    border-color: root.lifted ? Theme.accent : Theme.border;
+    drop-shadow-blur: root.lifted ? 16px : 0px;
+    drop-shadow-color: #00000066;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    // Playing, when that is what a press means. Declared before the drag area
+    // so the drag wins while editing; two touch areas over one row would
+    // otherwise both take the press.
+    play-touch := TouchArea {
+        enabled: !root.editing;
+        mouse-cursor: pointer;
+        clicked => { root.play(); }
+    }
+
+    touch := TouchArea {
+        enabled: root.editing;
+        mouse-cursor: grab;
+        moved => {
+            if (self.pressed && (root.held || Math.abs(self.mouse-y - self.pressed-y) > 4px)) {
+                root.held = true;
+                root.drag-moved(self.mouse-y - self.pressed-y + root.lift);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.up) {
+                if (root.held) {
+                    root.drag-done();
+                }
+                root.held = false;
+            }
+            if (event.kind == PointerEventKind.cancel) {
+                root.drag-cancelled();
+                root.held = false;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.gap;
+        padding-right: Theme.gap;
+        spacing: Theme.gap;
+
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                glyph: root.editing ? Icons.grip : Icons.station;
+                tint: Theme.faint;
+                width: 16px;
+                height: 16px;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+
+            // Retyped in place while editing. Seeded once from the station and
+            // reported on every keystroke — it is this app's own list, so a
+            // rename costs a write to a small file and nothing on the network.
+            if root.editing: LineEdit {
+                text: root.station.name;
+                placeholder-text: root.station.url;
+                font-size: Theme.body-size;
+                edited(t) => { root.renamed(t); }
+                accepted(t) => { root.renamed(t); }
+            }
+
+            if !root.editing: Text {
+                text: root.shown;
+                font-size: Theme.body-size;
+                color: Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        if root.editing: VerticalLayout {
+            alignment: center;
+            IconButton {
+                glyph: Icons.clear;
+                size: 30px;
+                glyph-size: 15px;
+                clicked => { root.remove(); }
             }
         }
     }
@@ -1799,6 +1924,15 @@ export component AppWindow inherits Window {
     in property <[SidebarRow]> sidebar;
     in property <[SettingItem]> settings;
     in property <bool> in-settings: false;
+    // Whether the middle pane is showing the player's screens rather than one
+    // of the app's own.
+    //
+    // Every piece of browse chrome — the selector, the search field, the
+    // header, the list, its empty state — used to test `!in-settings` for
+    // itself, in seven places. Adding a pane then meant remembering all seven,
+    // and the stations pane was drawn over a Home screen still showing its
+    // shelves because it was not. One property, so the next pane is one line.
+    property <bool> browse-pane: !root.in-settings && !root.in-stations;
     in-out property <int> selected: 0;
 
     callback toggle(string);
@@ -1908,6 +2042,18 @@ export component AppWindow inherits Window {
     callback setting-text(int, string);
     callback setting-open(int);
     callback open-help();
+    callback open-stations();
+    // The stations typed in by hand. `in-stations` is the pane's own "I am
+    // showing" flag, answered by publish_pane like every other one.
+    in property <bool> in-stations: false;
+    in property <[MyStation]> stations;
+    in property <bool> stations-editing: false;
+    callback stations-edit();
+    callback station-add(string, string);
+    callback station-play(int);
+    callback station-rename(int, string);
+    callback station-remove(int);
+    callback station-move(int, int);
     callback seek(string, int);
     callback toggle-shuffle(string);
     callback cycle-repeat(string);
@@ -2029,6 +2175,20 @@ export component AppWindow inherits Window {
 
                     // Where the official controller keeps them: below
                     // everything the player describes, above nothing.
+                    // Above Settings, because it is music rather than
+                    // configuration: a station typed in by hand is the same
+                    // kind of thing as the ones the player browses, and the
+                    // only reason it is not up there with them is that the
+                    // player does not know about it.
+                    NavRow {
+                        entry: {
+                            label: "My Stations",
+                            cover: Icons.station,
+                            is-glyph: true,
+                        };
+                        activate => { root.open-stations(); }
+                    }
+
                     NavRow {
                         entry: {
                             label: "Settings",
@@ -2091,11 +2251,11 @@ export component AppWindow inherits Window {
 
                         // Keeps the title centered against the back button
                         // when there is no picker to balance it.
-                        if root.in-settings || root.browse-selector.length == 0: Rectangle {
+                        if !root.browse-pane || root.browse-selector.length == 0: Rectangle {
                             width: 30px;
                         }
 
-                        if !root.in-settings && root.browse-selector.length > 0: VerticalLayout {
+                        if root.browse-pane && root.browse-selector.length > 0: VerticalLayout {
                             alignment: center;
 
                             Rectangle {
@@ -2224,7 +2384,7 @@ export component AppWindow inherits Window {
                     // Settings and Help take the pane whole. Leaving the last
                     // screen's search box above them offers to search a screen
                     // that is no longer on show.
-                    if !root.in-settings && root.browse-has-search: HorizontalLayout {
+                    if root.browse-pane && root.browse-has-search: HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         padding-bottom: Theme.gap;
@@ -2241,7 +2401,7 @@ export component AppWindow inherits Window {
 
                     // What has been searched for before, offered where the
                     // results will appear.
-                    if !root.in-settings
+                    if root.browse-pane
                         && root.browse-has-search
                         && root.browse-blocks.length == 0
                         && root.browse-recent.length > 0: VerticalLayout {
@@ -2331,7 +2491,7 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !root.in-settings && root.browse-header-title != "": HorizontalLayout {
+                    if root.browse-pane && root.browse-header-title != "": HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         padding-bottom: Theme.pad;
@@ -2393,7 +2553,7 @@ export component AppWindow inherits Window {
                     // still stretches, and it took the room the message should
                     // have been centered in — which left it sitting near the
                     // bottom of the pane.
-                    if root.devices.length > 0 && !root.in-settings
+                    if root.devices.length > 0 && root.browse-pane
                         && root.browse-empty == "": ListView {
                         vertical-stretch: 1;
                         // A ListView is a Flickable, and a Flickable sizes its
@@ -2445,7 +2605,7 @@ export component AppWindow inherits Window {
                             : "Nothing answered on this network. Check the speaker is powered on and on the same Wi-Fi, then search again — or add one by address from the players list.";
                     }
 
-                    if root.devices.length > 0 && !root.in-settings
+                    if root.devices.length > 0 && root.browse-pane
                         && root.browse-empty != "": EmptyState {
                         vertical-stretch: 1;
                         glyph: root.browse-empty-icon;
@@ -2521,6 +2681,162 @@ export component AppWindow inherits Window {
                                     letters: root.alarm-letters;
                                     days: root.alarm-days;
                                     toggled(i) => { root.alarm-day-toggled(i); }
+                                }
+                            }
+                        }
+                    }
+
+                    // The stations typed in by hand.
+                    //
+                    // Its own pane rather than settings rows, which is where
+                    // it started: a settings row fires one callback whether
+                    // its body or its control was pressed, so play and remove
+                    // could not be told apart, and a row's text field reports
+                    // only on Enter — a name typed before tabbing to the
+                    // address beside it was silently thrown away. Reordering
+                    // it could not express at all.
+                    if root.in-stations: VerticalLayout {
+                        vertical-stretch: 1;
+                        padding: Theme.pad;
+                        spacing: Theme.gap;
+
+                        // Both fields live here rather than in the backend, so
+                        // the address field can hand over the name beside it at
+                        // the moment it commits. Nothing is reported until
+                        // then, which is why neither has to be read as it is
+                        // typed.
+                        HorizontalLayout {
+                            spacing: Theme.gap;
+
+                            new-name := LineEdit {
+                                placeholder-text: "Name (optional)";
+                                font-size: Theme.small-size;
+                                width: 200px;
+                                accepted => { new-url.focus(); }
+                            }
+
+                            new-url := LineEdit {
+                                placeholder-text: "Enter a http or https address.";
+                                font-size: Theme.small-size;
+                                horizontal-stretch: 1;
+                                // A LineEdit asks to be as wide as what is in
+                                // it, so in a stretchy row the box grew as the
+                                // address was typed and the row rearranged
+                                // itself around it. The stretch decides the
+                                // width here, not the contents.
+                                min-width: 0px;
+                                accepted(url) => {
+                                    root.station-add(new-name.text, url);
+                                    new-name.text = "";
+                                    self.text = "";
+                                }
+                            }
+
+                            // The same commit as pressing Enter in the field,
+                            // for anyone who has just pasted with the mouse and
+                            // has no reason to reach for the keyboard.
+                            VerticalLayout {
+                                alignment: center;
+
+                                IconButton {
+                                    glyph: Icons.add;
+                                    size: 34px;
+                                    glyph-size: 17px;
+                                    enabled: new-url.text != "";
+                                    clicked => {
+                                        root.station-add(new-name.text, new-url.text);
+                                        new-name.text = "";
+                                        new-url.text = "";
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                // Only once there is something to edit.
+                                if root.stations.length > 0: PillButton {
+                                    label: root.stations-editing ? "Done" : "Edit";
+                                    clicked => { root.stations-edit(); }
+                                }
+                            }
+                        }
+
+                        if root.stations.length == 0: EmptyState {
+                            vertical-stretch: 1;
+                            glyph: Icons.station;
+                            headline: "No stations yet";
+                            detail: "Paste a stream address above. It plays on whichever "
+                                + "player is selected, and is kept on this computer — "
+                                + "the player has nowhere to put it.";
+                        }
+
+                        if root.stations.length > 0: Text {
+                            text: root.stations-editing
+                                ? "Drag to reorder, retype a name to rename, or press the bin to remove."
+                                : "Press a station to play it on the selected player.";
+                            font-size: Theme.small-size;
+                            color: Theme.dim;
+                            wrap: word-wrap;
+                        }
+
+                        if root.stations.length > 0: station-list := ListView {
+                            vertical-stretch: 1;
+
+                            property <length> row-height: 62px;
+                            property <int> from-row: -1;
+                            property <int> to-row: -1;
+                            property <bool> dragging: self.from-row >= 0;
+
+                            for station[i] in root.stations: VerticalLayout {
+                                spot := Rectangle {
+                                    height: station-list.row-height;
+
+                                    // The same shuffle the queue and the
+                                    // customise list do: the rows between the
+                                    // grabbed one and the drop step aside so
+                                    // the gap opens where it will land.
+                                    property <length> lift: station-list.from-row == i
+                                        ? (station-list.to-row - station-list.from-row) * station-list.row-height
+                                        : (station-list.dragging
+                                            && i > station-list.from-row
+                                            && i <= station-list.to-row
+                                            ? -station-list.row-height
+                                            : (station-list.dragging
+                                                && i < station-list.from-row
+                                                && i >= station-list.to-row
+                                                ? station-list.row-height
+                                                : 0px));
+
+                                    StationRow {
+                                        station: station;
+                                        editing: root.stations-editing;
+                                        lifted: station-list.from-row == i;
+                                        y: spot.lift;
+                                        lift: spot.lift;
+                                        play => { root.station-play(i); }
+                                        renamed(name) => { root.station-rename(i, name); }
+                                        remove => { root.station-remove(i); }
+                                        drag-moved(offset) => {
+                                            if (station-list.from-row < 0) {
+                                                station-list.from-row = i;
+                                            }
+                                            station-list.to-row = Math.clamp(
+                                                station-list.from-row
+                                                    + Math.round(offset / station-list.row-height),
+                                                0, root.stations.length - 1);
+                                        }
+                                        drag-done => {
+                                            if (station-list.to-row != station-list.from-row) {
+                                                root.station-move(station-list.from-row, station-list.to-row);
+                                            }
+                                            station-list.from-row = -1;
+                                            station-list.to-row = -1;
+                                        }
+                                        drag-cancelled => {
+                                            station-list.from-row = -1;
+                                            station-list.to-row = -1;
+                                        }
+                                    }
                                 }
                             }
                         }

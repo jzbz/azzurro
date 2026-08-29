@@ -1041,6 +1041,29 @@ impl Client {
         self.command("/Play", &[]).await
     }
 
+    /// Play a stream the caller names, rather than one the player offered.
+    ///
+    /// `/Play?url=` is the same route a `player-link` uses, and it takes an
+    /// **ordinary URL** as readily as the player's own schemes. Confirmed on a
+    /// Powernode running 4.16.22 by handing it an unreachable `http://`
+    /// address: it answered `<state>stream</state>`, tried to fetch it, and
+    /// fell back to `stop` with the queue untouched.
+    ///
+    /// Answers a [`Dialog`] instead of acting when starting this would discard
+    /// the play queue, exactly as [`Self::follow`] does — a caller has to put
+    /// that question to somebody rather than treat it as done.
+    ///
+    /// This crate does not decide what a URL may be. It carries what it is
+    /// given, the way it carries every other action; a client offering a text
+    /// box is the thing that knows a person typed into it, and is where a
+    /// policy about schemes belongs.
+    pub async fn play_url(&self, url: &str) -> Result<Option<Dialog>> {
+        let body = self
+            .get_text("/Play", &[("url", url)], REQUEST_TIMEOUT)
+            .await?;
+        crate::dialog::parse(&body)
+    }
+
     pub async fn pause(&self) -> Result<()> {
         self.command("/Pause", &[]).await
     }

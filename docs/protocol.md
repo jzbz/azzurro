@@ -251,7 +251,7 @@ Note that the queue keeps its position while a player is on an input: `pid` and
 
 | Endpoint | Parameters |
 | --- | --- |
-| `/Play` | none; `seek=<secs>`; `id=<queue index>` |
+| `/Play` | none; `seek=<secs>`; `id=<queue index>`; `url=<stream>` |
 | `/Pause` | none; `toggle=1` for play/pause in one round trip |
 | `/Stop`, `/Skip`, `/Back` | none |
 | `/Volume` | `level=0..100`, or `db=`, or `mute=0|1` |
@@ -399,6 +399,31 @@ The trap is that reads and writes are on **different ports**. A settings
 document is read from 11001, and a write goes back to **11000** — posting it to
 where the document came from answers 404. Confirmed by writing a setting the
 value it already held, then a different one, and watching it change and revert.
+
+### Playing something the player did not offer
+
+**Confirmed.** `/Play?url=` is how a `player-link` row starts what it names,
+and the value is normally the player's own scheme — `RadioParadise:/5:20/…`,
+`Capture:bluez:bluetooth`. It also takes an **ordinary URL**:
+
+```
+GET  http://player:11000/Play?url=http%3A%2F%2Fice1.somafm.com%2Fgroovesalad-128-mp3
+200  <state>stream</state>
+```
+
+and `/Status` then reports `service` as `http`, the address back as
+`streamUrl`, the station's description as `title1` and its live track as
+`title2` — so an arbitrary stream behaves like any other source, metadata
+included. Confirmed on a Powernode running 4.16.22, both ways: an unreachable
+`http://` address answers `<state>stream</state>`, fails to connect and falls
+back to `stop` with the queue untouched; a real one plays.
+
+Nothing in the official controller offers this — there is no box anywhere in it
+for a stream address — so a station missing from TuneIn is unreachable there.
+
+Like any play action it answers a `<dialog>` **instead of acting** when
+starting it would discard the play queue, so the reply has to be read rather
+than dropped.
 
 ### Firmware upgrades
 

@@ -11,6 +11,7 @@
 //! reaches a player.
 
 mod artwork;
+mod custom;
 mod glyphs;
 mod known;
 mod lane;
@@ -220,6 +221,16 @@ enum Command {
     BrowseMore,
     /// Enough of the queue has been scrolled that the next window is wanted.
     QueueMore,
+    /// Open the hand-typed stations.
+    OpenStations,
+    /// Turn the stations pane's editing mode on or off.
+    StationsEdit,
+    /// A name and an address, as typed. Both are checked here.
+    StationAdd(String, String),
+    StationPlay(usize),
+    StationRename(usize, String),
+    StationRemove(usize),
+    StationMove(usize, usize),
     /// Forget every search made this session.
     ClearRecent,
     /// A row on the "add to playlist" list: an existing one, or the line that
@@ -440,6 +451,22 @@ enum Pane {
     Customise(CustomisePage),
     /// Choosing where to file a track.
     Playlists(Box<PlaylistPage>),
+    /// Radio stations typed in by hand, which the player knows nothing about.
+    Stations(Box<StationsPage>),
+}
+
+/// The stations kept on this machine, as a page.
+#[derive(Default)]
+struct StationsPage {
+    stations: Vec<custom::Station>,
+    /// Whether the rows are being edited rather than played.
+    ///
+    /// A mode rather than controls always on show. Reordering needs the whole
+    /// row to be a handle and playing needs the whole row to be a target, and
+    /// one row cannot be both at once; and a removal cannot be undone, so
+    /// putting the bin behind Edit is the difference between deleting a
+    /// station and meaning to.
+    editing: bool,
 }
 
 /// Somewhere to put a track, being chosen.
@@ -1545,6 +1572,44 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_setting_open(move |index| {
         let _ = tx.send(Command::SettingAction(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_open_stations(move || {
+        let _ = tx.send(Command::OpenStations);
+    });
+
+    let tx = commands.clone();
+    ui.on_stations_edit(move || {
+        let _ = tx.send(Command::StationsEdit);
+    });
+
+    let tx = commands.clone();
+    ui.on_station_add(move |name, url| {
+        let _ = tx.send(Command::StationAdd(name.to_string(), url.to_string()));
+    });
+
+    let tx = commands.clone();
+    ui.on_station_play(move |at| {
+        let _ = tx.send(Command::StationPlay(at.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_station_rename(move |at, name| {
+        let _ = tx.send(Command::StationRename(at.max(0) as usize, name.to_string()));
+    });
+
+    let tx = commands.clone();
+    ui.on_station_remove(move |at| {
+        let _ = tx.send(Command::StationRemove(at.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_station_move(move |from, to| {
+        let _ = tx.send(Command::StationMove(
+            from.max(0) as usize,
+            to.max(0) as usize,
+        ));
     });
 
     let tx = commands.clone();
@@ -3067,6 +3132,34 @@ impl Backend {
     /// Indices are positions in a flattened walk of the groups, so that
     /// `SettingAction` can find its way back to the same playlist — the same
     /// arrangement the settings pages already use.
+    /// The hand-typed stations, as their own pane.
+    fn publish_stations(&self) {
+        let (stations, editing) = {
+            let browsing = self.browsing.lock().unwrap();
+            let Pane::Stations(page) = &browsing.pane else {
+                return;
+            };
+            (page.stations.clone(), page.editing)
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let rows: Vec<MyStation> = stations
+                .into_iter()
+                .map(|station| MyStation {
+                    name: station.name.into(),
+                    url: station.url.into(),
+                })
+                .collect();
+            ui.set_stations(ModelRc::new(VecModel::from(rows)));
+            ui.set_stations_editing(editing);
+            ui.set_in_stations(true);
+            ui.set_browse_title("My Stations".into());
+            ui.set_browse_can_go_back(true);
+        });
+    }
+
     fn publish_playlists(&self) {
         let (title, rows) = {
             let browsing = self.browsing.lock().unwrap();
@@ -3431,6 +3524,7 @@ impl Backend {
             // Drawn with the settings rows, which already have a line that is
             // a link and a line that is a text field.
             Pane::Playlists(_) => Showing::Settings,
+            Pane::Stations(_) => Showing::Settings,
         };
 
         let large = matches!(showing, Showing::NowPlaying);
@@ -3450,6 +3544,13 @@ impl Backend {
                 ui.set_now_playing(large);
                 ui.set_customising(customising);
                 ui.set_alarm_editing(false);
+                // And the stations pane, for the same reason as the two
+                // above: `publish_stations` can only ever set this true, so
+                // walking away from the pane would leave it drawn over
+                // whatever came next. Safe to clear unconditionally —
+                // `publish_stations` runs later in the same queue when the
+                // pane really is up, and puts it back.
+                ui.set_in_stations(false);
             }
         });
 
@@ -3461,10 +3562,18 @@ impl Backend {
                 self.publish_browse();
             }
             Showing::Settings => {
-                if matches!(self.browsing.lock().unwrap().pane, Pane::Playlists(_)) {
-                    self.publish_playlists();
-                } else {
-                    self.publish_settings();
+                let pane = {
+                    let browsing = self.browsing.lock().unwrap();
+                    match &browsing.pane {
+                        Pane::Playlists(_) => 1,
+                        Pane::Stations(_) => 2,
+                        _ => 0,
+                    }
+                };
+                match pane {
+                    1 => self.publish_playlists(),
+                    2 => self.publish_stations(),
+                    _ => self.publish_settings(),
                 }
             }
             Showing::Help => self.publish_help(),
@@ -6419,6 +6528,18 @@ async fn run_commands(
                             browsing.pane = Pane::Browse;
                             true
                         }
+                        // One level: out of editing before out of the page,
+                        // so Back leaves the mode rather than carrying it over
+                        // to whenever the page is next opened, with a bin on
+                        // every row waiting for a press meant for playing.
+                        Pane::Stations(page) if page.editing => {
+                            page.editing = false;
+                            true
+                        }
+                        Pane::Stations(_) => {
+                            browsing.pane = Pane::Browse;
+                            true
+                        }
                         Pane::HelpDetail(_, _, whence) => {
                             browsing.pane = match whence {
                                 Whence::Help => Pane::Help,
@@ -7096,6 +7217,171 @@ async fn run_commands(
             // While the alarms screen is up, its rows are alarms rather than
             // settings, so the presses the settings pane produces are turned
             // into alarm commands before the settings arm ever sees them.
+            Command::OpenStations => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.pane = Pane::Stations(Box::new(StationsPage {
+                        stations: custom::load(),
+                        ..StationsPage::default()
+                    }));
+                }
+                // Through publish_pane, never the specific publisher: it is
+                // what answers every "this pane is showing" flag, and a pane
+                // opened past it comes up underneath whatever is already on
+                // top of it.
+                backend.publish_pane();
+                continue;
+            }
+
+            Command::StationsEdit => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    if let Pane::Stations(page) = &mut browsing.pane {
+                        page.editing = !page.editing;
+                    }
+                }
+                backend.publish_stations();
+                continue;
+            }
+
+            Command::StationAdd(name, url) => {
+                let said = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Stations(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    let url = url.trim();
+                    if url.is_empty() {
+                        None
+                    } else if !custom::playable(url) {
+                        Some("A station needs an http or https address".to_owned())
+                    } else if custom::remember(&mut page.stations, &name, url) {
+                        custom::save(&page.stations);
+                        None
+                    } else {
+                        Some("That station is already here".to_owned())
+                    }
+                };
+                backend.publish_stations();
+                if let Some(line) = said {
+                    say(&backend.ui, line);
+                }
+                continue;
+            }
+
+            Command::StationRename(at, name) => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Stations(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    let Some(station) = page.stations.get_mut(at) else {
+                        continue;
+                    };
+                    station.name = name;
+                    custom::save(&page.stations);
+                }
+                // Deliberately no republish: the row that reported this is the
+                // field being typed into, and replacing the model under it
+                // would take the cursor with it.
+                continue;
+            }
+
+            Command::StationRemove(at) => {
+                let gone = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Stations(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    if at >= page.stations.len() {
+                        continue;
+                    }
+                    let gone = page.stations.remove(at);
+                    if page.stations.is_empty() {
+                        // Nothing left to edit, so the mode has nothing to be
+                        // about — and the button that leaves it is gone too.
+                        page.editing = false;
+                    }
+                    custom::save(&page.stations);
+                    gone
+                };
+                backend.publish_stations();
+                say(
+                    &backend.ui,
+                    format!(
+                        "Removed {}",
+                        if gone.name.is_empty() {
+                            gone.url
+                        } else {
+                            gone.name
+                        }
+                    ),
+                );
+                continue;
+            }
+
+            Command::StationMove(from, to) => {
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let Pane::Stations(page) = &mut browsing.pane else {
+                        continue;
+                    };
+                    if from >= page.stations.len() || to >= page.stations.len() || from == to {
+                        continue;
+                    }
+                    let moved = page.stations.remove(from);
+                    page.stations.insert(to, moved);
+                    custom::save(&page.stations);
+                }
+                backend.publish_stations();
+                continue;
+            }
+
+            Command::StationPlay(at) => {
+                let station = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let Pane::Stations(page) = &browsing.pane else {
+                        continue;
+                    };
+                    match page.stations.get(at) {
+                        Some(station) => station.clone(),
+                        None => continue,
+                    }
+                };
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    say(&backend.ui, "No player is selected");
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.play_url(&station.url).await {
+                        // The player asks before discarding a queue, and the
+                        // question has to reach somebody: answering it either
+                        // way from here is deciding for them.
+                        Ok(Some(dialog)) => {
+                            backend.browsing.lock().unwrap().dialog = Some(dialog);
+                            backend.publish_dialog();
+                        }
+                        Ok(None) => say(
+                            &backend.ui,
+                            format!(
+                                "Playing {}",
+                                if station.name.is_empty() {
+                                    &station.url
+                                } else {
+                                    &station.name
+                                }
+                            ),
+                        ),
+                        Err(e) => say(&backend.ui, format!("could not play it: {e}")),
+                    }
+                });
+                continue;
+            }
+
             Command::SettingAction(index) | Command::SettingEdit(index, _)
                 if matches!(backend.browsing.lock().unwrap().pane, Pane::Alarms(_)) =>
             {

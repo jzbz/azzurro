@@ -232,6 +232,43 @@ async fn an_upgrade_is_refused_unless_the_player_says_it_is_ready() {
     assert!(player.asked_for("upgrade=check"), "and it checked first");
 }
 
+/// A named stream goes out on the same route a player-link uses.
+#[tokio::test]
+async fn a_stream_can_be_named_rather_than_browsed_to() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+
+    player.serve("/Play", "<state>stream</state>");
+    let asked = client
+        .play_url("http://ice1.somafm.com/groovesalad-128-mp3")
+        .await
+        .expect("plays");
+    assert!(asked.is_none(), "an ordinary start asks nothing");
+
+    // Encoded once, by the client, and not twice: a player handed
+    // "http%3A%2F%2F..." would look for a host called "http%3A".
+    assert!(
+        player.asked_for("url=http%3A%2F%2Fice1.somafm.com%2Fgroovesalad-128-mp3"),
+        "the stream goes out percent-encoded exactly once: {:?}",
+        player.asked()
+    );
+}
+
+/// Starting a stream can replace the queue, and the player says so instead of
+/// doing it. Treating that answer as success loses the question entirely.
+#[tokio::test]
+async fn a_stream_that_would_replace_the_queue_asks_first() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+
+    player.serve("/Play", fixtures::replace_queue_dialog());
+    let asked = client
+        .play_url("http://example.com/live.mp3")
+        .await
+        .expect("answers");
+    assert!(asked.is_some(), "the question must survive the call");
+}
+
 /// A zone member is addressed through the player that leads it.
 ///
 /// `&slave=<host>&port=<port>` was read out of the official controller rather
