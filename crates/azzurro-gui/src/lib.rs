@@ -219,6 +219,8 @@ enum Command {
     ToggleNowPlaying,
     /// Fetch the next page of the list on show and add it to the end.
     BrowseMore,
+    /// A letter of the jump bar was pressed or typed.
+    BrowseJump(String),
     /// Enough of the queue has been scrolled that the next window is wanted.
     QueueMore,
     /// Run one of the actions the service offers for what is playing, by the
@@ -323,6 +325,37 @@ struct Browsing {
     /// holds — the same shape as `searches`, which has guarded typing this
     /// way from the start.
     era: u64,
+    /// Bumped every time a letter is jumped to.
+    ///
+    /// `era` is not enough. It marks a change of *screen*, and a jump stays on
+    /// the screen it is already on — it replaces the rows inside the crumb
+    /// rather than pushing a new one. So a page of the old window, asked for by
+    /// a scroll and still in flight, passed the `era` check and appended thirty
+    /// rows from wherever the list used to be onto the letter just jumped to.
+    /// Two jumps in quick succession had the same problem in reverse: the
+    /// slower request landing second put the wrong letter on screen.
+    jumps: u64,
+    /// Letters worked out from the rows on screen, for a list the player sent
+    /// no index for: `(key, every pixel offset that letter starts at)`.
+    ///
+    /// The player indexes its four long alphabetical lists — Artists, Albums,
+    /// Songs, Composers — and nothing else. Genres is 175 entries, sorted, and
+    /// gets none; measured on a Powernode running 4.16.22. The difference is
+    /// that an indexed list is *paged* and this one is not: the whole thing
+    /// arrives in one document, so the letters can be read off the rows and the
+    /// jump is a scroll rather than a request.
+    ///
+    /// Rebuilt whenever the rows are, and from the same rows the window is
+    /// given, so the offsets cannot drift from what is drawn.
+    derived: Vec<(String, Vec<f32>)>,
+    /// The bar letter last pressed, which era it was pressed in, and how far
+    /// through that letter's runs the list has been taken.
+    ///
+    /// A letter can start in more than one place and the bar shows one of it.
+    /// Pressing again goes to the next run and wraps at the end, which is how a
+    /// folded bar reaches everything it folded. The era is carried so that
+    /// leaving the screen and coming back starts from the top again.
+    cycling: Option<(u64, String, usize)>,
     /// The screens this player offers: `(label, uri)`, in the order it listed
     /// them. Read once from `/ui/Configuration`.
     screens: Vec<(String, String)>,
@@ -640,6 +673,22 @@ impl Browsing {
     fn current(&self) -> Option<&Screen> {
         self.trail.last().map(|c| &c.screen)
     }
+
+    /// Which of a letter's runs this press means, advancing on a repeat.
+    ///
+    /// `None` when the letter is on no list, which is the answer for a
+    /// keystroke that is not a letter of this bar at all.
+    fn next_stop(&mut self, key: &str, stops: usize) -> Option<usize> {
+        if stops == 0 {
+            return None;
+        }
+        let at = match &self.cycling {
+            Some((era, last, at)) if *era == self.era && last == key => (at + 1) % stops,
+            _ => 0,
+        };
+        self.cycling = Some((self.era, key.to_owned(), at));
+        Some(at)
+    }
 }
 
 /// Deliberately coarse: a caller names an intent, and the backend owns every
@@ -780,6 +829,12 @@ struct Backend {
     /// model with the most rows in it. A screen is republished whenever a
     /// thumbnail lands, on every page of a paged screen, and on every refresh.
     sent_browse: Arc<AtomicU64>,
+    /// The letters of the jump bar, so the model is not replaced on every
+    /// republish of the same screen.
+    sent_index: Arc<AtomicU64>,
+    /// Which screen the window was last shown, so a new one can start at the
+    /// top. See the note where it is read.
+    sent_era: Arc<AtomicU64>,
     /// Whether a stale-screen refresh is already in flight.
     ///
     /// Staleness is decided by comparing the screen's `refreshOnStatusChange`
@@ -1854,6 +1909,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_browse_jump(move |key| {
+        let _ = tx.send(Command::BrowseJump(key.to_string()));
+    });
+
+    let tx = commands.clone();
     ui.on_queue_more(move || {
         let _ = tx.send(Command::QueueMore);
     });
@@ -2011,6 +2071,8 @@ async fn run(
         told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
         update_offer: Arc::new(Mutex::new(None)),
         sent_browse: Arc::new(AtomicU64::new(0)),
+        sent_index: Arc::new(AtomicU64::new(0)),
+        sent_era: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
     };
@@ -4234,6 +4296,25 @@ impl Backend {
             )
         };
 
+        let mut blocks = blocks;
+        {
+            // Before `blocks` is handed over and consumed. Worth doing here
+            // rather than on demand because these are the rows as flattened for
+            // the window, headings and all — working them out a second time
+            // somewhere else is how the letters and the rows drift apart.
+            let mut browsing = self.browsing.lock().unwrap();
+            browsing.derived = match browsing.current() {
+                Some(screen) if screen.index.is_empty() && screen.next.is_none() => {
+                    collate(&mut blocks);
+                    derived_index(&blocks)
+                }
+                // A list the player indexed uses the player's own offsets, and
+                // one still arriving cannot be indexed from the part in hand:
+                // the letters would stop wherever the paging had got to.
+                _ => Vec::new(),
+            };
+        }
+
         self.send_browse(
             blocks,
             selector,
@@ -4244,6 +4325,86 @@ impl Backend {
             can_go_back,
             search,
         );
+        self.send_browse_index();
+
+        // A new screen starts at the top. Replacing a ListView's model does not
+        // move the Flickable — the same fact the jump reset exists for — and
+        // nothing else was putting it back, so walking into a row from halfway
+        // down a list opened the next screen halfway down as well.
+        //
+        // On the era rather than on every publish. This runs again for a status
+        // change or an arriving thumbnail, and resetting there would drag the
+        // list out from under anyone reading it; a page arriving as the list is
+        // scrolled must not do it either, and neither changes the era.
+        let era = self.browsing.lock().unwrap().era;
+        if !already_sent(&self.sent_era, era) {
+            self.scroll_browse_to(0.0);
+        }
+    }
+
+    /// The letters a long list can be jumped to.
+    ///
+    /// Its own call rather than a ninth argument to `send_browse`, which
+    /// already carries eight. The keys go to the window and the offsets stay
+    /// here: a jump is a request, and the window has no business building one.
+    fn send_browse_index(&self) {
+        let keys: Vec<String> = {
+            let browsing = self.browsing.lock().unwrap();
+            // The player's own where there is one, the rows' where there is
+            // not. The window is not told which: a letter is a letter, and
+            // what happens when it is pressed is settled here.
+            match browsing.current() {
+                // No screen means no letters, whatever was worked out for the
+                // last one — its own arm rather than an empty index falling
+                // through, or a bar outlives the list it was built from.
+                None => Vec::new(),
+                Some(screen) if !screen.index.is_empty() => {
+                    bar_keys(screen.index.iter().map(|j| j.key.clone()).collect())
+                }
+                Some(_) => bar_keys(
+                    browsing
+                        .derived
+                        .iter()
+                        .map(|(key, _)| key.clone())
+                        .collect(),
+                ),
+            }
+        };
+
+        if already_sent(&self.sent_index, {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            keys.hash(&mut hash);
+            hash.finish()
+        }) {
+            return;
+        }
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_browse_index(ModelRc::new(VecModel::from(
+                    keys.into_iter()
+                        .map(slint::SharedString::from)
+                        .collect::<Vec<_>>(),
+                )));
+            }
+        });
+    }
+
+    /// Put a letter of a list held whole at the top of the pane.
+    ///
+    /// The same event as a fetched jump — the window is told the list has moved
+    /// and where to — so the two kinds of jump land through one path. Zero is
+    /// what a fetched jump sends, its rows having been replaced.
+    fn scroll_browse_to(&self, y: f32) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_browse_jump_y(y);
+                ui.set_browse_jumped(ui.get_browse_jumped().wrapping_add(1));
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6288,6 +6449,367 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
             tokio::spawn(load_thumbnails(backend, id));
         }
         Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
+    }
+}
+
+/// The bar's catch-all, for a letter that is neither a digit nor Latin.
+///
+/// One entry however many scripts are behind it. A library with Chinese,
+/// Japanese and Korean titles produces a letter per character, and thirty of
+/// those down the side of the window is not a bar any more — it is a second
+/// list, taller than the pane, in front of the first.
+const OTHER_KEY: &str = "*";
+
+/// The two row heights are `BrowseRowView`'s and have to stay in step with it.
+/// Measured rather than assumed: a twenty-row list reported a viewport of
+/// 1040px, so the pitch is exactly 52 with no spacing or padding between rows.
+/// If that component's height changes, the letters drift further from their
+/// rows the further down the list you go.
+const ROW_PX: f32 = 52.0;
+const HEADING_PX: f32 = 30.0;
+
+/// How many rows are worth a bar. Below this the list fits on a screen or two
+/// and the letters would be furniture: the folder root is seven entries.
+const WORTH_INDEXING: usize = 40;
+
+/// Whether a letter stands on the bar as itself.
+fn has_own_letter(key: &str) -> bool {
+    key == "#" || (key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic())
+}
+
+/// The bar as drawn: every letter that is one, then a single `*` for the rest.
+///
+/// The rest keep their offsets — only the drawing is collapsed, and pressing
+/// `*` goes to the first of them. Applied to the player's own index as well as
+/// to a worked-out one, because the player has the same problem: its Composers
+/// index ends in two CJK characters, and would end in fifty for a library of
+/// mostly CJK titles.
+fn bar_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in keys {
+        if has_own_letter(&key) {
+            out.push(key);
+        } else if out.last().map(String::as_str) != Some(OTHER_KEY) {
+            out.push(OTHER_KEY.to_owned());
+        }
+    }
+    out
+}
+
+/// Every place a letter of a worked-out bar can take you, in list order.
+///
+/// Exact match first, because a click sends a key straight off the bar. Then
+/// case-insensitively, so typing `e` reaches `E`. `*` gathers every letter
+/// behind it, since the bar drew them as one.
+fn stops_derived(index: &[(String, Vec<f32>)], key: &str) -> Vec<f32> {
+    if key == OTHER_KEY {
+        return index
+            .iter()
+            .filter(|(k, _)| !has_own_letter(k))
+            .flat_map(|(_, stops)| stops.iter().copied())
+            .collect();
+    }
+    index
+        .iter()
+        .find(|(k, _)| k == key)
+        .or_else(|| index.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)))
+        .map(|(_, stops)| stops.clone())
+        .unwrap_or_default()
+}
+
+/// The same, for the index the player sent: one offset per letter, except the
+/// catch-all, which stands for as many as the bar collapsed into it.
+fn stops_sent(index: &[bluos::screen::Jump], key: &str) -> Vec<u32> {
+    if key == OTHER_KEY {
+        return index
+            .iter()
+            .filter(|jump| !has_own_letter(&jump.key))
+            .map(|jump| jump.offset)
+            .collect();
+    }
+    index
+        .iter()
+        .find(|jump| jump.key == key)
+        .or_else(|| index.iter().find(|jump| jump.key.eq_ignore_ascii_case(key)))
+        .map(|jump| vec![jump.offset])
+        .unwrap_or_default()
+}
+
+/// How many rows would have to be taken out for the letters to run in order.
+///
+/// The number of rows less the longest run already in letter order — so a
+/// sorted list answers zero, a sorted list with three stragglers on the end
+/// answers three, and a shuffled one answers most of its length. O(n log n).
+///
+/// This is the question [`collate`] needs, because sorting the rows cannot
+/// change the answer to it: it is asked once, of the rows as the player sent
+/// them.
+fn out_of_place(rows: &[BrowseData]) -> usize {
+    let keys: Vec<String> = rows
+        .iter()
+        .filter(|row| !row.heading)
+        .map(|row| leading_key(&row.title))
+        .collect();
+
+    // Patience sorting: `tails[i]` is the smallest letter that can end a run of
+    // length i+1. Non-decreasing rather than increasing, because a letter
+    // repeats for every row filed under it.
+    let mut tails: Vec<&str> = Vec::new();
+    for key in &keys {
+        let at = tails.partition_point(|end| *end <= key.as_str());
+        if at == tails.len() {
+            tails.push(key);
+        } else {
+            tails[at] = key;
+        }
+    }
+    keys.len() - tails.len()
+}
+
+/// Put the rows the player filed by character under the letter they read as.
+///
+/// The player sorts these lists by raw character code, so "classical" lands
+/// after "Vocaloid" and "Électronique" after that — outside the C and E they
+/// plainly belong to. Nothing else moves: the rows are stably sorted by the
+/// letter they file under, and a list whose letters are already in order is
+/// unchanged by that, so the only rows that travel are the stragglers, each
+/// joining the bottom of its own letter.
+///
+/// The rows carry their own `index` into the screen, and pressing one looks the
+/// item up by that rather than by where it sits, so moving a row does not
+/// change what it plays.
+fn collate(blocks: &mut [BlockData]) {
+    if blocks.len() != 1 || blocks[0].kind != 0 {
+        return;
+    }
+    let rows = &mut blocks[0].rows;
+    if rows.len() < WORTH_INDEXING {
+        return;
+    }
+    // A heading belongs where the player put it and is not a row that can be
+    // filed under a letter. A list with any heading is left alone rather than
+    // sorted around them: the lists this is for do not have them, and a rule
+    // with an exception in it is a rule waiting to be got wrong.
+    if rows.iter().any(|row| row.heading) {
+        return;
+    }
+    // Deliberately not "does `letters` succeed". That was the first version and
+    // it could never fire: `letters` refuses a list whose stragglers fall
+    // outside the letters already seen, which is precisely the list this exists
+    // to repair — the guard was the damage. A library with "quiet storm" and no
+    // uppercase Q got no bar at all rather than a Q in the right place.
+    //
+    // Asked of the rows in a way sorting them cannot invalidate instead. A
+    // handful out of place means an alphabetical list with codepoint stragglers
+    // on the end. A tenth of them means something that was never alphabetical —
+    // an album's tracks are in track order — and it is left exactly as sent.
+    if out_of_place(rows) * 10 > rows.len() {
+        return;
+    }
+    // Stable, so rows sharing a letter keep the order the player gave them.
+    rows.sort_by_key(|row| leading_key(&row.title));
+}
+
+/// Letters for a list the player did not index, with where each one starts.
+///
+/// Only for a list that is entirely in hand — the caller checks that. The
+/// offsets are pixels down the viewport, because scrolling is what a jump does
+/// here: there is nothing to fetch.
+fn derived_index(blocks: &[BlockData]) -> Vec<(String, Vec<f32>)> {
+    // Only a plain list. A screen of shelves and tiles has no single column to
+    // scroll a letter to, and mixing kinds would put the offsets out anyway
+    // because a tile is not `ROW_PX` tall.
+    if blocks.len() != 1 || blocks[0].kind != 0 {
+        return Vec::new();
+    }
+    let rows = &blocks[0].rows;
+    if rows.len() < WORTH_INDEXING {
+        return Vec::new();
+    }
+
+    let index = letters(rows).unwrap_or_default();
+
+    // Three letters is a bar; one is a decoration.
+    if index.len() < 3 { Vec::new() } else { index }
+}
+
+/// The letters of a list, or `None` if the rows are not in letter order.
+///
+/// Each letter carries **every** place it starts, not just the first, so a
+/// straggler [`collate`] could not move — a list with a heading in it, say — is
+/// still reachable by pressing its letter again.
+///
+/// Refused outright when the first appearances do not ascend, or when repeats
+/// are more than a quarter of the runs. Both mean the list is not alphabetical,
+/// and a bar on an unsorted list is worse than none: every letter would be a
+/// cycle through arbitrary rows.
+fn letters(rows: &[BrowseData]) -> Option<Vec<(String, Vec<f32>)>> {
+    let mut index: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut last: Option<String> = None;
+    let mut runs = 0usize;
+    let mut repeats = 0usize;
+    let mut y = 0.0;
+
+    for row in rows {
+        // A heading is not an entry, but it does take space.
+        if !row.heading {
+            let key = leading_key(&row.title);
+            if last.as_deref() != Some(key.as_str()) {
+                runs += 1;
+                match index.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, stops)) => {
+                        stops.push(y);
+                        repeats += 1;
+                    }
+                    None => index.push((key.clone(), vec![y])),
+                }
+                last = Some(key);
+            }
+        }
+        y += if row.heading { HEADING_PX } else { ROW_PX };
+    }
+
+    if !index.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return None;
+    }
+    if repeats * 4 > runs {
+        return None;
+    }
+    Some(index)
+}
+
+/// The letter a row files under.
+///
+/// `#` for anything not alphabetic, which is what the player itself puts at the
+/// head of its indexes — its Artists list starts `# A B C`. Accents are folded
+/// away and case with them, so Sigur Rós, Motörhead and "the xx" file under R,
+/// M and T rather than under letters of their own at the end of the bar.
+///
+/// A script with neither case nor a Latin base keeps itself here and is
+/// collected into one entry by [`bar_keys`].
+fn leading_key(title: &str) -> String {
+    match title.chars().find(|c| !c.is_whitespace()) {
+        Some(c) if c.is_alphabetic() => base_letter(c).to_uppercase().to_string(),
+        _ => "#".to_owned(),
+    }
+}
+
+/// A Latin letter with its accent taken off, or the character unchanged.
+///
+/// Covers U+00C0..=U+024F — Latin-1 Supplement through Latin Extended-B, which
+/// is every accented letter a Western or Central European name uses. Generated
+/// from Unicode's own decompositions rather than typed out by hand, with the
+/// handful that do not decompose (Æ, Ø, Ł, ß and their like) mapped to the
+/// letter they are alphabetised under.
+///
+/// Anything outside that range — Greek, Cyrillic, the CJK scripts — is left
+/// alone, having no Latin letter to be filed under.
+fn base_letter(c: char) -> char {
+    const LATIN_BASE: [char; 400] = [
+        'A', 'A', 'A', 'A', 'A', 'A', 'A', 'C', 'E', 'E', 'E', 'E', 'I', 'I', 'I', 'I', 'D', 'N',
+        'O', 'O', 'O', 'O', 'O', '×', 'O', 'U', 'U', 'U', 'U', 'Y', 'T', 's', 'a', 'a', 'a', 'a',
+        'a', 'a', 'a', 'c', 'e', 'e', 'e', 'e', 'i', 'i', 'i', 'i', 'd', 'n', 'o', 'o', 'o', 'o',
+        'o', '÷', 'o', 'u', 'u', 'u', 'u', 'y', 't', 'y', 'A', 'a', 'A', 'a', 'A', 'a', 'C', 'c',
+        'C', 'c', 'C', 'c', 'C', 'c', 'D', 'd', 'D', 'd', 'E', 'e', 'E', 'e', 'E', 'e', 'E', 'e',
+        'E', 'e', 'G', 'g', 'G', 'g', 'G', 'g', 'G', 'g', 'H', 'h', 'H', 'h', 'I', 'i', 'I', 'i',
+        'I', 'i', 'I', 'i', 'I', 'i', 'Ĳ', 'ĳ', 'J', 'j', 'K', 'k', 'ĸ', 'L', 'l', 'L', 'l', 'L',
+        'l', 'Ŀ', 'ŀ', 'L', 'l', 'N', 'n', 'N', 'n', 'N', 'n', 'ŉ', 'Ŋ', 'ŋ', 'O', 'o', 'O', 'o',
+        'O', 'o', 'O', 'o', 'R', 'r', 'R', 'r', 'R', 'r', 'S', 's', 'S', 's', 'S', 's', 'S', 's',
+        'T', 't', 'T', 't', 'T', 't', 'U', 'u', 'U', 'u', 'U', 'u', 'U', 'u', 'U', 'u', 'U', 'u',
+        'W', 'w', 'Y', 'y', 'Y', 'Z', 'z', 'Z', 'z', 'Z', 'z', 'ſ', 'ƀ', 'Ɓ', 'Ƃ', 'ƃ', 'Ƅ', 'ƅ',
+        'Ɔ', 'Ƈ', 'ƈ', 'Ɖ', 'Ɗ', 'Ƌ', 'ƌ', 'ƍ', 'Ǝ', 'Ə', 'Ɛ', 'Ƒ', 'ƒ', 'Ɠ', 'Ɣ', 'ƕ', 'Ɩ', 'Ɨ',
+        'Ƙ', 'ƙ', 'ƚ', 'ƛ', 'Ɯ', 'Ɲ', 'ƞ', 'Ɵ', 'O', 'o', 'Ƣ', 'ƣ', 'Ƥ', 'ƥ', 'Ʀ', 'Ƨ', 'ƨ', 'Ʃ',
+        'ƪ', 'ƫ', 'Ƭ', 'ƭ', 'Ʈ', 'U', 'u', 'Ʊ', 'Ʋ', 'Ƴ', 'ƴ', 'Ƶ', 'ƶ', 'Ʒ', 'Ƹ', 'ƹ', 'ƺ', 'ƻ',
+        'Ƽ', 'ƽ', 'ƾ', 'ƿ', 'ǀ', 'ǁ', 'ǂ', 'ǃ', 'Ǆ', 'ǅ', 'ǆ', 'Ǉ', 'ǈ', 'ǉ', 'Ǌ', 'ǋ', 'ǌ', 'A',
+        'a', 'I', 'i', 'O', 'o', 'U', 'u', 'U', 'u', 'U', 'u', 'U', 'u', 'U', 'u', 'ǝ', 'A', 'a',
+        'A', 'a', 'Æ', 'æ', 'Ǥ', 'ǥ', 'G', 'g', 'K', 'k', 'O', 'o', 'O', 'o', 'Ʒ', 'ʒ', 'j', 'Ǳ',
+        'ǲ', 'ǳ', 'G', 'g', 'Ƕ', 'Ƿ', 'N', 'n', 'A', 'a', 'Æ', 'æ', 'Ø', 'ø', 'A', 'a', 'A', 'a',
+        'E', 'e', 'E', 'e', 'I', 'i', 'I', 'i', 'O', 'o', 'O', 'o', 'R', 'r', 'R', 'r', 'U', 'u',
+        'U', 'u', 'S', 's', 'T', 't', 'Ȝ', 'ȝ', 'H', 'h', 'Ƞ', 'ȡ', 'Ȣ', 'ȣ', 'Ȥ', 'ȥ', 'A', 'a',
+        'E', 'e', 'O', 'o', 'O', 'o', 'O', 'o', 'O', 'o', 'Y', 'y', 'ȴ', 'ȵ', 'ȶ', 'ȷ', 'ȸ', 'ȹ',
+        'Ⱥ', 'Ȼ', 'ȼ', 'Ƚ', 'Ⱦ', 'ȿ', 'ɀ', 'Ɂ', 'ɂ', 'Ƀ', 'Ʉ', 'Ʌ', 'Ɇ', 'ɇ', 'Ɉ', 'ɉ', 'Ɋ', 'ɋ',
+        'Ɍ', 'ɍ', 'Ɏ', 'ɏ',
+    ];
+
+    let point = c as u32;
+    match point.checked_sub(0xC0) {
+        Some(at) if (at as usize) < LATIN_BASE.len() => LATIN_BASE[at as usize],
+        _ => c,
+    }
+}
+
+/// Fetch the page a letter starts on and put it on screen.
+///
+/// One request rather than paging up to the letter: a page is thirty rows
+/// whatever is asked for, a fetch at any offset takes about thirty
+/// milliseconds, and the alternative is seventy requests to reach the end of
+/// the Songs list.
+async fn jump_to_letter(
+    backend: Backend,
+    client: Client,
+    uri: String,
+    offset: u32,
+    era: u64,
+    jump: u64,
+) {
+    let asked = bluos::screen::jump_to(&uri, offset);
+    let page = match client.screen(&asked).await {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::debug!("could not jump to {offset}: {e}");
+            return;
+        }
+    };
+
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        // The screen may have gone while the request was out, exactly as a
+        // page of it may — and another jump may have overtaken this one.
+        if browsing.era != era || browsing.jumps != jump {
+            return;
+        }
+        let Some(crumb) = browsing.trail.last_mut() else {
+            return;
+        };
+
+        let arriving: Vec<_> = page
+            .sections
+            .into_iter()
+            .flat_map(|section| section.items)
+            .collect();
+        if arriving.is_empty() {
+            return;
+        }
+        let brought = arriving.len();
+        if let Some(section) = crumb.screen.sections.last_mut() {
+            section.items = arriving;
+        }
+
+        // Where the window now starts, which is what tells `continuation` where
+        // the next page begins. Without this the list would page from zero
+        // again and repeat everything up to the letter.
+        crumb.screen.offset = page.offset.or(Some(offset));
+        // Cleared first: `continuation` refuses to build one for a screen that
+        // already has a cursor, and the cursor still on the crumb is the old
+        // window's. Leaving it in place made the fallback return None for the
+        // one list kind it exists for — a library's Songs, which counts rather
+        // than points — and the list was then stuck with nothing to page on.
+        crumb.screen.next = None;
+        crumb.screen.next = page
+            .next
+            .or_else(|| bluos::screen::continuation(&crumb.uri, &crumb.screen));
+        // A continuation carries the index too, but an empty one is not a
+        // reason to throw away the letters already on screen.
+        if !page.index.is_empty() {
+            crumb.screen.index = page.index;
+        }
+        tracing::debug!(offset, brought, "jumped the list");
+    }
+
+    backend.publish_browse();
+    // The rows are all new, so the artwork walk starts at the top of them.
+    if let Some(id) = backend.browsing.lock().unwrap().device {
+        tokio::spawn(load_browse_thumbnails(backend.clone(), id, 0));
     }
 }
 
@@ -8840,6 +9362,66 @@ async fn run_commands(
                 continue;
             }
 
+            Command::BrowseJump(key) => {
+                // A list held whole scrolls to the letter; nothing is asked
+                // for, because there is nothing that is not already here.
+                let scrolled = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let stops = stops_derived(&browsing.derived, &key);
+                    browsing.next_stop(&key, stops.len()).map(|at| stops[at])
+                };
+                if let Some(y) = scrolled {
+                    backend.scroll_browse_to(y);
+                    continue;
+                }
+
+                // Otherwise the offsets are the player's and live on the
+                // screen; the window only ever sent the letter.
+                let target = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    let stops = browsing
+                        .trail
+                        .last()
+                        .map(|crumb| stops_sent(&crumb.screen.index, &key))
+                        .unwrap_or_default();
+                    match browsing.next_stop(&key, stops.len()) {
+                        // A letter this list does not have. Nothing is claimed
+                        // and nothing is cancelled: bumping the counter here
+                        // would abandon a jump still in flight because someone
+                        // leaned on a key.
+                        None => None,
+                        Some(at) => {
+                            let era = browsing.era;
+                            // Claimed before the request goes out, so a jump
+                            // already in flight knows it has been overtaken.
+                            browsing.jumps += 1;
+                            let jump = browsing.jumps;
+                            let offset = stops[at];
+                            browsing.trail.last().and_then(|crumb| {
+                                browsing
+                                    .device
+                                    .map(|id| (id, crumb.uri.clone(), offset, era, jump))
+                            })
+                        }
+                    }
+                };
+                let Some((id, uri, offset, era, jump)) = target else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
+                };
+                tokio::spawn(jump_to_letter(
+                    backend.clone(),
+                    client,
+                    uri,
+                    offset,
+                    era,
+                    jump,
+                ));
+                continue;
+            }
+
             Command::BrowseMore => {
                 let asking = {
                     let mut browsing = backend.browsing.lock().unwrap();
@@ -8847,17 +9429,18 @@ async fn run_commands(
                         continue;
                     }
                     let era = browsing.era;
+                    let jump = browsing.jumps;
                     let next = browsing
                         .current()
                         .and_then(|screen| screen.next.clone())
                         .zip(browsing.device)
-                        .map(|(next, id)| (next, id, era));
+                        .map(|(next, id)| (next, id, era, jump));
                     if next.is_some() {
                         browsing.fetching_more = true;
                     }
                     next
                 };
-                let Some((next, id, era)) = asking else {
+                let Some((next, id, era, jump)) = asking else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -8886,7 +9469,11 @@ async fn run_commands(
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
                                 browsing.fetching_more = false;
-                                if browsing.era != era {
+                                // `jumps` as well as `era`: this page continues
+                                // the window that was on screen when it was
+                                // asked for, and a jump has since replaced that
+                                // window with a different part of the same list.
+                                if browsing.era != era || browsing.jumps != jump {
                                     return;
                                 }
                                 let Some(crumb) = browsing.trail.last_mut() else {
@@ -8951,6 +9538,7 @@ async fn run_commands(
                             let mut browsing = backend.browsing.lock().unwrap();
                             browsing.fetching_more = false;
                             if browsing.era == era
+                                && browsing.jumps == jump
                                 && let Some(crumb) = browsing.trail.last_mut()
                             {
                                 crumb.screen.next = None;
@@ -9424,6 +10012,375 @@ mod queue_paging_tests {
     #[test]
     fn the_first_growth_starts_where_the_first_window_ended() {
         assert!(page_belongs(Some(1), 500, Some(1), Some(1), 42, 500));
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// A plain list of rows, written out rather than derived from `Default`:
+    /// only the title and `heading` matter here, and spelling the rest out
+    /// keeps the derive off a type the window depends on.
+    fn row_of(title: &str) -> BrowseData {
+        BrowseData {
+            index: 0,
+            plays: false,
+            title: title.to_owned(),
+            subtitle: String::new(),
+            track: String::new(),
+            quality: String::new(),
+            action: String::new(),
+            cover: None,
+            glyph: None,
+            heading: false,
+            actionable: true,
+            playing: false,
+            selected: false,
+            has_menu: false,
+        }
+    }
+
+    fn one_block(titles: &[String]) -> Vec<BlockData> {
+        vec![BlockData {
+            kind: 0,
+            title: String::new(),
+            action: String::new(),
+            section: 0,
+            rows: titles.iter().map(|t| row_of(t)).collect(),
+        }]
+    }
+
+    /// Fifty-odd sorted names, the shape of the Genres list: a number first,
+    /// then two of every letter.
+    fn genres() -> Vec<String> {
+        let mut out = vec!["80s".to_owned(), "A Cappella".to_owned()];
+        for letter in 'B'..='Z' {
+            out.push(format!("{letter}and"));
+            out.push(format!("{letter}lues"));
+        }
+        out
+    }
+
+    #[test]
+    fn a_straggler_joins_the_bottom_of_its_own_letter() {
+        // The player files by character code, so these land after Z.
+        let mut names = genres();
+        names.push("classical".to_owned());
+        names.push("\u{C9}lectronique".to_owned());
+
+        let mut blocks = one_block(&names);
+        collate(&mut blocks);
+        let after: Vec<&str> = blocks[0].rows.iter().map(|r| r.title.as_str()).collect();
+
+        // "classical" now sits with the Cs, after the ones already there...
+        let c_at = after
+            .iter()
+            .position(|t| *t == "classical")
+            .expect("classical");
+        assert_eq!(after[c_at - 1], "Clues");
+        assert_eq!(after[c_at + 1], "Dand");
+
+        // ...and the accented entry with the Es rather than at the very end.
+        let e_at = after
+            .iter()
+            .position(|t| *t == "\u{C9}lectronique")
+            .expect("it");
+        assert_eq!(after[e_at - 1], "Elues");
+        assert_eq!(after[e_at + 1], "Fand");
+        assert_ne!(after.last(), Some(&"\u{C9}lectronique"));
+
+        // Nothing was lost or duplicated.
+        assert_eq!(after.len(), names.len());
+    }
+
+    #[test]
+    fn a_list_that_is_not_alphabetical_is_never_reordered() {
+        // An album's tracks are in track order. Alphabetising forty of them
+        // would be vandalism, so the rule is tested before anything moves.
+        let names = genres();
+        let mut shuffled = Vec::new();
+        let (mut front, mut back) = (0, names.len() - 1);
+        while front <= back {
+            shuffled.push(names[back].clone());
+            if front != back {
+                shuffled.push(names[front].clone());
+            }
+            front += 1;
+            back -= 1;
+        }
+        let before = shuffled.clone();
+        let mut blocks = one_block(&shuffled);
+        collate(&mut blocks);
+        let after: Vec<String> = blocks[0].rows.iter().map(|r| r.title.clone()).collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_short_list_and_a_shelf_are_left_alone() {
+        let short: Vec<String> = ["zebra", "apple", "mango"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let mut blocks = one_block(&short);
+        collate(&mut blocks);
+        assert_eq!(blocks[0].rows[0].title, "zebra");
+
+        // A shelf of tiles has no single column to file rows into.
+        let names = genres();
+        let mut shelf = one_block(&names);
+        shelf[0].kind = 1;
+        let first = shelf[0].rows[0].title.clone();
+        collate(&mut shelf);
+        assert_eq!(shelf[0].rows[0].title, first);
+    }
+
+    #[test]
+    fn a_list_with_a_heading_is_left_alone() {
+        let mut names = genres();
+        names.push("classical".to_owned());
+        let mut blocks = one_block(&names);
+        blocks[0].rows[0].heading = true;
+        collate(&mut blocks);
+        // The straggler stayed put rather than the heading being sorted away.
+        assert_eq!(
+            blocks[0].rows.last().expect("a last row").title,
+            "classical"
+        );
+    }
+
+    #[test]
+    fn collating_puts_the_letters_back_in_one_piece() {
+        // After collation the bar has one stop per letter again, because the
+        // stragglers are no longer stranded past Z.
+        let mut names = genres();
+        names.push("classical".to_owned());
+        names.push("\u{C9}lectronique".to_owned());
+        let mut blocks = one_block(&names);
+        collate(&mut blocks);
+
+        let index = derived_index(&blocks);
+        let c = &index.iter().find(|(k, _)| k == "C").expect("a C").1;
+        let e = &index.iter().find(|(k, _)| k == "E").expect("an E").1;
+        assert_eq!(c.len(), 1);
+        assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn a_long_unindexed_list_gets_letters_off_its_rows() {
+        let index = derived_index(&one_block(&genres()));
+
+        // A digit files under #, exactly as the player's own indexes do.
+        assert_eq!(index[0].0, "#");
+        assert_eq!(index[1].0, "A");
+        assert_eq!(index[2].0, "B");
+        // Each letter named once: # and A, then B through Z.
+        assert_eq!(index.len(), 27);
+    }
+
+    #[test]
+    fn a_letter_points_at_the_row_it_starts_on() {
+        let names = genres();
+        let index = derived_index(&one_block(&names));
+
+        // Row 0 is "80s", row 1 "A Cappella", row 2 the first B.
+        assert_eq!(index[0].1, vec![0.0]);
+        assert_eq!(index[1].1, vec![ROW_PX]);
+        assert_eq!(index[2].1, vec![2.0 * ROW_PX]);
+
+        // And the last letter is where its row is, not where the list ends:
+        // Z has two rows, so it starts two from the bottom.
+        let (key, stops) = index.last().expect("a last letter");
+        assert_eq!(key, "Z");
+        assert_eq!(*stops, vec![(names.len() - 2) as f32 * ROW_PX]);
+    }
+
+    #[test]
+    fn a_heading_takes_space_without_taking_a_letter() {
+        let mut names = genres();
+        names.insert(0, "GENRES".to_owned());
+        let mut blocks = one_block(&names);
+        blocks[0].rows[0].heading = true;
+
+        let index = derived_index(&blocks);
+
+        // The heading is not a letter of its own...
+        assert_eq!(index[0].0, "#");
+        // ...but everything below it is pushed down by its lesser height.
+        assert_eq!(index[0].1, vec![HEADING_PX]);
+        assert_eq!(index[1].1, vec![HEADING_PX + ROW_PX]);
+    }
+
+    #[test]
+    fn a_short_list_gets_no_bar() {
+        // The folder root is seven entries; letters down the side of it would
+        // be furniture.
+        let short: Vec<String> = ["albums", "classical", "house", "intl"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(derived_index(&one_block(&short)).is_empty());
+    }
+
+    #[test]
+    fn tiles_and_mixed_screens_get_no_bar() {
+        // A tile is not `ROW_PX` tall, and a screen of several blocks has no
+        // single column for a letter to scroll to.
+        let names = genres();
+        let mut shelf = one_block(&names);
+        shelf[0].kind = 1;
+        assert!(derived_index(&shelf).is_empty());
+
+        let mut two = one_block(&names);
+        two.extend(one_block(&names));
+        assert!(derived_index(&two).is_empty());
+    }
+
+    #[test]
+    fn accents_file_under_the_letter_they_are_alphabetised_by() {
+        assert_eq!(leading_key("\u{C9}dith Piaf"), "E");
+        assert_eq!(leading_key("Sigur R\u{F3}s"), "S");
+        assert_eq!(leading_key("Mot\u{F6}rhead"), "M");
+        // The ones with no decomposition of their own.
+        assert_eq!(leading_key("\u{C6}on"), "A");
+        assert_eq!(leading_key("\u{141}\u{F3}d\u{17A}"), "L");
+        assert_eq!(leading_key("\u{D8}rsted"), "O");
+        // And a script with no Latin base keeps itself, to be bucketed later.
+        assert_eq!(leading_key("\u{6797}"), "\u{6797}");
+    }
+
+    #[test]
+    fn many_scripts_become_one_letter_on_the_bar() {
+        let keys = ["#", "A", "Z", "\u{6797}", "\u{68EE}", "\u{4E2D}"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        assert_eq!(bar_keys(keys), vec!["#", "A", "Z", "*"]);
+
+        // A bar that needs no catch-all does not grow one.
+        let latin = ["#", "A", "B"].iter().map(|k| (*k).to_owned()).collect();
+        assert_eq!(bar_keys(latin), vec!["#", "A", "B"]);
+    }
+
+    #[test]
+    fn a_script_without_case_keeps_its_own_letter() {
+        assert_eq!(leading_key("\u{6797}\u{61B6}\u{84EE}"), "\u{6797}");
+        assert_eq!(leading_key("the xx"), "T");
+        assert_eq!(leading_key("  spaced"), "S");
+        assert_eq!(leading_key("2Pac"), "#");
+        assert_eq!(leading_key(""), "#");
+    }
+    #[test]
+    fn a_letter_that_comes_back_keeps_both_places() {
+        // The player's own Genres list, in shape: uppercase A-Z, then the
+        // entries it sorts after Z — lowercase first, then accented. All of
+        // them are one letter on the bar, and that letter holds every place it
+        // starts.
+        let mut names = genres();
+        names.push("classical".to_owned());
+        names.push("hip hop / rap".to_owned());
+        names.push("\u{C9}lectronique".to_owned());
+
+        let index = derived_index(&one_block(&names));
+        let keys: Vec<&str> = index.iter().map(|(k, _)| k.as_str()).collect();
+
+        // One letter each, and nothing after Z.
+        assert_eq!(keys.first(), Some(&"#"));
+        assert_eq!(keys.last(), Some(&"Z"));
+        assert_eq!(keys.iter().filter(|k| **k == "C").count(), 1);
+        assert!(!keys.contains(&"c"));
+
+        // C leads with the uppercase run near the top and still knows where
+        // "classical" is, three rows from the bottom.
+        let c = &index.iter().find(|(k, _)| k == "C").expect("a C").1;
+        assert_eq!(c.len(), 2);
+        assert!(c[0] < 10.0 * ROW_PX);
+        assert_eq!(c[1], (names.len() - 3) as f32 * ROW_PX);
+
+        // And E knows about the accented entry, which is the very last row.
+        let e = &index.iter().find(|(k, _)| k == "E").expect("an E").1;
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[1], (names.len() - 1) as f32 * ROW_PX);
+    }
+
+    #[test]
+    fn pressing_a_letter_again_moves_to_its_next_place() {
+        let index = vec![
+            ("A".to_owned(), vec![0.0]),
+            ("E".to_owned(), vec![100.0, 900.0]),
+        ];
+        assert_eq!(stops_derived(&index, "E"), vec![100.0, 900.0]);
+        // Typed lowercase, which is how a keyboard sends it.
+        assert_eq!(stops_derived(&index, "e"), vec![100.0, 900.0]);
+
+        let mut browsing = Browsing::default();
+        assert_eq!(browsing.next_stop("E", 2), Some(0));
+        assert_eq!(browsing.next_stop("E", 2), Some(1));
+        // Round again rather than stopping at the end.
+        assert_eq!(browsing.next_stop("E", 2), Some(0));
+        // A different letter starts from its own beginning.
+        assert_eq!(browsing.next_stop("A", 1), Some(0));
+        assert_eq!(browsing.next_stop("E", 2), Some(0));
+        // And a letter with nowhere to go is not a jump at all.
+        assert_eq!(browsing.next_stop("Q", 0), None);
+    }
+
+    #[test]
+    fn leaving_the_screen_starts_the_cycle_over() {
+        let mut browsing = Browsing::default();
+        assert_eq!(browsing.next_stop("E", 2), Some(0));
+        assert_eq!(browsing.next_stop("E", 2), Some(1));
+        // Walking into another screen and back must not resume halfway.
+        browsing.moved_on();
+        assert_eq!(browsing.next_stop("E", 2), Some(0));
+    }
+
+    #[test]
+    fn a_keystroke_reaches_a_letter_the_bar_only_has_in_capitals() {
+        let index = vec![
+            ("#".to_owned(), vec![0.0]),
+            ("A".to_owned(), vec![52.0]),
+            ("C".to_owned(), vec![104.0]),
+        ];
+        assert_eq!(stops_derived(&index, "c"), vec![104.0]);
+        assert_eq!(stops_derived(&index, "C"), vec![104.0]);
+        // And a letter on no list is nowhere to go.
+        assert!(stops_derived(&index, "q").is_empty());
+    }
+
+    #[test]
+    fn the_catch_all_gathers_every_letter_behind_it() {
+        use bluos::screen::Jump;
+        let sent = vec![
+            Jump {
+                key: "A".to_owned(),
+                offset: 0,
+            },
+            Jump {
+                key: "Z".to_owned(),
+                offset: 400,
+            },
+            Jump {
+                key: "\u{6797}".to_owned(),
+                offset: 440,
+            },
+            Jump {
+                key: "\u{68EE}".to_owned(),
+                offset: 446,
+            },
+        ];
+        // What the bar drew as one `*` cycles through both.
+        assert_eq!(stops_sent(&sent, "*"), vec![440, 446]);
+        // An ordinary letter is itself, however it was typed.
+        assert_eq!(stops_sent(&sent, "a"), vec![0]);
+        assert!(stops_sent(&sent, "q").is_empty());
+
+        // On a bar with nothing behind it, `*` is nowhere to go.
+        let latin = vec![Jump {
+            key: "A".to_owned(),
+            offset: 0,
+        }];
+        assert!(stops_sent(&latin, "*").is_empty());
     }
 }
 

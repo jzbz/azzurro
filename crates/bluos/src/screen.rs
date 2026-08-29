@@ -78,6 +78,14 @@ pub struct Screen {
     /// forty-eight and hands over the request for the next thirty. Without
     /// following it there is no way to reach the four hundred and eighteen.
     pub next: Option<String>,
+    /// Where each letter begins, when the player has said.
+    ///
+    /// A long list arrives with an `<index>` — `#`, then A to Z, then whatever
+    /// else the collection contains — each naming the offset it starts at. It
+    /// is what makes four hundred artists navigable without scrolling through
+    /// them, and the offsets are the player's own: it knows the whole list and
+    /// the client only ever holds a window on it.
+    pub index: Vec<Jump>,
     /// Where this page starts and how long the whole list is, when the list
     /// says so: `<list offset="30" total="448">`.
     ///
@@ -804,6 +812,15 @@ fn start(
 
         _ => {
             if stack.last() == Some(&Ctx::Index) {
+                // Not a row — a place in the list. Kept rather than discarded:
+                // this is the alphabet a long list is navigated by, and the
+                // player has already worked out where each letter starts.
+                if let (Some(key), Some(offset)) = (
+                    a.remove("key"),
+                    a.remove("offset").and_then(|o| o.parse().ok()),
+                ) {
+                    screen.index.push(Jump { key, offset });
+                }
                 stack.push(Ctx::Other);
             } else if let Some((_, kind)) = ITEM_ELEMENTS.iter().find(|(n, _)| *n == name) {
                 // A search box is the one item whose action lives on the
@@ -1220,6 +1237,17 @@ pub fn presets_to_reorder(uri: &str) -> Option<u32> {
         .and_then(|prid| prid.parse().ok())
 }
 
+/// A letter in a long list, and where it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jump {
+    /// `#`, `A`, `B`… and whatever else a collection turns up: a Powernode's
+    /// artists end with 佐, 徐, 手 and 攬. Taken as the player writes it rather
+    /// than assumed to be twenty-seven of anything.
+    pub key: String,
+    /// Its position in the whole list, not in the page in hand.
+    pub offset: u32,
+}
+
 /// One slot moving to another, as `/Presets/edit` expresses reordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Move {
@@ -1303,6 +1331,19 @@ pub fn continuation(uri: &str, screen: &Screen) -> Option<String> {
         return None;
     }
     Some(with_continuation(uri, reached))
+}
+
+/// The request for the page a jump index points at.
+///
+/// A letter's offset is into the whole list, and the client only ever holds a
+/// window on it, so jumping is a fetch rather than a scroll: one request at
+/// any depth, which is what makes it work on two thousand songs as readily as
+/// on four hundred artists. Measured on a Powernode at about 30ms whether the
+/// offset is 0 or 420.
+///
+/// `uri` is the request that produced the screen the index came from.
+pub fn jump_to(uri: &str, offset: u32) -> String {
+    with_continuation(uri, offset)
 }
 
 /// `uri` with `listContinuation` set to `at`, replacing any it already has.
@@ -1551,6 +1592,25 @@ mod tests {
     }
 
     #[test]
+    fn a_jump_asks_for_the_page_the_letter_starts_on() {
+        let uri = "/ui/browseGrouped?browseIndex=0&service=LocalMusic&type=Artist";
+        assert_eq!(
+            jump_to(uri, 210),
+            "/ui/browseGrouped?browseIndex=0&service=LocalMusic&type=Artist&listContinuation=210"
+        );
+        // Jumping again replaces the last jump rather than stacking on it.
+        assert_eq!(
+            jump_to(&jump_to(uri, 210), 6),
+            "/ui/browseGrouped?browseIndex=0&service=LocalMusic&type=Artist&listContinuation=6"
+        );
+        // The top of the list is an offset like any other.
+        assert_eq!(
+            jump_to(uri, 0),
+            "/ui/browseGrouped?browseIndex=0&service=LocalMusic&type=Artist&listContinuation=0"
+        );
+    }
+
+    #[test]
     fn a_list_that_counts_asks_for_the_next_page_by_number() {
         // A library's Songs: 2062 of them, thirty at a time, no cursor.
         let uri = "/ui/browseGrouped?browseIndex=2&service=LocalMusic&type=Song";
@@ -1611,6 +1671,65 @@ mod tests {
     /// meant a library's Artists stopped at thirty of four hundred and
     /// forty-eight, with a cursor pointing at a page nothing would read — and
     /// the caller, having no page to graft, kept the cursor and asked again.
+    #[test]
+    fn a_long_list_says_where_each_letter_starts() {
+        // The index a Powernode sends for 448 artists, trimmed. It is not
+        // content — these entries have no title and no action — but it is what
+        // makes the list navigable, so it is kept rather than dropped.
+        const INDEXED: &str = r##"<screen>
+  <list offset="0" total="448">
+    <index revision="223">
+      <item key="#" offset="0" length="6"></item>
+      <item key="A" offset="6" length="22"></item>
+      <item key="B" offset="28" length="35"></item>
+      <item key="攬" offset="447" length="1"></item>
+    </index>
+    <item title="Bach"></item>
+  </list>
+</screen>"##;
+
+        let screen = parse(INDEXED).expect("parses");
+
+        assert_eq!(
+            screen.index,
+            vec![
+                Jump {
+                    key: "#".into(),
+                    offset: 0
+                },
+                Jump {
+                    key: "A".into(),
+                    offset: 6
+                },
+                Jump {
+                    key: "B".into(),
+                    offset: 28
+                },
+                // Not twenty-seven of anything: a real collection ends with
+                // whatever it ends with.
+                Jump {
+                    key: "攬".into(),
+                    offset: 447
+                },
+            ]
+        );
+
+        // And still not rows.
+        assert_eq!(
+            screen.items().filter_map(|i| i.label()).collect::<Vec<_>>(),
+            vec!["Bach"],
+            "an index entry drawn as a row is a blank line"
+        );
+        assert_eq!(screen.total, Some(448));
+    }
+
+    #[test]
+    fn a_list_with_no_index_has_none() {
+        let screen =
+            parse("<screen><list><item title=\"Bach\"></item></list></screen>").expect("parses");
+        assert!(screen.index.is_empty());
+    }
+
     #[test]
     fn a_grouped_lists_continuation_is_a_document_of_its_own() {
         // `r##` because the index carries key="#", which ends an `r#` string.

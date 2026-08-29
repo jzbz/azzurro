@@ -1972,6 +1972,19 @@ export component AppWindow inherits Window {
     callback toggle-now-playing();
     callback browse-more();
     callback queue-more();
+    // The letters a long list can be jumped to — "#", "A", "B", and whatever
+    // else a collection turns up. The player works out where each one starts;
+    // the window only ever sends back which was chosen.
+    in property <[string]> browse-index;
+    callback browse-jump(string);
+    // Bumped by the backend each time a jump lands, because replacing a
+    // model does not move a Flickable and the new rows would otherwise appear
+    // under whatever scroll position the old ones had.
+    in-out property <int> browse-jumped: 0;
+    // Where that jump landed, in pixels down the list. Zero for a jump that
+    // fetched its rows, since those replaced what was there; a real offset for
+    // a list held whole, where the letter is already on screen somewhere.
+    in property <float> browse-jump-y: 0;
     callback clear-recent();
     // The cover reduced to a wash. Slint has no blur, so the softening is
     // done in the pixels before they arrive — see artwork::frosted.
@@ -2581,56 +2594,234 @@ export component AppWindow inherits Window {
                     // still stretches, and it took the room the message should
                     // have been centered in — which left it sitting near the
                     // bottom of the pane.
+                    // The list, and the alphabet beside it.
+                    //
+                    // A row rather than the ListView alone, because a long
+                    // list needs somewhere to put the letters. The bar is
+                    // only there when the player sent an index, which it
+                    // does for the lists long enough to need one and for no
+                    // others.
                     if root.devices.length > 0 && root.browse-pane
-                        && root.browse-empty == "": ListView {
+                        && root.browse-empty == "": HorizontalLayout {
                         vertical-stretch: 1;
-                        // A ListView is a Flickable, and a Flickable sizes its
-                        // viewport to what the content would like to be — so
-                        // rows stopped at their own preferred width and left
-                        // the rest of the pane empty. Invisible while the
-                        // window opened at 1100 and the pane was narrower than
-                        // that preference; plain at 1440.
-                        viewport-width: self.width;
 
-                        // A library's Artists page answers thirty of four
-                        // hundred and hands over the request for the next
-                        // thirty. Asked for before the end arrives, so the
-                        // list grows under the scroll rather than stopping at
-                        // it. The backend ignores a second ask while one is
-                        // already out.
-                        changed viewport-y => {
-                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
-                                root.browse-more();
-                            }
-                        }
-
-                        // And on the list's own height, the same as the queue.
-                        // A page of thirty usually overflows the pane and there
-                        // is something to scroll, which is why this was never
-                        // missed — but a page that does not fill it leaves
-                        // nothing to scroll, and a scroll-only trigger can then
-                        // never fire again. The rest of the list is stranded
-                        // with a cursor pointing straight at it.
+                        // Type a letter, land on it.
                         //
-                        // Safe to chain only because `next_after_page` now
-                        // stops on a page that brought nothing and on a cursor
-                        // that repeats itself. Scrolling hid both, a person
-                        // being the thing that gets bored and stops.
-                        changed viewport-height => {
-                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
-                                root.browse-more();
+                        // A FocusScope so the keys are only ours when nothing
+                        // else wants them: a LineEdit with focus keeps its own
+                        // typing, which is what stops this stealing letters
+                        // from the search box.
+                        //
+                        // Single characters only, and only ones the player put
+                        // in the index — so Ctrl-anything, the arrow keys and a
+                        // letter no artist starts with all fall through to
+                        // whatever else would have had them.
+                        jump-keys := FocusScope {
+                            // Width only. A HorizontalLayout intersects its
+                            // children's *cross*-axis constraints, so a fixed
+                            // `height` here is a maximum for the whole row —
+                            // `height: 0px` collapsed the browse list and the
+                            // queue panel beside it, and dropped the player bar
+                            // into the middle of the window. Zero width costs
+                            // nothing because width is the axis being divided.
+                            width: 0px;
+                            enabled: root.browse-index.length > 0;
+
+                            // Claimed whenever a new indexed screen arrives.
+                            // A zero-sized FocusScope is never clicked, so it
+                            // has to take focus rather than be given it — and
+                            // it has to take it again on each screen, because
+                            // clicking the search box hands focus away and
+                            // nothing would hand it back.
+                            property <string> arrived:
+                                root.browse-title + "/" + root.browse-index.length;
+                            changed arrived => {
+                                if (root.browse-index.length > 0) { self.focus(); }
+                            }
+
+                            key-pressed(event) => {
+                                if (event.modifiers.control || event.modifiers.meta
+                                    || event.text == "") {
+                                    return EventResult.reject;
+                                }
+                                // A cased letter, or one of the two keys the
+                                // bar draws that are not letters.
+                                //
+                                // Slint does not send an empty `text` for a
+                                // named key: Tab arrives as U+0009, Escape as
+                                // U+001B, the arrows as U+F700 and up. Taking
+                                // those swallowed them — Tab stopped moving
+                                // focus at all, because the traversal only runs
+                                // once the focused element rejects the key.
+                                // Everything Slint sends for a named key has no
+                                // case, and so do digits, which is what this
+                                // tests without needing to know each one.
+                                if (event.text.to-uppercase() == event.text.to-lowercase()
+                                    && event.text != "#" && event.text != "*") {
+                                    return EventResult.reject;
+                                }
+                                // And nothing to jump to is nothing to take.
+                                if (root.browse-index.length == 0) {
+                                    return EventResult.reject;
+                                }
+                                // Sent exactly as typed. Matching it to a
+                                // letter is the backend's job: it holds the
+                                // offsets, it knows the bar may carry both "C"
+                                // and "c", and it ignores a key that is on
+                                // neither. Upper-casing here looked harmless
+                                // and made every lowercase letter on the bar
+                                // unreachable from the keyboard.
+                                root.browse-jump(event.text);
+                                return EventResult.accept;
                             }
                         }
 
-                        for block in root.browse-blocks: BrowseBlockView {
-                            block: block;
-                            activate(i) => { root.browse-activate(i); }
-                            open-menu(i, y, right) => {
-                                root.queue-menu-y = y;
-                                root.queue-menu-right = right;
-                                root.browse-menu(i);
+                        browse-list := ListView {
+                            horizontal-stretch: 1;
+
+                            vertical-stretch: 1;
+                            // A ListView is a Flickable, and a Flickable sizes its
+                            // viewport to what the content would like to be — so
+                            // rows stopped at their own preferred width and left
+                            // the rest of the pane empty. Invisible while the
+                            // window opened at 1100 and the pane was narrower than
+                            // that preference; plain at 1440.
+                            viewport-width: self.width;
+
+                            // A library's Artists page answers thirty of four
+                            // hundred and hands over the request for the next
+                            // thirty. Asked for before the end arrives, so the
+                            // list grows under the scroll rather than stopping at
+                            // it. The backend ignores a second ask while one is
+                            // already out.
+                            // Whether the rows are still arriving at their
+                            // final size, so the list should stay where it was
+                            // put rather than follow them.
+                            //
+                            // A screen is published twice: once as it arrives
+                            // and again when its artwork lands, and a tile is
+                            // sized from its caption, so the second publish is
+                            // taller. A ListView keeps the rows you are looking
+                            // at where they are when that happens, which pushes
+                            // everything above them off the top — measured at
+                            // 38px on a genre screen, which is exactly its
+                            // first heading. Nothing was scrolled: the heading
+                            // was inserted above the view after the fact.
+                            property <bool> settling: false;
+
+                            changed viewport-y => {
+                                if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                    root.browse-more();
+                                }
                             }
-                            section-action(i) => { root.browse-section(i); }
+
+                            // And on the list's own height, the same as the queue.
+                            // A page of thirty usually overflows the pane and there
+                            // is something to scroll, which is why this was never
+                            // missed — but a page that does not fill it leaves
+                            // nothing to scroll, and a scroll-only trigger can then
+                            // never fire again. The rest of the list is stranded
+                            // with a cursor pointing straight at it.
+                            //
+                            // Safe to chain only because `next_after_page` now
+                            // stops on a page that brought nothing and on a cursor
+                            // that repeats itself. Scrolling hid both, a person
+                            // being the thing that gets bored and stops.
+                            changed viewport-height => {
+                                if (self.settling) {
+                                    self.viewport-y = -root.browse-jump-y * 1px;
+                                }
+                                if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                    root.browse-more();
+                                }
+                            }
+
+                            for block in root.browse-blocks: BrowseBlockView {
+                                block: block;
+                                activate(i) => { root.browse-activate(i); }
+                                open-menu(i, y, right) => {
+                                    root.queue-menu-y = y;
+                                    root.queue-menu-right = right;
+                                    root.browse-menu(i);
+                                }
+                                section-action(i) => { root.browse-section(i); }
+                            }
+                        }
+
+                        // A jump replaces the rows; it does not move the
+                        // Flickable. Without this the letter asked for appears
+                        // under whatever scroll position the old list had,
+                        // which on a list scrolled halfway is the middle of it.
+                        //
+                        // Beside the list rather than in it: a ListView takes a
+                        // single `for` and nothing else.
+                        Rectangle {
+                            // Width only, for the reason given on the
+                            // FocusScope above.
+                            width: 0px;
+                            horizontal-stretch: 0;
+                            property <int> at: root.browse-jumped;
+                            changed at => {
+                                browse-list.viewport-y = -root.browse-jump-y * 1px;
+                                // Held there until the rows stop changing size
+                                // under it. See `settling` on the list.
+                                browse-list.settling = true;
+                            }
+
+                            // The settling window is given up after half a
+                            // second, so the list is the reader's from then on
+                            // and rows growing later — which is how paging
+                            // works — never yank it back.
+                            //
+                            // A timer rather than the scroll itself: a ListView
+                            // exposes no `flicked`, and telling a reader's
+                            // scroll from a re-layout by watching `viewport-y`
+                            // means knowing which of two `changed` handlers ran
+                            // first. The second publish lands well inside this.
+                            //
+                            // Out here because a ListView may hold a single
+                            // `for` and nothing else.
+                            Timer {
+                                interval: 500ms;
+                                running: browse-list.settling;
+                                triggered => {
+                                    browse-list.settling = false;
+                                }
+                            }
+                        }
+
+                        if root.browse-index.length > 0: VerticalLayout {
+                            alignment: center;
+                            padding-right: Theme.tight;
+                            horizontal-stretch: 0;
+
+                            for key in root.browse-index: Rectangle {
+                                width: 22px;
+                                height: 18px;
+                                border-radius: 4px;
+                                background: letter.has-hover
+                                    ? Theme.hover
+                                    : transparent;
+
+                                Text {
+                                    text: key;
+                                    font-size: Theme.micro-size;
+                                    font-weight: 600;
+                                    // Brighter on hover: at this size the
+                                    // background alone is not enough to say
+                                    // which letter is under the pointer.
+                                    color: letter.has-hover
+                                        ? Theme.text
+                                        : Theme.faint;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                letter := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.browse-jump(key); }
+                                }
+                            }
                         }
                     }
 
