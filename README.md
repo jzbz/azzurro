@@ -49,7 +49,7 @@ Measured against the official controller, in roughly the order a user notices:
 | **The fifteen-second nudge** | A podcast's skip and back carry an `interval`. Left out of the track actions beside them: no player here offers one, so their shape has never been seen. |
 | **Renaming a saved playlist** | Saving, listing, playing and deleting all work — the player serves a BluOS Playlists shelf and a context menu with Delete on it. Renaming is not offered by the player at all, in any menu or in `/Services`, so it is not a matter of building it. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
-| **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
+| **Named group configurations** | "Downstairs" as a one-press recall. There is no route for it: `/Zones`, `/Groups`, `/ZonePresets`, `/SavedGroups` and `/Rooms` all answer 404, and neither `/Services` nor the settings service mentions grouping. Only ad-hoc `/AddSlave` and `/RemoveSlave` exist, and both are used. So this would be the app's own file of player sets rather than anything the player keeps — buildable, but not testable on one speaker. |
 
 Most of these are UI work over a protocol layer that already reaches the
 endpoint, rather than protocol work waiting to be done.
