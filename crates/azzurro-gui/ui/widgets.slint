@@ -188,6 +188,87 @@ export component Segmented inherits Rectangle {
     }
 }
 
+// What a pane says when it has nothing to show.
+//
+// Extracted because the app had exactly one of these and it only ever appeared
+// when the *player* volunteered an info panel — so every place the app itself
+// had nothing (no speakers yet, an empty queue, a search that found nothing)
+// was blank space. Blank space reads as broken; a sentence reads as an answer.
+//
+// Three sizes of type, because an empty state is a small piece of writing and
+// not a label: the headline says what is true, the line under it says what to
+// do about it, and the glyph is there so the eye has somewhere to land first.
+export component EmptyState inherits VerticalLayout {
+    in property <image> glyph: Icons.info;
+    in property <string> headline;
+    in property <string> detail;
+    // Draws the glyph as a soft pulse rather than a static tile, for the states
+    // that are waiting on something rather than reporting a conclusion.
+    in property <bool> working: false;
+
+    alignment: center;
+    spacing: Theme.pad;
+    padding-left: 48px;
+    padding-right: 48px;
+
+    HorizontalLayout {
+        alignment: center;
+
+        Rectangle {
+            width: 58px;
+            height: 58px;
+            border-radius: Theme.radius;
+            background: Theme.raised;
+
+            Icon {
+                glyph: root.glyph;
+                tint: root.working ? Theme.accent : Theme.faint;
+                width: 26px;
+                height: 26px;
+
+                // Slow enough to read as breathing rather than blinking. Only
+                // while something is actually happening — a state that has
+                // finished should hold still.
+                opacity: root.working ? 0.45 : 1.0;
+                animate opacity {
+                    duration: 1100ms;
+                    easing: ease-in-out;
+                    iteration-count: root.working ? -1 : 1;
+                    direction: alternate;
+                }
+            }
+        }
+    }
+
+    Text {
+        text: root.headline;
+        // The headline of an empty state is the thing being said, so it is
+        // said at the weight of a title in the app's ordinary ink — not, as
+        // this was, one pixel above body size in the dim grey used for
+        // captions.
+        font-size: Theme.title-size;
+        font-weight: 600;
+        color: Theme.text;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+
+    if root.detail != "": HorizontalLayout {
+        alignment: center;
+
+        Text {
+            text: root.detail;
+            font-size: Theme.body-size;
+            color: Theme.dim;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            // A measure, so a long sentence sets as a paragraph rather than
+            // running the width of the pane.
+            max-width: 360px;
+        }
+    }
+}
+
 // A seek bar. Drawn rather than borrowed from std-widgets, because a slider
 // with a knob on it looks like a setting, and this is a position.
 export component Scrubber inherits Rectangle {

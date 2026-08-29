@@ -1844,9 +1844,18 @@ async fn run(
     // player switched on an hour later still appears.
     // Without a socket there is nothing to sweep and nothing to listen to, so
     // this task simply ends. The window and its command loop carry on.
-    let Some(discovery) = discovery else { return };
+    let Some(discovery) = discovery else {
+        backend.set_looking(false);
+        return;
+    };
 
+    // Said out loud for as long as it is true. The sweep spreads its
+    // broadcasts across twelve seconds, and for the whole of that a first-run
+    // window had nothing on it and no reason given — which is the moment
+    // somebody decides whether the app works at all.
+    backend.set_looking(true);
     sweep(backend.clone(), discovery.clone(), http.clone()).await;
+    backend.set_looking(false);
 
     loop {
         match discovery.recv().await {
@@ -2187,6 +2196,16 @@ impl Backend {
             }
         });
         self.publish();
+    }
+
+    /// Whether discovery is still sweeping, so the window can say so.
+    fn set_looking(&self, looking: bool) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_looking_for_players(looking);
+            }
+        });
     }
 
     /// Put every player's controls back.

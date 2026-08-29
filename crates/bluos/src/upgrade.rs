@@ -33,9 +33,12 @@
 //! error and must not be read as one — a parser that insists on the usual root
 //! sees a player that has gone mad at exactly the moment it needs watching.
 //!
-//! Stage 1 carries only the name, model and error flag. Stage 2 adds
-//! `step`, `total` and `percent`. So an upgrade in its first stage has no
-//! progress to show, which is a fact about the player rather than a gap here.
+//! Both stages *may* carry `step`, `total` and `percent`, and a Powernode
+//! carries none of them in either — it sent bare elements for the whole of a
+//! four-minute upgrade. So the stage is taken from which element arrived and
+//! the counters only refine it where they exist; read the other way round, an
+//! install reads as still preparing. An upgrade with no numbers to show is a
+//! fact about the player rather than a gap here.
 
 use crate::error::{Error, Result};
 use crate::xml::{attributes, local_name};

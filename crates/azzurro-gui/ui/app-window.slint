@@ -1,6 +1,6 @@
 import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
-import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker } from "widgets.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker, EmptyState } from "widgets.slint";
 
 // A bare file import is how Slint registers a custom font: the family the
 // file declares becomes usable as a font-family anywhere, and the file is
@@ -1699,6 +1699,10 @@ export component AppWindow inherits Window {
     // What the player says to draw where the rows would be, when there are
     // none. It writes both lines itself — "You don't have any Favourites on
     // Library" is its sentence, and it knows which service it means.
+    // Whether the first discovery sweep is still running. Distinguishes "no
+    // speakers here" from "no speakers yet", which are different sentences and
+    // want different words.
+    in property <bool> looking-for-players: false;
     in property <string> browse-empty: "";
     in property <string> browse-empty-detail: "";
     in property <image> browse-empty-icon;
@@ -2310,7 +2314,8 @@ export component AppWindow inherits Window {
                     // still stretches, and it took the room the message should
                     // have been centered in — which left it sitting near the
                     // bottom of the pane.
-                    if !root.in-settings && root.browse-empty == "": ListView {
+                    if root.devices.length > 0 && !root.in-settings
+                        && root.browse-empty == "": ListView {
                         vertical-stretch: 1;
                         // A ListView is a Flickable, and a Flickable sizes its
                         // viewport to what the content would like to be — so
@@ -2344,47 +2349,29 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !root.in-settings && root.browse-empty != "": VerticalLayout {
-                        alignment: center;
+                    // Before anything else: no speakers at all. Ahead of the
+                    // player's own info panels because until one has answered
+                    // there is no player to have volunteered one, and a first
+                    // run otherwise showed an empty pane for twelve seconds and
+                    // then an empty pane for good.
+                    if root.devices.length == 0: EmptyState {
                         vertical-stretch: 1;
-                        padding-left: 48px;
-                        padding-right: 48px;
-                        spacing: Theme.pad;
+                        working: root.looking-for-players;
+                        glyph: root.looking-for-players ? Icons.rescan : Icons.player;
+                        headline: root.looking-for-players
+                            ? "Looking for players"
+                            : "No players found";
+                        detail: root.looking-for-players
+                            ? "Listening for BluOS speakers on this network. This takes a few seconds."
+                            : "Nothing answered on this network. Check the speaker is powered on and on the same Wi-Fi, then search again — or add one by address from the players list.";
+                    }
 
-                        HorizontalLayout {
-                            alignment: center;
-
-                            Rectangle {
-                                width: 58px;
-                                height: 58px;
-                                border-radius: Theme.radius;
-                                background: Theme.raised;
-
-                                Icon {
-                                    glyph: root.browse-empty-icon;
-                                    tint: Theme.faint;
-                                    width: 26px;
-                                    height: 26px;
-                                }
-                            }
-                        }
-
-                        Text {
-                            text: root.browse-empty;
-                            font-size: Theme.body-size + 1px;
-                            font-weight: 600;
-                            color: Theme.dim;
-                            horizontal-alignment: center;
-                            wrap: word-wrap;
-                        }
-
-                        Text {
-                            text: root.browse-empty-detail;
-                            font-size: Theme.small-size;
-                            color: Theme.faint;
-                            horizontal-alignment: center;
-                            wrap: word-wrap;
-                        }
+                    if root.devices.length > 0 && !root.in-settings
+                        && root.browse-empty != "": EmptyState {
+                        vertical-stretch: 1;
+                        glyph: root.browse-empty-icon;
+                        headline: root.browse-empty;
+                        detail: root.browse-empty-detail;
                     }
 
                     // Pinned above the list rather than scrolling inside it.
@@ -3063,7 +3050,18 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    queue-list := ListView {
+                    // A queue with nothing in it is the most ordinary empty
+                    // state in the app — a speaker that has just been switched
+                    // on has one — and it was drawn as a column of nothing
+                    // under a heading that said "Queue".
+                    if root.queue.length == 0: EmptyState {
+                        vertical-stretch: 1;
+                        glyph: Icons.queue;
+                        headline: "Nothing queued";
+                        detail: "Pick something from Home or the library and it will play here.";
+                    }
+
+                    if root.queue.length > 0: queue-list := ListView {
                         vertical-stretch: 1;
 
                         for track[i] in root.queue: VerticalLayout {
