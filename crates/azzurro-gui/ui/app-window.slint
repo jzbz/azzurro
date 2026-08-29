@@ -2552,14 +2552,10 @@ export component AppWindow inherits Window {
                     // them down the moment it appears — which is what it did
                     // on Settings, where it sat between the two lists and so
                     // landed above the one that was showing.
-                    // walk away to Home and it is still running — so it is
-                    // reported here rather than on the settings row. At the
-                    // bottom, because it arrives while you are reading
-                    // something and everything above it would otherwise jump
-                    // down a line the moment it did.
-                    // Grown rather than inserted. It arrives unannounced while
-                    // you are reading something else, and a strip that simply
-                    // exists on the next frame reads as the page having jumped.
+                    //
+                    // Grown rather than inserted, for the same reason: a strip
+                    // that simply exists on the next frame reads as the page
+                    // having jumped.
                     //
                     // Clipped, so the contents are cut off by the shrinking
                     // edge instead of spilling past it, and the words are held
