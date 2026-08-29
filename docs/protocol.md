@@ -400,6 +400,43 @@ document is read from 11001, and a write goes back to **11000** — posting it t
 where the document came from answers 404. Confirmed by writing a setting the
 value it already held, then a different one, and watching it change and revert.
 
+### Reordering presets, and how it deletes them
+
+**Observed, and documented nowhere at all.** The Presets screen's footer offers
+`/reorder-presets?url=%2FPresets%2Fedit%3Fprid%3D34`, a route into the client.
+`/Presets/edit` answers **405** to a GET with no `Allow` header, and
+`must be application/json` to a POST with no body. Nothing in `/Services`
+describes it.
+
+The shape came out of the player's own type errors, which name its internals:
+
+```
+POST /Presets/edit?prid=34    Content-Type: application/json
+{"prid": 34, "ordering": [{"from": 4, "to": 1}, …]}
+```
+
+`BulkEdit { prid: int, ordering: []preset.Move }`, `Move { from: int, to: int }`.
+Send an array rather than an object and it says so by name — *cannot unmarshal
+array into Go value of type preset.BulkEdit* — and a wrong type on a field
+names the field and its type, which is how the whole thing was read.
+
+**Each move overwrites its destination, and the list must be a complete
+permutation.** A `to` that is nobody's `from` is a preset destroyed, silently,
+with an ordinary success in reply — `{"from":1,"to":3}` on four presets deleted
+the one in slot 3. Measured on a Powernode running 4.16.22, twice: once by
+accident on a real preset, once deliberately on throwaways.
+
+Sent whole it is atomic and behaves: reversing four presets in one request
+reverses them rather than walking into itself, and `4→1, 1→2, 2→3, 3→4` moves
+the last to the front and shifts the rest down.
+
+Slots are not necessarily contiguous — deleting a preset leaves a gap — so the
+permutation is over whatever slots are occupied, not over `1..n`.
+
+`prid` identifies the list and changes on **every** edit, including saves and
+deletes; the Presets screen carries `refreshOnStatusChange key="prid"` so a
+client knows to redraw.
+
 ### A grouped list continues as a document of its own
 
 **Confirmed.** A long library list — Artists, 448 of them — is served behind an

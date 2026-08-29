@@ -1150,6 +1150,52 @@ impl Client {
         self.command("/SetPreset", &query).await
     }
 
+    /// Put the presets in a new order.
+    ///
+    /// **Observed, and documented nowhere.** `/Presets/edit?prid=N` answers 405
+    /// to a GET and `must be application/json` to a POST with no body; the
+    /// shape below was read out of the type errors the player returns, which
+    /// name its own internals — `preset.BulkEdit` with a `prid` and an
+    /// `ordering` of `preset.Move`.
+    ///
+    /// **The moves must be a complete permutation.** Each is read as "put the
+    /// preset in `from` into `to`", overwriting what is there, so a slot that
+    /// is a destination and not a source is destroyed — silently, with an
+    /// ordinary success in reply. [`crate::screen::reordering`] is what builds
+    /// them; do not hand-roll a single move.
+    ///
+    /// `prid` identifies the preset list as it stands. It changes on every
+    /// edit, and the Presets screen asks to be refreshed when it does.
+    pub async fn reorder_presets(&self, prid: u32, moves: &[crate::screen::Move]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+
+        // By hand, like the settings write above, and for the same reason:
+        // this is the second and last JSON this crate sends, and it is a list
+        // of pairs of numbers.
+        let ordering: Vec<String> = moves
+            .iter()
+            .map(|m| format!("{{\"from\":{},\"to\":{}}}", m.from, m.to))
+            .collect();
+        let body = format!("{{\"prid\":{prid},\"ordering\":[{}]}}", ordering.join(","));
+
+        let url = format!("/Presets/edit?prid={prid}");
+        self.http
+            .post(self.resolve(&self.base, &url)?)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map(drop)
+            .map_err(|source| Error::Http {
+                device: self.id,
+                source,
+            })
+    }
+
     /// Play a stream the caller names, rather than one the player offered.
     ///
     /// `/Play?url=` is the same route a `player-link` uses, and it takes an

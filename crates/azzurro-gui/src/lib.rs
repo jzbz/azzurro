@@ -525,6 +525,13 @@ struct CustomisePage {
     /// in. Sections the player pinned are not here at all: they cannot move,
     /// so offering to move them would be a lie.
     rows: Vec<(String, String)>,
+    /// Set when what is being dragged is the player's presets rather than this
+    /// app's own idea of a screen's order, and carrying the list's `prid`.
+    ///
+    /// The same page for both because it is the same gesture and the same
+    /// rows; only where the answer goes differs — a file here, a request to
+    /// the player there. The ids in `rows` are slot numbers in that case.
+    presets: Option<u32>,
 }
 
 /// Where Back goes from a page that can be reached from more than one place.
@@ -5555,6 +5562,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                                 .map(american)
                                 .unwrap_or_else(|| "Customize".to_owned()),
                             rows,
+                            presets: None,
                         })
                     })
                 };
@@ -5573,6 +5581,44 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             // than saving it itself: a station's menu offers
             // `/add-preset?name=…&url=…&image=…`, everything already decided.
             // So this is a decode and a request, with nothing to ask anybody.
+            // Dragging the player's presets into a new order. The same page
+            // as Customise Home, because it is the same gesture over the same
+            // shape of row; only the saving differs.
+            //
+            // The rows come from the screen already showing rather than from a
+            // fresh request: the Presets screen is where this is pressed, its
+            // items carry the slot number as `counter`, and re-reading it
+            // would only invite the two to disagree.
+            Some(route) if bluos::screen::presets_to_reorder(route).is_some() => {
+                let prid = bluos::screen::presets_to_reorder(route).unwrap_or_default();
+                let page = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.current().map(|screen| {
+                        let rows: Vec<(String, String)> = screen
+                            .items()
+                            .filter_map(|item| {
+                                let slot = item.extra.get("counter")?.clone();
+                                Some((slot, item.label().unwrap_or_default().to_owned()))
+                            })
+                            .collect();
+                        CustomisePage {
+                            screen: screen.id.clone().unwrap_or_default(),
+                            title: "Reorder Presets".to_owned(),
+                            rows,
+                            presets: Some(prid),
+                        }
+                    })
+                };
+                match page {
+                    // Fewer than two and there is nothing to arrange.
+                    Some(page) if page.rows.len() > 1 => {
+                        backend.browsing.lock().unwrap().pane = Pane::Customise(page);
+                        backend.publish_pane();
+                    }
+                    _ => say(&backend.ui, "There are not enough presets to reorder"),
+                }
+            }
+
             Some(route) if bluos::screen::preset_to_save(route).is_some() => {
                 // Decoded twice — once to choose this arm and once to use it —
                 // because a match guard cannot hand its answer to the body. It
@@ -8897,8 +8943,45 @@ async fn run_commands(
                         continue;
                     };
                     let ids: Vec<String> = page.rows.iter().map(|(id, _)| id.clone()).collect();
-                    (page.screen.clone(), ids)
+                    (page.screen.clone(), ids, page.presets)
                 };
+
+                // The presets are the player's, so their new order is a
+                // request rather than a file.
+                if let Some(prid) = arranged.2 {
+                    let slots: Vec<u32> =
+                        arranged.1.iter().filter_map(|id| id.parse().ok()).collect();
+                    let moves = bluos::screen::reordering(&slots);
+
+                    let addressed =
+                        (slots.len() == arranged.1.len())
+                            .then_some(())
+                            .and_then(|()| {
+                                let id = (*backend.selected.lock().unwrap())?;
+                                backend.with_entry(id, |e| e.client.clone())
+                            });
+                    let Some(client) = addressed else {
+                        // Refusing rather than sending part of it: every slot
+                        // has to be in the permutation or the ones left out
+                        // are deleted.
+                        say(&backend.ui, "Could not work out the new order");
+                        continue;
+                    };
+
+                    backend.browsing.lock().unwrap().pane = Pane::Browse;
+                    backend.publish_pane();
+                    let backend = backend.clone();
+                    tokio::spawn(async move {
+                        match client.reorder_presets(prid, &moves).await {
+                            Ok(()) => {
+                                say(&backend.ui, "Presets reordered");
+                                refresh_current(backend).await;
+                            }
+                            Err(e) => say(&backend.ui, format!("could not reorder them: {e}")),
+                        }
+                    });
+                    continue;
+                }
                 let saved = {
                     let mut orders = backend.orders.lock().unwrap();
                     orders.insert(arranged.0, arranged.1);

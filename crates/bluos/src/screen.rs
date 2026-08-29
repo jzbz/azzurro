@@ -1169,6 +1169,68 @@ pub fn preset_to_save(uri: &str) -> Option<Preset> {
     found.url.is_some().then_some(found)
 }
 
+/// Which preset list a `/reorder-presets` deep link is about.
+///
+/// The Presets screen's footer offers
+/// `/reorder-presets?url=%2FPresets%2Fedit%3Fprid%3D34`, so the list's
+/// identity arrives wrapped in the route that would edit it. `prid` changes on
+/// every edit and the player refuses one that is out of date, which is what
+/// makes it worth carrying rather than guessing.
+pub fn presets_to_reorder(uri: &str) -> Option<u32> {
+    let (path, query) = uri.split_once('?')?;
+    if path != "/reorder-presets" {
+        return None;
+    }
+    let inner = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("url="))?;
+    let inner = percent_encoding::percent_decode_str(inner)
+        .decode_utf8()
+        .ok()?;
+    inner
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("prid="))
+        .and_then(|prid| prid.parse().ok())
+}
+
+/// One slot moving to another, as `/Presets/edit` expresses reordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// The moves that take `slots` to the order they are listed in.
+///
+/// **The list must be complete, and that is not a style preference.**
+/// `/Presets/edit` reads each move as "put the preset in slot `from` into slot
+/// `to`", overwriting whatever is there. A slot that is somebody's destination
+/// but nobody's source is therefore destroyed, silently, and the reply looks
+/// like an ordinary success. Sending one move of a four-preset list deleted
+/// the preset it landed on — measured, on a Powernode running 4.16.22.
+///
+/// So this takes the whole arrangement and emits a move for every slot that
+/// actually changes, which is a permutation of the occupied slots. The player
+/// applies them together: reversing four presets in one request reverses them,
+/// rather than walking into itself.
+///
+/// `slots` is the current slot number of each preset, in the order they should
+/// end up. `[4, 1, 2, 3]` means "the preset now in slot 4 goes first".
+pub fn reordering(slots: &[u32]) -> Vec<Move> {
+    // The slots to be filled are the ones being emptied — the set is the same
+    // either way round, which is what makes it a permutation and what keeps it
+    // from destroying anything.
+    let mut places: Vec<u32> = slots.to_vec();
+    places.sort_unstable();
+
+    slots
+        .iter()
+        .zip(places)
+        .filter(|(from, to)| **from != *to)
+        .map(|(from, to)| Move { from: *from, to })
+        .collect()
+}
+
 /// A preset on its way to being saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preset {
@@ -1311,6 +1373,87 @@ mod tests {
             }],
             ..Screen::default()
         }
+    }
+
+    #[test]
+    fn a_reorder_link_names_the_list_it_edits() {
+        assert_eq!(
+            presets_to_reorder("/reorder-presets?url=%2FPresets%2Fedit%3Fprid%3D34"),
+            Some(34)
+        );
+        // Not one of these.
+        assert_eq!(presets_to_reorder("/reorder-presets"), None);
+        assert_eq!(presets_to_reorder("/customise-screen?x=1"), None);
+        assert_eq!(
+            presets_to_reorder("/reorder-presets?url=%2FPresets%2Fedit"),
+            None
+        );
+    }
+
+    #[test]
+    fn reordering_moves_every_slot_that_changes() {
+        // Dragging the fourth preset to the top: measured against a Powernode,
+        // 4→1 1→2 2→3 3→4 turns [D,C,B,A] into [A,D,C,B].
+        assert_eq!(
+            reordering(&[4, 1, 2, 3]),
+            vec![
+                Move { from: 4, to: 1 },
+                Move { from: 1, to: 2 },
+                Move { from: 2, to: 3 },
+                Move { from: 3, to: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_slot_is_both_a_source_and_a_destination() {
+        // The property that keeps this from deleting anything. A destination
+        // nobody vacates is a preset overwritten — that is what a single
+        // partial move did to a real one.
+        for arrangement in [
+            vec![4u32, 1, 2, 3],
+            vec![1, 3, 2],
+            vec![5, 4, 3, 2, 1],
+            vec![2, 1],
+            vec![7, 3, 9, 1],
+        ] {
+            let moves = reordering(&arrangement);
+            let mut sources: Vec<u32> = moves.iter().map(|m| m.from).collect();
+            let mut targets: Vec<u32> = moves.iter().map(|m| m.to).collect();
+            sources.sort_unstable();
+            targets.sort_unstable();
+            assert_eq!(
+                sources, targets,
+                "every slot emptied must also be filled, for {arrangement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_already_right_moves_nothing() {
+        assert!(reordering(&[1, 2, 3, 4]).is_empty());
+        assert!(reordering(&[]).is_empty());
+        assert!(reordering(&[1]).is_empty());
+    }
+
+    #[test]
+    fn a_swap_is_two_moves_and_not_one() {
+        // One move here is exactly the bug: 2→1 alone overwrites the first
+        // preset and leaves slot 2 empty.
+        assert_eq!(
+            reordering(&[2, 1]),
+            vec![Move { from: 2, to: 1 }, Move { from: 1, to: 2 }]
+        );
+    }
+
+    #[test]
+    fn slots_need_not_be_contiguous() {
+        // Deleting a preset can leave gaps, and the arrangement is over
+        // whatever slots actually hold something.
+        assert_eq!(
+            reordering(&[9, 3]),
+            vec![Move { from: 9, to: 3 }, Move { from: 3, to: 9 }]
+        );
     }
 
     #[test]

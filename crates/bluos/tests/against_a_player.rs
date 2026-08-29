@@ -300,6 +300,54 @@ async fn a_reply_without_a_context_does_not_clear_the_one_held() {
     );
 }
 
+/// Reordering presets sends the whole permutation, as JSON, by POST.
+///
+/// The shape is not documented anywhere; it was read out of the type errors a
+/// Powernode returns for a wrong body. Pinned here because a partial ordering
+/// destroys presets, and nothing about the reply says so.
+#[tokio::test]
+async fn reordering_presets_sends_every_move() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+    player.serve("/Presets/edit", "<presets prid=\"5\"></presets>");
+
+    // Dragging the fourth preset to the top.
+    let moves = bluos::screen::reordering(&[4, 1, 2, 3]);
+    client.reorder_presets(4, &moves).await.expect("reorders");
+
+    assert!(
+        player.asked_for("/Presets/edit?prid=4"),
+        "the list it is editing is named on the query too: {:?}",
+        player.asked()
+    );
+
+    let head = player.heads().last().cloned().unwrap_or_default();
+    assert!(head.starts_with("POST "), "a GET answers 405: {head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "the player refuses anything else outright"
+    );
+    assert!(
+        head.contains(r#"{"prid":4,"ordering":[{"from":4,"to":1},{"from":1,"to":2},{"from":2,"to":3},{"from":3,"to":4}]}"#),
+        "every slot that moves must be named, or the ones left out are deleted: {head}"
+    );
+}
+
+/// Nothing to reorder sends nothing at all.
+#[tokio::test]
+async fn an_order_already_right_asks_the_player_for_nothing() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+    player.serve("/Presets/edit", "<presets/>");
+
+    client.reorder_presets(4, &[]).await.expect("does nothing");
+    assert!(
+        !player.asked_for("/Presets/edit"),
+        "an empty permutation is not a request worth making"
+    );
+}
+
 /// A named stream goes out on the same route a player-link uses.
 #[tokio::test]
 async fn a_stream_can_be_named_rather_than_browsed_to() {
