@@ -129,7 +129,41 @@ pub struct Client {
     id: DeviceId,
     base: String,
     http: reqwest::Client,
+    /// The player's own UI context, carried back to it on every request.
+    ///
+    /// Shared across clones on purpose: one player has one context, and the
+    /// app clones a client per task. A filter chosen on the browse screen has
+    /// to be in force for the request that redraws it.
+    context: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
+
+/// The header the player hands its UI context back in, and expects to see
+/// again.
+///
+/// **Observed, and not documented anywhere.** Choosing "CD Quality" on Radio
+/// Paradise fires `/ui/action?Cfilter=RadioParadise-~4`, which answers 200
+/// with an empty body and this header:
+///
+/// ```text
+/// X-Sovi-Ui-Context: eyJ2IjoxLCJmaWx0ZXJzIjp7IlJhZGlvUGFyYWRpc2UtIjoiNCJ9fQo=
+/// ```
+///
+/// which is base64 for `{"v":1,"filters":{"RadioParadise-":"4"}}`. The filter
+/// is not state the player keeps — it is state the *client* keeps and returns.
+/// Without echoing it, every request is answered as though nothing had been
+/// chosen, and the screen redraws exactly as it was: the action succeeds, the
+/// refresh happens, and nothing changes.
+///
+/// Treated as opaque. It is base64 JSON today and this crate does not care;
+/// what it is for is round-tripping.
+const UI_CONTEXT: &str = "x-sovi-ui-context";
+
+/// How much of that header is worth keeping.
+///
+/// It grows with the number of filters chosen, and it comes from the network.
+/// Generous enough for far more filters than a person will set, small enough
+/// that a player cannot make this app hold something silly.
+const MAX_UI_CONTEXT: usize = 8 * 1024;
 
 /// How far a redirect chain may run before it is a loop.
 ///
@@ -278,7 +312,16 @@ impl Client {
             id,
             base: id.base_url(),
             http,
+            context: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The player's UI context as it stands, if it has handed one over.
+    ///
+    /// Exposed for tests and for anyone who wants to see what is being
+    /// carried; nothing in the app reads it.
+    pub fn ui_context(&self) -> Option<String> {
+        self.context.lock().unwrap().clone()
     }
 
     pub fn id(&self) -> DeviceId {
@@ -424,13 +467,21 @@ impl Client {
         query: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<String> {
-        let response = self
+        let mut request = self
             .http
             .get(self.resolve(&self.base, path)?)
             .query(query)
             .header("x-sovi-schema-version", SCHEMA_VERSION)
             .header("x-sovi-ui-schema-version", UI_SCHEMA_VERSION)
-            .timeout(timeout)
+            .timeout(timeout);
+
+        // Whatever the player last told us to remember. See `UI_CONTEXT`: a
+        // filter is the client's to carry, not the player's to keep.
+        if let Some(context) = self.ui_context() {
+            request = request.header(UI_CONTEXT, context);
+        }
+
+        let response = request
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -439,7 +490,36 @@ impl Client {
                 source,
             })?;
 
+        self.remember_context(&response);
         self.body(response).await
+    }
+
+    /// Keep the UI context a response carried, if it carried one.
+    ///
+    /// A response without the header leaves what is held alone rather than
+    /// clearing it: most requests do not carry one, and treating those as
+    /// "forget the filter" would undo a choice on the very next poll.
+    fn remember_context(&self, response: &reqwest::Response) {
+        let Some(value) = response.headers().get(UI_CONTEXT) else {
+            return;
+        };
+        let Ok(value) = value.to_str() else {
+            tracing::debug!(device = %self.id, "ui context is not text; ignoring it");
+            return;
+        };
+        if value.len() > MAX_UI_CONTEXT {
+            tracing::debug!(
+                device = %self.id,
+                "ui context is {} bytes; ignoring it",
+                value.len()
+            );
+            return;
+        }
+        let mut held = self.context.lock().unwrap();
+        if held.as_deref() != Some(value) {
+            tracing::debug!(device = %self.id, "the player changed its ui context");
+            *held = Some(value.to_owned());
+        }
     }
 
     async fn get_xml<T: DeserializeOwned>(

@@ -400,6 +400,52 @@ document is read from 11001, and a write goes back to **11000** — posting it t
 where the document came from answers 404. Confirmed by writing a setting the
 value it already held, then a different one, and watching it change and revert.
 
+### The UI context is the client's to carry
+
+**Confirmed.** A screen can offer a `selectorMenu` — Radio Paradise's is
+"Filter by quality", MQA against CD Quality — whose items are ordinary
+`player-link` actions:
+
+```xml
+<selectorMenu menuTitle="Filter by quality" replaceScreen="false">
+  <item text="MQA" selected="true">
+    <action type="player-link" URI="/ui/action?Cfilter=RadioParadise-~20" refreshScreen="true"/>
+  </item>
+  <item text="CD Quality">
+    <action type="player-link" URI="/ui/action?Cfilter=RadioParadise-~4" refreshScreen="true"/>
+  </item>
+</selectorMenu>
+```
+
+Running one answers **200 with an empty body** and this header:
+
+```
+X-Sovi-Ui-Context: eyJ2IjoxLCJmaWx0ZXJzIjp7IlJhZGlvUGFyYWRpc2UtIjoiNCJ9fQo=
+```
+
+which is base64 for `{"v":1,"filters":{"RadioParadise-":"4"}}`.
+
+**The filter is not state the player keeps.** It is state the player hands to
+the client, and the client must send back on subsequent requests. Fetch the
+screen again without that header and it comes back exactly as it was —
+`MQA selected="true"` and every item still at `:20`. Send it and the same URL
+answers with `CD Quality selected="true"` and items at `:4`. Confirmed both
+ways on a Powernode running 4.16.22.
+
+This is why a picker can look broken while everything about it works: the
+action runs, `refreshScreen` is honoured, the screen is re-fetched — and the
+re-fetch says "no filter" because the context went nowhere.
+
+Treat it as opaque and round-trip it. Note also that the syntax is validated:
+`Cfilter=RadioParadise-4`, without the `~`, answers 400 `Invalid filter
+parameter`.
+
+A related trap for anyone poking at this with `curl`: the player answers a
+*different, older-shaped* document when the `x-sovi-schema-version` and
+`x-sovi-ui-schema-version` headers are absent — two plain `<list>` sections
+rather than a `selectorMenu` and one list. A hand-made request is not what the
+app sees.
+
 ### Playing something the player did not offer
 
 **Confirmed.** `/Play?url=` is how a `player-link` row starts what it names,

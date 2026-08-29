@@ -232,6 +232,74 @@ async fn an_upgrade_is_refused_unless_the_player_says_it_is_ready() {
     assert!(player.asked_for("upgrade=check"), "and it checked first");
 }
 
+/// A filter chosen on a screen is the client's to carry, not the player's to
+/// keep.
+///
+/// Choosing "CD Quality" on Radio Paradise answers 200 with an empty body and
+/// an `X-Sovi-Ui-Context` header — base64 JSON naming the filter. Nothing on
+/// the player changes. Send the next request without that header and the
+/// screen comes back exactly as it was, which is what made the picker look
+/// broken: the action ran, the refresh happened, and every request said "no
+/// filter" again.
+#[tokio::test]
+async fn the_players_ui_context_is_carried_back_to_it() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+
+    player.serve("/ui/action", "");
+    assert!(client.ui_context().is_none(), "nothing carried yet");
+
+    // The first request goes out without one, because there is none.
+    player.serve("/SyncStatus", fixtures::sync_status());
+    client.sync_status().await.expect("reads");
+    assert!(
+        !player.last_head_had("x-sovi-ui-context"),
+        "nothing to send, so nothing is sent"
+    );
+
+    // Now the player hands one over.
+    let context = "eyJ2IjoxLCJmaWx0ZXJzIjp7IlJhZGlvUGFyYWRpc2UtIjoiNCJ9fQo=";
+    player.hand_out_context(context);
+    client.sync_status().await.expect("reads");
+    assert_eq!(
+        client.ui_context().as_deref(),
+        Some(context),
+        "and it is kept"
+    );
+
+    // And every request after it carries it back.
+    client.sync_status().await.expect("reads");
+    assert!(
+        player.last_head_had(&format!("x-sovi-ui-context: {context}")),
+        "the context must go back or the filter is forgotten: {:?}",
+        player.heads().last()
+    );
+}
+
+/// A reply that says nothing about the context leaves it alone.
+///
+/// Most requests carry no such header. Treating those as "forget it" would
+/// undo a filter on the very next status poll, which is every second.
+#[tokio::test]
+async fn a_reply_without_a_context_does_not_clear_the_one_held() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+    player.serve("/SyncStatus", fixtures::sync_status());
+
+    player.hand_out_context("held");
+    client.sync_status().await.expect("reads");
+    assert_eq!(client.ui_context().as_deref(), Some("held"));
+
+    // The player stops mentioning it.
+    player.state_without_context();
+    client.sync_status().await.expect("reads");
+    assert_eq!(
+        client.ui_context().as_deref(),
+        Some("held"),
+        "silence is not a retraction"
+    );
+}
+
 /// A named stream goes out on the same route a player-link uses.
 #[tokio::test]
 async fn a_stream_can_be_named_rather_than_browsed_to() {

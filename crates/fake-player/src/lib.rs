@@ -46,6 +46,11 @@ struct State {
     /// Every path-and-query asked for, in order, so a test can assert on what
     /// the app actually sent rather than only on what it did with the reply.
     seen: Vec<String>,
+    /// Every request head in full, for the things a target cannot show — a
+    /// header the client is supposed to be carrying, chiefly.
+    heads: Vec<String>,
+    /// A `X-Sovi-Ui-Context` to put on every reply, if the test wants one.
+    context: Option<String>,
 }
 
 /// A player on the loopback.
@@ -68,6 +73,8 @@ impl Player {
                 .map(|(path, body)| (path.to_owned(), body))
                 .collect(),
             seen: Vec::new(),
+            heads: Vec::new(),
+            context: None,
         }));
 
         // Port zero: the kernel picks a free one, so tests can run at the same
@@ -123,6 +130,32 @@ impl Player {
     pub fn asked_for(&self, fragment: &str) -> bool {
         self.asked().iter().any(|seen| seen.contains(fragment))
     }
+
+    /// Put a `X-Sovi-Ui-Context` on every reply from here on.
+    ///
+    /// This is what a real player does when a filter is chosen: the state is
+    /// handed to the client to carry, not kept.
+    pub fn hand_out_context(&self, value: impl Into<String>) {
+        self.state.lock().unwrap().context = Some(value.into());
+    }
+
+    /// Stop putting a context on replies, without forgetting what was sent.
+    pub fn state_without_context(&self) {
+        self.state.lock().unwrap().context = None;
+    }
+
+    /// Every request head so far, in full.
+    pub fn heads(&self) -> Vec<String> {
+        self.state.lock().unwrap().heads.clone()
+    }
+
+    /// Whether the most recent request carried this text anywhere in its head.
+    pub fn last_head_had(&self, fragment: &str) -> bool {
+        self.heads().last().is_some_and(|head| {
+            head.to_ascii_lowercase()
+                .contains(&fragment.to_ascii_lowercase())
+        })
+    }
 }
 
 /// One request, one reply.
@@ -159,16 +192,23 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
         .to_owned();
     let path = target.split('?').next().unwrap_or_default().to_owned();
 
-    let body = {
+    let (body, context) = {
         let mut state = state.lock().unwrap();
         state.seen.push(target.clone());
-        state.routes.get(&path).cloned()
+        state.heads.push(head.clone());
+        (state.routes.get(&path).cloned(), state.context.clone())
+    };
+
+    let carried = match &context {
+        Some(value) => format!("X-Sovi-Ui-Context: {value}\r\n"),
+        None => String::new(),
     };
 
     let reply = match body {
         Some(body) => format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/xml\r\n\
+             {carried}\
              Content-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len()
