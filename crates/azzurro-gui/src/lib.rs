@@ -5195,6 +5195,46 @@ fn item_at<'a>(
     None
 }
 
+/// Save a preset, unless the player already has one holding that stream.
+///
+/// Nothing on the player refuses a duplicate: saving the same station twice
+/// puts it in two slots, and there are only so many. So the list is read
+/// first, which is the only thing `/Presets` is needed for — every other
+/// preset route is handed its subject rather than having to look it up.
+///
+/// A list that cannot be read is not a reason to refuse: the save is what was
+/// asked for, and a duplicate is a smaller problem than a button that does
+/// nothing when the player is briefly busy.
+async fn save_preset_once(backend: &Backend, client: &Client, preset: &bluos::screen::Preset) {
+    let Some(url) = preset.url.as_deref() else {
+        return;
+    };
+
+    if let Ok(held) = client.presets().await
+        && let Some(already) = held.holding(url)
+    {
+        say(
+            &backend.ui,
+            format!(
+                "{} is already preset {}",
+                bluos::presets::Presets::label(already),
+                already.id
+            ),
+        );
+        return;
+    }
+
+    let named = if preset.name.is_empty() {
+        "it".to_owned()
+    } else {
+        preset.name.clone()
+    };
+    match client.save_preset(preset).await {
+        Ok(()) => say(&backend.ui, format!("Saved {named} as a preset")),
+        Err(e) => say(&backend.ui, format!("could not save it: {e}")),
+    }
+}
+
 /// The cursor a screen should carry once a page has arrived.
 ///
 /// `None` stops the paging. Two ways a list can say it is finished without
@@ -5648,6 +5688,44 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             // fresh request: the Presets screen is where this is pressed, its
             // items carry the slot number as `counter`, and re-reading it
             // would only invite the two to disagree.
+            // The `+` at the top of the Presets screen, which unlike every
+            // other preset route arrives with nothing attached: it is asking
+            // for something to be chosen.
+            //
+            // What is playing is the answer, and the player has already said
+            // what that is. `streamUrl` is set whenever it is playing a URL
+            // rather than working through the queue — a station, or an input —
+            // and that is exactly what a preset holds. `title1` is the
+            // station, `title2` and `title3` being the track.
+            //
+            // The image is left off deliberately. `/Status`'s is the cover of
+            // the song playing this minute, and a preset wearing it would be
+            // wrong by the next one; the player draws its own placeholder.
+            Some("/add-preset") => {
+                let playing = backend.with_entry(id, |entry| {
+                    entry.status.as_ref().and_then(|status| {
+                        let url = status.stream_url.as_deref().filter(|u| !u.is_empty())?;
+                        Some(bluos::screen::Preset {
+                            name: status.title1.clone().unwrap_or_default(),
+                            url: Some(url.to_owned()),
+                            image: None,
+                        })
+                    })
+                });
+
+                let Some(Some(preset)) = playing else {
+                    say(
+                        &backend.ui,
+                        "Nothing is playing that can be a preset — open a station \
+                         and choose Add preset from its menu",
+                    );
+                    return;
+                };
+
+                save_preset_once(&backend, &client, &preset).await;
+                refresh_current(backend).await;
+            }
+
             // Renaming a preset. The player's own menu offers it and hands
             // over everything the slot holds, so this only has to ask for a
             // new name and send the lot back.
@@ -5699,21 +5777,11 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // is a string split; the alternative is a nested `if let` in
                 // the arm below, which buries the case that matters.
                 let preset = bluos::screen::preset_to_save(route).unwrap_or_default();
-                let named = if preset.name.is_empty() {
-                    "the station".to_owned()
-                } else {
-                    preset.name.clone()
-                };
-                match client.save_preset(&preset).await {
-                    Ok(()) => {
-                        say(&backend.ui, format!("Saved {named} as a preset"));
-                        // The shelf and the Presets screen are both the
-                        // player's, and both are now out of date.
-                        if action.refresh_screen {
-                            refresh_current(backend).await;
-                        }
-                    }
-                    Err(e) => say(&backend.ui, format!("could not save it: {e}")),
+                save_preset_once(&backend, &client, &preset).await;
+                // The shelf and the Presets screen are both the player's, and
+                // both may now be out of date.
+                if action.refresh_screen {
+                    refresh_current(backend).await;
                 }
             }
 
@@ -5722,10 +5790,8 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 say(
                     &backend.ui,
                     match route {
-                        // The bare form, from the `+` at the top of the
-                        // Presets screen. The parameterised one is handled
-                        // above; this one is being asked to choose something
-                        // to save, which is a screen this app has not built.
+                        // Handled above when it carries what to save. The
+                        // bare form cannot reach here.
                         "/add-preset" => {
                             "Open a station and choose Add preset from its menu".to_owned()
                         }

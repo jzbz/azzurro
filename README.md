@@ -24,8 +24,8 @@ The window lists the players it finds and drives them:
 - whatever the service offers for the track — Love, Ban, Shop — where it
   offers any
 - presets: the shelf, the screen, playing one, saving a station into one from
-  its own menu, deleting it from the player's, renaming one, and dragging them
-  into a new order
+  its own menu or from what is playing, deleting it from the player's, renaming
+  one, and dragging them into a new order
 - radio stations typed in by hand, for the ones no directory carries — kept on
   this machine, since the player has nowhere to put them
 - firmware upgrades: an offer on the way in, a confirmation, the install
@@ -45,7 +45,6 @@ Measured against the official controller, in roughly the order a user notices:
 
 | Missing | Where it stands |
 | --- | --- |
-| **Choosing what to save as a preset** | Everything else about presets works. The one route left is the `+` at the top of the Presets screen, which asks for something to be *chosen* rather than handed over — a picker, where every other preset route arrives with its subject attached. It says so. |
 | **The fifteen-second nudge** | A podcast's skip and back carry an `interval`. Left out of the track actions beside them: no player here offers one, so their shape has never been seen. |
 | **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |

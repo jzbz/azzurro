@@ -1150,6 +1150,16 @@ impl Client {
         self.command("/SetPreset", &query).await
     }
 
+    /// What is already in the preset slots.
+    ///
+    /// The one preset question the player does not answer by handing it over:
+    /// every other route carries its own subject, so this exists to ask
+    /// whether something is a preset already. Without it the same station goes
+    /// into a new slot every time it is saved.
+    pub async fn presets(&self) -> Result<crate::presets::Presets> {
+        self.get_xml("/Presets", &[], REQUEST_TIMEOUT).await
+    }
+
     /// Rewrite the preset in `slot`, leaving the others alone.
     ///
     /// The same route as saving, with the slot named: `/SetPreset?id=N&…`
