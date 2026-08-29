@@ -19,8 +19,8 @@ The window lists the players it finds and drives them:
 - the player's own settings, served from a second port and rendered from the
   forms the player sends
 - alarms: read, write, schedule, and choose what each one plays
-- firmware upgrades: an offer on the way in, a confirmation, and the install
-  itself
+- firmware upgrades: an offer on the way in, a confirmation, the install
+  itself, and a strip that follows it stage by stage
 
 Each player is also exported over MPRIS, so the desktop's own media controls
 work.
@@ -36,7 +36,6 @@ Measured against the official controller, in roughly the order a user notices:
 | Missing | Where it stands |
 | --- | --- |
 | **Presets** | The shelf is hidden and the save route is a stub. `bluosctl preset <player> <n>` recalls a slot; nothing enumerates the slots or stores into one. |
-| **Live upgrade progress** | The stage and percentage are polled and computed; no widget draws them. During an install the only signal is the player going quiet and a toast at the end. |
 | **Per-service track actions** | `/Status`'s `<actions>` are parsed in full — thumbs up and down, the shop link, the fifteen-second nudge — and nothing fires them. |
 | **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |

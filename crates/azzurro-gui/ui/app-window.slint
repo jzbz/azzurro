@@ -36,9 +36,18 @@ export struct Device {
     service: string,
     reachable: bool,
     // "Leading 2 players", "Following Kitchen", "Reconnecting…" or empty.
+    //
+    // Recomputed from the grouping state on every publish, so nothing else can
+    // borrow it to say something — an upgrade tried, and was overwritten on
+    // the same tick by the publish that carried it.
     role: string,
     in-group: bool,
     groupable: bool,
+    // Set for as long as the player is rewriting its own firmware, with the
+    // stage and any percentage it reports. Its own field precisely because
+    // `role` is not one it can share.
+    upgrading: bool,
+    upgrade-line: string,
 }
 
 // One row of the play queue.
@@ -669,11 +678,21 @@ component DeviceCard inherits Rectangle {
             toggle-mute => { root.toggle-mute(); }
         }
 
-        if root.device.role != "" || root.device.groupable: HorizontalLayout {
+        if root.device.upgrading || root.device.role != "" || root.device.groupable: HorizontalLayout {
             spacing: Theme.gap;
             padding-top: 2px;
 
-            if root.device.role != "": Badge {
+            // An upgrade displaces the grouping badge rather than sitting
+            // beside it. Both are "what this player is doing"; while it is
+            // rewriting its own firmware, that is the answer, and the row is
+            // too narrow to carry two badges without one wrapping.
+            if root.device.upgrading: Badge {
+                label: root.device.upgrade-line;
+                tint: Theme.accent;
+                glyph: Icons.upgrade;
+            }
+
+            if !root.device.upgrading && root.device.role != "": Badge {
                 label: root.device.role;
                 tint: Theme.accent;
                 glyph: Icons.grouped;
@@ -2596,6 +2615,108 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
+                    // The same strip for a firmware install, and the same
+                    // reasons: it outlives the page it was started from — the
+                    // Install row is three taps into Help and nobody watches
+                    // it there for four minutes — and it must not shove the
+                    // page down the instant it appears.
+                    //
+                    // Below indexing rather than above it. A reindex is
+                    // routine and an upgrade is not, so the rarer one sits
+                    // nearer the eye; and on the once-in-a-lifetime occasion
+                    // both are up, the order stays fixed instead of depending
+                    // on which started first.
+                    Rectangle {
+                        height: root.upgrading-player != "" ? 52px : 0px;
+                        clip: true;
+                        opacity: root.upgrading-player != "" ? 1.0 : 0.0;
+
+                        animate height, opacity {
+                            duration: Theme.settle;
+                            easing: ease-out;
+                        }
+
+                        Rectangle {
+                            x: Theme.pad;
+                            y: 0;
+                            width: parent.width - 2 * Theme.pad;
+                            height: parent.height - Theme.gap;
+                            border-radius: Theme.radius-small;
+                            background: Theme.accent-soft;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding: Theme.gap;
+                                spacing: 7px;
+
+                                HorizontalLayout {
+                                    spacing: 7px;
+
+                                    VerticalLayout {
+                                        alignment: center;
+
+                                        Icon {
+                                            glyph: Icons.upgrade;
+                                            tint: Theme.accent;
+                                            width: 14px;
+                                            height: 14px;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: root.upgrade-said;
+                                        font-size: Theme.small-size;
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    // Only when the player is actually
+                                    // counting. A Powernode reports no step,
+                                    // no total and no percentage at any point
+                                    // in the install, so on that hardware this
+                                    // never appears and the sweep below is the
+                                    // whole signal.
+                                    if root.upgrading-percent > 0: Text {
+                                        text: Math.round(root.upgrading-percent) + "%";
+                                        font-size: Theme.small-size;
+                                        color: Theme.dim;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // Determinate when there is a number to draw,
+                                // and a sweep when there is not. A bar pinned
+                                // at nought for four minutes says "stuck",
+                                // which is the one thing it must not say about
+                                // a player rewriting its own firmware.
+                                if root.upgrading-percent > 0: Rectangle {
+                                    height: 4px;
+                                    border-radius: 2px;
+                                    background: Theme.sunken;
+                                    clip: true;
+
+                                    Rectangle {
+                                        x: 0;
+                                        width: parent.width * (root.upgrading-percent / 100);
+                                        height: parent.height;
+                                        border-radius: 2px;
+                                        background: Theme.accent;
+                                        animate width {
+                                            duration: Theme.settle;
+                                            easing: ease-out;
+                                        }
+                                    }
+                                }
+
+                                if root.upgrading-percent <= 0: Indeterminate {
+                                    sweeping: root.upgrading-player != "";
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // The record, large.
@@ -4249,6 +4370,20 @@ export component AppWindow inherits Window {
         }
     }
 
+    // The upgrade strip's words, held for the same reason as `indexed`: the
+    // strip animates its own collapse, and a label bound straight through
+    // would blank on the frame the upgrade ended and leave an empty box
+    // shrinking. Composed here rather than in Rust so the two halves stay
+    // separate properties — the player's name is also what the row badge and
+    // the toasts use.
+    property <string> upgrade-said;
+
+    changed upgrading-stage => {
+        if (root.upgrading-player != "") {
+            root.upgrade-said = root.upgrading-player + " — " + root.upgrading-stage;
+        }
+    }
+
     // The last thing said, held past the moment it is cleared.
     //
     // The fade out needs words to fade: binding the label straight to
@@ -4282,6 +4417,7 @@ export component AppWindow inherits Window {
         // Animated on the same curve as the strip, so they move together
         // rather than the message jumping when indexing starts or stops.
         y: parent.height - 88px - (root.indexing != "" ? 52px : 0px)
+            - (root.upgrading-player != "" ? 52px : 0px)
             - self.height - Theme.pad;
 
         animate y {

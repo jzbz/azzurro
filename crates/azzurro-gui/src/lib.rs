@@ -2200,18 +2200,25 @@ impl Backend {
             self.publish_help();
         }
 
-        // Said on the player's own row as well as in the banner, and marked
+        // Said on the player's own row as well as in the strip, and marked
         // unreachable so the row reads as something that will not answer.
         // Note this dims the row rather than disabling its controls: taking
         // them away properly means keeping an upgrading player out of the
         // selection altogether, which is how the official controller does it
         // and is a larger change than this.
+        //
+        // Its own field rather than `role`. This used to write the line there
+        // and it never once reached the window: `publish` recomputes `role`
+        // from the grouping state on every call, including the one at the
+        // bottom of this function, so the words were overwritten on the same
+        // tick that carried them.
         let line = match progress.bar() {
             Some(percent) => format!("{stage} — {percent}%"),
             None => stage.clone(),
         };
         self.update(id, |view| {
-            view.role = line.clone().into();
+            view.upgrading = true;
+            view.upgrade_line = line.clone().into();
             view.reachable = false;
         });
 
@@ -2261,11 +2268,12 @@ impl Backend {
             ids
         };
 
-        // The next status puts the real role back; this only stops the
+        // The next status puts the real state back; this only stops the
         // upgrade's words outliving it.
         for id in was {
             self.update(id, |view| {
-                view.role = slint::SharedString::new();
+                view.upgrading = false;
+                view.upgrade_line = slint::SharedString::new();
                 view.reachable = true;
             });
         }

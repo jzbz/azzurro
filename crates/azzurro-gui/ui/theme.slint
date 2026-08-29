@@ -191,6 +191,10 @@ export global Icons {
     out property <image> unfavourite: @image-url("icons/star-off.svg");
     out property <image> clear: @image-url("icons/trash-2.svg");
     out property <image> save: @image-url("icons/download.svg");
+    // The same glyph as `save`, under the name the upgrade code reads by. A
+    // firmware install is a download the player performs on itself, and the
+    // call site saying `upgrade` rather than `save` is the point.
+    out property <image> upgrade: @image-url("icons/download.svg");
     // Stands in for a setting with no better icon — every row on a settings
     // page gets a tile, so a few empty squares among them read as missing
     // rather than as deliberate.
