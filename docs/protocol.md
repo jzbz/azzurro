@@ -440,6 +440,14 @@ Treat it as opaque and round-trip it. Note also that the syntax is validated:
 `Cfilter=RadioParadise-4`, without the `~`, answers 400 `Invalid filter
 parameter`.
 
+**The key belongs to the screen, not to the service.** The example above is
+from `/ui/BrowseObjects?service=RadioParadise&url=%2FRadioBrowse`, whose filter
+is `RadioParadise-`. The screen the app actually browses to reach the same
+service is `/ui/browseMenuGroup?service=RadioParadise`, and its filter is
+`RadioParadise-0`. Two screens onto one service, two keys, and a context
+carrying one says nothing about the other — which is a good reason to carry the
+header whole and never to build one.
+
 A related trap for anyone poking at this with `curl`: the player answers a
 *different, older-shaped* document when the `x-sovi-schema-version` and
 `x-sovi-ui-schema-version` headers are absent — two plain `<list>` sections
