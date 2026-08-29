@@ -4931,7 +4931,11 @@ fn user_screens(config: &bluos::Configuration) -> Vec<(String, String)> {
     // three of these and not the rest: Recently Played and Presets are rows on
     // the Home screen, Sources is the two sections drawn underneath, and News
     // is an empty screen on every player seen.
-    const IN_SIDEBAR: &[&str] = &["home", "favourites", "search"];
+    // `presets` is here because the player serves a whole screen for it —
+    // rows that play, each with a context menu offering Edit and Delete — and
+    // the hardware buttons it names are on the remote in the room. It sits
+    // after Home for the same reason the official controller puts it there.
+    const IN_SIDEBAR: &[&str] = &["home", "presets", "favourites", "search"];
 
     config
         .items
@@ -5565,12 +5569,46 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 }
             }
 
+            // The player gathers what a preset needs and hands it over rather
+            // than saving it itself: a station's menu offers
+            // `/add-preset?name=…&url=…&image=…`, everything already decided.
+            // So this is a decode and a request, with nothing to ask anybody.
+            Some(route) if bluos::screen::preset_to_save(route).is_some() => {
+                // Decoded twice — once to choose this arm and once to use it —
+                // because a match guard cannot hand its answer to the body. It
+                // is a string split; the alternative is a nested `if let` in
+                // the arm below, which buries the case that matters.
+                let preset = bluos::screen::preset_to_save(route).unwrap_or_default();
+                let named = if preset.name.is_empty() {
+                    "the station".to_owned()
+                } else {
+                    preset.name.clone()
+                };
+                match client.save_preset(&preset).await {
+                    Ok(()) => {
+                        say(&backend.ui, format!("Saved {named} as a preset"));
+                        // The shelf and the Presets screen are both the
+                        // player's, and both are now out of date.
+                        if action.refresh_screen {
+                            refresh_current(backend).await;
+                        }
+                    }
+                    Err(e) => say(&backend.ui, format!("could not save it: {e}")),
+                }
+            }
+
             Some(route) => {
                 tracing::debug!(%id, "no equivalent for the route {route}");
                 say(
                     &backend.ui,
                     match route {
-                        "/add-preset" => "Saving presets is not built yet".to_owned(),
+                        // The bare form, from the `+` at the top of the
+                        // Presets screen. The parameterised one is handled
+                        // above; this one is being asked to choose something
+                        // to save, which is a screen this app has not built.
+                        "/add-preset" => {
+                            "Open a station and choose Add preset from its menu".to_owned()
+                        }
                         _ => format!(
                             "{} is not built yet",
                             action.title.as_deref().unwrap_or(route)

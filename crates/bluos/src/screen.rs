@@ -1120,6 +1120,65 @@ impl Configuration {
     }
 }
 
+/// What an `/add-preset` deep link is asking to be saved.
+///
+/// The player routes preset-saving through the client rather than answering it
+/// itself, but it does the gathering first: a station's context menu offers
+///
+/// ```text
+/// /add-preset?image=https%3A%2F%2F…&name=The+Main+Mix&url=RadioParadise%3A%2F0%3A20
+/// ```
+///
+/// so the name, the stream and the artwork are all already decided. Nothing
+/// has to be asked of anybody; this is only the decoding.
+///
+/// The bare `/add-preset` — the `+` at the top of the Presets screen — carries
+/// none of them, and is a different job: choosing something to save. `None`
+/// says so.
+///
+/// `url` is required and `name` is not: a preset with no name is one the
+/// player will show by its address, which beats refusing to save it.
+pub fn preset_to_save(uri: &str) -> Option<Preset> {
+    let (path, query) = uri.split_once('?')?;
+    if path != "/add-preset" {
+        return None;
+    }
+
+    let mut found = Preset::default();
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        // `+` is a space here: this is a query string, and the player writes
+        // "The+Main+Mix".
+        let decoded = percent_encoding::percent_decode_str(&value.replace('+', " "))
+            .decode_utf8()
+            .ok()?
+            .into_owned();
+        if decoded.is_empty() {
+            continue;
+        }
+        match name {
+            "name" => found.name = decoded,
+            "url" => found.url = Some(decoded),
+            "image" => found.image = Some(decoded),
+            _ => {}
+        }
+    }
+
+    found.url.is_some().then_some(found)
+}
+
+/// A preset on its way to being saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preset {
+    pub name: String,
+    /// The player's own scheme — `RadioParadise:/0:20` — or an ordinary URL.
+    /// Carried, never built.
+    pub url: Option<String>,
+    pub image: Option<String>,
+}
+
 /// The request for the next page of a list that counts rather than points.
 ///
 /// Most long lists hand over a `<nextLink>` and a client only has to follow
@@ -1252,6 +1311,49 @@ mod tests {
             }],
             ..Screen::default()
         }
+    }
+
+    #[test]
+    fn a_station_menu_hands_over_everything_a_preset_needs() {
+        // Exactly as a Powernode on 4.16.22 writes it for Radio Paradise.
+        let uri = "/add-preset?image=https%3A%2F%2Fimg.radioparadise.com%2F0.jpg\
+                   &name=The+Main+Mix&url=RadioParadise%3A%2F0%3A20";
+        let preset = preset_to_save(uri).expect("a preset");
+        assert_eq!(preset.name, "The Main Mix", "+ is a space in a query");
+        assert_eq!(preset.url.as_deref(), Some("RadioParadise:/0:20"));
+        assert_eq!(
+            preset.image.as_deref(),
+            Some("https://img.radioparadise.com/0.jpg")
+        );
+    }
+
+    #[test]
+    fn the_bare_route_is_asking_to_choose_something() {
+        // The `+` at the top of the Presets screen. A different job, and not
+        // this function's.
+        assert_eq!(preset_to_save("/add-preset"), None);
+        assert_eq!(preset_to_save("/add-preset?"), None);
+    }
+
+    #[test]
+    fn a_preset_needs_something_to_play() {
+        assert_eq!(preset_to_save("/add-preset?name=Nameless"), None);
+        // An empty url is no url.
+        assert_eq!(preset_to_save("/add-preset?name=X&url="), None);
+    }
+
+    #[test]
+    fn a_preset_with_no_name_is_still_saveable() {
+        // The player shows it by its address, which beats refusing to save it.
+        let preset = preset_to_save("/add-preset?url=http%3A%2F%2Fx.example%2Fs").expect("saves");
+        assert!(preset.name.is_empty());
+        assert_eq!(preset.url.as_deref(), Some("http://x.example/s"));
+    }
+
+    #[test]
+    fn another_route_is_not_an_add_preset() {
+        assert_eq!(preset_to_save("/edit-preset/1?id=1&name=X&url=Y"), None);
+        assert_eq!(preset_to_save("/music-service/Tidal?url=x"), None);
     }
 
     #[test]

@@ -21,6 +21,10 @@ The window lists the players it finds and drives them:
 - the player's own settings, served from a second port and rendered from the
   forms the player sends
 - alarms: read, write, schedule, and choose what each one plays
+- whatever the service offers for the track — Love, Ban, Shop — where it
+  offers any
+- presets: the shelf, the screen, playing one, saving a station into one from
+  its own menu, and deleting it from the player's
 - radio stations typed in by hand, for the ones no directory carries — kept on
   this machine, since the player has nowhere to put them
 - firmware upgrades: an offer on the way in, a confirmation, the install
@@ -40,8 +44,8 @@ Measured against the official controller, in roughly the order a user notices:
 
 | Missing | Where it stands |
 | --- | --- |
-| **Presets** | The shelf is hidden and the save route is a stub. `bluosctl preset <player> <n>` recalls a slot; nothing enumerates the slots or stores into one. |
-| **Per-service track actions** | `/Status`'s `<actions>` are parsed in full — thumbs up and down, the shop link, the fifteen-second nudge — and nothing fires them. |
+| **Editing and reordering presets** | Listing, playing, saving and deleting all work. The three routes the player hands to the client — the `+` on the Presets screen, Edit on a preset, and Reorder — are not built, and say so. |
+| **The fifteen-second nudge** | A podcast's skip and back carry an `interval`. Left out of the track actions beside them: no player here offers one, so their shape has never been seen. |
 | **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
 | **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |

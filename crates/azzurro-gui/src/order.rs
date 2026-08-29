@@ -118,12 +118,16 @@ fn writable(id: &str) -> bool {
 /// with `noReorder`, so Customise Home cannot move it and nothing else can
 /// get above it. It says nothing about the music on the system, and this app
 /// is not the place the vendor gets to promote its features.
+///
+/// `presets` used to be here too, on the grounds that the shelf was a heading
+/// over nothing and a `+` that reported itself unbuilt. That was true when the
+/// app had no preset support of any kind. It is not true now: the rows the
+/// player serves are ordinary `player-link`s to `/Preset?id=N`, each with a
+/// context menu of the player's own offering Play, Edit and Delete, so the
+/// shelf works through the same machinery as every other row on the screen.
+/// Only the `+` is still the client's to build.
 pub fn is_hidden(id: Option<&str>) -> bool {
-    // `presets` joins it. The row is a shelf of numbered slots plus a `+` that
-    // leads to a route only the official controller answers, so with nothing
-    // behind it here it is a heading over an empty space and a button that
-    // reports itself unbuilt. Better absent than present and inert.
-    matches!(id, Some("teaser" | "presets"))
+    matches!(id, Some("teaser"))
 }
 
 /// The order a screen takes before anyone has arranged it.
@@ -277,12 +281,20 @@ mod tests {
         assert_eq!(arrange(&ids, &pinned, &[]), vec![0, 1, 2]);
     }
     #[test]
-    fn the_shelves_with_nothing_behind_them_are_never_drawn() {
+    fn only_the_vendors_own_advertising_is_never_drawn() {
         assert!(is_hidden(Some("teaser")));
-        assert!(is_hidden(Some("presets")));
         assert!(!is_hidden(Some("recent")));
         assert!(!is_hidden(Some("mostUsed")));
         assert!(!is_hidden(None));
+    }
+
+    #[test]
+    fn the_presets_shelf_is_drawn() {
+        // It was hidden while the app could do nothing with a preset. The rows
+        // the player serves are plain player-links to /Preset?id=N, each with
+        // a context menu of the player's own — Play, Edit, Delete — so the
+        // shelf works through the machinery every other row already uses.
+        assert!(!is_hidden(Some("presets")));
     }
 
     #[test]

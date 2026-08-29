@@ -1121,6 +1121,35 @@ impl Client {
         self.command("/Play", &[]).await
     }
 
+    /// Store something in the next free preset slot.
+    ///
+    /// `/SetPreset` takes a name, a URL and an optional image, and answers with
+    /// the whole list as it now stands — so a caller that wants to redraw need
+    /// not ask again. Without an `id` it appends; the player picks the slot,
+    /// which is the number printed on the remote.
+    ///
+    /// Confirmed on a Powernode running 4.16.22: saving answered
+    /// `<presets prid="1"><preset id="1" name="…" url="…"/></presets>`, and
+    /// `prid` advances on every change — which is what the Presets screen asks
+    /// to be refreshed on.
+    ///
+    /// The URL is carried, never built. It is the player's own scheme for a
+    /// station it offered and an ordinary address for one typed in, and this
+    /// crate has no business inventing either.
+    pub async fn save_preset(&self, preset: &crate::screen::Preset) -> Result<()> {
+        let Some(url) = preset.url.as_deref() else {
+            return Err(Error::Screen("a preset needs something to play".to_owned()));
+        };
+        let mut query: Vec<(&str, &str)> = vec![("url", url)];
+        if !preset.name.is_empty() {
+            query.push(("name", &preset.name));
+        }
+        if let Some(image) = preset.image.as_deref() {
+            query.push(("image", image));
+        }
+        self.command("/SetPreset", &query).await
+    }
+
     /// Play a stream the caller names, rather than one the player offered.
     ///
     /// `/Play?url=` is the same route a `player-link` uses, and it takes an
