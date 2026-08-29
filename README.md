@@ -6,14 +6,48 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
 **Status: young, and exercised against real hardware.** Discovery, status, the
 long poll and the transport verbs all run against a player rather than a
-fixture. The window lists the players it finds, shows the selected one's play
-queue with cover art, browses and searches every source the player offers, and
-drives all of it. Each player is exported over MPRIS so the desktop's own media
-controls work.
+fixture, and firmware upgrades have been driven end to end on an NAD Powernode.
+
+The window lists the players it finds and drives them:
+
+- the selected player's queue, with cover art — play a row, remove one,
+  reorder by dragging, save the lot as a playlist
+- browse and search every source the player offers, with Home rearrangeable
+  and favourites and recent searches to hand
+- transport, volume, mute and the physical inputs
+- ad-hoc grouping, one player at a time or all of them at once
+- the player's own settings, served from a second port and rendered from the
+  forms the player sends
+- alarms: read, write, schedule, and choose what each one plays
+- firmware upgrades: an offer on the way in, a confirmation, and the install
+  itself
+
+Each player is also exported over MPRIS, so the desktop's own media controls
+work.
 
 Two things are not reimplementable and are out of scope: linking a new music
 service, which happens on Lenbrook's cloud control panel, and anything else
 behind a BluOS account.
+
+## What is not there yet
+
+Measured against the official controller, in roughly the order a user notices:
+
+| Missing | Where it stands |
+| --- | --- |
+| **Presets** | The shelf is hidden and the save route is a stub. `bluosctl preset <player> <n>` recalls a slot; nothing enumerates the slots or stores into one. |
+| **Live upgrade progress** | The stage and percentage are polled and computed; no widget draws them. During an install the only signal is the player going quiet and a toast at the end. |
+| **Per-service track actions** | `/Status`'s `<actions>` are parsed in full — thumbs up and down, the shop link, the fifteen-second nudge — and nothing fires them. |
+| **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
+| **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
+| **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
+| **Queues past 500 tracks** | The queue is fetched as one window of 500. The header says `500 of 1234`, so nothing is hidden silently, but the tail cannot be reached. |
+| **Custom radio by stream URL** | Radio is whatever the player's browse tree offers. No endpoint for pasting a URL is documented. |
+| **Upgrading through a master** | The upgrade route takes `slave=` to reach a zone member. Not sent, so such a player cannot be upgraded from here. `upgrade=all` is refused deliberately. |
+| **Recent searches** | Kept for the session only, though the remembered-players file already shows how to persist them. |
+
+Most of these are UI work over a protocol layer that already reaches the
+endpoint, rather than protocol work waiting to be done.
 
 ## Layout
 
@@ -22,6 +56,7 @@ behind a BluOS account.
 | `crates/bluos` | The protocol: LSDP discovery, the control API, the long poll, the status documents. No GUI types, no UI dependencies. Meant to be published on its own. |
 | `crates/bluos-cli` | `bluosctl`, the same crate with a command line on it. The fast way to check something against real hardware. |
 | `crates/azzurro-gui` | Slint front end. Binary is `azzurro`. |
+| `crates/fake-player` | A test double that answers like a player, so the protocol and the window can be driven with no speaker on the network. Not published. |
 
 The GUI depends only on `bluos`'s own types — no XML parser or HTTP client
 reaches a Slint callback — so the protocol layer stays usable by anything else.
@@ -98,17 +133,24 @@ client.
 
 ## Installing
 
-There is no packaged build yet. To put it in your desktop's menu from a
-checkout:
+There is no published release yet. Linux is the target and the only platform
+this is used on; CI builds and tests on macOS and Windows as well, so the code
+stays honest about what is platform-specific, but neither is packaged.
+
+To put it in your desktop's menu from a checkout:
 
 ```bash
 cargo build --release -p azzurro-gui
-install -Dm755 "$CARGO_TARGET_DIR/release/azzurro" ~/.local/bin/azzurro
+install -Dm755 target/release/azzurro ~/.local/bin/azzurro
 install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro.desktop \
     ~/.local/share/applications/blue.azzurro.Azzurro.desktop
 install -Dm644 crates/azzurro-gui/desktop/blue.azzurro.Azzurro-256.png \
     ~/.local/share/icons/hicolor/256x256/apps/blue.azzurro.Azzurro.png
 ```
+
+If `build.target-dir` is set in your Cargo config the binary is under that
+directory instead; `cargo build --release -p azzurro-gui --message-format=json`
+reports where it actually went.
 
 `packaging/blue.azzurro.Azzurro.yml` is a Flatpak manifest for the same
 thing. It needs `packaging/cargo-sources.json`, which is generated from
