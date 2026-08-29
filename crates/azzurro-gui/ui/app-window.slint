@@ -1819,6 +1819,7 @@ export component AppWindow inherits Window {
     callback browse-header(int);
     callback toggle-now-playing();
     callback browse-more();
+    callback queue-more();
     callback clear-recent();
     // The cover reduced to a wash. Slint has no blur, so the softening is
     // done in the pixels before they arrive — see artwork::frosted.
@@ -3251,6 +3252,34 @@ export component AppWindow inherits Window {
 
                     if root.queue.length > 0: queue-list := ListView {
                         vertical-stretch: 1;
+
+                        // The queue arrives five hundred tracks at a time. The
+                        // same lookahead as the browse list, and the same
+                        // reason: asked for before the end is reached, so the
+                        // list grows under the scroll rather than stopping
+                        // dead at it. The backend drops a second ask while one
+                        // is already out, and a page that arrives for a queue
+                        // that has since been replaced.
+                        changed viewport-y => {
+                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                root.queue-more();
+                            }
+                        }
+
+                        // And on the list's own height, not only on scrolling
+                        // it. A page that does not fill the pane leaves
+                        // nothing to scroll, so a scroll-only trigger can
+                        // never fire again and the rest of the queue is
+                        // stranded — which is what happens to every queue
+                        // whose first window is shorter than the pane.
+                        // Growing the viewport re-asks, so the pages chain
+                        // until there is either something to scroll or
+                        // nothing left to fetch.
+                        changed viewport-height => {
+                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                root.queue-more();
+                            }
+                        }
 
                         for track[i] in root.queue: VerticalLayout {
                             // `i` is the row's place in the list; `track.id` is

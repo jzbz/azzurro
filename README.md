@@ -11,7 +11,8 @@ fixture, and firmware upgrades have been driven end to end on an NAD Powernode.
 The window lists the players it finds and drives them:
 
 - the selected player's queue, with cover art — play a row, remove one,
-  reorder by dragging, save the lot as a playlist
+  reorder by dragging, save the lot as a playlist; long ones arrive five
+  hundred tracks at a time as the list is scrolled
 - browse and search every source the player offers, with Home rearrangeable,
   favourites to hand, and recent searches that survive a restart
 - transport, volume, mute and the physical inputs
@@ -40,7 +41,6 @@ Measured against the official controller, in roughly the order a user notices:
 | **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
 | **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
-| **Queues past 500 tracks** | The queue is fetched as one window of 500. The header says `500 of 1234`, so nothing is hidden silently, but the tail cannot be reached. |
 | **Custom radio by stream URL** | Radio is whatever the player's browse tree offers. No endpoint for pasting a URL is documented. |
 
 Most of these are UI work over a protocol layer that already reaches the

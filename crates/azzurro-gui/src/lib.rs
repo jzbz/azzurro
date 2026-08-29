@@ -54,6 +54,10 @@ const APP_ID: &str = "blue.azzurro.Azzurro";
 /// the app at a player holding somebody's entire library does not drag a
 /// megabyte of XML across the network on every selection. The header says when
 /// the view is a window rather than the whole thing.
+///
+/// A page rather than a ceiling: it used to be both, and everything past the
+/// five hundredth track was simply unreachable. Scrolling near the end asks
+/// for the next window, the same way a long browse list does.
 const QUEUE_WINDOW: u32 = 500;
 
 /// How long the artwork has to stop changing before it is drawn.
@@ -214,6 +218,8 @@ enum Command {
     ToggleNowPlaying,
     /// Fetch the next page of the list on show and add it to the end.
     BrowseMore,
+    /// Enough of the queue has been scrolled that the next window is wanted.
+    QueueMore,
     /// Forget every search made this session.
     ClearRecent,
     /// A row on the "add to playlist" list: an existing one, or the line that
@@ -353,6 +359,12 @@ struct Browsing {
     /// Whether a page of a long list is already on its way, so that scrolling
     /// past the trigger a second time does not ask for it twice.
     fetching_more: bool,
+    /// The same, for the queue.
+    ///
+    /// Its own flag rather than sharing `fetching_more`: the browse list and
+    /// the play queue are two lists on screen at once, and one of them paging
+    /// must not stop the other from doing it.
+    fetching_queue: bool,
     /// What has been searched for, most recent first.
     ///
     /// The player does not keep this — the official controller keeps its own,
@@ -1656,6 +1668,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_browse_more(move || {
         let _ = tx.send(Command::BrowseMore);
+    });
+
+    let tx = commands.clone();
+    ui.on_queue_more(move || {
+        let _ = tx.send(Command::QueueMore);
     });
 
     let tx = commands.clone();
@@ -5755,6 +5772,99 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
     }
 }
 
+/// Whether a window that has arrived still belongs on the rows already held.
+///
+/// The request goes out off the command loop, so anything can happen while it
+/// is in flight. Getting this wrong is not a cosmetic problem: grafting a
+/// window of one playlist onto the rows of another interleaves two lists, and
+/// every row below the join then plays something other than what it says.
+///
+/// `pid` is the queue this page was asked about. A queue is replaced whole and
+/// takes a new id when it is, so a page whose id does not match on *both*
+/// sides — the rows held now and the page just read — is about a list that no
+/// longer exists.
+fn page_belongs(
+    held_id: Option<u32>,
+    held: usize,
+    pid: Option<u32>,
+    page_id: Option<u32>,
+    page: usize,
+    from: u32,
+) -> bool {
+    // A queue with no id cannot be told from another one with no id, so it is
+    // never grown: the player sends one for every queue worth paging.
+    if pid.is_none() || held_id != pid || page_id != pid {
+        return false;
+    }
+    // Something else grew the list while this was out, so this page either
+    // duplicates rows or leaves a hole. Either way it is not the next one.
+    if held as u32 != from {
+        return false;
+    }
+    // Nothing more to give. Grafting it would be harmless and asking again
+    // would not, so this is the answer that stops the scroll re-asking.
+    page != 0
+}
+
+/// Read the next window of the queue and graft it onto what is already held.
+///
+/// `from` is how many rows are held, which is also the index of the first one
+/// that is not — the player numbers from zero and `queue_range` is inclusive
+/// at both ends.
+async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option<u32>) {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        backend.browsing.lock().unwrap().fetching_queue = false;
+        return;
+    };
+
+    let read = client.queue_range(from, from + QUEUE_WINDOW - 1).await;
+    // Cleared before anything else can return, so a failure does not wedge the
+    // list into never asking again.
+    backend.browsing.lock().unwrap().fetching_queue = false;
+
+    let more = match read {
+        Ok(more) => more,
+        Err(e) => {
+            tracing::debug!(%id, "could not read more of the queue: {e}");
+            return;
+        }
+    };
+
+    let grew = {
+        let mut guard = backend.registry.lock().unwrap();
+        let Some(entry) = guard.get_mut(&id) else {
+            return;
+        };
+        let Some(queue) = entry.queue.as_mut() else {
+            return;
+        };
+
+        if !page_belongs(
+            queue.id,
+            queue.songs.len(),
+            pid,
+            more.id,
+            more.songs.len(),
+            from,
+        ) {
+            tracing::debug!(%id, "dropping a queue page that no longer fits");
+            return;
+        }
+
+        queue.songs.extend(more.songs);
+        // The player's own count wins: tracks can be added or removed between
+        // one window and the next, and the header reads from this.
+        queue.length = more.length;
+        queue.songs.len()
+    };
+
+    tracing::debug!(%id, tracks = grew, "grew the queue");
+    backend.publish_queue();
+    // Walks the whole list and skips what the cache already holds, so the
+    // rows that just arrived are the only ones that cost anything.
+    tokio::spawn(load_thumbnails(backend, id));
+}
+
 /// Read the queue's own document, for the buttons the player puts under it.
 ///
 /// Separate from the rows, which come from `/Playlist`: that endpoint pages and
@@ -7925,6 +8035,38 @@ async fn run_commands(
                 continue;
             }
 
+            Command::QueueMore => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // How much is held, how much there is, and which queue it is.
+                // The identity matters: a queue replaced while the request is
+                // out is a different list, and grafting a window of it onto
+                // the rows already drawn would interleave two playlists.
+                let held = backend
+                    .with_entry(id, |e| {
+                        e.queue
+                            .as_ref()
+                            .map(|q| (q.songs.len() as u32, q.length, q.id))
+                    })
+                    .flatten();
+                let Some((held, total, pid)) = held else {
+                    continue;
+                };
+                if held >= total {
+                    continue;
+                }
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    if browsing.fetching_queue {
+                        continue;
+                    }
+                    browsing.fetching_queue = true;
+                }
+                tokio::spawn(fetch_more_queue(backend.clone(), id, held, pid));
+                continue;
+            }
+
             Command::BrowseMore => {
                 let asking = {
                     let mut browsing = backend.browsing.lock().unwrap();
@@ -8357,6 +8499,79 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
             ui.set_status_line(message.into());
         }
     });
+}
+
+#[cfg(test)]
+mod queue_paging_tests {
+    use super::page_belongs;
+
+    #[test]
+    fn the_next_window_of_the_same_queue_belongs() {
+        assert!(page_belongs(Some(856), 500, Some(856), Some(856), 500, 500));
+    }
+
+    #[test]
+    fn a_page_of_a_queue_that_has_been_replaced_does_not() {
+        // The rows held are the new queue, the page is the old one. Grafting
+        // it would put one playlist under another.
+        assert!(!page_belongs(
+            Some(857),
+            500,
+            Some(856),
+            Some(856),
+            500,
+            500
+        ));
+        // And the other way about: the page is for a queue nobody holds.
+        assert!(!page_belongs(
+            Some(856),
+            500,
+            Some(856),
+            Some(857),
+            500,
+            500
+        ));
+    }
+
+    #[test]
+    fn a_queue_with_no_id_is_never_grown() {
+        // Two queues with no id are indistinguishable, so there is no way to
+        // know whether a page belongs to the one on screen.
+        assert!(!page_belongs(None, 500, None, None, 500, 500));
+    }
+
+    #[test]
+    fn a_page_that_starts_somewhere_else_does_not_belong() {
+        // Something already grew the list past where this page begins, so it
+        // would duplicate rows.
+        assert!(!page_belongs(
+            Some(856),
+            700,
+            Some(856),
+            Some(856),
+            500,
+            500
+        ));
+        // Or the list shrank, and it would leave a hole.
+        assert!(!page_belongs(
+            Some(856),
+            300,
+            Some(856),
+            Some(856),
+            500,
+            500
+        ));
+    }
+
+    #[test]
+    fn an_empty_page_is_the_end() {
+        assert!(!page_belongs(Some(856), 500, Some(856), Some(856), 0, 500));
+    }
+
+    #[test]
+    fn the_first_growth_starts_where_the_first_window_ended() {
+        assert!(page_belongs(Some(1), 500, Some(1), Some(1), 42, 500));
+    }
 }
 
 #[cfg(test)]
