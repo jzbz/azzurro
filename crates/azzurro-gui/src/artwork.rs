@@ -35,19 +35,24 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// Counted in entries rather than bytes, so what it costs depends on which
 /// sizes are in it. Nothing asks for the 80×80 this comment used to claim; the
 /// three tiers the GUI requests are `THUMB_SIZE` 72, `TILE_SIZE` 232 and
-/// `COVER_SIZE` 360, and one LRU holds all of them. At four bytes a pixel the
+/// `COVER_SIZE` 720, and one LRU holds all of them. At four bytes a pixel the
 /// worst case for a full cache of each is
 ///
 /// | tier | one entry | 256 entries |
 /// |------|-----------|-------------|
 /// | 72   | 20 KiB    | 5 MiB       |
 /// | 232  | 210 KiB   | 53 MiB      |
-/// | 360  | 506 KiB   | 127 MiB     |
+/// | 720  | 2 MiB     | 506 MiB     |
 ///
 /// so a realistic mix — mostly thumbnails and shelf tiles, a few covers — sits
-/// in the tens of megabytes. The 360 row needs 256 *different albums* opened
-/// at full size to be reached and is the least likely of the three; the 232
-/// row is the one a few minutes of browsing actually approaches.
+/// in the tens of megabytes. The 720 row needs 256 *different albums* opened
+/// at full size to be reached and is by far the least likely of the three; the
+/// 232 row is the one a few minutes of browsing actually approaches.
+///
+/// That top row grew fourfold when the now-playing sleeve went from 360 to
+/// 720, which is the honest cost of the hero being sharp rather than upscaled.
+/// If it ever bites, the fix is a small separate cache for the cover tier
+/// rather than shrinking the picture the app is arranged around.
 ///
 /// Nothing here is unbounded and no player can push past it: the entry count
 /// is fixed and each entry is capped by the size that was asked for. Whether

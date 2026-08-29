@@ -36,8 +36,13 @@ export component IconButton inherits Rectangle {
     height: root.size;
     border-radius: self.height / 2;
 
+    // A disabled *primary* keeps its shape. Dropping every disabled button to
+    // transparent left the play control as an empty space in the middle of the
+    // transport on every cold start — the app's most important button, missing
+    // rather than unavailable, at the moment a stranger is deciding whether the
+    // app works. Secondary buttons have no fill to lose and still fade out.
     background: !root.enabled
-        ? transparent
+        ? (root.primary ? Theme.raised : transparent)
         : (root.primary
             ? (touch.pressed ? Theme.accent-hover : Theme.accent)
             : (root.active
@@ -48,7 +53,7 @@ export component IconButton inherits Rectangle {
     // list where the pointer crosses several rows at once.
     animate background { duration: 120ms; easing: ease-out; }
 
-    opacity: root.enabled ? 1.0 : 0.35;
+    opacity: root.enabled ? 1.0 : (root.primary ? 0.72 : 0.35);
     animate opacity { duration: 120ms; }
 
     Icon {
@@ -56,7 +61,7 @@ export component IconButton inherits Rectangle {
         width: root.glyph-size;
         height: root.glyph-size;
         tint: root.primary
-            ? Theme.accent-ink
+            ? (root.enabled ? Theme.accent-ink : Theme.faint)
             : (root.active ? Theme.accent : (touch.has-hover ? Theme.text : root.tint));
     }
 
@@ -216,7 +221,7 @@ export component Scrubber inherits Rectangle {
         y: (parent.height - 4px) / 2;
         height: 4px;
         border-radius: 2px;
-        background: Theme.sunken;
+        background: Theme.track;
 
         Rectangle {
             x: 0;
@@ -353,7 +358,12 @@ export component Level inherits HorizontalLayout {
             Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                width: reading.preferred-width + 13px;
+                // Fixed, not measured. This pill is centred on its own width,
+                // so sizing it to the number made it grow from both edges and
+                // re-centre on every step — a 13px pulse under the pointer
+                // through the whole of a drag, which is the second-most-used
+                // interaction in the app. 32px holds "100" at this size.
+                width: 32px;
                 height: 17px;
                 border-radius: self.height / 2;
                 background: Theme.surface;
@@ -415,15 +425,27 @@ export component Artwork inherits Rectangle {
     // whatever shape its designer chose, and cropping one cuts the name in
     // half. Rows that may show either ask for `contain`.
     in property <bool> crop: true;
+    // The well behind the art, for the moment before it arrives.
+    //
+    // A parameter because Home puts inputs and albums on one shelf: the input
+    // tiles draw a glyph on `raised`, and an album whose art had not landed
+    // drew its placeholder on `sunken` beside them, so two tiles in a row were
+    // two different greys for the same reason.
+    in property <brush> well: Theme.sunken;
 
     border-radius: root.corner;
-    background: Theme.sunken;
+    background: root.well;
     clip: true;
 
     Icon {
         glyph: root.fallback;
         tint: Theme.faint;
-        width: Math.min(parent.width, parent.height) * 0.42;
+        // Proportional up to a point. 0.42 is right at 36px, where the glyph
+        // reads as "nothing here"; at the now-playing sleeve it was a 235px
+        // grey music note, which reads as a picture of a note. Past about
+        // 64px a placeholder stops standing in for the thing and starts
+        // being a thing.
+        width: Math.min(Math.min(parent.width, parent.height) * 0.42, 64px);
         height: self.width;
         visible: root.source.width == 0;
     }
@@ -433,6 +455,14 @@ export component Artwork inherits Rectangle {
         image-fit: root.crop ? ImageFit.cover : ImageFit.contain;
         width: 100%;
         height: 100%;
+
+        // Art arrives over the network, so every cover in the app appears at
+        // a moment nobody chose. Cutting to it makes a list of them flicker as
+        // it fills; fading lets them settle. Short enough that nothing feels
+        // withheld — this is the difference between a picture appearing and a
+        // picture being switched on.
+        opacity: root.source.width > 0 ? 1.0 : 0.0;
+        animate opacity { duration: 220ms; easing: ease-out; }
     }
 }
 

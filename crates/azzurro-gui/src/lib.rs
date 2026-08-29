@@ -62,9 +62,24 @@ const QUEUE_WINDOW: u32 = 500;
 /// between sources. See [`load_cover`].
 const COVER_SETTLE: Duration = Duration::from_millis(180);
 
-/// Cover art is drawn into a 180px box, doubled so it stays sharp on a HiDPI
-/// screen. Fetched once at this size rather than per scale factor.
-const COVER_SIZE: u32 = 360;
+/// The now-playing sleeve, at twice the largest box it is drawn in so it stays
+/// sharp on a HiDPI screen. Fetched once at this size rather than per scale
+/// factor.
+///
+/// The box this is doubled from is the hero's ceiling — `root.height - 278px`,
+/// capped by the pane's width — which lands around 560px on an ordinary
+/// window. The old comment here described a 180px box, and there had not been
+/// one anywhere in the window for some time: at 360 the largest thing in the
+/// app was being upscaled 1.1x on a plain screen and 2.2x on a HiDPI one, so
+/// the one picture the whole app is arranged around was the softest thing in
+/// it.
+///
+/// The cost is real and is worth stating: 720² × 4 = 2 MiB per entry against
+/// 506 KiB before, and the table on [`artwork::MEMORY_CACHE`] carries the
+/// arithmetic. Only the hero asks for this tier — the 232px shelf tiles and
+/// 72px thumbnails are unchanged — so a cache full of them needs 256 different
+/// albums opened at full size.
+const COVER_SIZE: u32 = 720;
 
 /// Queue thumbnails are drawn at 34px, likewise doubled. Browse rows use the
 /// same size, so the two panes share cache entries for the same art.

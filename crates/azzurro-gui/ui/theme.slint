@@ -38,6 +38,15 @@ export global Theme {
     out property <brush> backdrop-top: dark ? #16202e : #eef2f7;
     out property <brush> backdrop-bottom: dark ? #06080b : #dfe5ec;
 
+    // The empty half of a progress or volume bar.
+    //
+    // Not `sunken`: these rails sit on `glass-raised` over the backdrop, and
+    // against that composite `sunken` measures 1.10:1 — the most-looked-at
+    // ambient indicator in a music player, drawn with no visible track behind
+    // it at all. This is the same idea one step brighter, so the bar reads as
+    // a length even when it is nearly empty.
+    out property <brush> track: dark ? #2b313a : #d2d9e2;
+
     out property <brush> border: dark ? #ffffff14 : #e3e7ed;
     out property <brush> border-strong: dark ? #2f3640 : #ccd3dc;
 
@@ -62,6 +71,13 @@ export global Theme {
 
     out property <length> radius: 12px;
     out property <length> radius-small: 8px;
+
+    // Artwork rounds less than furniture does, and does not round more as it
+    // grows. A sleeve is a square with its corners barely broken; the covers
+    // in here were between 3% and 18% of their own width before this, which
+    // reads as nobody having decided.
+    out property <length> radius-art: 6px;
+    out property <length> radius-art-large: 16px;
 
     // Type. The display size is for the one line that matters — what is
     // playing — and everything else steps down from the body size.

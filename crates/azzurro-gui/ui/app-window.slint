@@ -818,7 +818,7 @@ component TrackRow inherits Rectangle {
 
             Artwork {
                 source: root.track.cover;
-                corner: 5px;
+                corner: Theme.radius-art;
                 width: 36px;
                 height: 36px;
             }
@@ -1057,7 +1057,7 @@ component BrowseRowView inherits Rectangle {
                     // an artist with a radio beside their name reads as a
                     // station.
                     fallback: Icons.track;
-                    corner: 5px;
+                    corner: Theme.radius-art;
                     width: 36px;
                     height: 36px;
                     // A browse row shows covers and service logos alike.
@@ -2644,16 +2644,78 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 alignment: center;
 
-                                Artwork {
-                                    source: root.cover;
-                                    corner: Theme.radius;
-                                    // Sized from the window rather than from
-                                    // the room left over: asking the layout how
-                                    // much space there is, while being the
-                                    // thing that decides it, is a loop.
-                                    width: Math.max(140px,
-                                        Math.min(root.width - 700px, 400px));
+                                // Both the sleeve and the light it throws are
+                                // sized from this, so the arithmetic is done
+                                // once rather than twice with a chance to
+                                // disagree.
+                                //
+                                // From the window's own numbers rather than
+                                // from the room left over: asking the layout
+                                // how much space there is, while being the
+                                // thing that decides it, is a loop. The
+                                // sidebar is 268 and the queue column is 330
+                                // or nothing, both literals a few hundred
+                                // lines up, so what is left for this pane is
+                                // arithmetic. The `- 700px` that used to stand
+                                // here was that arithmetic done once by hand
+                                // and then left to rot: it took no notice of
+                                // the queue being hidden, so the sleeve stayed
+                                // 400px in a pane that had grown to 1172.
+                                //
+                                // Vertically: the pane less the title row and
+                                // the block of text beneath. Whichever is
+                                // smaller wins, which is what stops a short
+                                // wide window pushing the sleeve off the
+                                // bottom.
+                                property <length> stage: Math.max(160px, Math.min(
+                                    root.height - 278px,
+                                    root.width - 268px
+                                        - (root.queue-shown ? 330px : 0px)
+                                        - 96px));
+
+                                Rectangle {
+                                    width: parent.stage;
                                     height: self.width;
+
+                                    // The record lighting the room it is in.
+                                    // The window-wide wash further up is
+                                    // centred on the window, so the brightest
+                                    // part of a sleeve's colour lands over a
+                                    // column of text and is spent by the time
+                                    // it reaches the sleeve that produced it.
+                                    // A colour taken from a picture should
+                                    // come from where the picture is.
+                                    Rectangle {
+                                        width: parent.width * 1.9;
+                                        height: self.width;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        background: @radial-gradient(circle,
+                                            root.cover-tint.with-alpha(0.30) 0%,
+                                            root.cover-tint.with-alpha(0.09) 40%,
+                                            transparent 68%);
+                                        opacity: root.has-tint ? 1.0 : 0.0;
+                                        animate opacity { duration: 600ms; easing: ease-out; }
+                                    }
+
+                                    Artwork {
+                                        source: root.cover;
+                                        corner: Theme.radius-art-large;
+                                        width: 100%;
+                                        height: 100%;
+
+                                        // A record on a table has a shadow
+                                        // under it. Without one the sleeve is a
+                                        // coloured square printed on the
+                                        // backdrop rather than an object in
+                                        // front of it — which is most of why
+                                        // this screen read flat while the
+                                        // frosting behind it was working
+                                        // perfectly.
+                                        drop-shadow-blur: 34px;
+                                        drop-shadow-offset-y: 16px;
+                                        drop-shadow-color: #000000a6;
+                                    }
                                 }
                             }
                         }
@@ -2908,7 +2970,7 @@ export component AppWindow inherits Window {
                     image-fit: ImageFit.cover;
                     width: 100%;
                     height: 100%;
-                    opacity: 0.22;
+                    opacity: 0.38;
                 }
 
                 Rectangle {
@@ -2916,9 +2978,18 @@ export component AppWindow inherits Window {
                     // as a picture — a legible sleeve behind a track list is
                     // just noise competing with the words on top of it.
                     background: @linear-gradient(180deg,
-                        Theme.backdrop-bottom.with-alpha(0.78) 0%,
-                        Theme.backdrop-bottom.with-alpha(0.9) 55%,
-                        Theme.backdrop-bottom.with-alpha(0.96) 100%);
+                        // Committing to the frosting rather than paying for it
+                        // and hiding it. At 0.22 under a 0.78 scrim about one
+                        // percent of the record survived to the top of this
+                        // column and under a tenth of one percent to the
+                        // bottom — a full-column image redrawn on every track
+                        // change to deliver nothing anyone could see. The
+                        // colour now reaches the top, where the list is
+                        // sparse, and the scrim still closes over the bottom,
+                        // where the rows are dense and have to stay legible.
+                        Theme.backdrop-bottom.with-alpha(0.62) 0%,
+                        Theme.backdrop-bottom.with-alpha(0.80) 55%,
+                        Theme.backdrop-bottom.with-alpha(0.90) 100%);
                 }
 
                 pane := VerticalLayout {
@@ -3262,7 +3333,7 @@ export component AppWindow inherits Window {
 
                                 Artwork {
                                     source: root.cover;
-                                    corner: 6px;
+                                    corner: Theme.radius-art;
                                     width: 52px;
                                     height: 52px;
                                 }
@@ -3400,24 +3471,39 @@ export component AppWindow inherits Window {
 
                         HorizontalLayout {
                             alignment: center;
-                            spacing: Theme.gap;
+                            // 4px, not 8: sixteen pixels of air was holding
+                            // apart two halves of one reading.
+                            spacing: Theme.tight;
                             padding-top: 2px;
 
                             Text {
                                 text: root.duration > 0 ? root.position-text : "";
-                                font-size: Theme.micro-size;
-                                color: Theme.faint;
+                                font-size: Theme.small-size;
+                                // The number that moves is the brighter of the
+                                // two; the total it is measured against sits back.
+                                color: Theme.dim;
+                                // The total is fixed for the length of a track
+                                // and never shorter than the position, so it
+                                // sizes the box both numbers sit in. Geist's
+                                // figures are proportional and unusually so —
+                                // its "1" is 42% narrower than its "0" — so
+                                // without a fixed box this whole group slid
+                                // sideways on every tick, all through every
+                                // track, in the one bar that is always on
+                                // screen. 0:59 to 1:00 alone moved it 1.8px.
+                                width: total.preferred-width;
+                                horizontal-alignment: right;
                             }
 
                             Text {
                                 text: root.duration > 0 ? "/" : "";
-                                font-size: Theme.micro-size;
+                                font-size: Theme.small-size;
                                 color: Theme.faint;
                             }
 
-                            Text {
+                            total := Text {
                                 text: root.duration > 0 ? root.duration-text : "";
-                                font-size: Theme.micro-size;
+                                font-size: Theme.small-size;
                                 color: Theme.faint;
                             }
                         }
