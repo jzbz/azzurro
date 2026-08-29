@@ -26,7 +26,15 @@ jobs:
   # which either fails the build or quietly falls back to the tag, voiding the
   # guarantee. Checked here rather than in CI because the placeholder is only
   # wrong at the point something is released.
+  #
+  # And on a release only, which is what that sentence always meant. A manual
+  # run is how the macOS and Windows bundles get built for testing, and the
+  # placeholder is not wrong then — nothing is being released. Left ungated it
+  # failed every dispatch, which is three red runs in the Actions list saying
+  # nothing, and a guard nobody reads is a guard nobody will believe when it
+  # does mean something.
   manifest:
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
