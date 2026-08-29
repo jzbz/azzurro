@@ -459,6 +459,42 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `<actions>` list, exactly as a Powernode on 4.16.22 sends it while
+    /// playing Radio Paradise.
+    ///
+    /// Worth pinning for what it does *not* contain. That service offers no
+    /// ratings at all through BluOS — no love, no ban, no shop — so a client
+    /// drawing rating buttons for it would be drawing them for nothing. And
+    /// `state` is on both entries, including the one with no URL, so it is not
+    /// a marker of a toggle however it reads on services that have them.
+    #[test]
+    fn a_real_actions_list_off_a_player() {
+        const RP: &str = r#"<status etag="abc123">
+  <actions>
+    <action name="back" state="0"></action>
+    <action name="skip" url="/Action?service=RadioParadise&amp;next=2825604" state="0"></action>
+  </actions>
+</status>"#;
+
+        let s: Status = quick_xml::de::from_str(RP).unwrap();
+        assert_eq!(s.actions().len(), 2);
+
+        let back = s.action("back").expect("listed");
+        assert!(back.url.is_none(), "listed without a URL is unavailable");
+        assert_eq!(back.state, Some(0), "and still carries a state");
+
+        let skip = s.action("skip").expect("listed");
+        assert_eq!(
+            skip.url.as_deref(),
+            Some("/Action?service=RadioParadise&next=2825604"),
+            "the entity is decoded, so the URL is usable as it stands"
+        );
+
+        assert!(s.action("love").is_none(), "no ratings on this service");
+        assert!(s.action("shop").is_none());
+    }
+
     use super::*;
 
     /// Captured from an NAD Powernode N330 on BluOS 4.16.6, sitting on its HDMI

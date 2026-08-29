@@ -50,6 +50,18 @@ export struct Device {
     upgrade-line: string,
 }
 
+/// One thing the service offers for what is playing — Love, Ban, Shop.
+///
+/// `name` is the player's own identifier and is what gets sent back, rather
+/// than a position in this list: the list is rebuilt from every status that
+/// arrives, so an index could name a different action by the time it is
+/// pressed.
+export struct TrackAction {
+    name: string,
+    label: string,
+    on: bool,
+}
+
 /// One hand-typed radio station.
 export struct MyStation {
     name: string,
@@ -1877,6 +1889,8 @@ export component AppWindow inherits Window {
     // "FLAC 24/44.1". Says what the badge beside it cannot: the codec, and the
     // depth and rate behind a tier. Shown only where there is room for it.
     in property <string> stream-format: "";
+    in property <[TrackAction]> track-actions;
+    callback track-action(string);
     // Whether the middle pane is showing the record rather than a screen.
     in property <bool> now-playing: false;
     in property <[BrowseBlock]> browse-blocks;
@@ -3288,6 +3302,28 @@ export component AppWindow inherits Window {
                                         overflow: elide;
                                     }
                                 }
+
+                            // What the service offers for this track: a rating
+                            // it will learn from, a way to buy it. Only ever
+                            // what the player listed with a URL, so a source
+                            // that offers nothing shows nothing rather than a
+                            // row of dead buttons.
+                            if root.track-actions.length > 0: HorizontalLayout {
+                                alignment: center;
+                                spacing: Theme.tight;
+                                padding-top: Theme.gap;
+
+                                for action in root.track-actions: PillButton {
+                                    label: action.label;
+                                    // Filled while it is set, which is what
+                                    // `state` on a toggle means — the player
+                                    // says whether this track is already loved,
+                                    // and the button has to show it rather than
+                                    // look like a fresh one every time.
+                                    primary: action.on;
+                                    clicked => { root.track-action(action.name); }
+                                }
+                            }
                         }
                     }
                     }

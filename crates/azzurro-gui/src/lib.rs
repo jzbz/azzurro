@@ -221,6 +221,9 @@ enum Command {
     BrowseMore,
     /// Enough of the queue has been scrolled that the next window is wanted.
     QueueMore,
+    /// Run one of the actions the service offers for what is playing, by the
+    /// player's own name for it.
+    TrackAction(String),
     /// Open the hand-typed stations.
     OpenStations,
     /// Turn the stations pane's editing mode on or off.
@@ -871,6 +874,72 @@ fn american(text: &str) -> String {
 /// shows that as HR — high resolution — which is what the word means on a
 /// hi-fi. Everything else is already the abbreviation it should be: `cd`,
 /// `mqa`.
+/// One thing the service offers for what is playing, on its way to the window.
+#[derive(Debug, PartialEq, Eq)]
+struct TrackActionData {
+    name: String,
+    label: String,
+    on: bool,
+}
+
+/// Which of a status's actions belong on the Now Playing panel.
+///
+/// Availability is `url.is_some()` rather than [`Status::can`]. That helper
+/// falls back to "anything not a stream can do it", which is right for skip
+/// and back and wrong for these: a local file is queue-based, so the fallback
+/// would put a Love button on a track no service will ever hear about. An
+/// action listed *without* a URL is the player declaring it unavailable, and
+/// that is the whole signal here.
+///
+/// Skip and back are the transport's, and the interval variants of them are
+/// the fifteen-second nudges a podcast wants — transport territory too, and no
+/// document showing their shape has been seen here, so they are left out
+/// rather than guessed at.
+fn track_actions(status: &bluos::Status) -> Vec<TrackActionData> {
+    status
+        .actions()
+        .iter()
+        .filter(|action| action.url.is_some())
+        .filter(|action| action.interval.is_none())
+        .filter(|action| !matches!(action.name.as_str(), "skip" | "back"))
+        .map(|action| TrackActionData {
+            name: action.name.clone(),
+            label: action_label(&action.name),
+            // Whether a toggle is set — the player says whether this track is
+            // already loved. Note a real Powernode sends `state` on skip and
+            // back as well, so this is not by itself a sign that an action is
+            // a toggle; those two are filtered out above regardless.
+            on: action.state.unwrap_or(0) != 0,
+        })
+        .collect()
+}
+
+/// A word for an action the player names.
+///
+/// The player sends identifiers, not labels — `love`, `ban`, `shop` — and the
+/// official controller draws each as its own glyph. Words here instead: the
+/// icon set this app uses has no heart, no thumb and no cart, and inventing
+/// three that merely resemble the ones it does have would be worse than saying
+/// what the button does.
+///
+/// Anything unrecognised is title-cased and shown regardless. The list is
+/// whatever the service offers, so a name nobody here has met is a button that
+/// still works rather than one that vanishes.
+fn action_label(name: &str) -> String {
+    match name {
+        "love" => "Love".to_owned(),
+        "ban" => "Ban".to_owned(),
+        "shop" => "Shop".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
 fn quality_label(raw: &str) -> String {
     let raw = raw.trim();
     match raw.to_ascii_lowercase().as_str() {
@@ -1595,6 +1664,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_setting_open(move |index| {
         let _ = tx.send(Command::SettingAction(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_track_action(move |name| {
+        let _ = tx.send(Command::TrackAction(name.to_string()));
     });
 
     let tx = commands.clone();
@@ -4360,6 +4434,24 @@ impl Backend {
                 .unwrap_or_default(),
         );
 
+        // What the service offers for this track, beyond the transport.
+        //
+        // Availability is `url.is_some()` rather than `Status::can`. That
+        // helper falls back to "anything not a stream can do it", which is
+        // right for skip and back and wrong for these: a local file is
+        // queue-based, so the fallback would put a Love button on a track no
+        // service will ever hear about. An action listed without a URL is the
+        // player declaring it unavailable, and that is the whole signal here.
+        //
+        // Skip and back are the transport's, and the interval variants of them
+        // are the fifteen-second nudges a podcast wants — transport territory
+        // too, and no document showing their shape has been seen here, so they
+        // are left out rather than guessed at.
+        let track_actions = snapshot
+            .as_ref()
+            .map(|(status, _)| track_actions(status))
+            .unwrap_or_default();
+
         // The player writes its own phrase for this — "MP3 128 kb/s" for a
         // stream, "FLAC 24/44.1" for a library track — and it says what the
         // badge cannot: the codec, and the depth and rate behind a tier. Too
@@ -4438,6 +4530,16 @@ impl Backend {
             ui.set_indexing(indexing.as_str().into());
             ui.set_quality(quality.as_str().into());
             ui.set_stream_format(stream_format.as_str().into());
+            ui.set_track_actions(ModelRc::new(VecModel::from(
+                track_actions
+                    .into_iter()
+                    .map(|action| TrackAction {
+                        name: action.name.into(),
+                        label: action.label.into(),
+                        on: action.on,
+                    })
+                    .collect::<Vec<_>>(),
+            )));
         });
     }
 
@@ -7287,6 +7389,44 @@ async fn run_commands(
                 continue;
             }
 
+            Command::TrackAction(name) => {
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // Read the URL now rather than carrying it from when the
+                // button was drawn: a rating flips the player's own state, and
+                // the URL that unsets a Love is not the one that set it.
+                let found = backend.with_entry(id, |entry| {
+                    entry.status.as_ref().and_then(|status| {
+                        status
+                            .action(&name)
+                            .and_then(|action| action.url.clone())
+                            .zip(Some(entry.client.clone()))
+                    })
+                });
+                let Some(Some((url, client))) = found else {
+                    tracing::debug!(%id, "no {name} action on this track any more");
+                    continue;
+                };
+
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    match client.follow(&url).await {
+                        // Some of these open a shop, and the player asks
+                        // before it sends anybody anywhere.
+                        Ok(Some(dialog)) => {
+                            backend.browsing.lock().unwrap().dialog = Some(dialog);
+                            backend.publish_dialog();
+                        }
+                        // Nothing said: the next status carries the new state
+                        // and the button redraws itself from it.
+                        Ok(None) => {}
+                        Err(e) => say(&backend.ui, format!("could not do that: {e}")),
+                    }
+                });
+                continue;
+            }
+
             Command::StationsEdit => {
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
@@ -9390,6 +9530,141 @@ mod tests {
         assert_eq!(quality_label("mqa"), "MQA");
         assert_eq!(quality_label(""), "");
         assert_eq!(quality_label("  "), "");
+    }
+
+    #[test]
+    fn an_action_the_player_names_gets_a_word() {
+        assert_eq!(action_label("love"), "Love");
+        assert_eq!(action_label("ban"), "Ban");
+        assert_eq!(action_label("shop"), "Shop");
+    }
+
+    #[test]
+    fn an_action_nobody_here_has_met_is_still_a_button() {
+        // The list is whatever the service offers, and a name this does not
+        // know is a working action — showing it title-cased beats hiding it.
+        assert_eq!(action_label("bookmark"), "Bookmark");
+        assert_eq!(action_label("addToLibrary"), "AddToLibrary");
+        assert_eq!(action_label(""), "");
+    }
+
+    fn act(name: &str, url: Option<&str>, state: Option<i32>) -> bluos::status::Action {
+        bluos::status::Action {
+            name: name.to_owned(),
+            url: url.map(str::to_owned),
+            state,
+            ..bluos::status::Action::default()
+        }
+    }
+
+    /// A skip or back carrying an interval: the fifteen-second nudge.
+    fn nudge(name: &str, url: &str, seconds: i32) -> bluos::status::Action {
+        bluos::status::Action {
+            interval: Some(seconds),
+            ..act(name, Some(url), None)
+        }
+    }
+
+    fn status_offering(actions: Vec<bluos::status::Action>) -> bluos::Status {
+        bluos::Status {
+            actions: Some(bluos::status::Actions { actions }),
+            ..bluos::Status::default()
+        }
+    }
+
+    #[test]
+    fn the_transports_own_actions_are_not_drawn_again() {
+        // The shape a Powernode on 4.16.22 actually sends for Radio Paradise,
+        // which offers no ratings through BluOS at all: a skip with a URL, a
+        // back without one, and nothing else. The right answer is no buttons,
+        // not a row of dead ones. The document itself is pinned in
+        // `bluos::status`.
+        let status = status_offering(vec![
+            act("back", None, Some(0)),
+            act(
+                "skip",
+                Some("/Action?service=RadioParadise&next=2825604"),
+                Some(0),
+            ),
+        ]);
+        assert_eq!(status.actions().len(), 2, "both arrived");
+        assert!(track_actions(&status).is_empty(), "and neither is drawn");
+    }
+
+    #[test]
+    fn a_service_that_offers_ratings_gets_them() {
+        let status = status_offering(vec![
+            act("love", Some("/Action?love=1"), Some(1)),
+            act("ban", Some("/Action?ban=1"), Some(0)),
+            act("shop", Some("/Action?shop=1"), None),
+            act("skip", Some("/Skip"), None),
+        ]);
+        let drawn = track_actions(&status);
+
+        assert_eq!(
+            drawn.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(),
+            vec!["Love", "Ban", "Shop"],
+            "skip is the transport's and is left out"
+        );
+        assert!(drawn[0].on, "already loved, so the button is filled");
+        assert!(!drawn[1].on);
+        assert!(!drawn[2].on, "no state at all is not set");
+    }
+
+    #[test]
+    fn an_action_listed_without_a_url_is_not_offered() {
+        // The player declaring it unavailable. This is the case `can` gets
+        // wrong, and the reason the filter does not use it.
+        let status = status_offering(vec![
+            act("love", None, Some(0)),
+            act("ban", Some("/Action?ban=1"), Some(0)),
+        ]);
+        let drawn = track_actions(&status);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].label, "Ban");
+    }
+
+    #[test]
+    fn a_nudge_is_the_transports_business() {
+        let status = status_offering(vec![
+            nudge("skip", "/Action?fwd=15", 15),
+            nudge("back", "/Action?rew=15", 15),
+            act("love", Some("/Action?love=1"), None),
+        ]);
+        let drawn = track_actions(&status);
+        assert_eq!(drawn.len(), 1, "only the rating belongs here");
+        assert_eq!(drawn[0].label, "Love");
+    }
+
+    #[test]
+    fn availability_is_the_url_and_not_can() {
+        use bluos::status::{Action, Actions, Status};
+
+        // `can` falls back to "anything not a stream can do it", which is
+        // right for skip and back and wrong here: this status is queue-based,
+        // so `can("love")` says yes about a track whose service never offered
+        // a rating at all.
+        let listed_without_a_url = Status {
+            actions: Some(Actions {
+                actions: vec![Action {
+                    name: "love".to_owned(),
+                    url: None,
+                    ..Action::default()
+                }],
+            }),
+            ..Status::default()
+        };
+        assert!(
+            listed_without_a_url.can("love"),
+            "this is the trap: can() says yes"
+        );
+        assert!(
+            listed_without_a_url
+                .action("love")
+                .and_then(|a| a.url.as_deref())
+                .is_none(),
+            "and the URL, which is the real signal, says no"
+        );
     }
 
     #[test]
