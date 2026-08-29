@@ -160,9 +160,13 @@ client.
 There is no published release yet. CI builds and tests all three platforms on
 every push, and packages two of them as artifacts — a universal `.app` for
 macOS and an executable for Windows — but **neither is signed or notarised**,
-so both will need to be allowed past the operating system by hand. Linux is
-where this is developed and used daily; the other two are built and tested but
-not lived in.
+so both will need to be allowed past the operating system by hand.
+
+Linux is where this is developed and used daily. The other two have each had
+their artifact run on a real machine — the window drawn, a player found on the
+network and its playback shown — rather than only compiled. That is worth doing
+rather than trusting: the Windows build passed every test on every push while
+being unable to start on any machine that was not the one that built it.
 
 To put it in your desktop's menu from a checkout:
 
