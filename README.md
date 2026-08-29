@@ -51,8 +51,8 @@ Measured against the official controller, in roughly the order a user notices:
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
 | **Named group configurations** | "Downstairs" as a one-press recall. There is no route for it: `/Zones`, `/Groups`, `/ZonePresets`, `/SavedGroups` and `/Rooms` all answer 404, and neither `/Services` nor the settings service mentions grouping. Only ad-hoc `/AddSlave` and `/RemoveSlave` exist, and both are used. So this would be the app's own file of player sets rather than anything the player keeps — buildable, but not testable on one speaker. |
 
-Most of these are UI work over a protocol layer that already reaches the
-endpoint, rather than protocol work waiting to be done.
+None of these is waiting on interface work. Two need a second speaker, one
+needs a service that offers it, and one is not something the player does.
 
 One thing is built but unproven. A zone member that will not answer about its
 own firmware is asked about through the player leading it, using the `&slave=`
@@ -108,8 +108,13 @@ something that eats broadcast traffic, so addresses that have answered are
 remembered in `~/.config/azzurro/players` and tried again next time. One can be
 pinned there by hand, or typed into the box under the player list.
 
-Every player is also exported on D-Bus as its own MPRIS media player, named
-after the speaker rather than after the app — two speakers playing two
+Three more files sit beside it, all plain text and all the app's own: the
+stations typed in by hand, the searches made, and the order Home's shelves were
+dragged into. Nothing else is written anywhere, and none of it is anything the
+player could hold.
+
+On Linux every player is also exported on D-Bus as its own MPRIS media player,
+named after the speaker rather than after the app — two speakers playing two
 different things are two things the desktop should be able to see and drive.
 Media keys, the GNOME shell menu, the KDE applet and a lock screen all reach a
 player through the same command channel the window's own buttons use.
@@ -120,6 +125,12 @@ action names the next document to fetch. The vocabulary is closed — about
 twenty-five elements and nine action types — so `crates/bluos/src/screen.rs`
 is a `match` rather than a general document renderer, and the app needs no
 knowledge of any particular music service.
+
+One obligation comes with that. A screen can offer a filter or a sort — Radio
+Paradise's MQA against CD Quality — and choosing one is **not** state the
+player keeps. It answers with an `X-Sovi-Ui-Context` header and expects it back
+on every request afterwards; without that, the action succeeds, the screen
+refreshes, and nothing changes.
 
 The interface draws its own controls rather than using the platform's — a
 music controller is one of the few app classes where looking like itself is
