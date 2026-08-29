@@ -16,6 +16,7 @@ The window lists the players it finds and drives them:
   hundred tracks at a time as the list is scrolled
 - browse and search every source the player offers, with Home rearrangeable,
   favourites to hand, and recent searches that survive a restart
+- saved playlists: keep the queue as one, play it, and delete it
 - transport, volume, mute and the physical inputs
 - ad-hoc grouping, one player at a time or all of them at once
 - the player's own settings, served from a second port and rendered from the
@@ -46,7 +47,7 @@ Measured against the official controller, in roughly the order a user notices:
 | Missing | Where it stands |
 | --- | --- |
 | **The fifteen-second nudge** | A podcast's skip and back carry an `interval`. Left out of the track actions beside them: no player here offers one, so their shape has never been seen. |
-| **Saved playlists** | The queue can be saved and a track filed into a playlist. Listing, renaming, deleting and reordering are absent. |
+| **Renaming a saved playlist** | Saving, listing, playing and deleting all work — the player serves a BluOS Playlists shelf and a context menu with Delete on it. Renaming is not offered by the player at all, in any menu or in `/Services`, so it is not a matter of building it. |
 | **Stereo pairs and surround zones** | Only ad-hoc groups exist. A bonded pair shows as two unrelated players. |
 | **Named group configurations** | "Downstairs" as a one-press recall. No route for it is documented. |
 

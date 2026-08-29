@@ -400,6 +400,32 @@ document is read from 11001, and a write goes back to **11000** — posting it t
 where the document came from answers 404. Confirmed by writing a setting the
 value it already held, then a different one, and watching it change and revert.
 
+### Saved playlists have no id
+
+**Confirmed.** `/Save?name=…` keeps the current queue and answers
+`<saved><entries>42</entries></saved>`. `/Playlists` then lists them:
+
+```xml
+<playlists service="BluOS">
+  <name image="/Artwork?service=LocalMusic&amp;fn=…">Azzurro test playlist</name>
+</playlists>
+```
+
+The name is the **element text**, and there is no id anywhere — a playlist is
+addressed by its name, which is why deleting one is
+`/Delete?name=<name>&service=BluOS` and answers `<deleted>…</deleted>`.
+
+A player with none answers `<playlists service="BluOS"></playlists>`, and its
+`/ui/Sources` does not mention the BluOS service at all. The moment one exists,
+a **BluOS Playlists** shelf appears on `/ui/Home` and the playlist's own
+context menu carries Play now, Shuffle, Add next, Add last and Delete — the
+last as a confirmation. **Renaming is offered nowhere**, in no menu and in no
+request description.
+
+`/ui/browseMenuGroup?service=BluOS` browses them, with a sort selector using
+`Csort=BluOS-0~alpha` — the same client-carried context as `Cfilter`, and it
+must be echoed back the same way.
+
 ### Reordering presets, and how it deletes them
 
 **Observed, and documented nowhere at all.** The Presets screen's footer offers
