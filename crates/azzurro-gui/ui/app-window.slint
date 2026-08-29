@@ -3117,7 +3117,15 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
                         glyph: Icons.queue;
                         headline: "Nothing queued";
-                        detail: "Pick something from Home or the library and it will play here.";
+                        // Three ways to arrive at an empty queue, and only one
+                        // of them is answered by "go pick a track". Pointing at
+                        // the library when there is no player to play it on is
+                        // an instruction that cannot be followed.
+                        detail: root.has-selection && root.current.reachable
+                            ? "Pick something from Home or the library and it will play here."
+                            : (root.devices.length > 0
+                                ? "Pick a player that is responding and its queue will appear here."
+                                : "Once a player answers on the network, its queue will appear here.");
                     }
 
                     if root.queue.length > 0: queue-list := ListView {
@@ -3639,7 +3647,21 @@ export component AppWindow inherits Window {
                                     x: -24px;
                                     y: -1 * self.height - 10px;
                                     width: 340px;
-                                    height: min(root.devices.length * 132px + 108px, 470px);
+                                    // Height is deliberately absent. It used to
+                                    // be `devices.length * 132px + 108px`, and
+                                    // 108px did not cover the header, the two
+                                    // bulk buttons and the address field that
+                                    // sit around the list — so the fixed parts
+                                    // were clipped by the popup that was meant
+                                    // to hold them. With no player at all there
+                                    // was no list to absorb the shortfall and
+                                    // the buttons were cut in half.
+                                    //
+                                    // Sizing the list instead lets the popup
+                                    // take its own preferred height, so the
+                                    // chrome is measured rather than guessed
+                                    // and cannot fall out of step with it again.
+                                    // Measured: 140px of chrome, not 108px.
                                     close-policy: PopupClosePolicy.close-on-click-outside;
 
                                     Rectangle {
@@ -3682,8 +3704,15 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
+                                            // Two and a half cards: the half is
+                                            // the affordance, since a list cut on
+                                            // a card boundary looks complete when
+                                            // it is not. 330px of list under the
+                                            // 140px of chrome measured above puts
+                                            // the whole popup at the same 470px
+                                            // it was meant to stop at.
                                             ListView {
-                                                vertical-stretch: 1;
+                                                height: min(root.devices.length * 132px, 330px);
 
                                                 for device[i] in root.devices: DeviceCard {
                                                     device: device;
