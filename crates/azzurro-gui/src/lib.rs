@@ -62,6 +62,16 @@ const QUEUE_WINDOW: u32 = 500;
 /// between sources. See [`load_cover`].
 const COVER_SETTLE: Duration = Duration::from_millis(180);
 
+/// The cover on a player's row in the sidebar, at twice the 40px it is drawn
+/// in.
+///
+/// Its own tier because it is fetched for *every* player rather than only the
+/// one being looked at: in a house with speakers in four rooms the sidebar is
+/// a list of what each room is playing, and at this size that is a picture
+/// rather than a line of elided text. One of these is 25 KiB against the
+/// hero's 2 MiB, so the whole list costs less than a single sleeve.
+const CARD_SIZE: u32 = 80;
+
 /// The now-playing sleeve, at twice the largest box it is drawn in so it stays
 /// sharp on a HiDPI screen. Fetched once at this size rather than per scale
 /// factor.
@@ -623,6 +633,12 @@ struct Entry {
     /// start the fetch again, and so a fetch that lands late can tell whether
     /// it is still wanted.
     cover_url: Option<String>,
+    /// The same art at [`CARD_SIZE`], for this player's row in the sidebar.
+    ///
+    /// Held decoded rather than fetched at publish time: the player list is
+    /// rebuilt on every status tick, and a fetch on that path would be a
+    /// request per player per second.
+    card_cover: Option<Pixels>,
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
@@ -1952,6 +1968,7 @@ impl Backend {
                     queue: None,
                     sync: None,
                     cover_url: None,
+                    card_cover: None,
                 },
             );
         }
@@ -2019,6 +2036,13 @@ impl Backend {
         // everywhere.
         let selected = *self.selected.lock().unwrap();
 
+        // Gathered beside the rows rather than inside them: `Device` is held
+        // in the registry and travels between threads, and `slint::Image` is
+        // not `Send`, so the picture cannot live in the struct. The two are
+        // built in one pass over one lock and handed to the window together,
+        // which is what keeps them aligned.
+        let mut covers: Vec<Option<Pixels>> = Vec::new();
+
         let rows: Vec<Device> = {
             let guard = self.registry.lock().unwrap();
 
@@ -2031,6 +2055,7 @@ impl Backend {
             guard
                 .iter()
                 .map(|(id, entry)| {
+                    covers.push(entry.card_cover.clone());
                     let mut view = entry.view.clone();
                     let sync = entry.sync.as_ref();
 
@@ -2091,6 +2116,13 @@ impl Backend {
                 row.in_group.hash(&mut hash);
                 row.groupable.hash(&mut hash);
             }
+            // Whether each row has its art yet. Art arrives after the row it
+            // belongs to, so without this the covers land in a model the memo
+            // then refuses to send — the same trap the queue's fingerprint
+            // documents.
+            for cover in &covers {
+                cover.is_some().hash(&mut hash);
+            }
             hash.finish()
         }) {
             return;
@@ -2111,6 +2143,12 @@ impl Backend {
                 .and_then(|id| rows.iter().position(|d| d.id == id))
                 .unwrap_or(0);
 
+            ui.set_device_covers(ModelRc::new(VecModel::from(
+                covers
+                    .into_iter()
+                    .map(|c| c.map(slint::Image::from_rgba8).unwrap_or_default())
+                    .collect::<Vec<_>>(),
+            )));
             ui.set_devices(ModelRc::new(VecModel::from(rows)));
             ui.set_selected(restored as i32);
             // Not the toast. This is a standing fact about the system rather
@@ -5466,6 +5504,52 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, done: usize) {
 /// Late arrivals are discarded rather than drawn: by the time a fetch returns,
 /// the selection may have moved to another player, or the track may have
 /// changed under it. Both are checked before anything reaches the window.
+/// Fetch this player's art at the size its sidebar row draws it.
+///
+/// Separate from [`load_cover`] and deliberately simpler. That one settles for
+/// a moment before drawing, because switching input walks the art through
+/// three values in about a second and the hero is 560px of it — a flicker
+/// there is the whole screen changing twice. A 40px row can take the flicker,
+/// and waiting would mean the sidebar lagged the thing it is describing.
+///
+/// Failure is silence: a row with no art draws the speaker glyph it always
+/// drew, which is a complete state rather than a gap.
+async fn load_card_cover(backend: Backend, id: DeviceId) {
+    let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
+
+    let pixels = match &wanted {
+        Some(url) => backend.artwork.get(url, CARD_SIZE).await,
+        None => None,
+    };
+
+    // Checked against what the player wants *now*, not what it wanted when
+    // this started: a fetch that lost a race to a track change would otherwise
+    // put the previous record back on the row.
+    let still_wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
+    if still_wanted != wanted {
+        return;
+    }
+
+    let changed = {
+        let mut registry = backend.registry.lock().unwrap();
+        match registry.get_mut(&id) {
+            Some(entry) => {
+                let was = entry.card_cover.is_some();
+                entry.card_cover = pixels;
+                was != entry.card_cover.is_some()
+            }
+            None => false,
+        }
+    };
+
+    // Only when the row's appearance actually changed. The players model is
+    // memo-guarded, so an unconditional publish would be a rebuild per fetch
+    // that the memo then throws away.
+    if changed {
+        backend.publish();
+    }
+}
+
 async fn load_cover(backend: Backend, id: DeviceId) {
     let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
 
@@ -5772,8 +5856,15 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                         _ => false,
                     }
                 };
-                if art_changed && backend.is_selected(id) {
-                    tokio::spawn(load_cover(backend.clone(), id));
+                if art_changed {
+                    // Every player gets the small one: the sidebar draws a
+                    // cover per row, so art matters for the rooms nobody is
+                    // looking at as much as for the one they are.
+                    tokio::spawn(load_card_cover(backend.clone(), id));
+
+                    if backend.is_selected(id) {
+                        tokio::spawn(load_cover(backend.clone(), id));
+                    }
                 }
 
                 // A screen carries the status values it was built against; when

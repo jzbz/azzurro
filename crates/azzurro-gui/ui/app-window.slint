@@ -549,6 +549,11 @@ component NavRow inherits Rectangle {
 }
 
 component DeviceCard inherits Rectangle {
+    // What this player is playing, at 40px. Empty until the art arrives, and
+    // empty forever for a source that has none — an input, a stream with no
+    // logo — which is why the speaker glyph it replaces is still drawn
+    // underneath rather than removed.
+    in property <image> cover;
     in property <Device> device;
     in property <bool> selected;
     callback picked();
@@ -588,12 +593,37 @@ component DeviceCard inherits Rectangle {
         HorizontalLayout {
             spacing: Theme.gap;
 
-            Icon {
-                glyph: root.device.in-group ? Icons.grouped : Icons.player;
-                tint: root.selected ? Theme.accent : Theme.faint;
-                width: 17px;
-                height: 17px;
-                y: 2px;
+            // A tile that is a cover when there is one and a glyph when there
+            // is not. Same size either way, so a row does not change shape as
+            // its art arrives.
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                border-radius: Theme.radius-art;
+                background: Theme.raised;
+                clip: true;
+                y: 1px;
+
+                Icon {
+                    glyph: root.device.in-group ? Icons.grouped : Icons.player;
+                    tint: root.selected ? Theme.accent : Theme.faint;
+                    width: 17px;
+                    height: 17px;
+                    // Hidden rather than removed: it is the ground the cover
+                    // sits on, and a cover that fades in over nothing fades in
+                    // over the panel behind the row.
+                    opacity: root.cover.width > 0 ? 0.0 : 1.0;
+                    animate opacity { duration: Theme.settle; easing: ease-out; }
+                }
+
+                Image {
+                    source: root.cover;
+                    image-fit: ImageFit.cover;
+                    width: 100%;
+                    height: 100%;
+                    opacity: root.cover.width > 0 ? 1.0 : 0.0;
+                    animate opacity { duration: Theme.settle; easing: ease-out; }
+                }
             }
 
             VerticalLayout {
@@ -1726,6 +1756,11 @@ export component AppWindow inherits Window {
     // Whether the first discovery sweep is still running. Distinguishes "no
     // speakers here" from "no speakers yet", which are different sentences and
     // want different words.
+    // One per row of `devices`, in the same order. Beside the model rather
+    // than inside it because `Device` is held on the backend across threads
+    // and an image cannot travel with it; both are set in one place so the
+    // indices cannot drift.
+    in property <[image]> device-covers;
     in property <bool> looking-for-players: false;
     in property <string> browse-empty: "";
     in property <string> browse-empty-detail: "";
@@ -3652,6 +3687,7 @@ export component AppWindow inherits Window {
 
                                                 for device[i] in root.devices: DeviceCard {
                                                     device: device;
+                                                    cover: root.device-covers[i];
                                                     selected: i == root.selected;
                                                     picked => {
                                                         root.selected = i;
