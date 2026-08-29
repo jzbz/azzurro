@@ -17,6 +17,7 @@ mod lane;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod order;
+mod searches;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -105,8 +106,9 @@ const TILE_SIZE: u32 = 232;
 const SEARCH_SETTLE: Duration = Duration::from_millis(280);
 
 /// How many past searches to keep. The player keeps none — this is the app's
-/// own list, and it lasts as long as the app is running.
-const RECENT_SEARCHES: usize = 8;
+/// own list, and it now outlives the run, so the bound belongs with the file
+/// that has to stay a sensible size.
+use searches::KEEP as RECENT_SEARCHES;
 
 /// How many players discovery may adopt on its own.
 ///
@@ -351,12 +353,15 @@ struct Browsing {
     /// Whether a page of a long list is already on its way, so that scrolling
     /// past the trigger a second time does not ask for it twice.
     fetching_more: bool,
-    /// What has been searched for this session, most recent first.
+    /// What has been searched for, most recent first.
     ///
     /// The player does not keep this — the official controller keeps its own,
     /// which is why the list is empty on a player you have used for years.
     /// Recorded when a search is committed rather than on every keystroke, or
     /// every prefix of every word would be on it.
+    ///
+    /// Seeded from `searches` at startup and written back on every change, so
+    /// a name looked up yesterday does not have to be typed again today.
     recent: Vec<String>,
     /// What the middle pane is showing.
     ///
@@ -1789,7 +1794,13 @@ async fn run(
         commands,
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(art, players)),
-        browsing: Arc::new(Mutex::new(Browsing::default())),
+        browsing: Arc::new(Mutex::new(Browsing {
+            // The one field that starts as something other than empty. Read
+            // here rather than lazily on the first search, so the list is
+            // already under the field the first time it is opened.
+            recent: searches::load(),
+            ..Default::default()
+        })),
         known: Arc::new(Mutex::new(Vec::new())),
         writes: Arc::new(lane::Lane::default()),
         searches: Arc::new(AtomicU64::new(0)),
@@ -4948,14 +4959,18 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
     backend.publish_form();
 }
 
-/// Put a query at the top of the recent list.
+/// Put a query at the top of the recent list, and write the list down.
 fn remember_search(backend: &Backend, query: String) {
-    {
+    let keeping = {
         let mut browsing = backend.browsing.lock().unwrap();
         browsing.recent.retain(|seen| seen != &query);
         browsing.recent.insert(0, query);
         browsing.recent.truncate(RECENT_SEARCHES);
-    }
+        browsing.recent.clone()
+    };
+    // Off the event loop and out from under the lock: this is a file write on
+    // the path that runs when a search is committed.
+    tokio::task::spawn_blocking(move || searches::save(&keeping));
     backend.publish_browse();
 }
 
@@ -7846,6 +7861,9 @@ async fn run_commands(
 
             Command::ClearRecent => {
                 backend.browsing.lock().unwrap().recent.clear();
+                // Emptied on disk too. A list that came back at the next
+                // startup would make "Clear" mean "until you restart".
+                tokio::task::spawn_blocking(|| searches::save(&[]));
                 backend.publish_browse();
                 continue;
             }
