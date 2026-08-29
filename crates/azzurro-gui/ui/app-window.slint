@@ -2735,8 +2735,19 @@ export component AppWindow inherits Window {
                             // The same commit as pressing Enter in the field,
                             // for anyone who has just pasted with the mouse and
                             // has no reason to reach for the keyboard.
+                            //
+                            // Not stretchy, and nor is the one below it. A
+                            // layout in Slint stretches by default, so these
+                            // two wrappers were quietly splitting the row's
+                            // spare width with the address field — and since
+                            // that field asks for nothing (see its min-width),
+                            // it lost, collapsing to the width of its own
+                            // clear button. The empty one is the greedier of
+                            // the two: with no stations there is no Edit
+                            // button in it and nothing but stretch left.
                             VerticalLayout {
                                 alignment: center;
+                                horizontal-stretch: 0;
 
                                 IconButton {
                                     glyph: Icons.add;
@@ -2753,6 +2764,7 @@ export component AppWindow inherits Window {
 
                             VerticalLayout {
                                 alignment: center;
+                                horizontal-stretch: 0;
                                 // Only once there is something to edit.
                                 if root.stations.length > 0: PillButton {
                                     label: root.stations-editing ? "Done" : "Edit";

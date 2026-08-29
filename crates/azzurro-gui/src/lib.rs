@@ -4128,6 +4128,24 @@ impl Backend {
             }
             hash.finish()
         }) {
+            // The rows on screen are already these — but the title and the
+            // back arrow may not be, and this memo cannot see that. It compares
+            // against what *browse* last sent, and another pane can overwrite
+            // those two properties behind its back: walk from My Stations into
+            // Now Playing and close it, and the browse screen comes back under
+            // a heading that still says My Stations, with a back arrow that
+            // goes nowhere.
+            //
+            // The same trap `send_settings` documents, in the other publisher.
+            // What the memo is worth skipping is the model replacement, which
+            // re-creates every row; two property writes are not worth being
+            // clever about.
+            let ui = self.ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = ui.upgrade() else { return };
+                ui.set_browse_title(title.into());
+                ui.set_browse_can_go_back(can_go_back);
+            });
             return;
         }
 
