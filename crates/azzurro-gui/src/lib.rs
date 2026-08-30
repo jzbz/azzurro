@@ -9470,7 +9470,14 @@ async fn run_commands(
                 };
                 if let Some((uri, id)) = target {
                     backend.publish_sidebar();
-                    tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Root));
+                    // Deeper, not Root. Pressing Search in the sidebar means
+                    // "start here" and clears the trail, but reaching it with a
+                    // key from the middle of a library is a detour: measured
+                    // with a probe, `can-go-back` went true to false the moment
+                    // this opened, so Escape out of the box then had nowhere to
+                    // go and looked broken. This way Back returns to whatever
+                    // was being browsed when search was asked for.
+                    tokio::spawn(open_screen(backend.clone(), id, uri, Arrive::Deeper));
                 }
                 continue;
             }
