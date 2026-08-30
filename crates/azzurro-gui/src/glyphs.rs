@@ -28,6 +28,15 @@ pub enum Glyph {
     Playlist,
     Library,
     Radio,
+    /// Radio Paradise, whose own brand mark is a pair of headphones. Its own
+    /// glyph rather than the general radio one because it sits in the sidebar
+    /// directly under Radio, and two services one above the other under the
+    /// same picture read as one entry drawn twice.
+    Headphones,
+    /// TuneIn: a dot between two arcs, which is a signal going out rather than
+    /// a set receiving one. The three radio services in the sidebar are told
+    /// apart by their pictures, so each keeps one of its own.
+    Broadcast,
     Station,
     Favourite,
     Preset,
@@ -280,7 +289,13 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Track)
     } else if has("station") {
         Some(Glyph::Station)
-    } else if has("radio") || has("tunein") || has("tune in") {
+    } else if has("radio paradise") {
+        // Both of these come before the general radio test below, which their
+        // names would otherwise answer first.
+        Some(Glyph::Headphones)
+    } else if has("tunein") || has("tune in") {
+        Some(Glyph::Broadcast)
+    } else if has("radio") {
         Some(Glyph::Radio)
     } else {
         None
@@ -361,11 +376,17 @@ mod tests {
                 "Radio Paradise",
                 Some("/Sources/images/RadioParadiseIcon.png")
             ),
+            Some(Glyph::Headphones)
+        );
+        // And the general radio glyph is still what everything else with
+        // "radio" in its name gets.
+        assert_eq!(
+            glyph_for("Radio", Some("/Sources/images/AirableIcon.png")),
             Some(Glyph::Radio)
         );
         assert_eq!(
             glyph_for("TuneIn", Some("/images/ui/Source/TuneInSourceIcon.png")),
-            Some(Glyph::Radio)
+            Some(Glyph::Broadcast)
         );
 
         // Still deferred to, and this is the line that matters: a station's

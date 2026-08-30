@@ -152,7 +152,13 @@ export global Icons {
     out property <image> menu: @image-url("icons/ellipsis.svg");
 
     out property <image> player: @image-url("icons/speaker.svg");
-    out property <image> radio: @image-url("icons/radio.svg");
+    // Lucide's `boom-box`, under the app's own name for it: a stereo says
+    // "a radio service" where Lucide's `radio` — a dot between two arcs — says
+    // "a signal", which is what a station in one of these services is.
+    out property <image> radio: @image-url("icons/boom-box.svg");
+    out property <image> headphones: @image-url("icons/headphones.svg");
+    // Lucide's `radio`, which TuneIn had before the boom-box arrived and keeps.
+    out property <image> broadcast: @image-url("icons/radio.svg");
     out property <image> track: @image-url("icons/music-4.svg");
     out property <image> group: @image-url("icons/link-2.svg");
     out property <image> ungroup: @image-url("icons/unlink-2.svg");

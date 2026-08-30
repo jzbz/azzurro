@@ -1511,6 +1511,8 @@ fn glyph_image(icons: &Icons<'_>, glyph: Glyph) -> slint::Image {
         Glyph::Playlist => icons.get_playlist(),
         Glyph::Library => icons.get_library(),
         Glyph::Radio => icons.get_radio(),
+        Glyph::Headphones => icons.get_headphones(),
+        Glyph::Broadcast => icons.get_broadcast(),
         Glyph::Station => icons.get_station(),
         Glyph::Favourite => icons.get_favourite(),
         Glyph::Preset => icons.get_preset(),
