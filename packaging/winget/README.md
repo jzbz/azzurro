@@ -24,37 +24,45 @@ must be published, not a draft**. release.yml deliberately creates a draft, so t
 winget step comes after the release is complete and public — after the signature
 over SHA256SUMS, not before.
 
-## First submission
+## Submitting
 
-Once v0.1.2 is published, from any machine (Komac is Rust and runs on Linux):
+By hand, per release, and deliberately so — see below. From any machine, once the
+release is published (Komac is Rust and runs on Linux):
 
-    komac new Azzurro.Azzurro \
-      --urls https://github.com/jzbz/azzurro/releases/download/v0.1.2/azzurro-v0.1.2-x86_64.exe \
+    komac update Azzurro.Azzurro --version 0.1.0 \
+      --urls https://github.com/jzbz/azzurro/releases/download/v0.1.0/azzurro-v0.1.0-x86_64.exe \
       --submit
 
 Komac computes the hash, fills the schema, forks `microsoft/winget-pkgs` and opens
-the pull request. The Microsoft CLA is a one-time checkbox on that PR.
+the pull request. Use `komac new` instead of `update` for a package winget has
+never seen. The Microsoft CLA is a one-time checkbox on that PR.
 
-`manifest/` here holds what the result should look like, for review before it is
-sent and as a reference if a later version needs hand-editing.
+`manifest/` here holds what was actually submitted, for review before it is sent
+and as the starting point for the next version. Keep `InstallerSha256` in step
+with the release's signed `SHA256SUMS` rather than recomputing it: pinning the
+hash that signature covers is the only thread connecting a winget install back to
+the key.
 
-## Later releases
+Without Komac, the same thing is a fork, a branch, three files under
+`manifests/a/Azzurro/Azzurro/<version>/`, and a pull request — `gh api` can do all
+of it, and 0.1.0 was submitted that way.
 
-Two options, and they differ in where a credential lives.
+## Why there is no workflow for this
 
-By hand, per release, from the machine that already holds the signing keys:
+There was one, and it never ran. `winget.yml` fired on every published release,
+found no `WINGET_PAT`, skipped itself and reported success — three releases across
+two projects, each with a green check for having done nothing.
 
-    komac update Azzurro.Azzurro --version 0.1.3 \
-      --urls https://github.com/jzbz/azzurro/releases/download/v0.1.3/azzurro-v0.1.3-x86_64.exe \
-      --submit
+Setting the token would have been worse than leaving it unset. The job called a
+third-party action and would have handed it that credential, which is the one
+thing `ci.yml` opens by saying this project does not do: a third-party action runs
+with the same access to the workflow as anything else in it. The workflow was a
+trap primed to spring the day somebody decided to finish the automation.
 
-Or automatically, via `.github/workflows/winget.yml`, which fires when a release is
-published. That needs a classic personal access token with `public_repo` scope in
-this repository's secrets, because the action opens a pull request against a fork
-under your account. It cannot sign anything and cannot touch this repository's
-contents, but it is a credential in CI, which is the thing this project otherwise
-avoids — hence it is opt-in: the workflow is dispatch-only until that secret
-exists, and does nothing without it.
+So the submission is a command, run by a person, from the machine that already
+holds the signing keys. At this release cadence that is a smaller cost than a
+credential in CI, and it puts the person who signed the checksums in the same
+place as the person who pins the hash.
 
 ## What a winget user actually trusts
 
