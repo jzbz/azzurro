@@ -2,10 +2,11 @@
 # Lay out Azzurro.app around a universal binary.
 #
 # A .app is a directory with a particular shape and a plist that names the
-# executable; nothing here needs Xcode. Signing and notarisation are not done —
-# see .github/workflows/package.yml for why — so a Mac will refuse this until
-# the user allows it in Privacy & Security, or until someone with a Developer
-# ID signs it.
+# executable; nothing here needs Xcode. Signing and notarisation are not done
+# here — Gatekeeper refuses an unsigned bundle outright, so this is an input to
+# packaging/macos-sign.sh, which signs and notarises it on the machine holding
+# the Developer ID key. `release.yml` calls this script and ships what it makes
+# as the `-unsigned` zip.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
