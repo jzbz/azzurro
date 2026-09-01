@@ -120,15 +120,17 @@ case "$IDENTITY" in
 esac
 echo "  identity:  $IDENTITY"
 
-xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 \
-    || die "notarytool profile '$PROFILE' is missing or its credentials are rejected.
-  Run '$0 --setup' for how to create it, or set AZZURRO_NOTARY_PROFILE."
-echo "  notary:    profile '$PROFILE' authenticates"
-
 # The login keychain unlocks with the password at console login and stays locked
 # in an SSH session, so this is the normal state when signing remotely. Checked
 # here rather than left to codesign, which fails partway through with an error
 # about the identity rather than about the lock.
+#
+# Before the notary check below, and that order is load-bearing: a locked
+# keychain makes `notarytool history` fail too, and the message it earns
+# there is "the profile is missing or its credentials are rejected" — which
+# sends you to App Store Connect to re-make a key that was never the
+# problem. Measured: a freshly stored, working profile reported exactly that
+# over SSH, and `notarytool` said `keychainLocked` once asked directly.
 if ! security show-keychain-info 2>&1 | grep -qi "no-timeout\|timeout"; then
     die "the login keychain is locked, so codesign cannot reach the private key.
   Unlock it and run this again:
@@ -139,6 +141,11 @@ if ! security show-keychain-info 2>&1 | grep -qi "no-timeout\|timeout"; then
   when you log in at the console, not when you connect remotely."
 fi
 echo "  keychain:  unlocked"
+
+xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 \
+    || die "notarytool profile '$PROFILE' is missing or its credentials are rejected.
+  Run '$0 --setup' for how to create it, or set AZZURRO_NOTARY_PROFILE."
+echo "  notary:    profile '$PROFILE' authenticates"
 
 # ------------------------------------------------------------------- unpack
 WORK=$(mktemp -d) || die "could not create a working directory"

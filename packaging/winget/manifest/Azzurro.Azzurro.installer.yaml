@@ -14,14 +14,12 @@ InstallerType: portable
 UpgradeBehavior: install
 Commands:
 - azzurro
-ReleaseDate: 2026-08-30
+ReleaseDate: 2026-09-01
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/jzbz/azzurro/releases/download/v0.1.0/azzurro-v0.1.0-x86_64.exe
-  # Matches the entry for this file in the release's PGP-signed SHA256SUMS.
-  # Filled from that file once the release is built; komac computes it too, and
-  # the two must agree. Left as zeros until then rather than as a plausible
-  # wrong value, so nothing can submit it by accident.
-  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+  # Taken from the release's PGP-signed SHA256SUMS rather than computed here,
+  # so the hash winget pins is the one covered by that signature.
+  InstallerSha256: 47A1F37CD85BF90A54C5AD86F950919C09A1541F39EB404EC564C9C197A0C1D3
 ManifestType: installer
 ManifestVersion: 1.12.0

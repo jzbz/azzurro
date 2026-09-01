@@ -82,5 +82,5 @@ modules:
         # builds, so what CI ships is the tagged tree regardless; what is
         # written here is what a Flathub submission would use, and it is
         # corrected to the tag's own commit immediately after tagging.
-        commit: 11c8155bb82f76f2cd726ffb77c7a9e41aff9666
+        commit: 9d3ed9ce9fd1f517c972677ef8cb6f07733988c0
       - cargo-sources.json
