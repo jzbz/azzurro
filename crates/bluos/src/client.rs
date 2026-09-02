@@ -59,7 +59,7 @@ pub enum Sync {
 /// for every player adopted.
 ///
 /// A hundredfold headroom over anything a real player sends. Measured on an
-/// NAD Powernode at schema 35: `/Status` 1.2 KB, `/ui/Home` 15.4 KB, the
+/// Bluesound Powernode at schema 35: `/Status` 1.2 KB, `/ui/Home` 15.4 KB, the
 /// library's Albums page 30.8 KB, and its Songs page — the largest document
 /// observed anywhere — 39.9 KB. Long lists page rather than growing, so the
 /// ceiling is a property of the document rather than of the library behind it.

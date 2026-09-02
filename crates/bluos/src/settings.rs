@@ -486,7 +486,7 @@ fn push(settings: &mut Settings, groups: &mut [Group], entry: Entry) {
 mod tests {
     use super::*;
 
-    /// The Audio page from a real NAD Powernode. Between them these settings
+    /// The Audio page from a real Bluesound Powernode. Between them these settings
     /// use every class and both meanings of `<value>`.
     const AUDIO: &str = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <settings pageId="audio" schemaVersion="28">

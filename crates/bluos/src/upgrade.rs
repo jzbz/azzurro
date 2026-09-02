@@ -274,7 +274,7 @@ mod tests {
         );
     }
 
-    /// Captured verbatim from an NAD Powernode running 4.16.6, which is where
+    /// Captured verbatim from a Bluesound Powernode running 4.16.6, which is where
     /// the `version` attribute is known from — the official controller reads
     /// past it.
     #[test]

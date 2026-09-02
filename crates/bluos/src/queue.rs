@@ -142,7 +142,7 @@ fn leading_number(raw: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// Two songs from a real 42-track queue on an NAD Powernode, with the
+    /// Two songs from a real 42-track queue on a Bluesound Powernode, with the
     /// library's own paths replaced.
     const PLAYLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <playlist length="42" id="692" shuffle="0" repeat="0">

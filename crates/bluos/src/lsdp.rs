@@ -3,7 +3,7 @@
 //! LSDP is how BluOS players announce themselves. It is undocumented; this
 //! implementation was written against the format the official controller's own
 //! decoder implements, and checked against packets from real hardware (see the
-//! test at the bottom, which is a capture from an NAD Powernode).
+//! test at the bottom, which is a capture from a Bluesound Powernode).
 //!
 //! A packet is a six-byte header followed by one or more messages:
 //!
@@ -215,7 +215,7 @@ fn parse_announce(body: &[u8]) -> Result<Announce> {
 mod tests {
     use super::*;
 
-    /// A real announcement from an NAD Powernode N330 running BluOS 4.16.6,
+    /// A real announcement from a Bluesound Powernode N330 running BluOS 4.16.6,
     /// with the MAC and address replaced by documentation values. Two records:
     /// the control API on 11000, and a second service on 11431 that is not a
     /// player and must not be treated as one.

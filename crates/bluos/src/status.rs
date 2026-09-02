@@ -497,7 +497,7 @@ mod tests {
 
     use super::*;
 
-    /// Captured from an NAD Powernode N330 on BluOS 4.16.6, sitting on its HDMI
+    /// Captured from a Bluesound Powernode N330 on BluOS 4.16.6, sitting on its HDMI
     /// ARC input, with the address and MAC replaced by documentation values.
     const SYNC_STATUS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <SyncStatus etag="97" syncStat="97" version="4.16.6" id="192.0.2.155:11000" db="-30.6" volume="31" name="Powernode" model="N330" modelName="POWERNODE" class="streamer-amplifier" icon="/images/players/N225_nt.png" brand="Bluesound" schemaVersion="34" initialized="true" mac="AA:BB:CC:DD:EE:FF"><zoneOptions><option canHaveCentre="true" zoneMaster="true">front</option><option zoneMaster="true">side</option></zoneOptions><pairWithSub></pairWithSub><bluetoothOutput></bluetoothOutput></SyncStatus>"#;

@@ -4,7 +4,7 @@ BluOS publishes no protocol specification. Everything here was established one
 of three ways, and each claim below says which:
 
 * **Observed** — a request this project made to a real player, whose response
-  was read. The player was an NAD Powernode N330, on BluOS 4.16.6 and latterly
+  was read. The player was a Bluesound Powernode N330, on BluOS 4.16.6 and latterly
   4.16.22 — the upgrade section below is an account of it going from one to the
   other. Addresses and MACs in the examples have been replaced with
   documentation values.

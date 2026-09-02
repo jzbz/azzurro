@@ -7,7 +7,7 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
 **Status: young, and exercised against real hardware.** Discovery, status, the
 long poll and the transport verbs all run against a player rather than a
-fixture, and firmware upgrades have been driven end to end on an NAD Powernode.
+fixture, and firmware upgrades have been driven end to end on a Bluesound Powernode.
 
 The window lists the players it finds and drives them:
 

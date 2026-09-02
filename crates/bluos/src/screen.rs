@@ -1768,7 +1768,7 @@ mod tests {
     use super::*;
     use crate::Status;
 
-    /// `/ui/Sources` from a real NAD Powernode. Exercises most of the
+    /// `/ui/Sources` from a real Bluesound Powernode. Exercises most of the
     /// vocabulary in one document: screen-level menu actions, two rows, a
     /// nested list, inputs, services, four of the nine action types, and the
     /// now-playing rules.
@@ -2384,7 +2384,7 @@ mod tests {
         assert_eq!(config.uri("queue"), Some("/ui/Queue"));
         assert_eq!(config.uri("nonesuch"), None);
     }
-    /// `/ui/queueItemCM?id=0` from a real NAD Powernode. Every row labels
+    /// `/ui/queueItemCM?id=0` from a real Bluesound Powernode. Every row labels
     /// itself with `text` and none of them carry a `title`, which is the whole
     /// point of this fixture.
     const QUEUE_ITEM_MENU: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
@@ -2430,7 +2430,7 @@ mod tests {
         assert!(menu.items().all(|item| item.title.is_none()));
         assert!(menu.items().all(|item| item.action.is_some()));
     }
-    /// `/ui/Sources` from a real NAD Powernode. Its inputs and its music
+    /// `/ui/Sources` from a real Bluesound Powernode. Its inputs and its music
     /// services sit in one flat list of items and are told apart only by the
     /// action each carries.
     const SOURCES_SCREEN: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
