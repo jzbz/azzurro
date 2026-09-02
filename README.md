@@ -31,6 +31,10 @@ The window lists the players it finds and drives them:
   this machine, since the player has nowhere to put them
 - firmware upgrades: an offer on the way in, a confirmation, the install
   itself, and a strip that follows it stage by stage
+- a keyboard: space plays and pauses, Escape and Backspace go back, Home and
+  End reach the ends of a list, and `/` opens search. Typing a letter jumps a
+  long list to it, as does the alphabet down the side — the player indexes its
+  four long lists, and a list held whole is indexed from its own rows
 
 On Linux each player is also exported over MPRIS, so the desktop's own media
 controls work. That is the one feature that is not on all three: MPRIS is
@@ -157,10 +161,29 @@ client.
 
 ## Installing
 
-There is no published release yet. CI builds and tests all three platforms on
-every push, and packages two of them as artifacts — a universal `.app` for
-macOS and an executable for Windows — but **neither is signed or notarised**,
-so both will need to be allowed past the operating system by hand.
+Releases carry a Flatpak bundle for `x86_64` and `aarch64`, a universal `.app`
+for macOS, and one self-contained `.exe` for Windows. The macOS bundle is signed
+with a Developer ID and notarised by Apple, so it opens without being allowed
+past Gatekeeper by hand; the Windows executable is not signed, so SmartScreen
+warns on first run and then lets you through. Installing it through winget
+avoids that warning entirely.
+
+```bash
+brew install --cask jzbz/azzurro/azzurro           # macOS, from the tap
+flatpak install ./azzurro-*.flatpak                # Linux, from the bundle
+winget install Azzurro.Azzurro                     # Windows, once the manifest lands
+```
+
+The winget manifest is submitted rather than merged — until a moderator takes
+it, the Windows route is the `.exe` from the release.
+
+Every release ships a `SHA256SUMS` signed with the maintainer's PGP key. It is
+the one artefact that survives a compromise of GitHub, winget or the Homebrew
+tap, so it is worth checking before trusting any of them:
+
+```bash
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
+```
 
 Linux is where this is developed and used daily. The other two have each had
 their artifact run on a real machine — the window drawn, a player found on the
