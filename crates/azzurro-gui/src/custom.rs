@@ -89,15 +89,27 @@ pub fn playable(url: &str) -> bool {
 ///
 /// An empty one is not an error — a station with no name is shown by its URL,
 /// which is better than refusing to save what somebody just pasted.
-fn tidy(name: &str) -> String {
+///
+/// Every way a name reaches the list goes through here: [`remember`] on the
+/// way in, [`read`] at startup, [`body`] on the way to the file, and renaming
+/// from the window.
+///
+/// Idempotent, and it has to be: a rename tidies into the row model and
+/// [`body`] tidies again on the way to the file, so a second pass that changed
+/// anything would leave the window holding a different name than the one
+/// written down.
+pub fn tidy(name: &str) -> String {
     let name: String = name
         .trim()
         // Newlines and tabs would break the file; a name is one line.
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let name = name.trim().to_owned();
-    name.chars().take(MAX_NAME).collect()
+    // Cut first and trim after, not the other way round: a cut that lands on a
+    // space would otherwise leave it on the end, where the next pass would take
+    // it off and disagree with this one.
+    let name: String = name.chars().take(MAX_NAME).collect();
+    name.trim().to_owned()
 }
 
 /// Read the file's contents into a list, in the order they were written.
@@ -255,6 +267,24 @@ mod tests {
         // format splits on the first space.
         assert!(!playable("http://example.com/a b"));
         assert!(!playable("http://example.com/a\tb"));
+    }
+
+    #[test]
+    fn tidying_a_tidy_name_changes_nothing() {
+        // This has to hold: a renamed station is tidied into the row model and
+        // tidied again on the way to the file, and the two must not disagree.
+        let cases = [
+            "Radio Paradise",
+            // A cut that lands on a space: the 120th character here is one.
+            &format!("{} {}", "a".repeat(MAX_NAME - 1), "b".repeat(4)),
+            &format!("  \u{7}spaced out\u{7}  {}", "c".repeat(MAX_NAME)),
+        ];
+        for case in cases {
+            let once = tidy(case);
+            assert_eq!(tidy(&once), once, "tidy is not idempotent on {case:?}");
+            assert!(once.chars().count() <= MAX_NAME);
+            assert_eq!(once.trim(), once, "a tidy name has no loose ends");
+        }
     }
 
     #[test]

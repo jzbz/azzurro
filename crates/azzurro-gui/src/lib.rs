@@ -8293,7 +8293,10 @@ async fn run_commands(
                     let Some(station) = page.stations.get_mut(at) else {
                         continue;
                     };
-                    station.name = name;
+                    // Tidied here and not only on the way to the file: the
+                    // window draws this model, so an untidied name would be
+                    // on screen until something reloaded the list.
+                    station.name = custom::tidy(&name);
                     custom::save(&page.stations);
                 }
                 // Deliberately no republish: the row that reported this is the

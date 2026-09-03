@@ -1168,17 +1168,23 @@ pub fn preset_to_save(uri: &str) -> Option<Preset> {
         };
         // `+` is a space here: this is a query string, and the player writes
         // "The+Main+Mix".
-        let decoded = percent_encoding::percent_decode_str(&value.replace('+', " "))
-            .decode_utf8()
-            .ok()?
-            .into_owned();
+        let value = value.replace('+', " ");
+        // A value that is not UTF-8 is that one parameter's problem, not the
+        // whole link's — the same call the pair without an `=` gets above.
+        // Refusing everything was the wider answer, and it threw away a
+        // perfectly good `url` over a mangled `image`, or over a parameter
+        // this does not even read. A `url` that fails here still fails the
+        // check on the way out, which is where that belongs.
+        let Ok(decoded) = percent_encoding::percent_decode_str(&value).decode_utf8() else {
+            continue;
+        };
         if decoded.is_empty() {
             continue;
         }
         match name {
-            "name" => found.name = decoded,
-            "url" => found.url = Some(decoded),
-            "image" => found.image = Some(decoded),
+            "name" => found.name = decoded.into_owned(),
+            "url" => found.url = Some(decoded.into_owned()),
+            "image" => found.image = Some(decoded.into_owned()),
             _ => {}
         }
     }
@@ -1583,6 +1589,25 @@ mod tests {
         let preset = preset_to_save("/add-preset?url=http%3A%2F%2Fx.example%2Fs").expect("saves");
         assert!(preset.name.is_empty());
         assert_eq!(preset.url.as_deref(), Some("http://x.example/s"));
+    }
+
+    #[test]
+    fn one_unreadable_parameter_does_not_lose_the_preset() {
+        // %FF decodes to a byte no UTF-8 string can hold. The name is the
+        // casualty; the stream still saves.
+        let preset =
+            preset_to_save("/add-preset?name=%FF&url=http%3A%2F%2Fx.example%2Fs").expect("saves");
+        assert!(preset.name.is_empty());
+        assert_eq!(preset.url.as_deref(), Some("http://x.example/s"));
+
+        // Even on a parameter nothing here reads.
+        let preset =
+            preset_to_save("/add-preset?junk=%FF&url=http%3A%2F%2Fx.example%2Fs").expect("saves");
+        assert_eq!(preset.url.as_deref(), Some("http://x.example/s"));
+
+        // An unreadable url is still no url, which is what makes this a
+        // save route at all.
+        assert_eq!(preset_to_save("/add-preset?name=X&url=%FF"), None);
     }
 
     #[test]

@@ -863,8 +863,7 @@ impl Client {
             )
         } else {
             self.http.get(format!(
-                "{}{}{body}",
-                self.web_url(&form.action)?,
+                "{url}{}{body}",
                 if form.action.contains('?') { "&" } else { "?" }
             ))
         };

@@ -526,10 +526,23 @@ async fn queue(device: DeviceId, limit: Option<u32>) -> Result<()> {
         );
     }
 
-    if queue.songs.len() as u32 != queue.length {
-        println!("... {} not shown", queue.length - queue.songs.len() as u32);
+    if let Some(rest) = not_shown(queue.length, queue.songs.len()) {
+        println!("... {rest} not shown");
     }
     Ok(())
+}
+
+/// How many tracks the window left out, if any.
+///
+/// `length` and the songs are two fields of one document the player writes,
+/// and nothing cross-checks them. A player claiming five while sending ten
+/// takes a plain subtraction below zero: a panic in debug, and in release —
+/// where overflow checks are off — a remainder near four billion printed as
+/// though it meant something. Saturating leaves the miscount where it was
+/// made.
+fn not_shown(length: u32, shown: usize) -> Option<u32> {
+    let shown = u32::try_from(shown).unwrap_or(u32::MAX);
+    (length > shown).then(|| length - shown)
 }
 
 /// Cut on a character boundary, not a byte one.
@@ -550,4 +563,23 @@ async fn volume(device: DeviceId, level: Option<i32>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_reports_what_it_left_behind() {
+        assert_eq!(not_shown(60, 30), Some(30));
+        assert_eq!(not_shown(30, 30), None);
+    }
+
+    #[test]
+    fn more_songs_than_length_is_not_a_negative_remainder() {
+        // A player that sends more than it claims is wrong, but the answer to
+        // that is to say nothing about a remainder — not to go under zero
+        // working one out.
+        assert_eq!(not_shown(5, 10), None);
+    }
 }
