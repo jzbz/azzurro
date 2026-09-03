@@ -75,5 +75,5 @@ That is not an argument against winget. `winget install` has no Mark-of-the-Web
 and no SmartScreen prompt, so it is the least unpleasant way to get an unsigned
 exe onto a Windows machine, and it is strictly better than the browser download it
 replaces. It is an argument for keeping the signed checksum file prominent in the
-README: it is the artefact that survives a compromise of any of the above, and it
+README: it is the artifact that survives a compromise of any of the above, and it
 lets anyone audit a packager's hash line years later.

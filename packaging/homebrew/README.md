@@ -19,7 +19,7 @@ would therefore install cleanly and then refuse to open, which is a worse
 experience than not offering it at all.
 
 So the cask is only worth publishing once `packaging/macos-sign.sh` has produced
-a notarised, stapled zip. The 2026-09-01 deadline that disables unsigned casks
+a notarized, stapled zip. The 2026-09-01 deadline that disables unsigned casks
 applies only to the main repository, not to a tap — but Gatekeeper applies
 everywhere.
 
@@ -38,7 +38,7 @@ or in one step, without tapping first:
 
 ## Per release
 
-After the release is published and the notarised zip is attached:
+After the release is published and the notarized zip is attached:
 
     ./packaging/homebrew/update-cask.sh v0.1.0 > ~/homebrew-azzurro/Casks/azzurro.rb
     cd ~/homebrew-azzurro && git commit -a -S -m "azzurro 0.1.0" && git push

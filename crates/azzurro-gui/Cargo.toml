@@ -51,7 +51,7 @@ slint = { version = "1.17", default-features = false, features = [
 # trades working accessibility for nothing: zbus's default async-io reactor
 # drives the MPRIS server perfectly well from a tokio task.
 # Linux only. MPRIS is a D-Bus interface: there is no session bus to claim a
-# name on under Windows, and macOS has its own Now Playing centre instead. Left
+# name on under Windows, and macOS has its own Now Playing center instead. Left
 # unconditional it stayed in the dependency graph for both — `cargo tree
 # --target x86_64-pc-windows-msvc` pulled zbus in — for a bridge that could
 # never do anything there.
@@ -70,6 +70,6 @@ slint-build = "1.17"
 # regeneration of the offline source list.
 #
 # Its clicks are real: `single_click` dispatches a PointerPressed at the
-# element's own centre and the window hit-tests it like any other, so a
+# element's own center and the window hit-tests it like any other, so a
 # control covered by something else fails here the way it would on screen.
 i-slint-backend-testing = "1.17"

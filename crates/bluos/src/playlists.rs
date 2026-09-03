@@ -175,7 +175,7 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
             }
             // quick-xml delivers `&amp;` as an event of its own rather than
             // as part of the text around it, so a parser that only handles
-            // `Text` loses everything from the entity onwards: a playlist
+            // `Text` loses everything from the entity onward: a playlist
             // called "Rock & Roll" arrived as "Rock", and that truncated name
             // is what got posted back, since BluOS files by name and not by
             // id. `screen.rs` has handled this from the start; this did not.

@@ -244,7 +244,7 @@ export component EmptyState inherits VerticalLayout {
         text: root.headline;
         // The headline of an empty state is the thing being said, so it is
         // said at the weight of a title in the app's ordinary ink — not, as
-        // this was, one pixel above body size in the dim grey used for
+        // this was, one pixel above body size in the dim gray used for
         // captions.
         font-size: Theme.title-size;
         font-weight: 600;
@@ -345,7 +345,7 @@ export component Scrubber inherits Rectangle {
         enabled: root.enabled;
         moved => {
             if (self.pressed) {
-                // A press that has travelled is a drag whatever the mode, so
+                // A press that has traveled is a drag whatever the mode, so
                 // the handle can always be taken hold of and moved.
                 if (root.jump-to-click || Math.abs(self.mouse-x - self.pressed-x) > 3px) {
                     root.dragging = true;
@@ -385,7 +385,7 @@ export component Level inherits HorizontalLayout {
     spacing: Theme.tight;
 
     // Every child here is a different height, and a row does not center what
-    // it does not have to. Each one carries its own centring layout.
+    // it does not have to. Each one carries its own centering layout.
     VerticalLayout {
         alignment: center;
 
@@ -439,9 +439,9 @@ export component Level inherits HorizontalLayout {
             Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                // Fixed, not measured. This pill is centred on its own width,
+                // Fixed, not measured. This pill is centered on its own width,
                 // so sizing it to the number made it grow from both edges and
-                // re-centre on every step — a 13px pulse under the pointer
+                // re-center on every step — a 13px pulse under the pointer
                 // through the whole of a drag, which is the second-most-used
                 // interaction in the app. 32px holds "100" at this size.
                 width: 32px;
@@ -511,7 +511,7 @@ export component Artwork inherits Rectangle {
     // A parameter because Home puts inputs and albums on one shelf: the input
     // tiles draw a glyph on `raised`, and an album whose art had not landed
     // drew its placeholder on `sunken` beside them, so two tiles in a row were
-    // two different greys for the same reason.
+    // two different grays for the same reason.
     in property <brush> well: Theme.sunken;
 
     border-radius: root.corner;
@@ -523,7 +523,7 @@ export component Artwork inherits Rectangle {
         tint: Theme.faint;
         // Proportional up to a point. 0.42 is right at 36px, where the glyph
         // reads as "nothing here"; at the now-playing sleeve it was a 235px
-        // grey music note, which reads as a picture of a note. Past about
+        // gray music note, which reads as a picture of a note. Past about
         // 64px a placeholder stops standing in for the thing and starts
         // being a thing.
         width: Math.min(Math.min(parent.width, parent.height) * 0.42, 64px);
@@ -728,7 +728,7 @@ export component TimeField inherits Rectangle {
             padding-right: Theme.tight;
             spacing: 0px;
 
-            // Each group is a fixed box with the text centred in it. Slint has
+            // Each group is a fixed box with the text centered in it. Slint has
             // no tabular figures, so without one 09 → 10 shifts the colon
             // sideways on every turn of the wheel.
             hours := Rectangle {
@@ -820,7 +820,7 @@ export component TimeField inherits Rectangle {
 // Seven round chips is what the official controller draws, and it is a touch
 // idiom that needs no translating: it is already seven targets a mouse can
 // hit. Round rather than the squared-off `PillButton` because they are a set
-// of seven equals rather than separate labelled actions.
+// of seven equals rather than separate labeled actions.
 //
 // The letters and their order arrive from Rust with the data, so nothing here
 // has to know what a week is or which end of it the player writes first.

@@ -131,7 +131,7 @@ GET /Status?timeout=100&etag=8a52c91ed3074a395d457626b80b20c2
 
 The player holds the connection open until something changes, or until
 `timeout` seconds have elapsed — measured at 5.016 s for a 5 s poll, so the
-deadline is honoured precisely — and then answers with the current document
+deadline is honored precisely — and then answers with the current document
 either way. Every reply carries a fresh `etag` to hand back on the next call.
 
 This is the whole reactive core of a controller: one long poll per player, no
@@ -546,7 +546,7 @@ answers with `CD Quality selected="true"` and items at `:4`. Confirmed both
 ways on a Powernode running 4.16.22.
 
 This is why a picker can look broken while everything about it works: the
-action runs, `refreshScreen` is honoured, the screen is re-fetched — and the
+action runs, `refreshScreen` is honored, the screen is re-fetched — and the
 re-fetch says "no filter" because the context went nowhere.
 
 Treat it as opaque and round-trip it. Note also that the syntax is validated:

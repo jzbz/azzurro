@@ -7,7 +7,7 @@
 //!
 //! Every field beyond identity is optional. A player on an HDMI input reports
 //! nothing about artists or track length; one playing a stream reports no input
-//! id. Modelling that as `Option` rather than empty strings keeps "the player
+//! id. Modeling that as `Option` rather than empty strings keeps "the player
 //! did not say" distinct from "the player said nothing".
 
 use serde::Deserialize;

@@ -511,7 +511,7 @@ enum Pane {
 /// The url and the image are carried rather than shown: `/SetPreset` replaces
 /// the whole slot, so a field left out is a field cleared, and they have to go
 /// back exactly as they came. Only the name is anybody's business to change —
-/// the stream came out of the player's own catalogue, and retyping it by hand
+/// the stream came out of the player's own catalog, and retyping it by hand
 /// would sever the preset from the thing it names.
 struct EditPresetPage {
     slot: u32,
@@ -1011,7 +1011,7 @@ fn track_actions(status: &bluos::Status) -> Vec<TrackActionData> {
 /// three that merely resemble the ones it does have would be worse than saying
 /// what the button does.
 ///
-/// Anything unrecognised is title-cased and shown regardless. The list is
+/// Anything unrecognized is title-cased and shown regardless. The list is
 /// whatever the service offers, so a name nobody here has met is a button that
 /// still works rather than one that vanishes.
 fn action_label(name: &str) -> String {
@@ -2521,7 +2521,7 @@ impl Backend {
         });
 
         // A Powernode sends no counters at any point, so for that player the
-        // words carry the whole thing and the bar stays at nought. `bar()` is
+        // words carry the whole thing and the bar stays at zero. `bar()` is
         // what decides there is something worth drawing.
         let percent = progress.bar().unwrap_or(0) as f32;
         let name = progress
@@ -2859,7 +2859,7 @@ impl Backend {
     /// Put the player's question in front of the user, or take it away.
     ///
     /// The buttons are the player's, in its order and with its wording — the
-    /// one it colours is the one it considers destructive, and nothing here
+    /// one it colors is the one it considers destructive, and nothing here
     /// decides which that is.
     fn publish_dialog(&self) {
         let asked = self.browsing.lock().unwrap().dialog.clone();
@@ -2877,7 +2877,7 @@ impl Backend {
                 .map(|(index, choice)| DialogButton {
                     index: index as i32,
                     label: choice.text.as_str().into(),
-                    // Coloured means "this is the one that throws something
+                    // Colored means "this is the one that throws something
                     // away", which is what the primary styling is for here.
                     destructive: choice.color.is_some(),
                 })
@@ -2976,7 +2976,7 @@ impl Backend {
         // are never held at once and there is no order to get wrong.
         let selected = *self.selected.lock().unwrap();
 
-        // What the player offers to do with the queue. Recognised by what each
+        // What the player offers to do with the queue. Recognized by what each
         // action is rather than by what it says: matching on the label is what
         // the official controller does and it would break on the first player
         // set to another language.
@@ -3388,7 +3388,7 @@ impl Backend {
             }];
 
             // What it plays, shown and not editable. The stream came from the
-            // player's own catalogue and is what ties the preset to the thing
+            // player's own catalog and is what ties the preset to the thing
             // it names; retyping it by hand would quietly sever that.
             if let Some(url) = page.preset.url.as_deref() {
                 rows.push(SettingData {
@@ -6744,7 +6744,7 @@ fn leading_key(title: &str) -> String {
 /// is every accented letter a Western or Central European name uses. Generated
 /// from Unicode's own decompositions rather than typed out by hand, with the
 /// handful that do not decompose (Æ, Ø, Ł, ß and their like) mapped to the
-/// letter they are alphabetised under.
+/// letter they are alphabetized under.
 ///
 /// Anything outside that range — Greek, Cyrillic, the CJK scripts — is left
 /// alone, having no Latin letter to be filed under.
@@ -9518,7 +9518,7 @@ async fn run_commands(
                         .unwrap_or_default();
                     match browsing.next_stop(&key, stops.len()) {
                         // A letter this list does not have. Nothing is claimed
-                        // and nothing is cancelled: bumping the counter here
+                        // and nothing is canceled: bumping the counter here
                         // would abandon a jump still in flight because someone
                         // leaned on a key.
                         None => None,
@@ -10246,7 +10246,7 @@ mod index_tests {
 
     #[test]
     fn a_list_that_is_not_alphabetical_is_never_reordered() {
-        // An album's tracks are in track order. Alphabetising forty of them
+        // An album's tracks are in track order. Alphabetizing forty of them
         // would be vandalism, so the rule is tested before anything moves.
         let names = genres();
         let mut shuffled = Vec::new();
@@ -10387,7 +10387,7 @@ mod index_tests {
     }
 
     #[test]
-    fn accents_file_under_the_letter_they_are_alphabetised_by() {
+    fn accents_file_under_the_letter_they_are_alphabetized_by() {
         assert_eq!(leading_key("\u{C9}dith Piaf"), "E");
         assert_eq!(leading_key("Sigur R\u{F3}s"), "S");
         assert_eq!(leading_key("Mot\u{F6}rhead"), "M");

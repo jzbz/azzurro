@@ -334,19 +334,19 @@ fn name_the_fields(form: &mut Form, labels: &BTreeMap<String, String>) {
             field.label.clone_from(&field.placeholder);
         }
         // Last resort, the field's own name: `<select name="quality">` on the
-        // Qobuz page carries neither a label nor a placeholder. Capitalised,
+        // Qobuz page carries neither a label nor a placeholder. Capitalized,
         // because a name written for a form post is lower case by convention
         // and reads as a mistake beside "Username" and "Password".
         if field.label.is_empty() {
-            field.label = capitalise(&field.name);
+            field.label = capitalize(&field.name);
         }
     }
 }
 
 /// The first character upper-cased, the rest left exactly as it is — a name
-/// that is already capitalised, or one like `ipAddress` with a capital inside
+/// that is already capitalized, or one like `ipAddress` with a capital inside
 /// it, must come through unharmed.
-fn capitalise(name: &str) -> String {
+fn capitalize(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -762,10 +762,10 @@ mod tests {
     }
 
     #[test]
-    fn capitalising_leaves_the_rest_of_a_name_alone() {
-        assert_eq!(capitalise("quality"), "Quality");
-        assert_eq!(capitalise("Quality"), "Quality");
-        assert_eq!(capitalise("ipAddress"), "IpAddress");
-        assert_eq!(capitalise(""), "");
+    fn capitalizing_leaves_the_rest_of_a_name_alone() {
+        assert_eq!(capitalize("quality"), "Quality");
+        assert_eq!(capitalize("Quality"), "Quality");
+        assert_eq!(capitalize("ipAddress"), "IpAddress");
+        assert_eq!(capitalize(""), "");
     }
 }

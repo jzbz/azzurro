@@ -11,7 +11,7 @@ PackageName: Azzurro
 PackageUrl: https://azzurro.blue/
 License: MIT
 # Pinned to the tag, not HEAD: a manifest describing 0.1.0 should point at the
-# licence 0.1.0 shipped under, whatever master does later.
+# license 0.1.0 shipped under, whatever master does later.
 LicenseUrl: https://github.com/jzbz/azzurro/blob/v0.1.0/LICENSE
 Copyright: Copyright (c) 2026 Jonathan Zeppettini
 ShortDescription: Control BluOS players

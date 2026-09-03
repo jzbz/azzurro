@@ -1,19 +1,19 @@
 #!/bin/sh
-# Sign, notarise and staple the macOS bundle, on the machine that holds the key.
+# Sign, notarize and staple the macOS bundle, on the machine that holds the key.
 #
 # CI builds Azzurro.app and stops there: the Developer ID key is not on the runner
 # and is not going to be. That is not caution for its own sake. A leaked
 # Developer ID key cannot be quietly rotated — Apple does not let you revoke one
 # from the account portal (it is an email to product-security@apple.com), and a
 # revocation stops every already-shipped copy from launching on every machine
-# that has one, including correctly notarised ones. Expiry is survivable;
+# that has one, including correctly notarized ones. Expiry is survivable;
 # revocation is not. So the key stays on this machine, next to the PGP key
 # that signs the release's SHA256SUMS, and never goes near a runner.
 #
 #   ./packaging/macos-sign.sh azzurro-v0.1.2-macos-universal.zip
 #
 # Takes the unsigned zip CI produced (or an unpacked Azzurro.app) and leaves a
-# signed, notarised, stapled zip beside it, verified the way a stranger's Mac
+# signed, notarized, stapled zip beside it, verified the way a stranger's Mac
 # will verify it.
 #
 # One-time setup on this machine — see the block printed by --setup.
@@ -30,7 +30,7 @@ step() { printf '\n== %s\n' "$*"; }
 # and an `|| die` after it is unreachable. That is not hypothetical: the first
 # real run of this script had codesign fail with errSecInternalComponent, print
 # "code object is not signed at all", and carry on to spend four minutes
-# notarising an unsigned bundle before Apple rejected it.
+# notarizing an unsigned bundle before Apple rejected it.
 run() {
     _out=$("$@" 2>&1); _rc=$?
     [ -n "$_out" ] && printf '%s\n' "$_out" | sed 's/^/  /'
@@ -56,7 +56,7 @@ One-time setup on the signing Mac
        security find-identity -v -p codesigning
 
    You want a line reading "Developer ID Application: <name> (<TEAMID>)".
-   "Apple Development" is a different certificate and will notarise-reject.
+   "Apple Development" is a different certificate and will notarize-reject.
 
 2. An App Store Connect API key of this app's own, stored as a notarytool
    profile.
@@ -68,7 +68,7 @@ One-time setup on the signing Mac
    from the same page.
 
    A key per app rather than one shared across them. They cost nothing, and the
-   point is the blast radius: a key that only ever notarises Azzurro can be
+   point is the blast radius: a key that only ever notarizes Azzurro can be
    revoked the day this repository is suspected of anything without stopping
    any other app from shipping. Name it for the app in App Store Connect too,
    or a year from now the list is four keys called "notary".
@@ -99,7 +99,7 @@ command -v xcrun >/dev/null 2>&1 || die "xcrun not found — this must run on ma
 
 # ---------------------------------------------------------------- preflight
 # All of it before anything is modified, because the failures here are the ones
-# that otherwise surface ten minutes into a notarisation wait.
+# that otherwise surface ten minutes into a notarization wait.
 step "Preflight"
 
 IDENTITY="${AZZURRO_SIGN_IDENTITY:-}"
@@ -116,7 +116,7 @@ case "$IDENTITY" in
     "Developer ID Application: "*) ;;
     *) die "'$IDENTITY' is not a Developer ID Application certificate.
   Apple Development and Apple Distribution certificates are for other purposes
-  and notarisation will reject a bundle signed with one." ;;
+  and notarization will reject a bundle signed with one." ;;
 esac
 echo "  identity:  $IDENTITY"
 
@@ -184,7 +184,7 @@ xattr -cr "$APP"
 # and every library the binary links is a system framework — so a single call is
 # the whole job. (--deep IS still correct for verifying, below.)
 #
-# --options runtime enables the hardened runtime, which notarisation requires.
+# --options runtime enables the hardened runtime, which notarization requires.
 # --timestamp gets a secure timestamp from Apple, which is what keeps already
 # shipped copies working after the certificate expires.
 #
@@ -208,7 +208,7 @@ run codesign --sign "$IDENTITY" \
     1. Run this from Terminal ON the Mac, once. macOS asks whether codesign may
        use the key; choose 'Always Allow'. Afterwards SSH runs work too.
 
-    2. Or authorise it without the prompt, which needs your login password on
+    2. Or authorize it without the prompt, which needs your login password on
        the command line:
 
            security set-key-partition-list -S apple-tool:,apple:,codesign: \\
@@ -217,11 +217,11 @@ run codesign --sign "$IDENTITY" \
 run codesign --verify --deep --strict --verbose=2 "$APP" \
     || die "the signature did not verify immediately after signing"
 
-# ----------------------------------------------------------------- notarise
+# ----------------------------------------------------------------- notarize
 # The zip submitted here is scaffolding, never the artifact that ships: the
 # ticket is stapled into the .app afterwards, so this zip is already stale by
-# the time notarisation returns.
-step "Notarising (this usually takes a few minutes)"
+# the time notarization returns.
+step "Notarizing (this usually takes a few minutes)"
 SUBMIT="$WORK/submit.zip"
 ditto -c -k --keepParent "$APP" "$SUBMIT"
 
@@ -234,10 +234,10 @@ echo "$OUT" | sed 's/^/  /'
 ID=$(echo "$OUT" | sed -n 's/.*id: \([0-9a-f-][0-9a-f-]*\).*/\1/p' | head -1)
 if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "status: Accepted"; then
     if [ -n "$ID" ]; then
-        step "Notarisation log for $ID"
+        step "Notarization log for $ID"
         xcrun notarytool log "$ID" --keychain-profile "$PROFILE" 2>&1 | sed 's/^/  /'
     fi
-    die "notarisation did not return Accepted — see the log above"
+    die "notarization did not return Accepted — see the log above"
 fi
 
 # ------------------------------------------------------------------- staple

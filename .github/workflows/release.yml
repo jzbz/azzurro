@@ -142,7 +142,7 @@ jobs:
       #
       # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
       # tip of the ref the workflow was *dispatched on* — master — while the
-      # checkout above honours inputs.ref and sits on the tag. Rewriting the
+      # checkout above honors inputs.ref and sits on the tag. Rewriting the
       # pin to master while `tag:` still named the release left the two
       # contradicting each other, and flatpak-builder refused the source with
       # "Git commit for branch (null) is <tag>, but expected <master>". HEAD is
@@ -245,7 +245,7 @@ jobs:
   # the dialog reads "Apple could not verify Azzurro is free of malware", offers
   # Move to Trash as the default button, and no longer offers Open Anyway at
   # all — so this artifact is an input to packaging/macos-sign.sh, which signs
-  # and notarises it on the machine holding the Developer ID key. That key is
+  # and notarizes it on the machine holding the Developer ID key. That key is
   # not here for the same reason no signing key is.
   #
   # Universal: macos-latest is Apple Silicon, and the Intel half is
@@ -321,7 +321,7 @@ jobs:
           done
 
           # ditto rather than zip: it preserves the bundle's metadata, and it
-          # is what notarisation expects to be handed later. `-unsigned` in the
+          # is what notarization expects to be handed later. `-unsigned` in the
           # name because that is exactly what this is — packaging/macos-sign.sh
           # takes this file and writes the signed one beside it.
           NAME="azzurro-${TAG}-macos-universal-unsigned.zip"

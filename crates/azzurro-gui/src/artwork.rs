@@ -103,7 +103,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// so one such reply meant that cover was permanently undecodable: the cache
 /// answered before the network could ever be tried again.
 ///
-/// Only the three formats the workspace compiles are recognised; anything else
+/// Only the three formats the workspace compiles are recognized; anything else
 /// would be undecodable regardless.
 fn looks_like_an_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0x89, b'P', b'N', b'G'])
@@ -391,7 +391,7 @@ impl Artwork {
             }
         }
 
-        // The player chose this address, so it is checked before it is dialled
+        // The player chose this address, so it is checked before it is dialed
         // rather than trusted because a player said it. Redirects are checked
         // per hop by the policy on the client itself.
         if !self.may_fetch(url) {
@@ -509,7 +509,7 @@ fn decode(bytes: &[u8], size: u32) -> Option<Pixels> {
 
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .inspect_err(|e| tracing::debug!("unrecognisable artwork: {e}"))
+        .inspect_err(|e| tracing::debug!("unrecognizable artwork: {e}"))
         .ok()?;
     reader.limits(limits);
 
@@ -894,10 +894,10 @@ mod tests {
     }
 
     #[test]
-    fn takes_its_colour_from_the_coloured_pixels() {
+    fn takes_its_color_from_the_colored_pixels() {
         // A saturated cover gives its own hue back, lifted to a usable
         // brightness rather than reproduced exactly.
-        let tint = dominant(&swatch(120, 30, 30)).expect("a red cover has a colour");
+        let tint = dominant(&swatch(120, 30, 30)).expect("a red cover has a color");
         assert!(
             tint[0] > tint[1] && tint[0] > tint[2],
             "still red: {tint:?}"
@@ -958,7 +958,7 @@ mod frost_timing {
 
         assert_eq!(out.width(), 144);
         println!("frosted in {took:?}");
-        // 3ms in release, ~170ms unoptimised. The bound is loose on purpose:
+        // 3ms in release, ~170ms unoptimized. The bound is loose on purpose:
         // it is here to catch the blur becoming a whole different order of
         // cost, not to police a few milliseconds on a busy machine.
         assert!(

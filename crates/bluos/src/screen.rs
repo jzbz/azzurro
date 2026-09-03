@@ -226,7 +226,7 @@ pub struct Item {
     /// that field set to that value. The player is telling the client how to
     /// decide, instead of the client inferring it.
     pub now_playing_match: Option<(String, String)>,
-    /// Anything not modelled above, kept rather than discarded so a client can
+    /// Anything not modeled above, kept rather than discarded so a client can
     /// still pass it back.
     pub extra: BTreeMap<String, String>,
 }
@@ -1095,7 +1095,7 @@ fn without_playnow(query: &str) -> (String, bool) {
         // length of a URI the player chose.
         //
         // Repeated until it settles rather than replaced once, because
-        // removing one occurrence can join its neighbours into another:
+        // removing one occurrence can join its neighbors into another:
         // "playn" + "playnow=1&" + "ow=1&" becomes a match that a single pass
         // would leave behind. The string shrinks every round, so this ends.
         loop {
@@ -1924,7 +1924,7 @@ mod tests {
             "and it does not match inside a longer word"
         );
 
-        // Removing one occurrence can join its neighbours into another, which
+        // Removing one occurrence can join its neighbors into another, which
         // a single pass would leave behind.
         assert_eq!(
             strip("aplaynplaynow=1&ow=1&b"),
@@ -1956,15 +1956,15 @@ mod tests {
         assert!(!with("prid", "8").is_stale(&status), "the value matches");
         assert!(
             with("prid", "9").is_stale(&status),
-            "a modelled key that moved is stale"
+            "a modeled key that moved is stale"
         );
         assert!(
             !with("nosuchkey", "1").is_stale(&status),
-            "an unmodelled key cannot be satisfied, so it must not mean stale"
+            "an unmodeled key cannot be satisfied, so it must not mean stale"
         );
         assert!(
             !with("sid", "3").is_stale(&status),
-            "a modelled key the player left out is 'cannot tell', not 'changed'"
+            "a modeled key the player left out is 'cannot tell', not 'changed'"
         );
     }
 

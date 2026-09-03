@@ -245,7 +245,7 @@ pub enum PlaylistTarget {
 /// request.
 fn time_zone() -> String {
     // `TZ` first, which the crate does not consult on Unix. Someone who has
-    // set it means it, and honouring it is what this did before. A POSIX rule
+    // set it means it, and honoring it is what this did before. A POSIX rule
     // like `EST5EDT,M3.2.0` names no zone the player could look up, so
     // `zone_name` refuses it and the machine is asked instead.
     if let Ok(tz) = std::env::var("TZ")
@@ -536,7 +536,7 @@ impl Client {
         })
     }
 
-    /// Fire a control verb and discard the acknowledgement.
+    /// Fire a control verb and discard the acknowledgment.
     async fn command(&self, path: &str, query: &[(&str, &str)]) -> Result<()> {
         self.get_text(path, query, REQUEST_TIMEOUT).await.map(drop)
     }
@@ -644,7 +644,7 @@ impl Client {
             )));
         };
 
-        // Built by hand rather than with a serialiser: this is the only JSON
+        // Built by hand rather than with a serializer: this is the only JSON
         // this crate ever sends, and it is two strings.
         let body = format!("{{{}:{}}}", json_string(name), json_string(value));
 

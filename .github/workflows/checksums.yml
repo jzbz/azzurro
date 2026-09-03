@@ -3,7 +3,7 @@ name: Release checksums
 # One SHA256SUMS over every artifact in a release, written after they are all
 # there. It is separate from release.yml because they cannot all be there when
 # release.yml runs: the macOS bundle detours through the machine holding the
-# Developer ID key to be signed and notarised, and only then is it uploaded. A
+# Developer ID key to be signed and notarized, and only then is it uploaded. A
 # checksum file written before that names fewer files than the release ships,
 # which is worse than none — it looks complete.
 #
@@ -13,7 +13,7 @@ name: Release checksums
 # unsigned file: it does not publish the release and it cannot sign anything.
 #
 #   1. tag        -> release.yml builds and attaches what CI can, as a draft
-#   2. by hand    -> sign and notarise the macOS bundle, upload it to the draft
+#   2. by hand    -> sign and notarize the macOS bundle, upload it to the draft
 #   3. this       -> hash everything attached, upload SHA256SUMS
 #   4. by hand    -> gpg --detach-sign --armor SHA256SUMS, upload the .asc
 #   5. by hand    -> publish the draft

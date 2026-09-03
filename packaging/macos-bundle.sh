@@ -2,9 +2,9 @@
 # Lay out Azzurro.app around a universal binary.
 #
 # A .app is a directory with a particular shape and a plist that names the
-# executable; nothing here needs Xcode. Signing and notarisation are not done
+# executable; nothing here needs Xcode. Signing and notarization are not done
 # here — Gatekeeper refuses an unsigned bundle outright, so this is an input to
-# packaging/macos-sign.sh, which signs and notarises it on the machine holding
+# packaging/macos-sign.sh, which signs and notarizes it on the machine holding
 # the Developer ID key. `release.yml` calls this script and ships what it makes
 # as the `-unsigned` zip.
 set -euo pipefail
@@ -35,7 +35,7 @@ iconset="$root/dist/azzurro.iconset"
 rm -rf "$iconset"
 mkdir -p "$iconset"
 
-# The names are Apple's, and iconutil refuses anything it does not recognise.
+# The names are Apple's, and iconutil refuses anything it does not recognize.
 # A size appears twice wherever it serves both a scale-1 slot and the retina
 # slot of the size below it.
 cp "$root/crates/azzurro-gui/desktop/blue.azzurro.Azzurro-16.png"   "$iconset/icon_16x16.png"

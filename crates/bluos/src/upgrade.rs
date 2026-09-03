@@ -67,7 +67,7 @@ pub struct Availability {
 /// The counters are optional because a real player leaves them out. A
 /// Powernode sends stage 2 with no `step`, `total` or `percent` at all, so
 /// absent and zero have to be told apart: read as zero, stage two looks like
-/// the very beginning of the work and is labelled as preparing while the
+/// the very beginning of the work and is labeled as preparing while the
 /// player is installing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
@@ -302,7 +302,7 @@ mod tests {
     }
 
     /// Stage 1 carries no step, total or percent — there is genuinely nothing
-    /// to show yet, and reading zeros as progress would draw a bar at nought.
+    /// to show yet, and reading zeros as progress would draw a bar at zero.
     #[test]
     fn stage_one_has_a_name_and_nothing_to_measure() {
         let one = in_sync_status(

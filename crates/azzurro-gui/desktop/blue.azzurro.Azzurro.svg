@@ -14,7 +14,7 @@
     icon at 64.
 
     A ground rather than a bare glyph, because an icon is composited onto a
-    panel of unknown colour and a thin stroke on transparency disappears there.
+    panel of unknown color and a thin stroke on transparency disappears there.
     The blue is the light-theme accent, fixed: the app follows the system
     theme, but nothing asks an icon to redraw when the theme changes.
   -->
@@ -24,7 +24,7 @@
       two: a vertical two-stop ramp reads as a flat card with a shadow on it,
       while running light-to-deep across the corner gives the tile a direction
       the eye follows. Sky at the top left, azure through the middle, indigo in
-      the far corner — all blue, so it still reads as one colour at 32px.
+      the far corner — all blue, so it still reads as one color at 32px.
     -->
     <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#7dd3fc"/>

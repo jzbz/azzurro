@@ -2,7 +2,7 @@
 //!
 //! `GET /Alarms` answers with the lot, and the same route with different
 //! parameters is also how they are made, changed, switched off and deleted —
-//! see [`crate::client::Client::alarms`] and its neighbours. Every reply is
+//! see [`crate::client::Client::alarms`] and its neighbors. Every reply is
 //! this document, so a caller never has to re-read after a write.
 //!
 //! ```xml

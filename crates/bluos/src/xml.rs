@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn entities_in_an_attribute_are_normalised() {
+    fn entities_in_an_attribute_are_normalized() {
         let e = element(r#"action URI="/Play?a=1&amp;b=2""#);
         assert_eq!(
             attributes(&e).get("URI").map(String::as_str),

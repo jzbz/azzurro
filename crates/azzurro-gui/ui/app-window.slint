@@ -102,8 +102,8 @@ export struct ActionButton {
 export struct DialogButton {
     index: int,
     label: string,
-    // The player coloured this one, which is how it marks the answer that
-    // discards something. Drawn as the emphasised button.
+    // The player colored this one, which is how it marks the answer that
+    // discards something. Drawn as the emphasized button.
     destructive: bool,
 }
 
@@ -949,7 +949,7 @@ component TrackRow inherits Rectangle {
     callback drag-done();
     callback drag-cancelled();
 
-    // True once a press has travelled far enough to be a drag rather than a
+    // True once a press has traveled far enough to be a drag rather than a
     // click. Queue rows are narrow and reordering by a twitch is worse than
     // needing a firmer gesture.
     property <bool> held: false;
@@ -1280,7 +1280,7 @@ component BrowseRowView inherits Rectangle {
                     animate opacity { duration: Theme.quick; easing: ease-out; }
 
                     Icon {
-                        // See the tile: a triangle looks off in a centred box.
+                        // See the tile: a triangle looks off in a centered box.
                         x: (parent.width - self.width) / 2 + 1px;
                         glyph: Icons.play;
                         tint: Theme.text;
@@ -1501,7 +1501,7 @@ component BrowseTile inherits Rectangle {
 
                 Icon {
                     // Nudged right by an eighth of its width: a triangle's
-                    // visual centre is left of its bounding box, so centring
+                    // visual center is left of its bounding box, so centering
                     // the box leaves it looking off.
                     x: (parent.width - self.width) / 2 + 1px;
                     glyph: Icons.play;
@@ -1883,8 +1883,8 @@ component BrowseBlockView inherits VerticalLayout {
             // placement. A shelf can mix a tile that has a subtitle with one
             // that has not — Recently Played holds both records and artists —
             // and those are now different heights, so without this the shorter
-            // one could sit centred and its cover would ride below its
-            // neighbours'.
+            // one could sit centered and its cover would ride below its
+            // neighbors'.
             for entry in root.block.rows: VerticalLayout {
                 alignment: start;
 
@@ -2178,7 +2178,7 @@ export component AppWindow inherits Window {
     // read was barely wider than the two edges put together.
     preferred-width: 1440px;
     preferred-height: 920px;
-    // No min-width. This said 900px, which the window could not honour: the
+    // No min-width. This said 900px, which the window could not honor: the
     // transport bar's own minimum measures 948px, so dragging down to 900 did
     // not shrink the bar, it pushed the last control in it — the button that
     // hides the queue — off the right edge where nothing could reach it.
@@ -2425,7 +2425,7 @@ export component AppWindow inherits Window {
                         // name rather than text, and wants its own letterforms.
                         //
                         // Optically centered rather than centered: Geo's caps sit
-                        // high in the line box, so centring the box leaves the
+                        // high in the line box, so centering the box leaves the
                         // letters riding above the mark beside them.
                         VerticalLayout {
                             alignment: center;
@@ -3097,7 +3097,7 @@ export component AppWindow inherits Window {
 
                     // Pinned above the list rather than scrolling inside it.
                     // Two reasons: a wheel over the time must not also scroll
-                    // the page, and a virtualised row can carry the focused
+                    // the page, and a virtualized row can carry the focused
                     // field away with it when it goes off screen.
                     if root.alarm-editing: Panel {
                         VerticalLayout {
@@ -3496,7 +3496,7 @@ export component AppWindow inherits Window {
 
                                 // Determinate when there is a number to draw,
                                 // and a sweep when there is not. A bar pinned
-                                // at nought for four minutes says "stuck",
+                                // at zero for four minutes says "stuck",
                                 // which is the one thing it must not say about
                                 // a player rewriting its own firmware.
                                 if root.upgrading-percent > 0: Rectangle {
@@ -3653,11 +3653,11 @@ export component AppWindow inherits Window {
 
                                     // The record lighting the room it is in.
                                     // The window-wide wash further up is
-                                    // centred on the window, so the brightest
-                                    // part of a sleeve's colour lands over a
+                                    // centered on the window, so the brightest
+                                    // part of a sleeve's color lands over a
                                     // column of text and is spent by the time
                                     // it reaches the sleeve that produced it.
-                                    // A colour taken from a picture should
+                                    // A color taken from a picture should
                                     // come from where the picture is.
                                     Rectangle {
                                         width: parent.width * 1.9;
@@ -3680,7 +3680,7 @@ export component AppWindow inherits Window {
 
                                         // A record on a table has a shadow
                                         // under it. Without one the sleeve is a
-                                        // coloured square printed on the
+                                        // colored square printed on the
                                         // backdrop rather than an object in
                                         // front of it — which is most of why
                                         // this screen read flat while the
@@ -3999,7 +3999,7 @@ export component AppWindow inherits Window {
                         // column and under a tenth of one percent to the
                         // bottom — a full-column image redrawn on every track
                         // change to deliver nothing anyone could see. The
-                        // colour now reaches the top, where the list is
+                        // color now reaches the top, where the list is
                         // sparse, and the scrim still closes over the bottom,
                         // where the rows are dense and have to stay legible.
                         Theme.backdrop-bottom.with-alpha(0.62) 0%,
@@ -4474,7 +4474,7 @@ export component AppWindow inherits Window {
 
                         // The play button is taller than the four around it,
                         // so it decides the height of the row and the others
-                        // each need centring against it.
+                        // each need centering against it.
                         HorizontalLayout {
                             alignment: center;
                             spacing: Theme.gap;

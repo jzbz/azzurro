@@ -140,13 +140,13 @@ The interface draws its own controls rather than using the platform's — a
 music controller is one of the few app classes where looking like itself is
 the expectation. `ui/theme.slint` holds the palette, spacing and type in one
 place; `ui/widgets.slint` holds the pieces built from them. Icons are
-[Lucide](https://lucide.dev), recoloured through their alpha channel so one
-copy of each glyph serves every colour the theme has.
+[Lucide](https://lucide.dev), recolored through their alpha channel so one
+copy of each glyph serves every color the theme has.
 
-The now-playing panel takes a colour from the cover art and washes it behind
+The now-playing panel takes a color from the cover art and washes it behind
 everything at low opacity, so a red sleeve and a green one feel different from
-across the room. Greys and near-blacks are discarded before averaging, because
-the mean of a whole sleeve is always a muddy brown; a cover with no colour in
+across the room. Grays and near-blacks are discarded before averaging, because
+the mean of a whole sleeve is always a muddy brown; a cover with no color in
 it gets no tint rather than a dirty one.
 
 Cover art is the one place Slint costs more than a toolkit with a URL-loading
@@ -163,7 +163,7 @@ client.
 
 Releases carry a Flatpak bundle for `x86_64` and `aarch64`, a universal `.app`
 for macOS, and one self-contained `.exe` for Windows. The macOS bundle is signed
-with a Developer ID and notarised by Apple, so it opens without being allowed
+with a Developer ID and notarized by Apple, so it opens without being allowed
 past Gatekeeper by hand; the Windows executable is not signed, so SmartScreen
 warns on first run and then lets you through. Installing it through winget
 avoids that warning entirely.
@@ -178,7 +178,7 @@ The winget manifest is submitted rather than merged — until a moderator takes
 it, the Windows route is the `.exe` from the release.
 
 Every release ships a `SHA256SUMS` signed with the maintainer's PGP key. It is
-the one artefact that survives a compromise of GitHub, winget or the Homebrew
+the one artifact that survives a compromise of GitHub, winget or the Homebrew
 tap, so it is worth checking before trusting any of them:
 
 ```bash
@@ -226,7 +226,7 @@ The sandbox takes no filesystem permissions. It does need `--share=network`,
 and not only for HTTP: discovery is a UDP broadcast, which needs the host's
 network namespace rather than a proxied socket.
 
-## Licence
+## License
 
 MIT. See `LICENSE`.
 

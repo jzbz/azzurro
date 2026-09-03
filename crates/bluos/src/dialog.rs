@@ -19,7 +19,7 @@
 //! and done nothing, which is exactly how pressing a track came to do nothing
 //! at all once there was a queue to replace.
 //!
-//! The wording, the colour of the dangerous button and which action each
+//! The wording, the color of the dangerous button and which action each
 //! button carries are all the player's to decide, the same as everywhere else
 //! in this crate. Nothing here invents a phrase.
 
