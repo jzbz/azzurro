@@ -15,7 +15,7 @@ The window lists the players it finds and drives them:
   reorder by dragging, save the lot as a playlist; long ones arrive five
   hundred tracks at a time as the list is scrolled
 - browse and search every source the player offers, with Home rearrangeable,
-  favourites to hand, and recent searches that survive a restart
+  favorites to hand, and recent searches that survive a restart
 - saved playlists: keep the queue as one, play it, and delete it
 - transport, volume, mute and the physical inputs
 - ad-hoc grouping, one player at a time or all of them at once

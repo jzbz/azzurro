@@ -152,7 +152,7 @@ export struct BrowseRow {
 //
 // The player says how each section wants to be drawn and the official
 // controller obeys: a shelf of covers for "Recently Played", a strip of
-// service chips at the top of Favourites, a plain list for an album. A flat
+// service chips at the top of Favorites, a plain list for an album. A flat
 // list of everything is legible but it is not what the player asked for.
 export struct BrowseBlock {
     // 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips,
@@ -178,7 +178,7 @@ export struct SidebarRow {
     header: bool,
     selected: bool,
     // 0 = a screen from /ui/Configuration, 1 = an item on the Sources screen,
-    // 2 = the button on a section heading — "Customise" on Inputs, "Manage" on
+    // 2 = the button on a section heading — "Customize" on Inputs, "Manage" on
     // Music Services. The player names those; they are not ours to invent.
     kind: int,
     index: int,
@@ -848,7 +848,7 @@ component StationRow inherits Rectangle {
     }
 }
 
-// One movable section on the Customise screen.
+// One movable section on the Customize screen.
 //
 // The same drag as TrackRow and for the same reason — see the note there about
 // `lift`. Simpler in every other respect: there is nothing to play, nothing to
@@ -1559,7 +1559,7 @@ component BrowseTile inherits Rectangle {
 
 }
 
-// One service in a selector menu. Favourites and Search are per-service on a
+// One service in a selector menu. Favorites and Search are per-service on a
 // BluOS player, and this strip is how you say which service you mean.
 component ServiceChip inherits Rectangle {
     in property <BrowseRow> entry;
@@ -1947,7 +1947,7 @@ export component AppWindow inherits Window {
     in property <string> browse-header-subtitle: "";
     in property <string> browse-header-detail: "";
     in property <[ActionButton]> browse-header-buttons;
-    // A screen that is about one music service at a time — Favourites and
+    // A screen that is about one music service at a time — Favorites and
     // Search both are — names the others so you can switch.
     in property <[BrowseRow]> browse-selector;
     in property <string> browse-service: "";
@@ -3286,7 +3286,7 @@ export component AppWindow inherits Window {
                                     height: station-list.row-height;
 
                                     // The same shuffle the queue and the
-                                    // customise list do: the rows between the
+                                    // customize list do: the rows between the
                                     // grabbed one and the drop step aside so
                                     // the gap opens where it will land.
                                     property <length> lift: station-list.from-row == i

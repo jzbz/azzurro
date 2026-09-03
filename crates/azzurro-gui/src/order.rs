@@ -1,7 +1,7 @@
 //! The order the user put a screen's sections in.
 //!
 //! The home screen arrives as a list of rows the player chose the order of,
-//! and "Customise Home" lets that order be changed. Nothing about it is stored
+//! and "Customize Home" lets that order be changed. Nothing about it is stored
 //! on the player — the official controller keeps the same preference in its
 //! own local storage, so a rearranged home screen follows the *app*, not the
 //! speaker, and two controllers on one system can disagree about it. This
@@ -71,7 +71,7 @@ fn parse(text: &str) -> Orders {
 /// Separate from `save` for the same reason as `parse`: the whole of the
 /// formatting can be tested without a config directory to write into.
 fn body(orders: &Orders) -> String {
-    let mut text = String::from("# Section order per screen, set by Customise Home.\n");
+    let mut text = String::from("# Section order per screen, set by Customize Home.\n");
     for (screen, rows) in orders {
         let Some(rows) = savable(screen, rows) else {
             tracing::debug!(screen, "not saving an order the file cannot hold");
@@ -143,7 +143,7 @@ fn writable(id: &str) -> bool {
 ///
 /// The home screen's `teaser` row is BluOS advertising itself — "Add your
 /// Music Services", "Queue Builder Mode" — pinned to the top by the player
-/// with `noReorder`, so Customise Home cannot move it and nothing else can
+/// with `noReorder`, so Customize Home cannot move it and nothing else can
 /// get above it. It says nothing about the music on the system, and this app
 /// is not the place the vendor gets to promote its features.
 ///

@@ -279,7 +279,7 @@ enum Command {
     /// Answer the player's question by pressing one of its buttons. The index
     /// is into the dialog's own list, and out of range means dismissed.
     DialogPress(usize),
-    /// Move a section from one place in the Customise list to another.
+    /// Move a section from one place in the Customize list to another.
     CustomiseMove(usize, usize),
     /// Keep the arrangement and go back to the screen it describes.
     CustomiseSave,
@@ -401,7 +401,7 @@ struct Browsing {
     ///
     /// A browse row's menu is fetched from `device` — the player whose screens
     /// are being read — and its lines were run against `selected`. Those are
-    /// normally the same player and briefly are not, so a Favourite carrying
+    /// normally the same player and briefly are not, so a Favorite carrying
     /// one player's local file path could be sent to another. Recorded with
     /// the menu and checked before anything on it is run.
     queue_menu_owner: Option<DeviceId>,
@@ -411,7 +411,7 @@ struct Browsing {
     ///
     /// The player puts a search box on exactly one screen — measured on a
     /// Powernode running 4.16.22: not on Artists, Albums, Songs, Genres,
-    /// Composers, Playlists, Folders or Favourites, and not on the library's
+    /// Composers, Playlists, Folders or Favorites, and not on the library's
     /// front page either. So a key that means "search" cannot focus a box on
     /// the screen you are looking at; it has to be able to fetch the one screen
     /// that has one.
@@ -496,7 +496,7 @@ enum Pane {
     NowPlaying,
     /// The player's alarms, and the one being edited if any.
     Alarms(Box<AlarmsPage>),
-    /// Rearranging the sections of a screen — "Customise Home".
+    /// Rearranging the sections of a screen — "Customize Home".
     Customise(CustomisePage),
     /// Choosing where to file a track.
     Playlists(Box<PlaylistPage>),
@@ -649,7 +649,7 @@ impl Browsing {
 /// How a settings page joins the pane's own trail.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
-    /// Start again here: opening Settings, or arriving from a Customise button
+    /// Start again here: opening Settings, or arriving from a Customize button
     /// on a screen somewhere else.
     Root,
     /// Opened from the page showing, which Back undoes.
@@ -868,7 +868,7 @@ struct Backend {
     told_about_update: Arc<Mutex<std::collections::HashSet<DeviceId>>>,
     /// Which player the offer on screen is about.
     update_offer: Arc<Mutex<Option<DeviceId>>>,
-    /// Section order per screen, as set by Customise Home and kept on disk.
+    /// Section order per screen, as set by Customize Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
 }
 
@@ -1424,7 +1424,7 @@ struct BrowseData {
     /// Both empty except on a screen about one album.
     track: String,
     quality: String,
-    /// The caption on a section heading's button — "Customise" on the Inputs
+    /// The caption on a section heading's button — "Customize" on the Inputs
     /// row, "Manage" on Music Services. Empty everywhere else, which is most
     /// places: only the sidebar draws these, and only on headings.
     action: String,
@@ -1436,7 +1436,7 @@ struct BrowseData {
     actionable: bool,
     playing: bool,
     /// Which service a selector menu is currently showing. Not the same thing
-    /// as `playing`: you can be looking at TuneIn's favourites while the
+    /// as `playing`: you can be looking at TuneIn's favorites while the
     /// library is what is coming out of the speakers.
     selected: bool,
     has_menu: bool,
@@ -3979,7 +3979,7 @@ impl Backend {
 
     /// The order to draw a screen's sections in.
     ///
-    /// The identity permutation unless Customise Home has been used on this
+    /// The identity permutation unless Customize Home has been used on this
     /// screen, so a screen nobody has rearranged costs one map lookup.
     fn arrangement(&self, screen: &Screen) -> Vec<usize> {
         let shown = |at: &usize| {
@@ -4000,7 +4000,7 @@ impl Backend {
         };
         // A default where nothing has been arranged, so Home leads with what
         // was last played rather than with whatever the player listed first.
-        // Customise Home overrides it the moment it is used.
+        // Customize Home overrides it the moment it is used.
         let wanted = wanted.unwrap_or_else(|| order::default_for(id));
         if wanted.is_empty() {
             return plain();
@@ -4111,7 +4111,7 @@ impl Backend {
                 .filter(|s| s.kind == SectionKind::List && s.title.is_some())
                 .count();
 
-            // Whatever order Customise Home last put these in. `ordinal` stays
+            // Whatever order Customize Home last put these in. `ordinal` stays
             // the section's real index throughout, because every action
             // published from this loop refers back into the screen the player
             // sent — reordering the drawing must not reorder the addressing.
@@ -5479,7 +5479,7 @@ async fn activate(backend: Backend, index: usize) {
         // Choosing a service out of a picker is done on the URL, not by the
         // action attached to it.
         //
-        // The Favourites picker offers `<action type="player-link"
+        // The Favorites picker offers `<action type="player-link"
         // URI="/ui/action?CfavouritesService=TuneIn" refreshScreen="true">`,
         // and on a Powernode that call answers 200 and changes nothing: the
         // refresh that follows fetches the same address and gets Library back,
@@ -5517,7 +5517,7 @@ async fn activate(backend: Backend, index: usize) {
     }
     // The picker's own address, where it has one: the same screen asked for a
     // different service. Replaces rather than pushes, because it is not a step
-    // into anything — Back from TuneIn's favourites should leave Favourites,
+    // into anything — Back from TuneIn's favorites should leave Favorites,
     // not return to Library's.
     if let Some(uri) = switch_to {
         open_screen(backend, id, uri, Arrive::Replace(None)).await;
@@ -5774,7 +5774,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
 
             // While Queue Builder Mode is on, anything that would start
             // playing is turned into an append instead. `appending` returns
-            // nothing for an action that does not play — favouriting,
+            // nothing for an action that does not play — favoriting,
             // switching service, clearing — so those run untouched.
             let building = backend.browsing.lock().unwrap().queue_building;
             let (uri, appended) = match building.then(|| bluos::screen::appending(&uri)).flatten() {
@@ -5802,7 +5802,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                     if let Some(text) = &action.notification {
                         say(&backend.ui, text.clone());
                     }
-                    // Favouriting changes what the menu should say next time,
+                    // Favoriting changes what the menu should say next time,
                     // and the player says so.
                     if action.refresh_screen {
                         refresh_current(backend).await;
@@ -5886,7 +5886,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
             // `/add-preset?name=…&url=…&image=…`, everything already decided.
             // So this is a decode and a request, with nothing to ask anybody.
             // Dragging the player's presets into a new order. The same page
-            // as Customise Home, because it is the same gesture over the same
+            // as Customize Home, because it is the same gesture over the same
             // shape of row; only the saving differs.
             //
             // The rows come from the screen already showing rather than from a
@@ -6015,7 +6015,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
         ActionKind::Webpage | ActionKind::Setting => {
             if let Some(uri) = uri {
                 // Except this one, which only looks like a web page. The
-                // Customise button on the Inputs row leads to
+                // Customize button on the Inputs row leads to
                 // `/Settings?id=capture`, and that is a settings document this
                 // app already renders — sending it to a browser would be
                 // handing back a page it can draw itself.
@@ -8142,7 +8142,7 @@ async fn run_commands(
                     let backend = backend.clone();
                     tokio::spawn(async move {
                         run_action(backend.clone(), id, action, Arrive::Deeper).await;
-                        // Favouriting and deleting both change the queue, and
+                        // Favoriting and deleting both change the queue, and
                         // the player announces neither.
                         fetch_queue(backend, id).await;
                     });
