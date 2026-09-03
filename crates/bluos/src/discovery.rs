@@ -109,8 +109,18 @@ impl Discovery {
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
             match lsdp::parse(&buf[..n]) {
-                Ok(found) if !found.is_empty() => return Ok(found),
-                Ok(_) => {}
+                Ok(decoded) => {
+                    // Said here rather than in the decoder, which does not know
+                    // which host it is reading: with several players answering
+                    // at once, the address is the whole of what makes this
+                    // worth printing.
+                    if let Some(e) = decoded.skipped {
+                        tracing::debug!(%from, "LSDP packet only partly decodable: {e}");
+                    }
+                    if !decoded.announces.is_empty() {
+                        return Ok(decoded.announces);
+                    }
+                }
                 Err(e) => tracing::debug!(%from, "undecodable LSDP packet: {e}"),
             }
         }

@@ -36,6 +36,25 @@ pub const KEEP: usize = 8;
 /// file that is slow to read at every startup.
 const MAX_LEN: usize = 200;
 
+/// Whether a query is one this file will keep.
+///
+/// Asked before a query joins the recent list as well as on the way out to
+/// disk, and that is the point of it being here rather than inline in either:
+/// the list in the window is drawn from the same values the file holds, so a
+/// query only one of them accepts is a row that disappears at the next start,
+/// having pushed a real one off the end of an eight-long list to get there.
+pub fn keepable(query: &str) -> bool {
+    // A query cannot contain a newline — the field is one line — but it
+    // arrives from outside this module, and one that did would turn a single
+    // entry into two on the way back in. Dropped rather than escaped: there is
+    // no reader for an escape, and this file is only ever written by the code
+    // that reads it.
+    !query.contains('\n')
+        && !query.contains('\r')
+        && !query.trim().is_empty()
+        && query.chars().count() <= MAX_LEN
+}
+
 fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("azzurro").join("searches"))
 }
@@ -47,7 +66,7 @@ fn path() -> Option<PathBuf> {
 fn read(text: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.chars().count() > MAX_LEN {
+        if !keepable(line) {
             continue;
         }
         // Written by this app, so a duplicate means the file was edited or a
@@ -71,15 +90,7 @@ fn read(text: &str) -> Vec<String> {
 fn body(searches: &[String]) -> String {
     let mut body = String::new();
     for query in searches.iter().take(KEEP) {
-        // A query cannot contain a newline — the field is one line — but it
-        // arrives from outside this module, and one that did would turn a
-        // single entry into two on the way back in. Dropped rather than
-        // escaped: there is no reader for an escape, and this file is only
-        // ever written by the code that reads it.
-        if query.contains('\n') || query.contains('\r') {
-            continue;
-        }
-        if query.trim().is_empty() || query.chars().count() > MAX_LEN {
+        if !keepable(query) {
             continue;
         }
         body.push_str(query);
@@ -166,6 +177,31 @@ mod tests {
     fn a_query_with_a_newline_in_it_does_not_become_two() {
         let written = body(&owned(&["one\ntwo", "van halen"]));
         assert_eq!(read(&written), owned(&["van halen"]));
+    }
+
+    #[test]
+    fn the_list_in_the_window_holds_what_the_file_would() {
+        // The recent list is drawn from the same values that go to disk, so a
+        // query the file refuses must not reach the list either: it would draw
+        // a row that vanishes at the next start, having pushed a real one off
+        // the end of an eight-long list on the way there.
+        let cases = [
+            "van halen",
+            "#1 hits",
+            "",
+            "   ",
+            "one\ntwo",
+            "one\rtwo",
+            &"x".repeat(MAX_LEN),
+            &"x".repeat(MAX_LEN + 1),
+        ];
+        for case in cases {
+            assert_eq!(
+                keepable(case),
+                !body(&owned(&[case])).is_empty(),
+                "keepable disagrees with the file about {case:?}"
+            );
+        }
     }
 
     #[test]

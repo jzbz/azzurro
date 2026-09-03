@@ -5625,6 +5625,13 @@ async fn ask_about_firmware(
 
 /// Put a query at the top of the recent list, and write the list down.
 fn remember_search(backend: &Backend, query: String) {
+    // A query the file will not keep does not go in the list either. It would
+    // draw a row that is gone at the next start, and take a real one off the
+    // end of the list with it on the way.
+    if !searches::keepable(&query) {
+        return;
+    }
+
     let keeping = {
         let mut browsing = backend.browsing.lock().unwrap();
         browsing.recent.retain(|seen| seen != &query);
