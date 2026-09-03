@@ -9881,9 +9881,15 @@ async fn run_commands(
                     });
                     continue;
                 }
+                // What the file can hold of this, worked out before the map
+                // takes it so there is something to say about it. The whole
+                // arrangement goes into the map either way: it is what was
+                // just asked for, and it holds for as long as the window is
+                // open whether or not it can be written down.
+                let kept = order::savable(&arranged.0, &arranged.1);
                 let saved = {
                     let mut orders = backend.orders.lock().unwrap();
-                    orders.insert(arranged.0, arranged.1);
+                    orders.insert(arranged.0, arranged.1.clone());
                     orders.clone()
                 };
                 // Written on the spot rather than at exit: the app is a
@@ -9893,7 +9899,19 @@ async fn run_commands(
 
                 backend.browsing.lock().unwrap().pane = Pane::Browse;
                 backend.publish_pane();
-                say(&backend.ui, "Home rearranged");
+                // Section ids come from the player, and one carrying this
+                // file's own structure cannot be written down. Saying it was
+                // saved when it was not is worse than it not lasting: the
+                // screen comes back the player's way at the next start with
+                // nothing to explain it.
+                say(
+                    &backend.ui,
+                    match kept {
+                        Some(rows) if rows == arranged.1 => "Home rearranged",
+                        Some(_) => "Home rearranged, but not all of it can be saved",
+                        None => "Home rearranged, but it cannot be saved",
+                    },
+                );
                 continue;
             }
 

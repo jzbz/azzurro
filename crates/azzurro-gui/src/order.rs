@@ -66,6 +66,25 @@ fn parse(text: &str) -> Orders {
     orders
 }
 
+/// Render the map as the file's contents.
+///
+/// Separate from `save` for the same reason as `parse`: the whole of the
+/// formatting can be tested without a config directory to write into.
+fn body(orders: &Orders) -> String {
+    let mut text = String::from("# Section order per screen, set by Customise Home.\n");
+    for (screen, rows) in orders {
+        let Some(rows) = savable(screen, rows) else {
+            tracing::debug!(screen, "not saving an order the file cannot hold");
+            continue;
+        };
+        text.push_str(screen);
+        text.push_str(": ");
+        text.push_str(&rows.join(", "));
+        text.push('\n');
+    }
+    text
+}
+
 /// Write the whole map back. Failure is logged and swallowed: a preference
 /// that will not persist is not a reason to stop.
 pub fn save(orders: &Orders) {
@@ -78,30 +97,39 @@ pub fn save(orders: &Orders) {
         return;
     }
 
-    let mut text = String::from("# Section order per screen, set by Customise Home.\n");
-    for (screen, rows) in orders {
-        // The ids in here come from the player's documents, and the file's
-        // structure is one line per screen with a colon and commas inside it.
-        // An id carrying any of those would be written out and read back as
-        // structure: a newline in a screen id forges a whole entry for another
-        // screen, and it persists after the player that supplied it is gone.
-        //
-        // Refused rather than escaped. These are opaque identifiers, one
-        // containing a newline is already wrong, and a format with real
-        // quoting would be a bigger change than the problem deserves.
-        if !writable(screen) || rows.iter().any(|row| !writable(row)) {
-            tracing::debug!(screen, "not saving an order with an unwritable id");
-            continue;
-        }
-        text.push_str(screen);
-        text.push_str(": ");
-        text.push_str(&rows.join(", "));
-        text.push('\n');
-    }
-
-    if let Err(e) = std::fs::write(&path, text) {
+    if let Err(e) = std::fs::write(&path, body(orders)) {
         tracing::debug!("cannot save the screen order: {e}");
     }
+}
+
+/// The part of one screen's order the file can hold, or `None` if it can hold
+/// none of it.
+///
+/// The ids come from the player's documents, and this file's structure is one
+/// line per screen with a colon and commas inside it. An id carrying any of
+/// those would be written out and read back as structure: a newline in a
+/// screen id forges a whole entry for another screen, and it persists after
+/// the player that supplied it is gone.
+///
+/// Refused rather than escaped. These are opaque identifiers, one containing a
+/// newline is already wrong, and a format with real quoting would be a bigger
+/// change than the problem deserves.
+///
+/// A single unwritable *row* costs only itself. Dropping the whole line over
+/// one of them threw away an arrangement made by hand, silently, at the next
+/// start; what the row loses instead is its place in the preference, which
+/// puts it after the ones still named — where [`arrange`] already puts a
+/// section it has never heard of. An unwritable *screen* id has nowhere to go,
+/// and neither does a screen with no writable rows left.
+///
+/// Asked by the caller as well as here, because being told an arrangement was
+/// saved when none of it was is worse than it not lasting.
+pub fn savable(screen: &str, rows: &[String]) -> Option<Vec<String>> {
+    if !writable(screen) {
+        return None;
+    }
+    let rows: Vec<String> = rows.iter().filter(|row| writable(row)).cloned().collect();
+    (!rows.is_empty()).then_some(rows)
 }
 
 /// Whether an id survives the round trip through the file above.
@@ -197,18 +225,7 @@ mod tests {
         orders.insert("screen-colon:x".to_owned(), vec!["ok".to_owned()]);
         orders.insert("screen-comma".to_owned(), vec!["a,b".to_owned()]);
 
-        let mut text = String::from("# header\n");
-        for (screen, rows) in &orders {
-            if !writable(screen) || rows.iter().any(|r| !writable(r)) {
-                continue;
-            }
-            text.push_str(screen);
-            text.push_str(": ");
-            text.push_str(&rows.join(", "));
-            text.push('\n');
-        }
-
-        let back = parse(&text);
+        let back = parse(&body(&orders));
         assert_eq!(
             back.keys().collect::<Vec<_>>(),
             vec!["screen-real"],
@@ -217,6 +234,30 @@ mod tests {
         assert!(
             !back.contains_key("library"),
             "and the forged second line never appears"
+        );
+    }
+
+    #[test]
+    fn one_unwritable_row_does_not_lose_the_screens_whole_order() {
+        let mut orders = Orders::new();
+        orders.insert(
+            "screen-home".to_owned(),
+            vec!["a".to_owned(), "b,c".to_owned(), "d".to_owned()],
+        );
+
+        // The row the format cannot hold is the only thing dropped. Losing the
+        // whole line over it would undo an arrangement the user made by hand,
+        // silently, at the next start.
+        let back = parse(&body(&orders));
+        assert_eq!(back["screen-home"], vec!["a", "d"]);
+
+        // What it costs is that row's place: unnamed now, it falls in after
+        // the ones that are named, which is where a section the preference has
+        // never heard of goes anyway.
+        let ids = ids(&["a", "b,c", "d"]);
+        assert_eq!(
+            arrange(&ids, &[false; 3], &back["screen-home"]),
+            vec![0, 2, 1]
         );
     }
 
