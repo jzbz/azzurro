@@ -3799,6 +3799,17 @@ impl Backend {
                 // `publish_stations` runs later in the same queue when the
                 // pane really is up, and puts it back.
                 ui.set_in_stations(false);
+                // And the settings rows, which look answered but are not.
+                // `publish_settings` clears this whenever the pane is no
+                // longer a settings page — but the Stations, Playlists and
+                // Edit-preset panes are dispatched as `Showing::Settings` and
+                // go to their own publisher instead, so `publish_settings`
+                // never runs for them and never gets the chance. The two that
+                // draw settings-shaped rows put it back through
+                // `send_settings`; the stations pane does not, and so came up
+                // with the player's Alarms, Sleep timer, Audio and Player rows
+                // still stacked underneath its list.
+                ui.set_in_settings(false);
             }
         });
 
