@@ -268,9 +268,9 @@ fn unencode(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `/AddToPlaylistOptions?service=LocalMusic&songid=…` from a real NAD
-    /// Powernode with no playlists yet, which is why the group is empty and
-    /// only `create` is offered.
+    /// `/AddToPlaylistOptions?service=LocalMusic&songid=…` from a real
+    /// Bluesound Powernode with no playlists yet, which is why the group is
+    /// empty and only `create` is offered.
     const OPTIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <addToPlaylistOptions service="LocalMusic">
   <urlPath>/AddToPlaylist</urlPath>
