@@ -5587,7 +5587,15 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
             from,
         }));
     }
-    backend.publish_form();
+    // Through `publish_pane`, not `publish_form`. Every caller of this reaches
+    // it after awaiting the player, and the command loop keeps reading its
+    // channel while that is in flight — deliberately, so a player that has
+    // gone away cannot freeze the window. The wireless form is the worst of
+    // them: the player scans for networks first and takes about three and a
+    // half seconds, which is long enough to press My Stations in the sidebar
+    // and have the form land on top of a pane that is still drawing itself.
+    // Only `publish_pane` answers the other panes' flags.
+    backend.publish_pane();
 }
 
 /// Ask about a player's firmware, through its leader if it will not answer.
@@ -8636,7 +8644,10 @@ async fn run_commands(
                                         facts,
                                         Whence::Help,
                                     );
-                                    backend.publish_help();
+                                    // As above: asking the player takes as
+                                    // long as it takes, and the sidebar is
+                                    // live throughout.
+                                    backend.publish_pane();
                                 }
                                 // The page is the player's own HTML, so it can
                                 // change under us; offer it rather than nothing.
@@ -8734,7 +8745,8 @@ async fn run_commands(
                                 );
                                 browsing.can_upgrade = offer;
                             }
-                            backend.publish_help();
+                            // And this one waits on two round trips.
+                            backend.publish_pane();
                         }
                     }
                 });
@@ -9216,7 +9228,11 @@ async fn run_commands(
                             browsing.highlighted = None;
                             drop(browsing);
                             backend.publish_sidebar();
-                            backend.publish_web();
+                            // `publish_pane`, not `publish_web`: this lands
+                            // after a round trip the loop went on reading
+                            // through, so the pane it is opening over may not
+                            // be the one that was up when the press was made.
+                            backend.publish_pane();
                         }
                         // The page is the player's own HTML and a firmware update
                         // could change its shape. Falling back to opening it beats
@@ -9257,7 +9273,8 @@ async fn run_commands(
                             browsing.highlighted = None;
                             drop(browsing);
                             backend.publish_sidebar();
-                            backend.publish_web();
+                            // As for the services page above.
+                            backend.publish_pane();
                         }
                         Err(e) => {
                             tracing::debug!(%id, "could not read the shares page: {e}");
