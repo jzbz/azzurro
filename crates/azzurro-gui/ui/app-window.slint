@@ -271,7 +271,20 @@ component SettingRow inherits Rectangle {
             || root.item.control == "cycle"
             || root.item.control == "button"
             || root.item.opens);
-    accessible-action-default => { root.opened(); }
+    // Guarded on the same test as `accessible-enabled` above: a node marked
+    // disabled is still sent the click, so the row has to refuse it here
+    // rather than trust the marking. Otherwise a setting the player has said
+    // it will not take right now could be pressed anyway.
+    accessible-action-default => {
+        if (root.item.available
+            && !root.item.heading
+            && (root.item.control == "link"
+                || root.item.control == "cycle"
+                || root.item.control == "button"
+                || root.item.opens)) {
+            root.opened();
+        }
+    }
 
     // Tall enough for the contents, and never shorter than a row.
     //
