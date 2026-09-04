@@ -584,6 +584,8 @@ component NavRow inherits Rectangle {
                 animate background { duration: Theme.quick; easing: ease-out; }
 
                 caption := Text {
+                    // The pill below carries this string as its name.
+                    accessible-role: none;
                     text: root.entry.action;
                     font-size: Theme.micro-size;
                     font-weight: 600;
@@ -594,6 +596,13 @@ component NavRow inherits Rectangle {
                 }
 
                 menu := TouchArea {
+                    // The button a section heading carries — "Customize" on
+                    // Inputs, "Manage" on Music Services. The player names
+                    // these, so the name comes from the row rather than from
+                    // anything invented here.
+                    accessible-role: button;
+                    accessible-label: root.entry.action;
+                    accessible-action-default => { root.activate(); }
                     clicked => { root.activate(); }
                 }
             }
@@ -1611,6 +1620,13 @@ component BrowseTile inherits Rectangle {
                 }
 
                 dots := TouchArea {
+                    accessible-role: button;
+                    accessible-label: "Actions for " + root.entry.title;
+                    accessible-action-default => {
+                        root.open-menu(
+                            root.absolute-position.y,
+                            root.absolute-position.x + root.width);
+                    }
                     mouse-cursor: pointer;
                     clicked => {
                         root.open-menu(
@@ -1924,8 +1940,12 @@ component BrowseBlockView inherits VerticalLayout {
         spacing: Theme.gap;
         alignment: start;
 
-        for entry in root.block.rows: ServiceChip {
+        accessible-role: list;
+        accessible-item-count: root.block.rows.length;
+
+        for entry[i] in root.block.rows: ServiceChip {
             entry: entry;
+            accessible-item-index: i;
             activate => { root.activate(entry.index); }
         }
     }
@@ -1996,6 +2016,7 @@ component BrowseBlockView inherits VerticalLayout {
                 animate background { duration: Theme.quick; easing: ease-out; }
 
                 more := Text {
+                    accessible-role: none;
                     text: root.block.action;
                     font-size: Theme.micro-size;
                     font-weight: 600;
@@ -2006,6 +2027,11 @@ component BrowseBlockView inherits VerticalLayout {
                 }
 
                 shelf := TouchArea {
+                    accessible-role: button;
+                    accessible-label: root.block.action;
+                    accessible-action-default => {
+                        root.section-action(root.block.section);
+                    }
                     clicked => { root.section-action(root.block.section); }
                 }
             }
@@ -2024,6 +2050,8 @@ component BrowseBlockView inherits VerticalLayout {
         viewport-height: self.height;
 
         tiles := HorizontalLayout {
+            accessible-role: list;
+            accessible-item-count: root.block.rows.length;
             x: Theme.pad;
             width: root.block.rows.length * 128px;
             height: self.preferred-height;
@@ -2035,11 +2063,12 @@ component BrowseBlockView inherits VerticalLayout {
             // and those are now different heights, so without this the shorter
             // one could sit centered and its cover would ride below its
             // neighbors'.
-            for entry in root.block.rows: VerticalLayout {
+            for entry[i] in root.block.rows: VerticalLayout {
                 alignment: start;
 
                 BrowseTile {
                     entry: entry;
+                    accessible-item-index: i;
                     activate => { root.activate(entry.index); }
                     open-menu(y, right) => { root.open-menu(entry.index, y, right); }
                 }
@@ -2048,8 +2077,15 @@ component BrowseBlockView inherits VerticalLayout {
     }
 
     if root.block.kind == 0: VerticalLayout {
-        for entry in root.block.rows: BrowseRowView {
+        // A block is one shelf or list on a browse screen, so the set is this
+        // block's rows rather than everything on the screen — which is what a
+        // reader stepping through it is actually inside.
+        accessible-role: list;
+        accessible-item-count: root.block.rows.length;
+
+        for entry[i] in root.block.rows: BrowseRowView {
             entry: entry;
+            accessible-item-index: i;
             activate => { root.activate(entry.index); }
             open-menu(y, right) => { root.open-menu(entry.index, y, right); }
         }
@@ -2612,9 +2648,14 @@ export component AppWindow inherits Window {
 
                     ListView {
                         vertical-stretch: 1;
+                        // The count belongs here and the index on the row; see
+                        // the note on the queue's list.
+                        accessible-role: list;
+                        accessible-item-count: root.sidebar.length;
 
-                        for entry in root.sidebar: NavRow {
+                        for entry[i] in root.sidebar: NavRow {
                             entry: entry;
+                            accessible-item-index: i;
                             activate => { root.sidebar-activate(entry.kind, entry.index); }
                         }
                     }
@@ -3442,6 +3483,8 @@ export component AppWindow inherits Window {
 
                         if root.stations.length > 0: station-list := ListView {
                             vertical-stretch: 1;
+                            accessible-role: list;
+                            accessible-item-count: root.stations.length;
 
                             property <length> row-height: 62px;
                             property <int> from-row: -1;
@@ -3470,6 +3513,7 @@ export component AppWindow inherits Window {
 
                                     StationRow {
                                         station: station;
+                                        accessible-item-index: i;
                                         editing: root.stations-editing;
                                         lifted: station-list.from-row == i;
                                         y: spot.lift;
@@ -3509,9 +3553,12 @@ export component AppWindow inherits Window {
                         // technical-info rows are as wide as they would like
                         // rather than as wide as the pane.
                         viewport-width: self.width;
+                        accessible-role: list;
+                        accessible-item-count: root.settings.length;
 
-                        for item in root.settings: SettingRow {
+                        for item[i] in root.settings: SettingRow {
                             item: item;
+                            accessible-item-index: i;
                             toggled => { root.setting-toggle(item.index); }
                             chose(i) => { root.setting-choose(item.index, i); }
                             numbered(v) => { root.setting-number(item.index, v); }
@@ -4044,6 +4091,8 @@ export component AppWindow inherits Window {
                         }
 
                         order-list := ListView {
+                            accessible-role: list;
+                            accessible-item-count: root.customise-rows.length;
                             vertical-stretch: 1;
 
                             property <length> row-height: 58px;
@@ -4074,6 +4123,7 @@ export component AppWindow inherits Window {
 
                                     CustomiseRow {
                                         label: section-name;
+                                        accessible-item-index: i;
                                         lifted: order-list.from-row == i;
                                         y: place.lift;
                                         lift: place.lift;
@@ -4267,6 +4317,13 @@ export component AppWindow inherits Window {
                     }
 
                     if root.queue.length > 0: queue-list := ListView {
+                        // The size of the set belongs on the container, not on
+                        // the rows: AccessKit reads it from the list and hands
+                        // it down, which is why a count set on the row landed
+                        // on the row's own caption instead. The rows carry only
+                        // their index.
+                        accessible-role: list;
+                        accessible-item-count: root.queue.length;
                         vertical-stretch: 1;
 
                         // The queue arrives five hundred tracks at a time. The
@@ -4351,6 +4408,7 @@ export component AppWindow inherits Window {
 
                                 TrackRow {
                                 track: track;
+                                accessible-item-index: i;
                                 editing: pane.editing;
                                 spent: root.queue-cursor >= 0 && i < root.queue-cursor;
                                 lifted: pane.from-row == i;
@@ -4573,6 +4631,16 @@ export component AppWindow inherits Window {
                                 // The record, large. Where the official
                                 // controller puts the same gesture.
                                 TouchArea {
+                                    // The cover in the transport is a control:
+                                    // pressing it is how Now Playing opens,
+                                    // which nothing else in the bar says.
+                                    accessible-role: button;
+                                    accessible-label: root.now-playing
+                                        ? "Close Now Playing"
+                                        : "Open Now Playing";
+                                    accessible-action-default => {
+                                        root.toggle-now-playing();
+                                    }
                                     clicked => { root.toggle-now-playing(); }
                                 }
                             }
@@ -4628,6 +4696,11 @@ export component AppWindow inherits Window {
                                         }
 
                                         TouchArea {
+                                            accessible-role: button;
+                                            accessible-label: "Technical details for this stream";
+                                            accessible-action-default => {
+                                                root.now-playing-info();
+                                            }
                                             mouse-cursor: pointer;
                                             clicked => { root.now-playing-info(); }
                                         }
@@ -4815,6 +4888,12 @@ export component AppWindow inherits Window {
                                 }
 
                                 pick := TouchArea {
+                                    // Named after the player it is showing, so
+                                    // the pill says which one is being
+                                    // controlled as well as offering the swap.
+                                    accessible-role: button;
+                                    accessible-label: "Player: " + root.current.name;
+                                    accessible-action-default => { players.show(); }
                                     clicked => { players.show(); }
                                 }
 
@@ -4891,9 +4970,12 @@ export component AppWindow inherits Window {
                                             // it was meant to stop at.
                                             ListView {
                                                 height: min(root.devices.length * 132px, 330px);
+                                                accessible-role: list;
+                                                accessible-item-count: root.devices.length;
 
                                                 for device[i] in root.devices: DeviceCard {
                                                     device: device;
+                                                    accessible-item-index: i;
                                                     cover: root.device-covers[i];
                                                     selected: i == root.selected;
                                                     picked => {
@@ -5014,7 +5096,14 @@ export component AppWindow inherits Window {
 
         if menu-fade.visible: Rectangle {
         // Anything outside the panel dismisses it.
+        //
+        // Named, because for anyone stepping through the tree this is the only
+        // way out: nothing else closes the menu, and an unnamed hit target
+        // covering the window is a dead end rather than a dismissal.
         TouchArea {
+            accessible-role: button;
+            accessible-label: "Close this menu";
+            accessible-action-default => { root.queue-menu-open = false; }
             clicked => { root.queue-menu-open = false; }
         }
 
@@ -5087,6 +5176,16 @@ export component AppWindow inherits Window {
 
                 rows := VerticalLayout {
                     for entry[i] in root.queue-menu-rows: Rectangle {
+                        // The rows of the context menu, which are the whole of
+                        // what it offers. Unnamed they were fourteen anonymous
+                        // hit targets over a track nobody could identify.
+                        accessible-role: list-item;
+                        accessible-label: entry.label;
+                        accessible-item-index: i;
+                        accessible-action-default => {
+                            root.queue-menu-open = false;
+                            root.queue-menu-activate(entry.index);
+                        }
                         height: 44px;
                         border-radius: Theme.radius-small;
                         background: choose.has-hover ? Theme.hover : transparent;
@@ -5120,6 +5219,7 @@ export component AppWindow inherits Window {
                                 min-width: 0px;
 
                                 Text {
+                                    accessible-role: none;
                                     text: entry.label;
                                     font-size: Theme.body-size;
                                     color: Theme.text;
@@ -5154,7 +5254,11 @@ export component AppWindow inherits Window {
     if root.dialog-open: Rectangle {
         background: Theme.scrim;
 
+        // As on the queue's menu: the scrim is the way out, so it says so.
         TouchArea {
+            accessible-role: button;
+            accessible-label: "Dismiss";
+            accessible-action-default => { root.dialog-press(-1); }
             clicked => { root.dialog-press(-1); }
         }
 
