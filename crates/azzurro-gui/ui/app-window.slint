@@ -244,6 +244,35 @@ component SettingRow inherits Rectangle {
     callback typed(string);
     callback opened();
 
+    // One role for nine kinds of row, which is not the compromise it looks.
+    //
+    // `accessible-role` has to be a constant expression, so it cannot follow
+    // `item.control` the way the height and the hover below both do. That
+    // turns out to be the right shape anyway: the controls this row carries in
+    // its body — the Switch, the Slider, the LineEdit, the ComboBox — are
+    // std-widgets and bring their own roles and values with them, so naming
+    // the row a second time as a switch or a slider would say it twice and
+    // disagree with itself when the two drifted.
+    //
+    // What is left for the row to answer for is the three kinds that have no
+    // control of their own — `link`, `cycle` and `button` — plus any row that
+    // `opens`. Those press the row itself, which is exactly what the default
+    // action does, and its `enabled` here is the same test the TouchArea below
+    // makes. The rest are named containers, and their contents speak.
+    //
+    // `available` is the player's word for a setting it will not accept right
+    // now; a row it has dimmed is reported unavailable rather than pressable.
+    accessible-role: list-item;
+    accessible-label: root.item.label;
+    accessible-description: root.item.detail;
+    accessible-enabled: root.item.available
+        && !root.item.heading
+        && (root.item.control == "link"
+            || root.item.control == "cycle"
+            || root.item.control == "button"
+            || root.item.opens);
+    accessible-action-default => { root.opened(); }
+
     // Tall enough for the contents, and never shorter than a row.
     //
     // A plain `min-height` is not enough: a ListView asks each item how tall
@@ -475,6 +504,24 @@ component NavRow inherits Rectangle {
     in property <SidebarRow> entry;
     callback activate();
 
+    // A list item rather than a button: this is the sidebar, and which entry
+    // you are on is as much of the answer as what pressing it would do.
+    //
+    // One role for both kinds of row, because `accessible-role` has to be a
+    // constant expression — it cannot be chosen per row the way the height
+    // above is. A heading is reported unavailable instead, which is what its
+    // TouchArea's `enabled` already tells the pointer.
+    accessible-role: list-item;
+    accessible-label: root.entry.label;
+    accessible-enabled: !root.entry.header;
+    accessible-item-selectable: !root.entry.header;
+    accessible-item-selected: root.entry.selected;
+    accessible-action-default => {
+        if (!root.entry.header) {
+            root.activate();
+        }
+    }
+
     height: root.entry.header ? 34px : 40px;
     background: root.entry.selected
         ? Theme.selected
@@ -587,6 +634,17 @@ component DeviceCard inherits Rectangle {
     callback volume-changed(int);
     callback toggle-mute();
     callback toggle-group();
+
+    // The card names the player and says whether it is the one being
+    // controlled; the volume and group controls inside it carry their own
+    // names. What it is playing goes in the description rather than the label,
+    // so choosing a player is not read out as a track title.
+    accessible-role: list-item;
+    accessible-label: root.device.name;
+    accessible-description: root.device.now-playing;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => { root.picked(); }
 
     border-radius: Theme.radius-small;
     background: root.selected
@@ -720,6 +778,9 @@ component DeviceCard inherits Rectangle {
 
             if root.device.groupable: IconButton {
                 glyph: root.device.in-group ? Icons.ungroup : Icons.group;
+                // The name follows the glyph, so it says what the press will
+                // do rather than what the player currently is.
+                label: root.device.in-group ? "Ungroup" : "Group with the selected player";
                 size: 26px;
                 glyph-size: 14px;
                 active: root.device.in-group;
@@ -748,6 +809,20 @@ component StationRow inherits Rectangle {
     callback drag-moved(length);
     callback drag-done();
     callback drag-cancelled();
+
+    // Pressing the row plays the station, which is what it is for — but only
+    // outside edit mode, where the row stops being a target and becomes a
+    // handle with a rename field and a bin. Reported unavailable there, since
+    // the default action would do nothing.
+    accessible-role: list-item;
+    accessible-label: root.station.name != "" ? root.station.name : root.station.url;
+    accessible-description: root.station.url;
+    accessible-enabled: !root.editing;
+    accessible-action-default => {
+        if (!root.editing) {
+            root.play();
+        }
+    }
 
     property <bool> held: false;
     // A station saved without a name is shown by its address: an empty row
@@ -840,6 +915,7 @@ component StationRow inherits Rectangle {
             alignment: center;
             IconButton {
                 glyph: Icons.clear;
+                label: "Remove this station";
                 size: 30px;
                 glyph-size: 15px;
                 clicked => { root.remove(); }
@@ -860,6 +936,12 @@ component CustomiseRow inherits Rectangle {
     callback drag-moved(length);
     callback drag-done();
     callback drag-cancelled();
+
+    // Named, but with no default action: the only thing this row does is move,
+    // and a drag is not something an action can stand in for. Saying so as a
+    // plain list item is honest; claiming a press would do something is not.
+    accessible-role: list-item;
+    accessible-label: root.label;
 
     property <bool> held: false;
 
@@ -948,6 +1030,20 @@ component TrackRow inherits Rectangle {
     callback drag-moved(length);
     callback drag-done();
     callback drag-cancelled();
+
+    // Title as the name, artist and length as the detail, so a queue read
+    // aloud is a list of songs rather than a list of sentences. Whether this
+    // is the one playing is worth saying and is not visible in either.
+    accessible-role: list-item;
+    accessible-label: root.track.title;
+    accessible-description: root.track.artist + ", " + root.track.duration
+        + (root.track.cursor ? ", playing" : "");
+    accessible-enabled: !root.editing;
+    accessible-action-default => {
+        if (!root.editing) {
+            root.play();
+        }
+    }
 
     // True once a press has traveled far enough to be a drag rather than a
     // click. Queue rows are narrow and reordering by a twitch is worse than
@@ -1079,6 +1175,10 @@ component TrackRow inherits Rectangle {
 
             IconButton {
                 glyph: Icons.menu;
+                // Named after the track, not the control: fourteen buttons all
+                // called "Actions for this track" name nothing at all to
+                // anyone stepping through them one at a time.
+                label: "Actions for " + root.track.title;
                 size: 30px;
                 glyph-size: 15px;
                 opacity: touch.has-hover ? 1.0 : 0.45;
@@ -1111,6 +1211,7 @@ component TrackRow inherits Rectangle {
 
             IconButton {
                 glyph: Icons.clear;
+                label: "Remove from the queue";
                 size: 26px;
                 glyph-size: 15px;
                 tint: Theme.dim;
@@ -1160,6 +1261,20 @@ component BrowseRowView inherits Rectangle {
     in property <BrowseRow> entry;
     callback activate();
     callback open-menu(length, length);
+
+    // A heading is a row that is not a result, and a row the player marked
+    // unactionable cannot be opened — both are reported unavailable rather
+    // than given a press that would do nothing. `actionable` is the player's
+    // own word for it, so this follows the screen rather than guessing.
+    accessible-role: list-item;
+    accessible-label: root.entry.title;
+    accessible-description: root.entry.subtitle;
+    accessible-enabled: root.entry.actionable && !root.entry.heading;
+    accessible-action-default => {
+        if (root.entry.actionable) {
+            root.activate();
+        }
+    }
 
     height: root.entry.heading ? 30px : 52px;
     border-radius: Theme.radius-small;
@@ -1344,6 +1459,7 @@ component BrowseRowView inherits Rectangle {
 
             IconButton {
                 glyph: Icons.menu;
+                label: "Actions for " + root.entry.title;
                 size: 34px;
                 glyph-size: 16px;
                 opacity: touch.has-hover ? 1.0 : 0.5;
@@ -1383,6 +1499,18 @@ component BrowseTile inherits Rectangle {
     // Where the tile is, so its menu opens against it — the same pair the
     // rows send.
     callback open-menu(length, length);
+
+    // The other shape a browse result takes, named the same way as the row so
+    // that a shelf and a list read alike.
+    accessible-role: list-item;
+    accessible-label: root.entry.title;
+    accessible-description: root.entry.subtitle;
+    accessible-enabled: root.entry.actionable || root.entry.has-menu;
+    accessible-action-default => {
+        if (root.entry.actionable) {
+            root.activate();
+        }
+    }
 
     width: 128px;
     // Sized from the caption rather than fixed. At a fixed height the caption
@@ -1565,6 +1693,14 @@ component ServiceChip inherits Rectangle {
     in property <BrowseRow> entry;
     callback activate();
 
+    // Which service you are looking at is the whole point of the row of these,
+    // so the selected one says so rather than leaving it to the accent color.
+    accessible-role: list-item;
+    accessible-label: root.entry.title;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.entry.selected;
+    accessible-action-default => { root.activate(); }
+
     height: 32px;
     width: caption.preferred-width + 50px;
     border-radius: Theme.radius-small;
@@ -1710,6 +1846,7 @@ component SearchField inherits Rectangle {
                 // says the query is being thrown away rather than the box
                 // being emptied.
                 glyph: Icons.close;
+                label: "Clear the search box";
                 size: 26px;
                 glyph-size: 13px;
                 clicked => {
@@ -2527,6 +2664,7 @@ export component AppWindow inherits Window {
 
                         IconButton {
                             glyph: Icons.back;
+                            label: "Back";
                             size: 30px;
                             glyph-size: 17px;
                             enabled: root.browse-can-go-back;
@@ -3248,6 +3386,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.add;
+                                    label: "Add this station";
                                     size: 34px;
                                     glyph-size: 17px;
                                     enabled: new-url.text != "";
@@ -3608,6 +3747,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             IconButton {
                                 glyph: Icons.close;
+                                label: "Close Now Playing";
                                 size: 30px;
                                 glyph-size: 16px;
                                 clicked => { root.toggle-now-playing(); }
@@ -3851,6 +3991,7 @@ export component AppWindow inherits Window {
                                 alignment: center;
                                 IconButton {
                                     glyph: Icons.close;
+                                    label: "Close";
                                     size: 30px;
                                     glyph-size: 16px;
                                     clicked => { root.browse-back(); }
@@ -4380,6 +4521,7 @@ export component AppWindow inherits Window {
                 // where it reads as the state of the whole window rather than
                 // as one more control in a row of them.
                 Scrubber {
+                    label: "Position in the track";
                     enabled: root.current.reachable && root.seekable && root.duration > 0;
                     value: root.position / Math.max(root.duration, 1);
                     glide: 1s;
@@ -4499,6 +4641,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.shuffle;
+                                    label: root.shuffle ? "Shuffle, on" : "Shuffle, off";
                                     active: root.shuffle;
                                     enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.toggle-shuffle(root.current.id); }
@@ -4510,6 +4653,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.previous;
+                                    label: "Previous track";
                                     enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.back(root.current.id); }
                                 }
@@ -4517,6 +4661,7 @@ export component AppWindow inherits Window {
 
                             IconButton {
                                 glyph: root.current.playing ? Icons.pause : Icons.play;
+                                label: root.current.playing ? "Pause" : "Play";
                                 primary: true;
                                 size: 44px;
                                 glyph-size: 19px;
@@ -4529,6 +4674,7 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: Icons.next;
+                                    label: "Next track";
                                     enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.skip(root.current.id); }
                                 }
@@ -4539,6 +4685,12 @@ export component AppWindow inherits Window {
 
                                 IconButton {
                                     glyph: root.repeat == 1 ? Icons.repeat-one : Icons.repeat;
+                                    // Three states, so the name has to carry
+                                    // which one it is in: a glyph that has
+                                    // changed says nothing to anyone reading.
+                                    label: root.repeat == 0
+                                        ? "Repeat all"
+                                        : (root.repeat == 1 ? "Repeat one" : "Repeat off");
                                     active: root.repeat != 2;
                                     enabled: root.has-selection && root.current.reachable;
                                     clicked => { root.cycle-repeat(root.current.id); }
@@ -4710,6 +4862,7 @@ export component AppWindow inherits Window {
 
                                                 IconButton {
                                                     glyph: Icons.rescan;
+                                                    label: "Look for players again";
                                                     size: 26px;
                                                     glyph-size: 13px;
                                                     clicked => { root.rescan(); }
@@ -4810,6 +4963,7 @@ export component AppWindow inherits Window {
 
                             IconButton {
                                 glyph: Icons.queue;
+                                label: root.queue-shown ? "Hide the play queue" : "Show the play queue";
                                 size: 34px;
                                 glyph-size: 17px;
                                 tint: root.queue-shown ? Theme.text : Theme.dim;

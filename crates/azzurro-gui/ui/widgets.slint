@@ -30,7 +30,22 @@ export component IconButton inherits Rectangle {
     in property <length> size: 34px;
     in property <length> glyph-size: 17px;
     in property <brush> tint: Theme.dim;
+    // What the button is called, for anything that cannot see the glyph.
+    //
+    // A property rather than something derived, because a glyph is not a name:
+    // the same waste basket clears a queue in one place and a list of recent
+    // stations in another, and `Icons.close` is "Stop editing" on one screen
+    // and "Clear the search box" on the next. Only the call site knows.
+    //
+    // Defaulted to empty so an unnamed button is silent rather than wrong, and
+    // so this stays additive.
+    in property <string> label;
     callback clicked();
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
 
     width: root.size;
     height: root.size;
@@ -81,6 +96,12 @@ export component PillButton inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> primary: false;
     callback clicked();
+
+    // The label it already draws is the name it already has.
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
 
     height: 30px;
     width: content.preferred-width + 26px;
@@ -289,7 +310,33 @@ export component Scrubber inherits Rectangle {
     // on the way to the buttons beside it and a stray click is a room suddenly
     // at full volume. With this off the bar still drags, but only deliberately.
     in property <bool> jump-to-click: true;
+    // What this one is a scrubber for. Two of them exist and they are not
+    // interchangeable — one is a position in a song and the other is a room's
+    // volume — so the name comes from the call site.
+    in property <string> label;
+    // How much one increment or decrement is worth, as a fraction. A twentieth
+    // is the useful step for both: five percent of a volume, and about fifteen
+    // seconds of a five-minute song.
+    in property <float> keyboard-step: 0.05;
     callback seek(float);
+
+    // A slider rather than a progress bar, because it is one: it takes a value
+    // as well as reporting one. The increment and decrement actions are how it
+    // is set without a pointer, which is the whole of seeking for anyone who
+    // cannot drag a 4px track.
+    accessible-role: slider;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-value: Math.round(root.shown * 100);
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value-step: Math.round(root.keyboard-step * 100);
+    accessible-action-increment => {
+        root.seek(Math.clamp(root.shown + root.keyboard-step, 0, 1));
+    }
+    accessible-action-decrement => {
+        root.seek(Math.clamp(root.shown - root.keyboard-step, 0, 1));
+    }
 
     height: 18px;
     // While a drag is in progress the bar follows the pointer, not the player:
@@ -391,6 +438,7 @@ export component Level inherits HorizontalLayout {
 
         IconButton {
             glyph: root.muted ? Icons.muted : Icons.volume;
+            label: root.muted ? "Unmute" : "Mute";
             size: 26px;
             glyph-size: 15px;
             tint: root.muted ? Theme.faint : Theme.dim;
@@ -406,6 +454,7 @@ export component Level inherits HorizontalLayout {
 
         IconButton {
             glyph: Icons.less;
+            label: "Quieter";
             size: 22px;
             glyph-size: 12px;
             enabled: root.enabled && !root.muted;
@@ -431,6 +480,7 @@ export component Level inherits HorizontalLayout {
                 // The buttons either side are how this is meant to be set; the
                 // bar is for a deliberate drag, not for a passing click.
                 jump-to-click: false;
+                label: "Volume";
                 enabled: root.enabled && !root.muted;
                 value: root.value / 100;
                 seek(fraction) => { root.changed(Math.round(fraction * 100)); }
@@ -468,6 +518,7 @@ export component Level inherits HorizontalLayout {
 
         IconButton {
             glyph: Icons.add;
+            label: "Louder";
             size: 22px;
             glyph-size: 12px;
             enabled: root.enabled && !root.muted;
@@ -587,6 +638,10 @@ export component WideButton inherits Rectangle {
     in property <image> glyph;
     in property <string> label;
     callback clicked();
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
 
     horizontal-stretch: 1;
     height: 46px;
