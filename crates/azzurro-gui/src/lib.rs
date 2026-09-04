@@ -3810,6 +3810,17 @@ impl Backend {
                 // with the player's Alarms, Sleep timer, Audio and Player rows
                 // still stacked underneath its list.
                 ui.set_in_settings(false);
+                // Back closes both of these outright — see the arm in
+                // `Command::BrowseBack` that puts them back to `Pane::Browse`
+                // — so there is always somewhere to go. Neither publisher says
+                // so, though, and the flag is left reading for the browse
+                // screen underneath: opened from a top-level screen it is
+                // false, and Escape refused to close them. The same overlay
+                // opened one screen deeper closed on the first press, which is
+                // the sort of difference nobody can account for.
+                if large || customising {
+                    ui.set_browse_can_go_back(true);
+                }
             }
         });
 

@@ -1997,6 +1997,15 @@ export component AppWindow inherits Window {
     // and the stations pane was drawn over a Home screen still showing its
     // shelves because it was not. One property, so the next pane is one line.
     property <bool> browse-pane: !root.in-settings && !root.in-stations;
+    // Whether a search box is actually on screen, which is not what
+    // `browse-has-search` answers: that one is set by `publish_browse` alone
+    // and so describes the last browse screen visited, however long ago you
+    // left it. The two places that drew the box tested the pane as well; the
+    // two that read the key did not, and a `/` on Settings after one visit to
+    // Search went to a box that was not there. Worse, `claim` refused the
+    // caret for the same reason, which left the whole window without a
+    // keyboard on every pane but Browse.
+    property <bool> searchable: root.browse-pane && root.browse-has-search;
     in-out property <int> selected: 0;
 
     callback toggle(string);
@@ -2241,7 +2250,7 @@ export component AppWindow inherits Window {
             // measured, not assumed. So the key focuses the box when there is
             // one and otherwise goes and fetches the screen that has it.
             function reach-search() {
-                if (root.browse-has-search) {
+                if (root.searchable) {
                     root.focus-search += 1;
                 } else {
                     root.want-search = true;
@@ -2269,7 +2278,7 @@ export component AppWindow inherits Window {
                 // the way out and stays true for the life of the window —
                 // which, when it was consulted, left every letter on the
                 // Artists list dead after one visit to Search.
-                if (!root.browse-has-search) {
+                if (!root.searchable) {
                     self.focus();
                 }
             }
@@ -2376,7 +2385,14 @@ export component AppWindow inherits Window {
                     return EventResult.reject;
                 }
                 // And nothing to jump to is nothing to take.
-                if (root.browse-index.length == 0) {
+                //
+                // The pane as well as the bar, the way Home/End and the page
+                // keys above already test it. `browse-index` belongs to the
+                // last browse screen and outlives it, so a letter typed on
+                // Settings or My Stations was paging a list nobody could see:
+                // no feedback at all, a /Browse request on the wire, and the
+                // trail sitting somewhere else when you pressed Back.
+                if (!root.browse-pane || root.browse-index.length == 0) {
                     return EventResult.reject;
                 }
                 // Sent exactly as typed. Matching it to a letter is the
@@ -2664,7 +2680,7 @@ export component AppWindow inherits Window {
                     // Settings and Help take the pane whole. Leaving the last
                     // screen's search box above them offers to search a screen
                     // that is no longer on show.
-                    if root.browse-pane && root.browse-has-search: HorizontalLayout {
+                    if root.searchable: HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         padding-bottom: Theme.gap;
@@ -2711,8 +2727,7 @@ export component AppWindow inherits Window {
 
                     // What has been searched for before, offered where the
                     // results will appear.
-                    if root.browse-pane
-                        && root.browse-has-search
+                    if root.searchable
                         && root.browse-blocks.length == 0
                         && root.browse-recent.length > 0: VerticalLayout {
                         padding-left: Theme.pad;
