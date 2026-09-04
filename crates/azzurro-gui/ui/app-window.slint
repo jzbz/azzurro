@@ -2649,8 +2649,8 @@ export component AppWindow inherits Window {
                     ListView {
                         vertical-stretch: 1;
                         // The count belongs here and the index on the row; see
-                        // the note on the queue's list.
-                        accessible-role: list;
+                        // the note on the queue's list. The role is not
+                        // restated: a ListView already declares itself a list.
                         accessible-item-count: root.sidebar.length;
 
                         for entry[i] in root.sidebar: NavRow {
@@ -2775,6 +2775,8 @@ export component AppWindow inherits Window {
                                     }
 
                                     chosen := Text {
+                                        // The chip carries this as its detail.
+                                        accessible-role: none;
                                         text: root.browse-service;
                                         font-size: Theme.small-size;
                                         color: Theme.text;
@@ -2794,6 +2796,24 @@ export component AppWindow inherits Window {
                                 }
 
                                 swap := TouchArea {
+                                    // The only way to change which service is
+                                    // being browsed, so it is a button and not
+                                    // just a caption with a chevron.
+                                    //
+                                    // Not a combobox, which was the tempting
+                                    // role: the value a combobox carries only
+                                    // reaches AT-SPI here when it parses as a
+                                    // number, so the service's name would go
+                                    // unread — and the expand action is never
+                                    // offered either, since a node is given
+                                    // exactly one action and it is the click.
+                                    // The name goes in the label and the
+                                    // service in the description, both of
+                                    // which do arrive.
+                                    accessible-role: button;
+                                    accessible-label: "Music service";
+                                    accessible-description: root.browse-service;
+                                    accessible-action-default => { services.show(); }
                                     clicked => { services.show(); }
                                 }
 
@@ -2814,7 +2834,22 @@ export component AppWindow inherits Window {
                                         VerticalLayout {
                                             padding: Theme.gap;
 
-                                            for entry in root.browse-selector: Rectangle {
+                                            for entry[i] in root.browse-selector: Rectangle {
+                                                // The twin of ServiceChip on the
+                                                // strip, so it says the same
+                                                // things. The action keeps the
+                                                // press's order for the reason
+                                                // spelled out below it.
+                                                accessible-role: list-item;
+                                                accessible-label: entry.title;
+                                                accessible-item-index: i;
+                                                accessible-item-count: root.browse-selector.length;
+                                                accessible-item-selectable: true;
+                                                accessible-item-selected: entry.selected;
+                                                accessible-action-default => {
+                                                    root.browse-activate(entry.index);
+                                                    services.close();
+                                                }
                                                 height: 40px;
                                                 border-radius: Theme.radius-small;
                                                 background: entry.selected
@@ -2953,6 +2988,7 @@ export component AppWindow inherits Window {
                                     animate background { duration: Theme.quick; easing: ease-out; }
 
                                     wipe := Text {
+                                        accessible-role: none;
                                         text: "CLEAR";
                                         font-size: Theme.micro-size;
                                         font-weight: 600;
@@ -2963,13 +2999,33 @@ export component AppWindow inherits Window {
                                     }
 
                                     forget := TouchArea {
+                                        // "CLEAR" is a word, not a name: what
+                                        // it clears is the list beneath it.
+                                        // The enclosing `if` is the only guard
+                                        // this needs — the button is not on
+                                        // screen with nothing to forget.
+                                        accessible-role: button;
+                                        accessible-label: "Clear recent searches";
+                                        accessible-action-default => { root.clear-recent(); }
                                         clicked => { root.clear-recent(); }
                                     }
                                 }
                             }
                         }
 
-                        for entry in root.browse-recent: Rectangle {
+                        for entry[i] in root.browse-recent: Rectangle {
+                            // Named after the search it would run again. The
+                            // action writes the box as well as running it, the
+                            // way the press does: the query on screen has to be
+                            // the one whose results are under it.
+                            accessible-role: list-item;
+                            accessible-label: entry;
+                            accessible-item-index: i;
+                            accessible-item-count: root.browse-recent.length;
+                            accessible-action-default => {
+                                root.browse-query = entry;
+                                root.browse-search(entry);
+                            }
                             height: 38px;
                             border-radius: Theme.radius-small;
                             background: again.has-hover ? Theme.hover : transparent;
@@ -3246,8 +3302,20 @@ export component AppWindow inherits Window {
                             alignment: center;
                             padding-right: Theme.tight;
                             horizontal-stretch: 0;
+                            accessible-role: list;
+                            accessible-item-count: root.browse-index.length;
 
-                            for key in root.browse-index: Rectangle {
+                            for key[i] in root.browse-index: Rectangle {
+                                // Twenty-six hit targets that were all
+                                // anonymous, on the one control in the window
+                                // whose whole purpose is the letter written on
+                                // it. Named "Jump to C" rather than "C": a
+                                // reader stepping the bar otherwise recites the
+                                // alphabet and says nothing about what it does.
+                                accessible-role: button;
+                                accessible-label: "Jump to " + key;
+                                accessible-item-index: i;
+                                accessible-action-default => { root.browse-jump(key); }
                                 width: 22px;
                                 height: 18px;
                                 border-radius: 4px;
@@ -3256,6 +3324,8 @@ export component AppWindow inherits Window {
                                     : transparent;
 
                                 Text {
+                                    // The key above is already named for it.
+                                    accessible-role: none;
                                     text: key;
                                     font-size: Theme.micro-size;
                                     font-weight: 600;
@@ -3483,7 +3553,6 @@ export component AppWindow inherits Window {
 
                         if root.stations.length > 0: station-list := ListView {
                             vertical-stretch: 1;
-                            accessible-role: list;
                             accessible-item-count: root.stations.length;
 
                             property <length> row-height: 62px;
@@ -3553,7 +3622,6 @@ export component AppWindow inherits Window {
                         // technical-info rows are as wide as they would like
                         // rather than as wide as the pane.
                         viewport-width: self.width;
-                        accessible-role: list;
                         accessible-item-count: root.settings.length;
 
                         for item[i] in root.settings: SettingRow {
@@ -3957,6 +4025,14 @@ export component AppWindow inherits Window {
                                     }
 
                                     TouchArea {
+                                        // The transport carries the same badge
+                                        // and the same press; this is its copy
+                                        // on the Now Playing sleeve.
+                                        accessible-role: button;
+                                        accessible-label: "Technical details for this stream";
+                                        accessible-action-default => {
+                                            root.now-playing-info();
+                                        }
                                         mouse-cursor: pointer;
                                         clicked => { root.now-playing-info(); }
                                     }
@@ -4091,7 +4167,6 @@ export component AppWindow inherits Window {
                         }
 
                         order-list := ListView {
-                            accessible-role: list;
                             accessible-item-count: root.customise-rows.length;
                             vertical-stretch: 1;
 
@@ -4321,8 +4396,9 @@ export component AppWindow inherits Window {
                         // the rows: AccessKit reads it from the list and hands
                         // it down, which is why a count set on the row landed
                         // on the row's own caption instead. The rows carry only
-                        // their index.
-                        accessible-role: list;
+                        // their index. The role is not restated here either:
+                        // a ListView is already a list, and saying so a second
+                        // time is a binding that can only ever agree.
                         accessible-item-count: root.queue.length;
                         vertical-stretch: 1;
 
@@ -4970,7 +5046,6 @@ export component AppWindow inherits Window {
                                             // it was meant to stop at.
                                             ListView {
                                                 height: min(root.devices.length * 132px, 330px);
-                                                accessible-role: list;
                                                 accessible-item-count: root.devices.length;
 
                                                 for device[i] in root.devices: DeviceCard {
