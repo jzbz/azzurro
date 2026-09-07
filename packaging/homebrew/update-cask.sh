@@ -1,7 +1,7 @@
 #!/bin/sh
 # Emit the cask for a published release, with the real hash filled in.
 #
-#   ./packaging/homebrew/update-cask.sh v0.1.0 > ~/homebrew-azzurro/Casks/azzurro.rb
+#   ./packaging/homebrew/update-cask.sh v0.1.0 > ~/zx/dev/homebrew-tap/Casks/azzurro.rb
 #
 # Run after the release is published and the notarized macOS zip is attached —
 # the hash has to be of the artifact users will actually download, which is the

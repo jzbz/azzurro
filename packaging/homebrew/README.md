@@ -23,25 +23,30 @@ a notarized, stapled zip. The 2026-09-01 deadline that disables unsigned casks
 applies only to the main repository, not to a tap — but Gatekeeper applies
 everywhere.
 
-## Setting the tap up, once
+## The tap
 
-Create a public repository named `homebrew-azzurro` under your account, containing
-a `Casks/` directory. That is the whole of it: no registration, no review, no
-Homebrew involvement.
+`github.com/jzbz/homebrew-tap` — one tap for everything published this way,
+rather than one per app. A tap is a public repository named `homebrew-<name>`
+with a `Casks/` directory, and that is the whole of it: no registration, no
+review, no Homebrew involvement. Nothing about it is per-project, so rPGP's cask
+sits beside this one and a third app would need no new repository at all.
 
-    brew tap jzbz/azzurro
+    brew tap jzbz/tap
     brew install --cask azzurro
 
 or in one step, without tapping first:
 
-    brew install --cask jzbz/azzurro/azzurro
+    brew install --cask jzbz/tap/azzurro
 
 ## Per release
 
 After the release is published and the notarized zip is attached:
 
-    ./packaging/homebrew/update-cask.sh v0.1.0 > ~/homebrew-azzurro/Casks/azzurro.rb
-    cd ~/homebrew-azzurro && git commit -a -S -m "azzurro 0.1.0" && git push
+    ./packaging/homebrew/update-cask.sh v0.1.0 > ~/zx/dev/homebrew-tap/Casks/azzurro.rb
+    cd ~/zx/dev/homebrew-tap && git commit -S -m "azzurro 0.1.0" Casks/azzurro.rb && git push
+
+Name the file rather than reaching for `git commit -a`: the tap is shared now,
+and a bump for one app has no business carrying another app's in-flight change.
 
 The script downloads the published asset, hashes it, and — where the release
 carries a SHA256SUMS — refuses to emit a cask whose hash disagrees with it. That
@@ -56,6 +61,7 @@ so a tap is a hand-written commit each release — two lines, but they are yours
 ## Moving to homebrew-cask later
 
 When the project clears the notability bar, the cask can be submitted upstream
-and the tap kept as a redirect or archived. Users who tapped will keep working
-either way; `brew` prefers the official cask once both exist, and the fully
-qualified `jzbz/azzurro/azzurro` continues to resolve.
+and this one file deleted from the tap — the tap itself stays, because it holds
+other apps. Users who tapped will keep working either way; `brew` prefers the
+official cask once both exist, and the fully qualified `jzbz/tap/azzurro` goes
+on resolving until the file is removed.

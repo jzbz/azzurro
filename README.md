@@ -169,7 +169,7 @@ warns on first run and then lets you through. Installing it through winget
 avoids that warning entirely.
 
 ```bash
-brew install --cask jzbz/azzurro/azzurro           # macOS, from the tap
+brew install --cask jzbz/tap/azzurro               # macOS, from the tap
 flatpak install ./azzurro-*.flatpak                # Linux, from the bundle
 winget install Azzurro.Azzurro                     # Windows, once the manifest lands
 ```
