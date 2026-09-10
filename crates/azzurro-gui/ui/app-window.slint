@@ -2200,7 +2200,16 @@ export component AppWindow inherits Window {
     property <bool> searchable: root.browse-pane
         && root.browse-has-search
         && !root.now-playing
-        && !root.customising;
+        && !root.customising
+        && !root.modal;
+    // Something asking a question that has to be answered before the window
+    // can be used again. All of these cover it with a scrim, so nothing behind
+    // one is reachable by pointer either.
+    property <bool> modal: root.queue-menu-open
+        || root.dialog-open
+        || root.confirm-input != ""
+        || root.confirm-upgrade != ""
+        || root.update-notice != "";
     in-out property <int> selected: 0;
 
     callback toggle(string);
@@ -2443,7 +2452,8 @@ export component AppWindow inherits Window {
                 // the pane. Removing the box is not enough on its own: it is
                 // destroyed while it still holds the caret, and the caret goes
                 // with it rather than coming back here.
-                + "/" + (root.now-playing || root.customising ? "under" : "open");
+                + "/" + (root.now-playing || root.customising ? "under" : "open")
+                + "/" + (root.modal ? "asked" : "free");
 
             // Search is one screen, not a box on every screen: the player
             // carries a `<search>` on `/ui/Search` and on nothing else —
@@ -2491,6 +2501,39 @@ export component AppWindow inherits Window {
 
             key-pressed(event) => {
                 if (event.text == "") {
+                    return EventResult.reject;
+                }
+
+                // A question takes the keyboard while it is up. None of the
+                // window's own shortcuts belong to it: space must not reach the
+                // transport past a dialog, a letter must not page a list nobody
+                // can see, and Escape has something nearer to close than the
+                // screen behind it.
+                //
+                // Escape answers whichever is asking, exactly as clicking past
+                // it does — except the firmware question, which has no
+                // dismissal by design (see the note on its scrim) and so has to
+                // be answered with a button. It falls through the chain and the
+                // key is swallowed rather than passed to the screen underneath.
+                //
+                // Everything else is passed on rather than taken, so a button
+                // that has the caret still answers to it and Tab still moves
+                // between them.
+                if (root.modal) {
+                    if (event.text == Key.Escape) {
+                        if (root.queue-menu-open) {
+                            root.queue-menu-open = false;
+                        } else if (root.confirm-input != "") {
+                            root.confirm-input = "";
+                            root.answer-input(false);
+                        } else if (root.update-notice != "") {
+                            root.update-notice = "";
+                            root.answer-update-notice(false);
+                        } else if (root.dialog-open) {
+                            root.dialog-press(-1);
+                        }
+                        return EventResult.accept;
+                    }
                     return EventResult.reject;
                 }
 
@@ -2564,7 +2607,14 @@ export component AppWindow inherits Window {
                 if (event.text == Key.Escape
                     || event.text == Key.Backspace
                     || event.text == Key.LeftArrow) {
-                    if (!root.browse-can-go-back || !root.browse-pane) {
+                    // The pane is not asked about any more, only whether there
+                    // is anywhere to go. Every pane that is not a browse screen
+                    // sets `browse-can-go-back` and draws the arrow that goes
+                    // with it, so testing the pane as well meant the arrow
+                    // worked on Settings, Help and My Stations and the key
+                    // beside it did nothing. A field that wants these keys has
+                    // the caret and takes them before this is ever asked.
+                    if (!root.browse-can-go-back) {
                         return EventResult.reject;
                     }
                     root.browse-back();
