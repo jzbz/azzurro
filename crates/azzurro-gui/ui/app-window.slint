@@ -2191,7 +2191,16 @@ export component AppWindow inherits Window {
     // Search went to a box that was not there. Worse, `claim` refused the
     // caret for the same reason, which left the whole window without a
     // keyboard on every pane but Browse.
-    property <bool> searchable: root.browse-pane && root.browse-has-search;
+    // ...and not while something is drawn over the whole of it. Now Playing
+    // and Customize Home cover the pane without taking it: neither touches
+    // `in-settings` or `in-stations`, so `browse-pane` stays true underneath
+    // and the box went on holding the caret behind an opaque sleeve. Space
+    // typed a space into a box nobody could see instead of pausing the player,
+    // and every other key the window binds was swallowed with it.
+    property <bool> searchable: root.browse-pane
+        && root.browse-has-search
+        && !root.now-playing
+        && !root.customising;
     in-out property <int> selected: 0;
 
     callback toggle(string);
@@ -2429,7 +2438,12 @@ export component AppWindow inherits Window {
             // tracker never fires on creation, hence `init` as well.
             property <string> arrived:
                 root.browse-title + "/" + root.browse-index.length
-                + "/" + (root.browse-pane ? "browse" : "aside");
+                + "/" + (root.browse-pane ? "browse" : "aside")
+                // The overlays too, so that `claim` runs when one opens over
+                // the pane. Removing the box is not enough on its own: it is
+                // destroyed while it still holds the caret, and the caret goes
+                // with it rather than coming back here.
+                + "/" + (root.now-playing || root.customising ? "under" : "open");
 
             // Search is one screen, not a box on every screen: the player
             // carries a `<search>` on `/ui/Search` and on nothing else —
