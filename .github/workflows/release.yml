@@ -6,10 +6,13 @@
 # Flathub is the channel that solves both, and these exist to bridge until it
 # is there.
 #
-# Only official actions, for the reason the CI workflow gives: this is a
-# project about handling secret keys, and a third-party action runs with the
-# same access to the workflow as anything else in it. flatpak-builder comes
-# from apt rather than from an action for the same reason.
+# Only GitHub's own actions, and each pinned to a full commit rather than a tag
+# its owner can move. This workflow makes the files people download, and an
+# action runs with the same access to the workflow as anything else in it:
+# whatever it does lands inside the artifact, and the signature over SHA256SUMS
+# covers whatever CI produced, so signing does not catch it. ci.yml, which
+# publishes nothing, allows itself two third-party actions; this does not.
+# flatpak-builder comes from apt rather than from an action for the same reason.
 #
 # What is deliberately NOT published here is a bare Linux binary. One built on
 # a current distribution needs a glibc newer than Debian, Ubuntu LTS or Fedora
@@ -43,8 +46,58 @@ env:
   TAG: ${{ inputs.ref || github.ref_name }}
 
 jobs:
+  # Before any of the long builds, because nothing after them would notice. A
+  # tag that disagrees with the version it builds publishes a release whose
+  # name, `azzurro --version` and software-centre entry each say something
+  # different, and the metainfo is what Flathub and GNOME Software show as the
+  # changelog.
+  version:
+    name: Tag matches the version
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Compare the tag with Cargo.toml and the metainfo
+        run: |
+          set -euo pipefail
+          # The same test the release job uses to decide whether to publish, so
+          # everything that would be published is checked and nothing else is.
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "$TAG is not a release tag; there is no version to compare"
+              exit 0
+              ;;
+          esac
+          python3 - "${TAG#v}" <<'PY'
+          import sys, tomllib
+          import xml.etree.ElementTree as ET
+
+          want = sys.argv[1]
+          with open("Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)["workspace"]["package"]["version"]
+          metainfo = "crates/azzurro-gui/desktop/blue.azzurro.Azzurro.metainfo.xml"
+          releases = [r.get("version") for r in ET.parse(metainfo).getroot().iter("release")]
+
+          ok = True
+          if cargo != want:
+              print(f"::error::the tag says {want} but Cargo.toml's workspace version is {cargo}")
+              ok = False
+          if want not in releases:
+              print(f"::error::{metainfo} has no <release version=\"{want}\">; "
+                    f"it lists {', '.join(releases) or 'none'}")
+              ok = False
+          if not ok:
+              sys.exit(1)
+          print(f"{want}: Cargo.toml and the metainfo agree")
+          PY
+
   bundle:
     name: Flatpak (${{ matrix.arch }})
+    needs: version
     timeout-minutes: 90
     strategy:
       # One architecture failing must not hide the other's result: they are
@@ -56,7 +109,7 @@ jobs:
           - { os: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref || github.ref }}
 
@@ -64,9 +117,8 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          # Same apt shape as ci.yml, and for the same reason: apt has no
-          # wall-clock bound of its own, and a wedged Ubuntu mirror otherwise
-          # hangs the step until the job ceiling.
+          # apt has no wall-clock bound of its own, and a wedged Ubuntu mirror
+          # otherwise hangs the step until the job ceiling.
           opts=(
             -o Acquire::Retries=2
             -o Acquire::http::Timeout=15
@@ -142,25 +194,51 @@ jobs:
       #
       # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
       # tip of the ref the workflow was *dispatched on* — master — while the
-      # checkout above honors inputs.ref and sits on the tag. Rewriting the
-      # pin to master while `tag:` still named the release left the two
-      # contradicting each other, and flatpak-builder refused the source with
-      # "Git commit for branch (null) is <tag>, but expected <master>". HEAD is
-      # the commit being built by construction, on a tag push and a manual run
+      # checkout above honors inputs.ref and sits on the tag. HEAD is the
+      # commit being built by construction, on a tag push and a manual run
       # alike.
+      #
+      # `tag:` is rewritten with it, because flatpak-builder checks the two
+      # against each other and refuses a source where they disagree ("Git
+      # commit for branch (null) is <tag>, but expected <commit>"). On a tag
+      # build it becomes the tag being built. On anything else — a dispatch
+      # naming a commit or a branch, which is how this workflow is tested — the
+      # line is removed, since no tag names that commit and leaving the
+      # manifest's old one would contradict it.
+      #
+      # Whether this is a tag build is read from the checkout rather than from
+      # the name: actions/checkout fetches the tag's ref when it was given a
+      # tag, and only then.
       - name: Point the manifest at this commit
         run: |
           set -euo pipefail
-          python3 - "$(git rev-parse HEAD)" <<'PY'
+          head=$(git rev-parse HEAD)
+          tag=
+          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            if [ "$tagged" != "$head" ]; then
+              echo "::error::$TAG names $tagged, but the checkout is $head"
+              exit 1
+            fi
+            tag=$TAG
+          fi
+          python3 - "$head" "$tag" <<'PY'
           import pathlib, re, sys
-          sha = sys.argv[1]
+          sha, tag = sys.argv[1], sys.argv[2]
           p = pathlib.Path("packaging/blue.azzurro.Azzurro.yml")
           s = p.read_text()
-          s2 = re.sub(r"^        commit: [0-9a-f]{40}$",
-                      f"        commit: {sha}", s, count=1, flags=re.M)
-          assert s2 != s, "no commit: line to rewrite in the manifest"
-          p.write_text(s2)
-          print(f"building {sha}")
+          # Counted, not compared with the original: when the pin already names
+          # this commit the rewrite changes nothing, and that is a re-run of the
+          # tagged commit rather than a manifest with nothing to rewrite.
+          s, n = re.subn(r"^        commit: [0-9a-f]{40}$",
+                         f"        commit: {sha}", s, flags=re.M)
+          assert n == 1, f"expected one commit: line in the manifest, found {n}"
+          if tag:
+              s, n = re.subn(r"^        tag: \S+$", f"        tag: {tag}", s, flags=re.M)
+          else:
+              s, n = re.subn(r"^        tag: \S+\n", "", s, flags=re.M)
+          assert n == 1, f"expected one tag: line in the manifest, found {n}"
+          p.write_text(s)
+          print(f"building {sha} as {tag}" if tag else f"building {sha}, untagged")
           PY
 
       - name: Build
@@ -170,22 +248,27 @@ jobs:
             --arch=${{ matrix.arch }} --repo=repo build \
             packaging/blue.azzurro.Azzurro.yml
 
+      # --runtime-repo so the bundle says where its runtime comes from. Without
+      # it, installing the bundle on a machine that has never added Flathub
+      # fails for want of org.freedesktop.Platform, with nothing telling the
+      # user where to get it; with it, flatpak offers to add the remote.
       - name: Bundle
         run: |
           set -euo pipefail
           NAME="azzurro-${TAG}-${{ matrix.arch }}.flatpak"
           flatpak build-bundle --arch=${{ matrix.arch }} \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
             repo "$NAME" blue.azzurro.Azzurro master
           sha256sum "$NAME"
           ls -lh "$NAME"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
 
   # Wired into `release` below, which needs this job and uploads its .exe:
-  # Windows has shipped since v0.1.2 and the winget manifests point at the asset
+  # Windows ships in every release and the winget manifests point at the asset
   # produced here. It also keeps the release build honest — the workspace links
   # on Windows in CI, but a debug link is not a release link, and LTO and
   # codegen settings have their own ways of failing.
@@ -195,22 +278,27 @@ jobs:
   # without cutting a release.
   windows:
     name: Windows (x86_64)
+    needs: version
     timeout-minutes: 60
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/cache@v4
+      # The registry only, never target/. A tag run can restore only caches
+      # saved by its own ref or by master, so a target/ cache from the previous
+      # tag never hits — and on a run where one did, another build's objects
+      # would be linked into the binary that ships. What ships is compiled here,
+      # from nothing.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
 
       # The statically linked CRT is not set here. `.cargo/config.toml` already
       # asks for it per Windows target, and RUSTFLAGS in the environment
@@ -224,6 +312,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p azzurro-gui
 
+      # The step above explains the failure; this proves it did not happen to
+      # the file about to be uploaded. ci.yml runs the same script.
+      - name: No Visual C++ runtime imports
+        shell: pwsh
+        run: ./packaging/windows-imports.ps1 target/release/azzurro.exe
+
       - name: Stage the binary
         shell: pwsh
         run: |
@@ -232,7 +326,7 @@ jobs:
           Get-Item $name | Select-Object Name, Length
           (Get-FileHash -Algorithm SHA256 $name).Hash
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x86_64
           path: '*.exe'
@@ -254,22 +348,23 @@ jobs:
   # need one per arch.
   macos:
     name: macOS (universal, signed by hand)
+    needs: version
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/cache@v4
+      # The registry only, for the reason the Windows job gives.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
 
       - name: Add the Intel target
         run: rustup target add x86_64-apple-darwin
@@ -292,16 +387,12 @@ jobs:
           cargo build --release --locked -p azzurro-gui --target aarch64-apple-darwin
           cargo build --release --locked -p azzurro-gui --target x86_64-apple-darwin
 
-      # librsvg for the icon: macos-bundle.sh renders every iconset size from
-      # the same SVG the Linux packaging uses, and iconutil refuses an iconset
-      # with a size missing.
-      - name: Render the icon
-        run: brew install librsvg
-
       # The bundle is laid out by the script in this repository rather than
       # here. It is the same one used to build a bundle by hand on a Mac, so
       # what CI produces and what a developer produces cannot drift — and the
-      # plist, the icns and the lipo call live in one place.
+      # plist, the icns and the lipo call live in one place. The iconset is
+      # copied from the PNGs committed beside the SVG, so nothing renders an
+      # icon here.
       - name: Assemble the app bundle
         run: |
           set -euo pipefail
@@ -329,7 +420,7 @@ jobs:
           ls -lh "$NAME"
           shasum -a 256 "$NAME"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-universal
           path: 'azzurro-*-macos-universal-unsigned.zip'
@@ -337,7 +428,29 @@ jobs:
   release:
     name: Attach to the release
     needs: [bundle, windows]
-    if: startsWith(inputs.ref || github.ref_name, 'v')
+    # Windows has to have built, and at least one Flatpak architecture: they
+    # are separate downloads, so a release missing one of them is still worth
+    # attaching. `bundle` is a matrix, and its one result speaks for both legs:
+    # failure when either failed, and possibly cancelled when a leg ran past
+    # its timeout-minutes, which GitHub enforces by cancelling that job. So
+    # this does not ask which it was, only that the matrix ran at all, and
+    # leaves the Upload step to count what actually arrived; it already
+    # refuses when no .flatpak did, and a leg stopped mid-upload leaves no
+    # finished artifact for the download to find. Accepting only success or
+    # failure here would add no safety and would drop the Windows build and
+    # the other architecture along with the leg that timed out.
+    # !cancelled() is what lets this job be considered at all once a
+    # dependency has not succeeded, and it is not always(): a run the operator
+    # cancels — say on seeing the tag is on the wrong commit — skips this job
+    # instead of attaching what had already built, and a cancel that arrives
+    # while it is running stops it, which always() would not. Windows has to
+    # have succeeded, and `bundle` must not have been skipped, so a run the
+    # version check stopped publishes nothing.
+    if: >-
+      !cancelled()
+      && startsWith(inputs.ref || github.ref_name, 'v')
+      && needs.windows.result == 'success'
+      && needs.bundle.result != 'skipped'
     timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
@@ -376,12 +489,16 @@ jobs:
       # Trash" and nothing else. That bundle detours through the machine
       # holding the Developer ID key and is uploaded to this draft by hand.
       # See packaging/macos-sign.sh.
-      - uses: actions/download-artifact@v4
+      #
+      # A pattern matching nothing is not an error to download-artifact — it
+      # downloads nothing and succeeds — so a missing Flatpak architecture
+      # passes through here and is reported by the Upload step.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: flatpak-*
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: windows-*
           merge-multiple: true
@@ -407,10 +524,23 @@ jobs:
           mapfile -t files < <(
             find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%P\n' | sort
           )
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::no artifacts were collected, so there is nothing to publish"
+
+          shopt -s nullglob
+          exes=(*.exe)
+          flatpaks=(*.flatpak)
+          if [ "${#exes[@]}" -eq 0 ]; then
+            echo "::error::no Windows exe was collected, so there is nothing to publish"
             exit 1
           fi
+          if [ "${#flatpaks[@]}" -eq 0 ]; then
+            echo "::error::no Flatpak bundle was collected for either architecture"
+            exit 1
+          fi
+          for arch in x86_64 aarch64; do
+            if [ ! -e "azzurro-${TAG}-${arch}.flatpak" ]; then
+              echo "::warning::no $arch Flatpak was built; attaching the rest without it"
+            fi
+          done
           ls -lh "${files[@]}"
 
           # A tag push creates no release on its own, so make one if it is not
@@ -422,6 +552,44 @@ jobs:
               --verify-tag --draft \
               --title "Azzurro $TAG" \
               --generate-notes
+          fi
+
+          # Only ever onto a draft, and never under a signature. A re-run, or a
+          # dispatch naming a tag released long ago, would otherwise --clobber
+          # files that people have downloaded and that SHA256SUMS.asc and the
+          # winget manifest already vouch for — leaving a signature that fails
+          # against the file beside it, which reads as tampering rather than as
+          # a rebuild. The same refusal checksums.yml makes, for the same
+          # reason: the operator decides, not the workflow.
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft)
+          if [ "$draft" != true ]; then
+            echo "::error::$TAG is already published. Its assets are not replaced"
+            echo "::error::after the fact; a changed build needs a new tag."
+            exit 1
+          fi
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')
+          if grep -qx 'SHA256SUMS.asc' <<<"$assets"; then
+            echo "::error::$TAG already has SHA256SUMS.asc. Replacing assets would"
+            echo "::error::invalidate it. Delete the signature first if the"
+            echo "::error::artifacts genuinely need rebuilding:"
+            echo "::error::  gh release delete-asset $TAG SHA256SUMS.asc"
+            exit 1
+          fi
+          # An unsigned SHA256SUMS from an earlier run describes the builds
+          # this upload is about to replace, and neither the .exe nor the
+          # .flatpak is reproducible, so its lines for them are about to be
+          # wrong. Left in place it is the file the earlier checksums.yml
+          # summary tells the maintainer to download and sign, and a warning in
+          # a green run's log would not stop that. Deleted, there is nothing
+          # stale to sign: checksums.yml writes it again over what is attached.
+          if grep -qx 'SHA256SUMS' <<<"$assets"; then
+            gh release delete-asset "$TAG" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --yes
+            echo "::warning::$TAG had an unsigned SHA256SUMS from an earlier run,"
+            echo "::warning::which would not have matched these builds, so it was"
+            echo "::warning::deleted. Run checksums.yml again once every asset is attached."
           fi
 
           gh release upload "$TAG" \

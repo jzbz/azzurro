@@ -13,7 +13,7 @@ The Windows artifact is a single `.exe` with no installer, so `InstallerType` is
 is why `Commands: [azzurro]` matters more than it looks. winget picks the alias in
 this order — manifest `Commands[0]`, the `--rename` argument, `PortableCommandAlias`
 (archives only), then the file's own name. Without the `Commands` entry the alias
-becomes the asset name, `azzurro-v0.1.2-x86_64`, and it would change every release.
+becomes the asset name, `azzurro-v0.1.0-x86_64`, and it would change every release.
 
 Portable also means no Start Menu entry. That is the trade for shipping one file.
 
@@ -54,10 +54,11 @@ found no `WINGET_PAT`, skipped itself and reported success — three releases ac
 two projects, each with a green check for having done nothing.
 
 Setting the token would have been worse than leaving it unset. The job called a
-third-party action and would have handed it that credential, which is the one
-thing `ci.yml` opens by saying this project does not do: a third-party action runs
-with the same access to the workflow as anything else in it. The workflow was a
-trap primed to spring the day somebody decided to finish the automation.
+third-party action and would have handed it that credential, which is exactly what
+`release.yml` is written to avoid: it uses only GitHub's own actions, pinned by
+commit, because a third-party action runs with the same access to the workflow as
+anything else in it. The workflow was a trap primed to spring the day somebody
+decided to finish the automation.
 
 So the submission is a command, run by a person, from the machine that already
 holds the signing keys. At this release cadence that is a smaller cost than a

@@ -87,7 +87,17 @@ clap = { version = "4", features = ["derive"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
-strip = "debuginfo"
+
+# The symbol table goes too, not only the debug info.
+#
+# "debuginfo" left `.symtab` and `.strtab` behind, about 15 MB of a Linux
+# binary on their own, and the macOS universal binary keeps a table in each of
+# its two slices. Nothing reads them: no crash reporter symbolicates, and a panic's
+# message and `file:line` are string data compiled in at the panic site, which
+# stripping does not touch. What is lost is function names in a
+# `RUST_BACKTRACE=1` trace from a release build; a debug build still has them.
+# On Windows the two settings link the same way, with no PDB either way.
+strip = "symbols"
 
 # A panic kills the process rather than unwinding.
 #

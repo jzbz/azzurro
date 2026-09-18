@@ -109,13 +109,19 @@ wake, so one switched on an hour later still appears without a rescan.
 
 Neither of those helps a player that was asleep at startup or sits behind
 something that eats broadcast traffic, so addresses that have answered are
-remembered in `~/.config/azzurro/players` and tried again next time. One can be
-pinned there by hand, or typed into the box under the player list.
+remembered in a file called `players` and tried again next time. One can be
+pinned there by hand, or typed into the box under the player list. The file
+lives in the app's config directory: `~/.config/azzurro` on Linux (or under
+`$XDG_CONFIG_HOME`), `~/Library/Application Support/azzurro` on macOS, and
+`%APPDATA%\azzurro` on Windows.
 
 Three more files sit beside it, all plain text and all the app's own: the
 stations typed in by hand, the searches made, and the order Home's shelves were
-dragged into. Nothing else is written anywhere, and none of it is anything the
-player could hold.
+dragged into. The only other thing written is downloaded cover art, cached in
+`~/.cache/azzurro/artwork` on Linux (or under `$XDG_CACHE_HOME`),
+`~/Library/Caches/azzurro/artwork` on macOS, and
+`%LOCALAPPDATA%\azzurro\artwork` on Windows; deleting it costs nothing but the
+fetches to fill it again. None of it is anything the player could hold.
 
 On Linux every player is also exported on D-Bus as its own MPRIS media player,
 named after the speaker rather than after the app — two speakers playing two

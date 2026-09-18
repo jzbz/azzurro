@@ -40,19 +40,35 @@ or in one step, without tapping first:
 
 ## Per release
 
-After the release is published and the notarized zip is attached:
+After the release is published, the notarized zip is attached and SHA256SUMS
+is signed:
 
-    ./packaging/homebrew/update-cask.sh v0.1.0 > ~/zx/dev/homebrew-tap/Casks/azzurro.rb
-    cd ~/zx/dev/homebrew-tap && git commit -S -m "azzurro 0.1.0" Casks/azzurro.rb && git push
+    cd ~/zx/dev/azzurro && ./packaging/homebrew/update-cask.sh v0.1.0 ~/zx/dev/homebrew-tap/Casks/azzurro.rb &&
+      cd ~/zx/dev/homebrew-tap && git commit -S -m "azzurro 0.1.0" Casks/azzurro.rb && git push
+
+One command, chained with `&&`, and the script is handed the path rather than
+redirected into it. A `>` empties the cask before the script has even started,
+so a failed download would leave an empty file for the next line to commit and
+push. Instead the script builds the cask in a temporary file beside the real
+one and moves it into place only once every check has passed; a failure leaves
+the tap's copy exactly as it was and stops the commit.
 
 Name the file rather than reaching for `git commit -a`: the tap is shared now,
 and a bump for one app has no business carrying another app's in-flight change.
 
-The script downloads the published asset, hashes it, and — where the release
-carries a SHA256SUMS — refuses to emit a cask whose hash disagrees with it. That
-cross-check is the only point at which this project's signing discipline touches
-a Homebrew user, because the cask itself carries no signature: a cask user
-trusts the tap's git history and Apple's notary, not the key that signs
+The script downloads the published asset, hashes it, and refuses to write a
+cask unless the release's SHA256SUMS carries exactly one signature, a good one
+from `249738C8641C3359`, and lists that same hash for the zip. A second
+signature is refused rather than ignored, as is one from a revoked or expired
+key, so another key's good signature cannot carry a withdrawn one through. A
+release whose checksums have not been signed yet cannot reach the tap, and
+neither can one whose SHA256SUMS is missing or does not name the zip. It needs
+`gpg` with that key already in the keyring; the script verifies and never
+imports or signs.
+
+That cross-check is the only point at which this project's signing discipline
+touches a Homebrew user, because the cask itself carries no signature: a cask
+user trusts the tap's git history and Apple's notary, not the key that signs
 SHA256SUMS.
 
 There is no bot. BrewTestBot autobumps casks in the official repositories only,

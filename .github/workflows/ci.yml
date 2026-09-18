@@ -13,16 +13,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing here writes anywhere. The build compiles the build scripts of every
+# dependency, which run as ordinary code beside the token the checkout
+# persists, so that token should be able to do as little as possible.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  # A build that warns is a build that will eventually break; there are none
-  # today and that is worth keeping.
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # A cold Windows build of the workspace is the slowest leg and finishes
+    # well inside this. A run still going at an hour is wedged, not busy, and
+    # GitHub's own ceiling is six.
+    timeout-minutes: 60
     strategy:
       # One platform failing should not hide what the others would have said.
       fail-fast: false
@@ -30,19 +37,20 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Slint draws through wgpu and winit. Nothing here opens a window — the
       # tests use Slint's headless backend — but the crates still want these
       # present to build.
       - name: Linux build dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y libfontconfig-dev libxkbcommon-dev
@@ -50,11 +58,29 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # A build that warns is a build that will eventually break; there are
+      # none today and that is worth keeping.
+      #
+      # Denied here, on clippy's command line, rather than through RUSTFLAGS
+      # for the whole job. RUSTFLAGS in the environment *replaces* the
+      # per-target rustflags in .cargo/config.toml instead of adding to them,
+      # so setting it silently dropped the static CRT and Windows CI tested a
+      # binary linked differently from the one the release ships. Clippy runs
+      # every rustc lint as well as its own, over every target, so nothing the
+      # build could warn about gets past this step.
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --locked --workspace
+
+      # The reason the static CRT exists, checked on the binary instead of
+      # trusted from the config. release.yml runs the same script on the exe
+      # it ships.
+      - name: No Visual C++ runtime imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows-imports.ps1 target/debug/azzurro.exe
 
       # The fake player binds a loopback port and the window is headless, so
       # the whole suite runs unattended. Nothing here needs a speaker.
