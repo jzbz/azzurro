@@ -60,16 +60,21 @@ pub fn status_playing() -> &'static str {
 
 /// Which screens the player offers, and the routes for the queue and its
 /// context menus.
+///
+/// `URI` in capitals, as the player writes it and as `Configuration` reads
+/// it. This was spelled `uri` and nothing noticed, because nothing asked the
+/// fake for its configuration until the backend tests did — at which point it
+/// failed to parse and every screen after it was never fetched.
 pub fn configuration() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-  <item id="home" uri="/ui/Home"/>
-  <item id="favourites" uri="/ui/Favourites"/>
-  <item id="search" uri="/ui/Search"/>
-  <item id="queue" uri="/ui/playQueue"/>
-  <item id="nowPlayingContextMenu" uri="/ui/nowPlayingCM"/>
-  <item id="queueItemContextMenu" uri="/ui/queueCM"/>
-  <item id="sources" uri="/ui/Sources"/>
+  <item id="home" URI="/ui/Home"/>
+  <item id="favourites" URI="/ui/Favourites"/>
+  <item id="search" URI="/ui/Search"/>
+  <item id="queue" URI="/ui/playQueue"/>
+  <item id="nowPlayingContextMenu" URI="/ui/nowPlayingCM"/>
+  <item id="queueItemContextMenu" URI="/ui/queueCM"/>
+  <item id="sources" URI="/ui/Sources"/>
 </configuration>"#
 }
 

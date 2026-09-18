@@ -177,18 +177,34 @@ pub fn permitted(url: &reqwest::Url) -> bool {
 ///
 /// A URL writes IPv6 in brackets — `http://[::1]/x` — and those are not part
 /// of the address.
+///
+/// Canonical, so an IPv4 address written as IPv6 is judged as the IPv4 address
+/// it is. `http://[::ffff:127.0.0.1]:631/` dials the loopback on a dual-stack
+/// socket, but as an `Ipv6Addr` it is neither `::1` nor in either private
+/// prefix, so every check below passed it.
 fn literal_address(host: &str) -> Option<std::net::IpAddr> {
     host.trim_start_matches('[')
         .trim_end_matches(']')
-        .parse()
+        .parse::<std::net::IpAddr>()
         .ok()
+        .map(|addr| addr.to_canonical())
 }
 
 /// Address space that is reachable from this machine but not from the internet.
+///
+/// 100.64.0.0/10 is carrier-grade NAT's shared space, and it is also where a
+/// tailnet puts every machine on it — so an address there can be someone's
+/// other computer, reached through this one. A player on a tailnet is still
+/// allowed its own art, by being adopted.
 fn is_private(addr: std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
+            let [a, b, ..] = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (a == 100 && (b & 0xc0) == 64)
         }
         // `is_unique_local` and `is_unicast_link_local` are still unstable, so
         // the prefixes are written out: fc00::/7 and fe80::/10.
@@ -285,6 +301,27 @@ impl Artwork {
         }
     }
 
+    /// One that keeps nothing on disk, for a test.
+    ///
+    /// `new` creates and prunes the user's own cache directory, which a test
+    /// has no business touching.
+    #[cfg(test)]
+    pub fn in_memory(http: reqwest::Client, players: Players) -> Self {
+        Self {
+            http,
+            written: std::sync::atomic::AtomicUsize::new(0),
+            players,
+            memory: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
+            )),
+            tints: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
+            )),
+            disk: None,
+            limit: Semaphore::new(CONCURRENT_FETCHES),
+        }
+    }
+
     /// What is already decoded, without touching the disk or the network — and
     /// without counting as a use.
     ///
@@ -312,7 +349,53 @@ impl Artwork {
     /// goes away does not make the art it already served dangerous, and the
     /// set is bounded by `MAX_TRACKED` adoptions either way.
     pub fn remember_player(&self, host: std::net::IpAddr) {
-        self.players.lock().unwrap().insert(host);
+        // Canonical for the same reason [`literal_address`] is: the two are
+        // compared, and a player discovered as `::ffff:10.0.0.155` is the
+        // player whose art is at `10.0.0.155`.
+        self.players.lock().unwrap().insert(host.to_canonical());
+    }
+
+    /// The cover for `url` as the desktop should be told of it, if at all.
+    ///
+    /// MPRIS hands `mpris:artUrl` to the shell, which fetches it itself — with
+    /// none of the checks this module makes, and without the redirect policy
+    /// on this module's client. So the copy already on disk is preferred: a
+    /// `file://` URL costs the shell no request and gives a player nothing to
+    /// aim. Failing that, the URL is offered only where this app would fetch it
+    /// too, and a cover this app would refuse is not exported at all.
+    ///
+    /// Only from inside the tokio runtime: the disk is read on its blocking
+    /// pool. The D-Bus methods run on zbus's own executor thread, where there
+    /// is no runtime and asking for one panics — so they use
+    /// [`Self::offered`] instead.
+    pub async fn for_desktop(&self, url: &str) -> Option<String> {
+        if let Some(dir) = &self.disk {
+            let path = dir.join(file_name(url));
+            let found = tokio::task::spawn_blocking(move || {
+                // The first bytes, not just the name: a reply written before
+                // the image check existed is still an XML error document, and
+                // pointing the shell at that would lose it a URL that works.
+                use std::io::Read;
+                let mut head = [0u8; 12];
+                let read = std::fs::File::open(&path)
+                    .and_then(|mut f| f.read(&mut head))
+                    .ok()?;
+                looks_like_an_image(&head[..read]).then_some(path)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(url) = found.and_then(|path| reqwest::Url::from_file_path(path).ok()) {
+                return Some(url.to_string());
+            }
+        }
+        self.offered(url)
+    }
+
+    /// The URL itself, if this app would fetch it — the half of
+    /// [`Self::for_desktop`] that needs no disk and no runtime.
+    pub fn offered(&self, url: &str) -> Option<String> {
+        self.may_fetch(url).then(|| url.to_owned())
     }
 
     /// Whether art may be fetched from here, given the players adopted so far.
@@ -764,6 +847,105 @@ mod tests {
 
         // Not a fetchable scheme at all.
         assert!(!allow("file:///etc/passwd"));
+    }
+
+    /// An IPv4 address can be written as IPv6, and it dials the same place.
+    /// As an `Ipv6Addr` it is not `::1` and in neither private prefix, so
+    /// before canonicalizing, every one of these was a CDN as far as the check
+    /// could tell.
+    #[test]
+    fn an_ipv4_address_written_as_ipv6_is_judged_as_ipv4() {
+        let allow = |u: &str| permitted(&reqwest::Url::parse(u).expect(u));
+
+        assert!(!allow("http://[::ffff:127.0.0.1]:631/"), "mapped loopback");
+        assert!(!allow("http://[::ffff:192.168.1.1]/"), "mapped private");
+        assert!(
+            !allow("http://[::ffff:169.254.169.254]/"),
+            "mapped link-local"
+        );
+        assert!(!allow("http://[::ffff:0.0.0.0]/"), "mapped unspecified");
+
+        // A public address is public however it is spelled.
+        assert!(allow("http://[::ffff:93.184.216.34]/cover.jpg"));
+    }
+
+    /// Shared address space, where a tailnet numbers every machine on it.
+    #[test]
+    fn the_shared_address_space_is_not_the_internet() {
+        let allow = |u: &str| permitted(&reqwest::Url::parse(u).expect(u));
+
+        assert!(!allow("http://100.64.0.1/"), "the bottom of 100.64/10");
+        assert!(!allow("http://100.101.102.103:8080/"), "a tailnet address");
+        assert!(!allow("http://100.127.255.254/"), "the top of 100.64/10");
+        assert!(!allow("http://[::ffff:100.100.100.100]/"), "and mapped");
+
+        // Just either side of it is ordinary public space.
+        assert!(allow("http://100.63.255.255/"));
+        assert!(allow("http://100.128.0.1/"));
+    }
+
+    /// Adoption is still what allows a player's own art, wherever the player
+    /// is and however its address was written when it was found.
+    #[test]
+    fn a_player_in_shared_space_or_found_over_ipv6_keeps_its_own_art() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let art = Artwork::in_memory(reqwest::Client::new(), Players::default());
+
+        art.remember_player("100.101.102.103".parse().expect("an address"));
+        assert!(art.may_fetch("http://100.101.102.103:11004/library/v1/Artwork"));
+        assert!(!art.may_fetch("http://100.101.102.104/"), "only that one");
+
+        art.remember_player("::ffff:10.0.0.155".parse().expect("an address"));
+        assert!(
+            art.may_fetch("http://10.0.0.155:11000/Artwork"),
+            "found as mapped IPv6, fetched as IPv4"
+        );
+        assert!(art.may_fetch("http://[::ffff:10.0.0.155]:11000/Artwork"));
+    }
+
+    /// The desktop shell fetches `mpris:artUrl` itself, with none of this
+    /// module's checks, so what it is given has to be safe to hand over.
+    #[tokio::test]
+    async fn the_desktop_gets_the_cover_on_disk_or_a_url_this_would_fetch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("azzurro-desktop-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+
+        let art = Artwork {
+            disk: Some(dir.clone()),
+            ..Artwork::in_memory(reqwest::Client::new(), Players::default())
+        };
+        let own = "http://10.0.0.155:11000/Artwork?service=LocalMusic&album=A";
+
+        // Not cached, not adopted: this app would not fetch it, so neither is
+        // the shell told of it.
+        assert_eq!(art.for_desktop(own).await, None);
+        assert_eq!(
+            art.for_desktop("http://[::ffff:127.0.0.1]:631/").await,
+            None
+        );
+        assert_eq!(art.for_desktop("file:///etc/passwd").await, None);
+
+        // A CDN's cover is passed on as it is.
+        let cdn = "https://cdn.example.com/cover.jpg";
+        assert_eq!(art.for_desktop(cdn).await.as_deref(), Some(cdn));
+
+        // Once adopted, the player's own URL is what this would fetch.
+        art.remember_player("10.0.0.155".parse().expect("an address"));
+        assert_eq!(art.for_desktop(own).await.as_deref(), Some(own));
+
+        // A reply that is not an image is not a cover, even on disk.
+        std::fs::write(dir.join(file_name(own)), b"<error/>").expect("writes");
+        assert_eq!(art.for_desktop(own).await.as_deref(), Some(own));
+
+        // And a real one on disk is preferred to any request at all.
+        std::fs::write(dir.join(file_name(own)), png_of(4, 4)).expect("writes");
+        let exported = art.for_desktop(own).await.expect("cached");
+        assert!(exported.starts_with("file:///"), "{exported}");
+        assert!(exported.ends_with(&file_name(own)), "{exported}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The player's own art is served from its own address, which is in the

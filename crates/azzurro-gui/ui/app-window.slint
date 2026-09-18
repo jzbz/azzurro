@@ -312,10 +312,15 @@ component SettingRow inherits Rectangle {
     touch := TouchArea {
         // A button row too, where the pill has been left off: the row is then
         // the control, and it has to be pressable for that to mean anything.
-        enabled: root.item.control == "link"
-            || root.item.control == "cycle"
-            || root.item.control == "button"
-            || root.item.opens;
+        //
+        // Never where the player has dimmed the row. A disabled pill ignores
+        // its press, and the press then lands here instead: without this the
+        // row wrote the very setting its pill was refusing.
+        enabled: root.item.available
+            && (root.item.control == "link"
+                || root.item.control == "cycle"
+                || root.item.control == "button"
+                || root.item.opens);
         clicked => { root.opened(); }
     }
 

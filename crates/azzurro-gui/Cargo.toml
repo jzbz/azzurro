@@ -73,3 +73,7 @@ slint-build = "1.17"
 # element's own center and the window hit-tests it like any other, so a
 # control covered by something else fails here the way it would on screen.
 i-slint-backend-testing = "1.17"
+# The player on the loopback, for the backend tests that need a reply to come
+# back from somewhere — late, or not at all. A path dependency inside the
+# workspace, so nothing is downloaded for it.
+fake-player = { path = "../fake-player" }

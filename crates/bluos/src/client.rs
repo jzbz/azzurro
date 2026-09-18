@@ -785,7 +785,18 @@ impl Client {
             std::net::IpAddr::V4(v4) => format!("http://{v4}"),
             std::net::IpAddr::V6(v6) => format!("http://[{v6}]"),
         };
-        Ok(self.resolve(&base, path)?.to_string())
+        let url = self.resolve(&base, path)?;
+
+        // The host check alone passes `smb://<player>/share`: the same host,
+        // under a scheme the desktop hands to something that is not a browser.
+        // Nothing the player's web UI serves is anything but http.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::OffPlayer {
+                device: self.id,
+                url: url.to_string(),
+            });
+        }
+        Ok(url.to_string())
     }
 
     async fn get_web(&self, path: &str) -> Result<String> {
@@ -1713,6 +1724,38 @@ mod tests {
             let url = c.resolve(&c.base, path).expect(path);
             assert_eq!(url.host_str(), Some("192.0.2.155"), "{path}");
             assert_eq!(url.path(), format!("/{path}"));
+        }
+    }
+
+    /// A settings `<webview>` names its page itself, and that name reaches the
+    /// desktop's opener, so it has to come out as a page on the player.
+    #[test]
+    fn a_web_ui_page_is_an_http_page_on_the_player() {
+        let c = client();
+
+        // The shapes it arrives in: absolute, as a Powernode writes it, and
+        // relative.
+        assert_eq!(
+            c.web_url("http://192.0.2.155:80/sharecfg?noheader=1")
+                .expect("absolute"),
+            "http://192.0.2.155/sharecfg?noheader=1"
+        );
+        assert_eq!(
+            c.web_url("/wificfg?noheader=1").expect("relative"),
+            "http://192.0.2.155/wificfg?noheader=1"
+        );
+
+        // The player's own host, under a scheme that is not a web page. The
+        // first is the one the host check alone let through.
+        for url in [
+            "smb://192.0.2.155/share",
+            "ftp://192.0.2.155/x",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                matches!(c.web_url(url), Err(Error::OffPlayer { .. })),
+                "{url:?} was allowed as a web page"
+            );
         }
     }
 

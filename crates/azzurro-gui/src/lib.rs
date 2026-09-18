@@ -168,8 +168,13 @@ enum Command {
     ///
     /// Two steps on purpose. This one only puts the question up; nothing is
     /// sent to the player until [`Command::UpgradeAnswer`] says yes.
-    UpgradeAsk,
-    /// The answer to that question.
+    ///
+    /// The player is the one whose check offered the update, carried because
+    /// the page stays up when another player is chosen and its Install used
+    /// to be run on whichever player that was.
+    UpgradeAsk(DeviceId),
+    /// The answer to that question, which applies to the player it was asked
+    /// about: see `Browsing::upgrade_asked`.
     UpgradeAnswer(bool),
     /// Track a player at an address typed in by hand.
     AddPlayer(String),
@@ -247,18 +252,23 @@ enum Command {
     PlaylistPress(usize),
     /// The name typed into that line.
     PlaylistNamed(String),
-    /// Send the add, once somewhere has been settled on.
-    PlaylistAdd(Option<String>, bluos::client::PlaylistTarget),
+    /// Send the add, once somewhere has been settled on, from the opening of
+    /// the page it was settled on: see `PlaylistPage::opened`.
+    PlaylistAdd(u64, Option<String>, bluos::client::PlaylistTarget),
     /// Answer the "switch input?" question: run it, or forget it.
     ConfirmInput(bool),
     /// Run one line of the context menu open against a queue row.
     QueueMenuAction(usize),
     /// Show what the playing track actually is: format, rate, bit depth.
     NowPlayingInfo,
-    /// Open the alarms screen.
-    OpenAlarms,
-    /// Arm or disarm one from the list.
-    AlarmArm(u32, bool),
+    /// Open the alarms screen of this player: the one whose settings page it
+    /// was chosen on.
+    OpenAlarms(DeviceId),
+    /// Arm or disarm one from the list, on the player whose list it was read
+    /// from. The owner travels with the id because the press is sent back
+    /// through the channel, and a pane that changed players in between would
+    /// otherwise lend this id to the other player's alarm.
+    AlarmArm(DeviceId, u32, bool),
     /// Open the editor on one that already exists.
     AlarmOpen(u32),
     /// Start a new one. `true` makes a schedule — an alarm that runs to a
@@ -287,13 +297,31 @@ enum Command {
     GroupAll,
     /// Stop every player, grouped or not.
     PauseAll,
-    /// Read one of the player's web configuration pages and draw it.
-    OpenServices,
-    OpenShares,
+    /// Read one of this player's web configuration pages and draw it.
+    ///
+    /// The player is named rather than read from the selection when this is
+    /// handled, for the reason on `Step::Deeper`: shares are reached from a
+    /// settings page, and that page can be another player's than the one
+    /// selected.
+    ///
+    /// `reload` reads again a page that is already up, after a write from it.
+    /// Nobody pressed anything for that, so it lands only on the same page of
+    /// the same player's still showing and never opens a browser: a re-read
+    /// taking the rule for a press put the list back over wherever the user
+    /// had gone in the meantime.
+    OpenServices {
+        device: DeviceId,
+        reload: bool,
+    },
+    OpenShares {
+        device: DeviceId,
+        reload: bool,
+    },
     /// A row of whichever of those is showing.
     WebAction(usize),
-    /// Read a form off one of the player's pages and show it.
+    /// Read a form off one of this player's pages and show it.
     OpenForm {
+        device: DeviceId,
         title: String,
         path: String,
     },
@@ -366,18 +394,28 @@ struct Browsing {
     /// Queue Builder Mode: pressing a track adds it to the end of the queue
     /// instead of playing it.
     queue_building: bool,
-    /// Whether the open Upgrade Check page found something to install.
+    /// The player the "Update …?" question is up for, until it is answered.
     ///
-    /// Kept rather than recomputed: the button is only offered where the check
-    /// has already said yes, and asking again on every republish would put a
-    /// sixty-second request on the draw path.
-    can_upgrade: bool,
+    /// Kept for the reason `pending_input` keeps its player: the answer comes
+    /// back as a bare yes, and reading the selection then is reading it a
+    /// second time, after the question named a player.
+    upgrade_asked: Option<DeviceId>,
     /// An input waiting to be confirmed, because switching to it stops
-    /// whatever is playing.
-    pending_input: Option<bluos::screen::Action>,
-    /// The question the player asked instead of doing what it was told. See
-    /// [`bluos::dialog`]; `None` whenever there is nothing to answer.
-    dialog: Option<bluos::dialog::Dialog>,
+    /// whatever is playing, and the player it is an input of.
+    ///
+    /// The player is kept with it for the reason `queue_menu_owner` is: the
+    /// question stays up while the selection can move, and the action carries
+    /// one player's input path, which confirming used to send to whichever
+    /// player was selected by then.
+    pending_input: Option<(DeviceId, bluos::screen::Action)>,
+    /// The question the player asked instead of doing what it was told, and
+    /// which player asked it. See [`bluos::dialog`]; `None` whenever there is
+    /// nothing to answer.
+    ///
+    /// The buttons carry that player's own requests — "Replace" is an add of
+    /// one of its files — so pressing one runs on the player that asked, not
+    /// on whichever is selected when the answer comes.
+    dialog: Option<(DeviceId, bluos::dialog::Dialog)>,
     /// Where to ask for a queue item's context menu, also from the player.
     queue_menu_uri: Option<String>,
     /// And the menu for whatever is playing, which is where the technical
@@ -392,7 +430,12 @@ struct Browsing {
     /// buttons only exist on `/ui/Queue`, and which of them the player offers
     /// is its business — Queue Builder Mode appears there only for a client
     /// that declares a new enough schema.
-    queue_screen: Option<Screen>,
+    ///
+    /// Kept with the player it was read from. There is one of these for the
+    /// whole window and the queue beside it is always the selected player's,
+    /// so a document left from the last selection drew that player's buttons
+    /// under this one's tracks, and a press ran them here.
+    queue_screen: Option<(DeviceId, Screen)>,
     /// The context menu open against a queue row, if one is. Kept whole
     /// because activating a line means running the action the player attached
     /// to it, and that lives on the parsed document.
@@ -407,6 +450,13 @@ struct Browsing {
     queue_menu_owner: Option<DeviceId>,
     /// The queue screen's own uri, from `/ui/Configuration`.
     queue_uri: Option<String>,
+    /// Which player `queue_uri` and the addresses beside it were read from.
+    ///
+    /// They are written when a player's configuration arrives, which is some
+    /// time after it is chosen and never for one that cannot answer. Until
+    /// then they are the last player's, and a queue document fetched from
+    /// them could be the wrong route entirely.
+    configured: Option<DeviceId>,
     /// The search screen's own uri, from the same place.
     ///
     /// The player puts a search box on exactly one screen — measured on a
@@ -442,16 +492,43 @@ struct Browsing {
     /// was not on screen: with the services list left set, every row of the
     /// settings page opened a music service's sign-in page instead.
     pane: Pane,
-    /// Which sidebar entry is lit, as `(kind, index)`. Recorded on activation
-    /// rather than inferred, because a screen can be reached several ways.
-    highlighted: Option<(i32, i32)>,
+    /// Which sidebar entry is lit, as `(kind, index)`, and whose sidebar it
+    /// was lit on. Recorded on activation rather than inferred, because a
+    /// screen can be reached several ways.
+    ///
+    /// The index is a position in one player's list, and the next player's
+    /// list is a different one: kept bare, Favourites lit on one player lit
+    /// Search on a player without Favourites, and an input's position lit
+    /// whichever service sat there. Read it through [`Browsing::lit`], which
+    /// draws it only on the sidebar it belongs to.
+    ///
+    /// One entry per player rather than one for whoever pressed last. A press
+    /// on a player whose screens never came — its Home and its Search both
+    /// refused — took the only slot from the player whose screens were still
+    /// up, and choosing that player back kept its trail with nothing lit.
+    ///
+    /// Each entry carries the value of `configurations` when it was lit. Write
+    /// it through [`Browsing::light`].
+    highlighted: BTreeMap<DeviceId, ((i32, i32), u64)>,
+    /// How many times any player's configuration has been asked for.
+    ///
+    /// A configuration landing takes an entry of its player's off the sidebar
+    /// when it is left from before, and must keep one for a press made while
+    /// it was on its way. Who is configured cannot tell the two apart — a
+    /// player chosen away and back is still the one configured, and so is one
+    /// whose screens all failed and was pressed again — but when the entry
+    /// was lit can: lit before this configuration was asked for, it is from
+    /// before.
+    configurations: u64,
 }
 
 impl Pane {
-    /// The settings page on show, if that is what is.
-    fn settings(&self) -> Option<&SettingsPage> {
+    /// The settings page on show, if that is what is, and the player it
+    /// belongs to — one question, so a caller cannot read the page and then
+    /// act on somebody else.
+    fn settings_owned(&self) -> Option<(DeviceId, &SettingsPage)> {
         match self {
-            Pane::Settings(trail) => trail.last(),
+            Pane::Settings(owner, trail) => trail.last().map(|page| (*owner, page)),
             _ => None,
         }
     }
@@ -459,7 +536,23 @@ impl Pane {
     /// The web configuration page on show, if that is what is.
     fn web(&self) -> Option<&WebPage> {
         match self {
-            Pane::Web(page) => Some(page),
+            Pane::Web(_, page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// The player a page read from one player belongs to, for the panes a
+    /// further page of that player's is opened from: its settings, its web
+    /// pages and their forms, and its alarms.
+    ///
+    /// Those panes stay up when another player is chosen, so a page opened
+    /// from one of them lands on it by this, not by the selection. See
+    /// [`Backend::may_open_for`].
+    fn owner(&self) -> Option<DeviceId> {
+        match self {
+            Pane::Settings(owner, _) | Pane::Web(owner, _) => Some(*owner),
+            Pane::Form(page) => Some(page.device),
+            Pane::Alarms(page) => Some(page.device),
             _ => None,
         }
     }
@@ -483,12 +576,28 @@ enum Pane {
     /// The settings pages open, deepest last. A trail rather than one page,
     /// so that Back out of Audio lands on Settings instead of leaving
     /// altogether — which is what "back one level" has to mean here too.
-    Settings(Vec<SettingsPage>),
+    ///
+    /// With the player the trail was read from. The pane stays up when the
+    /// sidebar moves, so a press that resolved its target from `selected`
+    /// wrote one player's setting — its URL and its name — to another; see
+    /// `AlarmsPage::device`, which is the same fix.
+    Settings(DeviceId, Vec<SettingsPage>),
     Help,
-    /// A page of plain facts: its title, what is on it, and where Back goes.
-    HelpDetail(String, Vec<(String, String)>, Whence),
-    /// One of the player's web configuration pages, drawn rather than opened.
-    Web(WebPage),
+    /// A page of plain facts: its title, what is on it, where Back goes, and
+    /// the player it offers to install an update on, if it does.
+    ///
+    /// The offer is part of the page so that it goes when the page does. Kept
+    /// beside it, it outlived Back and was drawn on the next player's
+    /// Diagnostics; and with no player to it, Install ran on whichever player
+    /// was selected by the time it was pressed.
+    HelpDetail(String, Vec<(String, String)>, Whence, Option<DeviceId>),
+    /// One of the player's web configuration pages, drawn rather than opened,
+    /// and the player it was read from.
+    ///
+    /// Held for the reason `Settings` holds its player: removing a share posts
+    /// that player's own field name, and the page stays up when the sidebar
+    /// moves.
+    Web(DeviceId, WebPage),
     /// A form off one of those pages, filled in here rather than in a browser.
     Form(Box<FormPage>),
     /// The record, large. Reached by pressing the artwork on the transport bar,
@@ -514,6 +623,13 @@ enum Pane {
 /// the stream came out of the player's own catalog, and retyping it by hand
 /// would sever the preset from the thing it names.
 struct EditPresetPage {
+    /// Whose preset this is.
+    ///
+    /// `/SetPreset` replaces the whole slot, so sending it to a player other
+    /// than the one the menu came from does not rename anything — it
+    /// overwrites that player's preset in the same slot with this one's
+    /// station. Held for the reason `AlarmsPage::device` is.
+    device: DeviceId,
     slot: u32,
     preset: bluos::screen::Preset,
 }
@@ -534,6 +650,17 @@ struct StationsPage {
 
 /// Somewhere to put a track, being chosen.
 struct PlaylistPage {
+    /// The player the options were read from. They name the track in that
+    /// player's terms, so the add goes back to it rather than to whichever
+    /// player is selected when a playlist is picked.
+    device: DeviceId,
+    /// Which opening of the page this is, from `Backend::openings`.
+    ///
+    /// A press is sent back through the channel before the add is made, and
+    /// the add answers a round trip after that. Either can find another page
+    /// up by then — another player's playlists, or Settings — and the device
+    /// alone does not tell this player's page from its next one.
+    opened: u64,
     title: String,
     options: bluos::playlists::AddToPlaylist,
     /// Whether the row for a new playlist is open for typing. Closed, it is a
@@ -563,6 +690,12 @@ struct AlarmsPage {
     device: DeviceId,
     list: bluos::alarms::Alarms,
     editing: Option<bluos::alarms::Alarm>,
+    /// Which opening of the editor this is, from `Backend::openings`. A
+    /// picker level asked for with no level open joins only this one; see
+    /// [`AlarmsPage::top`]. A save or a delete closes only the opening it was
+    /// pressed on for the same reason: numbers are never handed out twice, so
+    /// an editor opened while the write was out is never mistaken for it.
+    opened: u64,
     /// The source picker, while it is open over the editor. A trail rather
     /// than one level, so Back walks out the way it walked in — the tree is
     /// several deep on a player with services on it.
@@ -574,6 +707,23 @@ struct AlarmsPage {
 struct PickerLevel {
     title: String,
     rows: bluos::stations::Stations,
+    /// Which opening of a level this is, from `Backend::openings`.
+    opened: u64,
+}
+
+impl AlarmsPage {
+    /// What a level asked for now would be put on top of: the level open, or
+    /// the editor when none is.
+    ///
+    /// Numbers are never handed out twice, so a level that was closed, or an
+    /// editor that was, is never the top again. How deep the picker is could
+    /// not say that: Back and Plays again put a new top level at the same
+    /// depth, and a folder pressed on the old one landed over it.
+    fn top(&self) -> u64 {
+        self.picking
+            .last()
+            .map_or(self.opened, |level| level.opened)
+    }
 }
 
 struct CustomisePage {
@@ -586,12 +736,18 @@ struct CustomisePage {
     /// so offering to move them would be a lie.
     rows: Vec<(String, String)>,
     /// Set when what is being dragged is the player's presets rather than this
-    /// app's own idea of a screen's order, and carrying the list's `prid`.
+    /// app's own idea of a screen's order, and carrying whose presets they are
+    /// and the list's `prid`.
     ///
     /// The same page for both because it is the same gesture and the same
     /// rows; only where the answer goes differs — a file here, a request to
     /// the player there. The ids in `rows` are slot numbers in that case.
-    presets: Option<u32>,
+    ///
+    /// The player is kept because the order is a permutation of its slots:
+    /// sent to another player, it shuffles that player's presets by numbers
+    /// read off a different list, and any slot the other list lacks is
+    /// deleted.
+    presets: Option<(DeviceId, u32)>,
 }
 
 /// Where Back goes from a page that can be reached from more than one place.
@@ -609,6 +765,24 @@ enum Whence {
 
 /// A form being filled in.
 struct FormPage {
+    /// Whose form this is.
+    ///
+    /// A form is submitted to the player that served it, not to whichever is
+    /// selected when the button is pressed. The WiFi form carries a network
+    /// key and a service's carries a password, and the pane stays up when the
+    /// sidebar moves: sent to the other player, a join could take that one
+    /// off the network. Held for the reason `AlarmsPage::device` is.
+    device: DeviceId,
+    /// Which opening of a form this is, from `Backend::forms`.
+    ///
+    /// The player is not enough to tell one form from another. Open WiFi, go
+    /// Back while it scans, open a service's sign-in, and both placeholders
+    /// are that player's: the scan landing second replaced the sign-in with
+    /// the WiFi form, and a scan that failed closed it and opened a browser.
+    /// A reply is for the form it was asked for, and this is how it knows it.
+    /// The steps of one form keep the number, so an answer to a submit lands
+    /// on the form that was submitted.
+    opened: u64,
     title: String,
     form: bluos::forms::Form,
     /// What has been typed or chosen, by field name. Seeded from what the page
@@ -623,7 +797,12 @@ struct FormPage {
     /// player's own list of them, and a form that forgot where it came from
     /// sent Back to the browse screen instead — one service configured, and
     /// the list you were working through is gone.
-    from: Option<WebPage>,
+    ///
+    /// A settings page too: the WiFi form is opened from Player settings, and
+    /// Back out of its placeholder landed on Home, where the row under the
+    /// pointer that had been WiFi was a Recently Played tile that plays. Only
+    /// ever `Pane::Web` or `Pane::Settings`, of the form's own player.
+    from: Option<Box<Pane>>,
 }
 
 struct Crumb {
@@ -644,20 +823,45 @@ impl Browsing {
     fn moved_on(&mut self) {
         self.era = self.era.wrapping_add(1);
     }
+
+    /// The sidebar entry to light, if the one recorded was lit on the sidebar
+    /// showing.
+    ///
+    /// Not cleared when another player's configuration lands, only not drawn:
+    /// that player's Home may never come, and choosing the last player back
+    /// keeps its trail, which the entry it had lit still describes.
+    fn lit(&self) -> Option<(i32, i32)> {
+        self.configured
+            .and_then(|owner| self.highlighted.get(&owner))
+            .map(|(entry, _)| *entry)
+    }
+
+    /// Light an entry on `id`'s sidebar, noting how many configurations had
+    /// been asked for by then; see `configurations`.
+    fn light(&mut self, id: DeviceId, entry: (i32, i32)) {
+        let at = self.configurations;
+        self.highlighted.insert(id, (entry, at));
+    }
 }
 
 /// How a settings page joins the pane's own trail.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
     /// Start again here: opening Settings, or arriving from a Customize button
-    /// on a screen somewhere else.
+    /// on a screen somewhere else. Always the selected player's.
     Root,
     /// Opened from the page showing, which Back undoes.
-    Deeper,
+    ///
+    /// This and `Reload` name the player whose trail they belong to rather
+    /// than reading the selection when they are handled: the pane stays up
+    /// when another player is chosen, and a page of one player's settings
+    /// pushed onto another's trail would have its rows written to the wrong
+    /// speaker.
+    Deeper(DeviceId),
     /// The same page again. A write can change more than the value written —
     /// turning tone controls on brings treble and bass to life — so the page is
     /// re-read rather than assumed.
-    Reload,
+    Reload(DeviceId),
 }
 
 /// How a newly fetched screen joins the trail.
@@ -665,6 +869,23 @@ enum Step {
 enum Arrive {
     /// A top-level screen off the sidebar: everything before it is gone.
     Root,
+    /// A player's first screen, arriving when it is chosen: `Root`, and the
+    /// sidebar lights its first entry.
+    ///
+    /// Lit as it lands, with the trail, and not when the configuration does.
+    /// Between those the screens showing are still the last player's, and
+    /// choosing that one back before this Home arrived dropped the Home and
+    /// kept its trail — Search, say — under a sidebar pointing at Home. What
+    /// is lit is recorded rather than inferred, so the only way to keep it
+    /// true is to write it at the moment the screen it describes goes up.
+    ///
+    /// Unless the user got there first. The sidebar takes presses as soon as
+    /// the configuration is in, which on a waking player is seconds before
+    /// Home: Favourites pressed in between stayed on screen under a lit Home.
+    /// So a Home that finds something of this player's already lit leaves it
+    /// lit, and one that finds this player's screens already up — the press
+    /// answered before it did — is not shown at all.
+    Home,
     /// A step deeper, which Back undoes.
     Deeper,
     /// A set of search results: pushed the first time, and thereafter in place
@@ -796,6 +1017,24 @@ struct Backend {
     registry: Registry,
     /// Whose queue the window is showing.
     selected: Arc<Mutex<Option<DeviceId>>>,
+    /// Bumped, under `selected`'s lock, every time `selected` changes.
+    ///
+    /// A screen is fetched off the loop, and the player it was fetched from
+    /// can stop being the selected one while the reply is on its way. Choosing
+    /// a player that was slow to answer and then another that was not let the
+    /// slow reply land second: the pane showed the first player's Home, and
+    /// took `Browsing::device` with it, while the sidebar, queue and transport
+    /// all showed the second — so a row pressed there played on a player that
+    /// was not the one selected. Checking the id when the reply lands is not
+    /// enough on its own, because choosing away and back again passes it.
+    ///
+    /// So a request takes this number with it, read with the id under the
+    /// same lock by [`Backend::selection`], and a reply that finds it moved is
+    /// dropped. It is `browsing.era`'s idea one level up: the era says the
+    /// trail changed, this says the player it belongs to did. An atomic rather
+    /// than a field of either mutex, so the check can be made with `browsing`
+    /// held without nesting two locks.
+    selections: Arc<AtomicU64>,
     commands: mpsc::UnboundedSender<Command>,
     ui: slint::Weak<AppWindow>,
     artwork: Arc<Artwork>,
@@ -818,6 +1057,13 @@ struct Backend {
     /// has no way to express today; the next keystroke fixes it, so it has been
     /// left. This comment used to claim the check happened on the way out.
     searches: Arc<AtomicU64>,
+    /// Forms opened so far, numbering each one as its placeholder goes up. See
+    /// `FormPage::opened`.
+    forms: Arc<AtomicU64>,
+    /// The same for the other pages a late reply has to find again: alarm
+    /// editors, picker levels and the playlist chooser. See
+    /// `PlaylistPage::opened` and [`AlarmsPage::top`].
+    openings: Arc<AtomicU64>,
     /// What the transport looked like when it was last sent.
     sent_transport: Arc<AtomicU64>,
     /// What the queue and the player list looked like when they were last sent
@@ -1092,20 +1338,47 @@ fn is_chrome_row(kind: ItemKind) -> bool {
 }
 
 /// Fetch one level of the source tree and push it onto the picker's trail.
-async fn open_picker(backend: &Backend, client: &Client, title: String, path: String) {
-    match client.stations(&path).await {
-        Ok(rows) => {
-            {
-                let mut browsing = backend.browsing.lock().unwrap();
-                let Pane::Alarms(page) = &mut browsing.pane else {
-                    return;
-                };
-                page.picking.push(PickerLevel { title, rows });
-            }
-            backend.publish_pane();
+///
+/// `owner` is the player whose alarm is being edited, and `top` what
+/// [`AlarmsPage::top`] said when this level was asked for. The level joins
+/// only that page with that same top. A slow folder answered after Back closed
+/// the picker used to open it again, and one answered after the pane had gone
+/// to another player's alarms put this player's sources into that player's
+/// alarm.
+async fn open_picker(
+    backend: &Backend,
+    client: &Client,
+    owner: DeviceId,
+    top: u64,
+    title: String,
+    path: String,
+) {
+    let listed = client.stations(&path).await;
+    let opened = backend.openings.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        let Pane::Alarms(page) = &mut browsing.pane else {
+            return;
+        };
+        if page.device != owner || page.editing.is_none() || page.top() != top {
+            return;
         }
-        Err(e) => say(&backend.ui, format!("could not read that list: {e}")),
+        // Said only while the picker it was asked from is still up: a list
+        // nobody is waiting for any more has not failed anybody.
+        match listed {
+            Ok(rows) => page.picking.push(PickerLevel {
+                title,
+                rows,
+                opened,
+            }),
+            Err(e) => {
+                drop(browsing);
+                say(&backend.ui, format!("could not read that list: {e}"));
+                return;
+            }
+        }
     }
+    backend.publish_pane();
 }
 
 /// Watch an upgrade through to the end, and tell the window what it is doing.
@@ -1178,18 +1451,6 @@ async fn follow_upgrade(backend: Backend, id: DeviceId) {
     }
 }
 
-/// Whose alarms the open pane belongs to.
-///
-/// The alarms pane outlives a change of selection, so every write it drives
-/// has to address the player it was opened for rather than whichever row the
-/// sidebar has highlighted now.
-fn alarms_owner(backend: &Backend) -> Option<DeviceId> {
-    match &backend.browsing.lock().unwrap().pane {
-        Pane::Alarms(page) => Some(page.device),
-        _ => None,
-    }
-}
-
 /// What a press on the alarms screen means.
 ///
 /// The screen borrows the settings pane's rows, so its presses arrive as
@@ -1221,7 +1482,7 @@ fn alarm_command(backend: &Backend, index: usize, edit: Option<Edit>) -> Option<
         }
         let found = page.list.alarms.get(index)?;
         return Some(match edit {
-            Some(Edit::Toggle) => Command::AlarmArm(found.id, !found.enabled),
+            Some(Edit::Toggle) => Command::AlarmArm(page.device, found.id, !found.enabled),
             _ => Command::AlarmOpen(found.id),
         });
     };
@@ -1290,7 +1551,7 @@ fn ask_before_input(
         return false;
     }
 
-    backend.browsing.lock().unwrap().pending_input = Some(action.clone());
+    backend.browsing.lock().unwrap().pending_input = Some((id, action.clone()));
     let ui = backend.ui.clone();
     let label = label.to_owned();
     let _ = slint::invoke_from_event_loop(move || {
@@ -1301,10 +1562,61 @@ fn ask_before_input(
     true
 }
 
-/// Put the player's answer back on the alarms page, if it is still up.
-fn replace_alarms(backend: &Backend, list: bluos::alarms::Alarms) {
-    if let Pane::Alarms(page) = &mut backend.browsing.lock().unwrap().pane {
-        page.list = list;
+/// Put up the question a player asked instead of acting, unless another
+/// player has been chosen since the press that led to it.
+///
+/// The question arrives a round trip after the press. Put up over the player
+/// chosen in the meantime, it reads as being about that one — "Replace" looks
+/// like it means the queue on screen — while the answer, rightly, goes to the
+/// player that asked, whose queue is the one replaced. The owner kept with the
+/// dialog decides where an answer goes; this decides whether to ask at all.
+fn offer_dialog(backend: &Backend, id: DeviceId, selection: u64, dialog: bluos::dialog::Dialog) {
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        // With the lock held, for the reason on `Backend::still_selected`.
+        if !backend.still_selected(selection) {
+            tracing::debug!(%id, "not asking: another player was chosen");
+            return;
+        }
+        browsing.dialog = Some((id, dialog));
+    }
+    backend.publish_dialog();
+}
+
+/// Open a context menu read from `id`, unless another player has been chosen
+/// since the dots were pressed.
+///
+/// For the reason `offer_dialog` gives. The menu names no player, and it sits
+/// over the queue and transport of whichever is selected, so a menu of the
+/// last player's track read as being about this one's while Play now and
+/// Remove from queue ran, rightly, on the player that served it.
+fn put_up_menu(backend: &Backend, id: DeviceId, selection: u64, menu: Screen) {
+    {
+        let mut browsing = backend.browsing.lock().unwrap();
+        // With the lock held, for the reason on `Backend::still_selected`.
+        if !backend.still_selected(selection) {
+            tracing::debug!(%id, "not opening the menu: another player was chosen");
+            return;
+        }
+        browsing.queue_menu = Some(menu);
+        browsing.queue_menu_owner = Some(id);
+    }
+    backend.publish_queue_menu();
+}
+
+/// Put the player's answer back on the alarms page, if it is still up and
+/// still that player's.
+///
+/// Returns whether it was. An alarm is named by a small integer that every
+/// player hands out from one, so another player's list on this page would
+/// have its toggles arm and its rows open alarms that happen to share an id.
+fn replace_alarms(backend: &Backend, id: DeviceId, list: bluos::alarms::Alarms) -> bool {
+    match &mut backend.browsing.lock().unwrap().pane {
+        Pane::Alarms(page) if page.device == id => {
+            page.list = list;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2076,6 +2388,7 @@ async fn run(
     let backend = Backend {
         registry: Arc::new(Mutex::new(BTreeMap::new())),
         selected: Arc::new(Mutex::new(None)),
+        selections: Arc::new(AtomicU64::new(0)),
         commands,
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(art, players)),
@@ -2089,6 +2402,8 @@ async fn run(
         known: Arc::new(Mutex::new(Vec::new())),
         writes: Arc::new(lane::Lane::default()),
         searches: Arc::new(AtomicU64::new(0)),
+        forms: Arc::new(AtomicU64::new(0)),
+        openings: Arc::new(AtomicU64::new(0)),
         sent_transport: Arc::new(AtomicU64::new(0)),
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
@@ -2278,6 +2593,7 @@ impl Backend {
             let mut selected = self.selected.lock().unwrap();
             if selected.is_none() {
                 *selected = Some(id);
+                self.selections.fetch_add(1, Ordering::SeqCst);
                 true
             } else {
                 false
@@ -2305,6 +2621,68 @@ impl Backend {
 
     fn is_selected(&self, id: DeviceId) -> bool {
         *self.selected.lock().unwrap() == Some(id)
+    }
+
+    /// The selected player, and which selection of it this is.
+    ///
+    /// Read together under one lock, which is what makes the pair mean
+    /// anything: the number is bumped under the same lock as the id is
+    /// changed, so it cannot belong to a different player than the id beside
+    /// it.
+    fn selection(&self) -> Option<(DeviceId, u64)> {
+        let selected = self.selected.lock().unwrap();
+        selected.map(|id| (id, self.selections.load(Ordering::SeqCst)))
+    }
+
+    /// Whether nothing has been selected since `selection` was read.
+    ///
+    /// No lock is taken, so this is the one question about the selection that
+    /// can be asked with `browsing` held — which is where it has to be asked,
+    /// alongside the write it guards, or the selection can change between
+    /// the answer and the write.
+    fn still_selected(&self, selection: u64) -> bool {
+        self.selections.load(Ordering::SeqCst) == selection
+    }
+
+    /// The player whose screens are showing, if it is also the one selected.
+    ///
+    /// `selection` is read before `browsing` is taken, and `browsing` is what
+    /// is passed in. A press on the browse pane runs on `device`, and `device`
+    /// stays the last player's until the next one's Home lands — and for as
+    /// long as that player is chosen, when it cannot say what screens it has.
+    /// A row pressed in between is the last player's row, and it played there
+    /// while the window showed another player as the one being controlled.
+    /// So every press there asks this first and does nothing on `None`.
+    fn browsing_selected(
+        &self,
+        browsing: &Browsing,
+        selection: Option<(DeviceId, u64)>,
+    ) -> Option<DeviceId> {
+        selection
+            .filter(|(id, n)| browsing.device == Some(*id) && self.still_selected(*n))
+            .map(|(id, _)| id)
+    }
+
+    /// Whether a page read for `id` may be put up now, with `browsing` held.
+    ///
+    /// Two ways it may. Over a pane that is already that player's — its
+    /// settings, its shares — because a page opened from one of those is a
+    /// step deeper into it, and those panes stay up when the sidebar moves.
+    /// Or while `id` is still the selected player it was when the page was
+    /// asked for, which is `selection`: taken then, and `None` if `id` was
+    /// not selected at all. Anything else is a reply that outlived the choice
+    /// it was made under, and it would put one player's page over another's
+    /// name.
+    fn may_open_for(&self, browsing: &Browsing, id: DeviceId, selection: Option<u64>) -> bool {
+        browsing.pane.owner() == Some(id) || selection.is_some_and(|n| self.still_selected(n))
+    }
+
+    /// The selection a page for `id` is being asked for under, if `id` is the
+    /// player selected. Passed to [`Backend::may_open_for`] when it lands.
+    fn selection_of(&self, id: DeviceId) -> Option<u64> {
+        self.selection()
+            .filter(|(selected, _)| *selected == id)
+            .map(|(_, n)| n)
     }
 
     /// Edit one player's row and push the result to the window.
@@ -2491,8 +2869,13 @@ impl Backend {
         // arrives, and the page redrawn if it happens to be the one on screen.
         let showing = {
             let mut browsing = self.browsing.lock().unwrap();
-            browsing.can_upgrade = false;
-            matches!(browsing.pane, Pane::HelpDetail(..))
+            match &mut browsing.pane {
+                Pane::HelpDetail(_, _, _, offer) if *offer == Some(id) => {
+                    *offer = None;
+                    true
+                }
+                _ => false,
+            }
         };
         if showing {
             self.publish_help();
@@ -2862,7 +3245,13 @@ impl Backend {
     /// one it colors is the one it considers destructive, and nothing here
     /// decides which that is.
     fn publish_dialog(&self) {
-        let asked = self.browsing.lock().unwrap().dialog.clone();
+        let asked = self
+            .browsing
+            .lock()
+            .unwrap()
+            .dialog
+            .as_ref()
+            .map(|(_, dialog)| dialog.clone());
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
@@ -2983,10 +3372,13 @@ impl Backend {
         let buttons: Vec<QueueButtonData> = {
             let browsing = self.browsing.lock().unwrap();
             let building = browsing.queue_building;
+            // Another player's buttons are not drawn under this one's queue:
+            // until its own document arrives there are none.
             browsing
                 .queue_screen
                 .as_ref()
-                .map(|screen| {
+                .filter(|(owner, _)| Some(*owner) == selected)
+                .map(|(_, screen)| {
                     screen
                         .buttons
                         .iter()
@@ -3196,7 +3588,7 @@ impl Backend {
     fn publish_sidebar(&self) {
         let rows = {
             let browsing = self.browsing.lock().unwrap();
-            let lit = browsing.highlighted;
+            let lit = browsing.lit();
             let mut rows: Vec<BrowseData> = Vec::new();
 
             for (index, (label, _)) in browsing.screens.iter().enumerate() {
@@ -3479,12 +3871,18 @@ impl Backend {
 
     /// Put the Help menu, or a page reached from it, in the middle pane.
     fn publish_help(&self) {
+        // Before `browsing`, which is not taken with `selected` held.
+        let selected = *self.selected.lock().unwrap();
         let (page, offer) = {
             let browsing = self.browsing.lock().unwrap();
             match &browsing.pane {
-                Pane::HelpDetail(title, facts, _) => {
-                    (Some((title.clone(), facts.clone())), browsing.can_upgrade)
-                }
+                // Drawn only while the player the check was for is the one
+                // selected. The page itself stays up when another is chosen,
+                // and Install under that player's name would read as its own.
+                Pane::HelpDetail(title, facts, _, offer) => (
+                    Some((title.clone(), facts.clone())),
+                    offer.is_some() && *offer == selected,
+                ),
                 _ => (None, false),
             }
         };
@@ -3761,9 +4159,9 @@ impl Backend {
         }
         let showing = match self.browsing.lock().unwrap().pane {
             Pane::Browse => Showing::Browse,
-            Pane::Settings(_) => Showing::Settings,
+            Pane::Settings(..) => Showing::Settings,
             Pane::Help | Pane::HelpDetail(..) => Showing::Help,
-            Pane::Web(_) => Showing::Web,
+            Pane::Web(..) => Showing::Web,
             Pane::Form(_) => Showing::Form,
             Pane::NowPlaying => Showing::NowPlaying,
             Pane::Customise(_) => Showing::Customise,
@@ -3863,7 +4261,14 @@ impl Backend {
 
     /// Turn a settings page into rows for the middle pane.
     fn publish_settings(&self) {
-        let Some(page) = self.browsing.lock().unwrap().pane.settings().cloned() else {
+        let owned = self
+            .browsing
+            .lock()
+            .unwrap()
+            .pane
+            .settings_owned()
+            .map(|(owner, page)| (owner, page.clone()));
+        let Some((owner, page)) = owned else {
             let ui = self.ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui.upgrade() {
@@ -3873,11 +4278,12 @@ impl Backend {
             return;
         };
 
-        // The selection out first, so `selected` is not still held when
-        // `with_entry` takes `registry`.
-        let selected = *self.selected.lock().unwrap();
-        let sleep = selected
-            .and_then(|id| self.with_entry(id, |e| e.status.clone()))
+        // The sleep timer of the player whose page this is, which is also
+        // where pressing the row sends the next rung. Read out of `browsing`
+        // above first, so it is not still held when `with_entry` takes
+        // `registry`.
+        let sleep = self
+            .with_entry(owner, |e| e.status.clone())
             .flatten()
             .and_then(|status| status.sleep_minutes());
 
@@ -5159,8 +5565,20 @@ enum Chosen {
 ///
 /// Walks the page the same way `settings_rows` draws it, so the two agree
 /// about what the numbers mean.
+///
+/// A setting the player has said it will not take right now — one whose
+/// `dependsOn` is not met, drawn dimmed — means nothing. The row refuses the
+/// press too, but it is not the only way here: the keyboard's Enter arrives as
+/// the same command, and a dimmed pill used to let its click fall through to
+/// the row beneath it. So the page decides, and it is the same test the row's
+/// `available` was drawn from.
 fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
-    fn walk(entries: &[SettingEntry], at: &mut usize, want: usize) -> Option<Chosen> {
+    fn walk(
+        page: &SettingsPage,
+        entries: &[SettingEntry],
+        at: &mut usize,
+        want: usize,
+    ) -> Option<Chosen> {
         for entry in entries {
             match entry {
                 SettingEntry::Group(group) if group.is_page_link() => {
@@ -5170,12 +5588,15 @@ fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
                     *at += 1;
                 }
                 SettingEntry::Group(group) => {
-                    if let Some(found) = walk(&group.entries, at, want) {
+                    if let Some(found) = walk(page, &group.entries, at, want) {
                         return Some(found);
                     }
                 }
                 SettingEntry::Setting(setting) => {
                     if *at == want {
+                        if !page.is_available(setting) {
+                            return None;
+                        }
                         if let Some(url) = &setting.webview {
                             return Some(Chosen::Web(url.clone()));
                         }
@@ -5202,7 +5623,7 @@ fn pick(page: &SettingsPage, index: usize) -> Option<Chosen> {
     }
 
     let mut at = 0;
-    walk(&page.entries, &mut at, index)
+    walk(page, &page.entries, &mut at, index)
 }
 
 /// The screens worth offering, in the order the player listed them.
@@ -5289,6 +5710,13 @@ async fn sweep(backend: Backend, discovery: Arc<Discovery>, http: reqwest::Clien
 /// `push` distinguishes going deeper from starting over: Back pops the trail,
 /// so every screen that is arrived at by following a row has to be on it.
 async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive) {
+    // Which selection this is for, taken before the request goes out. A
+    // screen of a player that is not selected is never shown — see
+    // `selections` for what that did — and neither is one that comes back
+    // after the choice has changed, even to this player and back.
+    let Some((_, selection)) = backend.selection().filter(|(selected, _)| *selected == id) else {
+        return;
+    };
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
@@ -5305,12 +5733,30 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             {
                 let mut browsing = backend.browsing.lock().unwrap();
 
+                // Another player chosen while this was on its way. Checked
+                // with the trail locked, so the choice cannot change between
+                // this and the write below.
+                if !backend.still_selected(selection) {
+                    return;
+                }
+
                 // Decided before anything is changed. A refresh that lost its
                 // race changes nothing at all — taking the pane from Settings
                 // and then dropping the screen would leave the window showing
                 // a pane nobody published.
                 if let Arrive::Refresh { was, .. } = &arrive
                     && !browsing.trail.last().is_some_and(|c| &c.uri == was)
+                {
+                    return;
+                }
+
+                // A Home is only asked for while this player's screens are not
+                // the ones showing — see `BrowseHome` — so finding them up now
+                // means one the user pressed for landed first. That screen is
+                // what was asked for last, and Home would replace it.
+                if arrive == Arrive::Home
+                    && browsing.device == Some(id)
+                    && !browsing.trail.is_empty()
                 {
                     return;
                 }
@@ -5333,6 +5779,16 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                     }
                     Arrive::Root => {
                         browsing.trail.clear();
+                        None
+                    }
+                    Arrive::Home => {
+                        browsing.trail.clear();
+                        // An entry of this player's lit since its Home was
+                        // asked for is a press still on its way, or an input
+                        // that shows nothing; either says more than Home.
+                        if !browsing.highlighted.contains_key(&id) {
+                            browsing.light(id, (0, 0));
+                        }
                         None
                     }
                     Arrive::Deeper => None,
@@ -5359,6 +5815,9 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             // which showed as a screen with the right title and the wrong list
             // under it.
             backend.publish_pane();
+            if arrive == Arrive::Home {
+                backend.publish_sidebar();
+            }
             tokio::spawn(load_browse_thumbnails(backend, id, 0));
         }
         Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
@@ -5480,9 +5939,18 @@ fn next_after_page(asked: &str, arrived: Option<String>, brought: usize) -> Opti
 
 /// Do whatever row `index` of the current screen says to do.
 async fn activate(backend: Backend, index: usize) {
+    // The selection out first; see the note on `Backend`.
+    let selection = backend.selection();
     let (id, action, named, arrive, worth_keeping, switch_to) = {
         let browsing = backend.browsing.lock().unwrap();
-        let Some(id) = browsing.device else { return };
+        let Some(id) = backend.browsing_selected(&browsing, selection) else {
+            let showing = browsing.device.is_some();
+            drop(browsing);
+            if showing {
+                refuse_other_players_screen(&backend);
+            }
+            return;
+        };
         let Some(crumb) = browsing.trail.last() else {
             return;
         };
@@ -5558,11 +6026,110 @@ async fn activate(backend: Backend, index: usize) {
     run_action(backend, id, action, arrive).await;
 }
 
-/// Show a form, keeping whatever the page arrived filled in with.
+/// What a form coming up for a player may take the place of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Replacing {
+    /// Any pane of that player's: the settings page or the list of shares or
+    /// services the form was chosen on. This is the placeholder going up.
+    Page,
+    /// That player's form, the one opened as this number, and nothing else.
+    /// This is the page arriving for the placeholder, or the next step of a
+    /// form that was submitted.
+    ///
+    /// Stricter than `Page` because it lands a round trip later. The wireless
+    /// page takes three and a half seconds, which is time enough to press
+    /// Back out of the placeholder, and a form that then came up anyway over
+    /// the settings page was a pane nobody had asked for. Time enough, too,
+    /// to open another of the same player's forms; see `FormPage::opened`.
+    Form(u64),
+}
+
+/// Say that a press on the browse pane was not run, because the screen showing
+/// is not the selected player's.
+///
+/// Said rather than silent: the row looks as pressable as any other, and a
+/// press that does nothing without a word reads as a broken app.
+fn refuse_other_players_screen(backend: &Backend) {
+    tracing::debug!("a press on a screen of a player that is not selected");
+    say(&backend.ui, "That screen is another player's");
+}
+
+/// Take down one opening of a form, putting back the page it was opened from,
+/// if that form is still the pane showing. Whether it was.
+///
+/// For every way off a form that is not Back: a page this crate cannot read,
+/// and a submit answered with no next step. Both used to land on Home, which is
+/// what `FormPage::from` exists to stop — the WiFi form's scan coming back
+/// unreadable closed it three and a half seconds after its row was pressed,
+/// and put a Recently Played tile that plays under the pointer. Whatever
+/// replaced the form in the meantime, another of this player's forms included,
+/// is not the reply's to close.
+fn close_form(backend: &Backend, device: DeviceId, opened: u64) -> bool {
+    let mut browsing = backend.browsing.lock().unwrap();
+    let Pane::Form(page) = &mut browsing.pane else {
+        return false;
+    };
+    if page.device != device || page.opened != opened {
+        return false;
+    }
+    let from = page.from.take();
+    browsing.pane = from.map_or(Pane::Browse, |pane| *pane);
+    true
+}
+
+/// Take down a form the player answered with no next step, and read again the
+/// page it goes back to.
+///
+/// The page put back is the copy taken when the form went up, before the
+/// submit, and the submit is what changed it: signed into a service, the
+/// Services list came back still offering the sign-in, and the WiFi form left
+/// Player settings showing the network it had just replaced. Every other write
+/// from those pages re-reads its page, for this reason.
+///
+/// Only a page of the form's own player, and only the kind that went back up.
+/// Anything else showing by the time the lock is taken again is not this
+/// reply's to refresh.
+fn close_answered_form(backend: &Backend, device: DeviceId, opened: u64) {
+    if !close_form(backend, device, opened) {
+        return;
+    }
+    let again = match &backend.browsing.lock().unwrap().pane {
+        Pane::Settings(owner, trail) if *owner == device => trail
+            .last()
+            .map(|page| Command::OpenSettings(page.page_id.clone(), Step::Reload(device))),
+        Pane::Web(owner, WebPage::Services(_)) if *owner == device => Some(Command::OpenServices {
+            device,
+            reload: true,
+        }),
+        Pane::Web(owner, WebPage::Shares { .. }) if *owner == device => Some(Command::OpenShares {
+            device,
+            reload: true,
+        }),
+        _ => None,
+    };
+    if let Some(again) = again {
+        let _ = backend.commands.send(again);
+    }
+}
+
+/// Show a form, keeping whatever the page arrived filled in with, and give
+/// the number it went up as, or `None` if it did not.
 ///
 /// Passwords are the exception: a page comes back with the field empty, and
 /// seeding it with anything would be inventing a value nobody typed.
-fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: String) {
+///
+/// It goes up only over what `replacing` allows of `device`'s. Anything else
+/// on show means the pane it belonged with has gone — another player's Home
+/// landed, Back was pressed, another form was opened — and a form put up
+/// then is one form over whatever replaced it.
+fn show_form(
+    backend: &Backend,
+    device: DeviceId,
+    replacing: Replacing,
+    title: String,
+    form: bluos::forms::Form,
+    note: String,
+) -> Option<u64> {
     let values = form
         .fields
         .iter()
@@ -5582,22 +6149,39 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
         })
         .collect();
 
-    {
+    let opened = {
         let mut browsing = backend.browsing.lock().unwrap();
+        let opened = match (&browsing.pane, replacing) {
+            (Pane::Form(page), Replacing::Form(opened))
+                if page.device == device && page.opened == opened =>
+            {
+                opened
+            }
+            (_, Replacing::Form(_)) => return None,
+            (pane, Replacing::Page) if pane.owner() == Some(device) => {
+                backend.forms.fetch_add(1, Ordering::Relaxed) + 1
+            }
+            (_, Replacing::Page) => return None,
+        };
         // Taken rather than read: the form is replacing it, and putting it in
-        // the form is what lets Back give it back.
+        // the form is what lets Back give it back. A form replacing a form
+        // keeps the page the first one came from.
         let from = match std::mem::replace(&mut browsing.pane, Pane::Browse) {
-            Pane::Web(page) => Some(page),
+            pane @ (Pane::Web(..) | Pane::Settings(..)) => Some(Box::new(pane)),
+            Pane::Form(page) => page.from,
             _ => None,
         };
         browsing.pane = Pane::Form(Box::new(FormPage {
+            device,
+            opened,
             title,
             form,
             values,
             note,
             from,
         }));
-    }
+        opened
+    };
     // Through `publish_pane`, not `publish_form`. Every caller of this reaches
     // it after awaiting the player, and the command loop keeps reading its
     // channel while that is in flight — deliberately, so a player that has
@@ -5607,6 +6191,7 @@ fn show_form(backend: &Backend, title: String, form: bluos::forms::Form, note: S
     // and have the form land on top of a pane that is still drawing itself.
     // Only `publish_pane` answers the other panes' flags.
     backend.publish_pane();
+    Some(opened)
 }
 
 /// Ask about a player's firmware, through its leader if it will not answer.
@@ -5678,13 +6263,30 @@ fn remember_search(backend: &Backend, query: String) {
 /// Search for what has been typed so far.
 ///
 /// Called once the typing has settled rather than on the keystroke itself, and
-/// then only if nothing has been typed since.
-async fn run_search(backend: Backend, query: String) {
+/// then only if nothing has been typed since. `selection` is the one the
+/// typing was done under.
+async fn run_search(backend: Backend, query: String, selection: Option<(DeviceId, u64)>) {
     let query = query.trim().to_owned();
 
+    // A search runs on the screen showing, so on the player that served it,
+    // and only while that is the one selected: see `browsing_selected`.
     let plan = {
         let browsing = backend.browsing.lock().unwrap();
-        let Some(id) = browsing.device else { return };
+        // Another player chosen while the typing settled. The search is
+        // simply abandoned: the refusal below is for typing on a screen that
+        // was not the selected player's, and said now it would read as the
+        // choice just made having failed.
+        if selection.is_some_and(|(_, n)| !backend.still_selected(n)) {
+            return;
+        }
+        let Some(id) = backend.browsing_selected(&browsing, selection) else {
+            let showing = browsing.device.is_some();
+            drop(browsing);
+            if showing {
+                refuse_other_players_screen(&backend);
+            }
+            return;
+        };
         let Some(crumb) = browsing.trail.last() else {
             return;
         };
@@ -5728,6 +6330,16 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
         return;
     };
     let uri = action.uri.clone().or_else(|| action.href.clone());
+    // Which selection this press was made under, if `id` is the player
+    // selected at all. What runs here always goes to `id`, whoever is
+    // selected; but a pane or a question it puts up is only put up while
+    // that is still the same choice, as `open_screen` does for screens.
+    // Otherwise one player's page lands over another's name, and a press on
+    // it reads as being about the player beside it.
+    let selection = backend
+        .selection()
+        .filter(|(selected, _)| *selected == id)
+        .map(|(_, selection)| selection);
 
     match action.kind {
         ActionKind::Browse | ActionKind::ContextBrowse => {
@@ -5747,11 +6359,16 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                             // track's context menu opens the same page from a
                             // browse screen. Back belongs wherever you were.
                             let mut browsing = backend.browsing.lock().unwrap();
+                            // With the lock held, for the reason on
+                            // `Backend::still_selected`.
+                            if !selection.is_some_and(|n| backend.still_selected(n)) {
+                                return;
+                            }
                             let whence = match browsing.pane {
                                 Pane::NowPlaying => Whence::NowPlaying,
                                 _ => Whence::Browse,
                             };
-                            browsing.pane = Pane::HelpDetail(title, facts, whence);
+                            browsing.pane = Pane::HelpDetail(title, facts, whence, None);
                             drop(browsing);
                             backend.publish_pane();
                         }
@@ -5772,12 +6389,22 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                             .title
                             .clone()
                             .unwrap_or_else(|| "Add to playlist".to_owned());
-                        backend.browsing.lock().unwrap().pane =
-                            Pane::Playlists(Box::new(PlaylistPage {
+                        {
+                            let mut browsing = backend.browsing.lock().unwrap();
+                            // The options name a track on `id`, and the list
+                            // is drawn under whichever player is selected.
+                            // Checked with the lock held, as above.
+                            if !selection.is_some_and(|n| backend.still_selected(n)) {
+                                return;
+                            }
+                            browsing.pane = Pane::Playlists(Box::new(PlaylistPage {
+                                device: id,
+                                opened: backend.openings.fetch_add(1, Ordering::Relaxed) + 1,
                                 title,
                                 options,
                                 naming: false,
                             }));
+                        }
                         backend.publish_pane();
                     }
                     other => {
@@ -5817,8 +6444,9 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // question up; nothing has happened yet, and pressing one of
                 // its buttons is what runs the action it carries.
                 Ok(Some(dialog)) => {
-                    backend.browsing.lock().unwrap().dialog = Some(dialog);
-                    backend.publish_dialog();
+                    if let Some(selection) = selection {
+                        offer_dialog(&backend, id, selection, dialog);
+                    }
                 }
                 Ok(None) => {
                     // The player has no phrase for this one, because it does
@@ -5968,8 +6596,20 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // Decoded twice, once to choose this arm and once to use it:
                 // a match guard cannot hand its answer to the body.
                 if let Some((slot, preset)) = bluos::screen::preset_to_edit(route) {
-                    backend.browsing.lock().unwrap().pane =
-                        Pane::EditPreset(Box::new(EditPresetPage { slot, preset }));
+                    {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        // The rename goes to `id` whatever happens, but the
+                        // field is drawn under the player selected; opened
+                        // over another one, it looks like that one's preset.
+                        if !selection.is_some_and(|n| backend.still_selected(n)) {
+                            return;
+                        }
+                        browsing.pane = Pane::EditPreset(Box::new(EditPresetPage {
+                            device: id,
+                            slot,
+                            preset,
+                        }));
+                    }
                     // Through publish_pane, so every "this pane is showing"
                     // flag is answered.
                     backend.publish_pane();
@@ -5978,9 +6618,23 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
 
             Some(route) if bluos::screen::presets_to_reorder(route).is_some() => {
                 let prid = bluos::screen::presets_to_reorder(route).unwrap_or_default();
-                let page = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    browsing.current().map(|screen| {
+                // Put up under the same lock it is checked under. Taken again
+                // to write, another player could be chosen in between, and
+                // this player's slots went up under that one's name.
+                let shown = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    // The slots are read off the screen showing and the moves
+                    // go to `id`, so the two have to be the same player's. They
+                    // normally are — the button is on that screen — and while
+                    // a selection is settling they are not, and one player's
+                    // slot numbers would be sent to reorder another's.
+                    //
+                    // `device` alone is not enough: it stays the last player's
+                    // until the next one's Home lands, so it is checked with
+                    // the selection this press was made under.
+                    let showing = browsing.device == Some(id)
+                        && selection.is_some_and(|n| backend.still_selected(n));
+                    let page = browsing.current().filter(|_| showing).map(|screen| {
                         let rows: Vec<(String, String)> = screen
                             .items()
                             .filter_map(|item| {
@@ -5992,17 +6646,22 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                             screen: screen.id.clone().unwrap_or_default(),
                             title: "Reorder Presets".to_owned(),
                             rows,
-                            presets: Some(prid),
+                            presets: Some((id, prid)),
                         }
-                    })
-                };
-                match page {
-                    // Fewer than two and there is nothing to arrange.
-                    Some(page) if page.rows.len() > 1 => {
-                        backend.browsing.lock().unwrap().pane = Pane::Customise(page);
-                        backend.publish_pane();
+                    });
+                    match page {
+                        // Fewer than two and there is nothing to arrange.
+                        Some(page) if page.rows.len() > 1 => {
+                            browsing.pane = Pane::Customise(page);
+                            true
+                        }
+                        _ => false,
                     }
-                    _ => say(&backend.ui, "There are not enough presets to reorder"),
+                };
+                if shown {
+                    backend.publish_pane();
+                } else {
+                    say(&backend.ui, "There are not enough presets to reorder");
                 }
             }
 
@@ -6059,7 +6718,10 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // of the services this player can be signed into, which is
                 // worth drawing; the sign-in form behind each one is not.
                 if uri.contains("%2Fservices") || uri.contains("/services") {
-                    let _ = backend.commands.send(Command::OpenServices);
+                    let _ = backend.commands.send(Command::OpenServices {
+                        device: id,
+                        reload: false,
+                    });
                     return;
                 }
                 let url = client.image_url(&uri);
@@ -6986,22 +7648,41 @@ async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option
 /// this one names the actions. Failing is not worth reporting — the queue still
 /// draws, just without its buttons.
 async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
+    // Only the selected player's queue is drawn, so only its buttons are
+    // worth asking for.
+    let Some((selected, selection)) = backend.selection() else {
+        return;
+    };
+    if selected != id {
+        return;
+    }
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
-    let uri = backend
-        .browsing
-        .lock()
-        .unwrap()
-        .queue_uri
-        .clone()
-        .unwrap_or_else(|| "/ui/Queue".to_owned());
+    // The address is this player's or it is not used. Not yet configured
+    // means its configuration is on its way, and that asks again when it
+    // lands; never configured means there is no address to read.
+    let uri = {
+        let browsing = backend.browsing.lock().unwrap();
+        if browsing.configured != Some(id) {
+            return;
+        }
+        browsing
+            .queue_uri
+            .clone()
+            .unwrap_or_else(|| "/ui/Queue".to_owned())
+    };
 
     match client.screen(&uri).await {
         Ok(screen) => {
             {
                 let mut browsing = backend.browsing.lock().unwrap();
-                browsing.queue_screen = Some(screen);
+                // Another player chosen while this was on its way: the queue
+                // on screen is that one's now.
+                if !backend.still_selected(selection) {
+                    return;
+                }
+                browsing.queue_screen = Some((id, screen));
             }
             backend.publish_queue();
         }
@@ -7193,9 +7874,12 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // The settings pane can be showing a row whose state is in
                 // the status rather than in the settings document — the sleep
                 // timer is one — so it is redrawn along with everything else.
-                if backend.is_selected(id)
-                    && matches!(backend.browsing.lock().unwrap().pane, Pane::Settings(_))
-                {
+                // Keyed on the player the pane belongs to, which is whose
+                // status that row shows.
+                if matches!(
+                    backend.browsing.lock().unwrap().pane,
+                    Pane::Settings(owner, _) if owner == id
+                ) {
                     backend.publish_settings();
                 }
 
@@ -7215,6 +7899,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                             name,
                             backend.registry.clone(),
                             backend.commands.clone(),
+                            backend.artwork.clone(),
                         )
                         .await;
                     }
@@ -7324,10 +8009,18 @@ async fn run_commands(
             }
 
             // Only puts the question up. Nothing reaches the player here.
-            Command::UpgradeAsk => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+            Command::UpgradeAsk(id) => {
+                // The page stays up when another player is chosen. Its facts
+                // and its offer are still this player's, and a question
+                // naming the player selected instead would be asking about an
+                // update nobody checked for.
+                if *backend.selected.lock().unwrap() != Some(id) {
+                    say(
+                        &backend.ui,
+                        "That check was for another player — check this one again",
+                    );
                     continue;
-                };
+                }
                 // Belt and braces with `start_upgrade`, which refuses a second
                 // upgrade on its own. This is the half that keeps the question
                 // from being asked at all, since answering yes to something
@@ -7340,6 +8033,7 @@ async fn run_commands(
                 let name = backend
                     .with_entry(id, |e| e.view.name.to_string())
                     .unwrap_or_else(|| "this player".to_owned());
+                backend.browsing.lock().unwrap().upgrade_asked = Some(id);
                 let ui = backend.ui.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui.upgrade() {
@@ -7350,19 +8044,31 @@ async fn run_commands(
             }
 
             Command::UpgradeAnswer(go) => {
-                if !go {
-                    continue;
-                }
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // Taken whatever the answer, so a yes can only ever answer
+                // the question that was put up.
+                let asked = backend.browsing.lock().unwrap().upgrade_asked.take();
+                let Some(id) = asked.filter(|_| go) else {
                     continue;
                 };
+                // The question is modal, but the selection can still move
+                // under it — an update notice selects the player it is about.
+                if *backend.selected.lock().unwrap() != Some(id) {
+                    say(
+                        &backend.ui,
+                        "Another player was chosen — nothing was updated",
+                    );
+                    continue;
+                }
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     // Checked again before anything is sent: the answer that
                     // put the offer on screen may be minutes old, and the
                     // player may have started one of its own in between. The
                     // route is settled by that check, so the start repeats
-                    // whatever request actually got an answer.
+                    // whatever request actually got an answer. What it says is
+                    // not read here: the start asks the same question over the
+                    // same route and refuses a player with nothing to install
+                    // or an install already running.
                     let (client, member) = match ask_about_firmware(&backend, id).await {
                         Ok((client, member, _)) => (client, member),
                         Err(e) => {
@@ -7401,8 +8107,34 @@ async fn run_commands(
                     let mut selected = backend.selected.lock().unwrap();
                     let already = *selected == Some(id);
                     *selected = Some(id);
+                    // Before `fresh` is read below, and that order is what
+                    // closes the race `selections` is for: a write for the
+                    // last player either lands before this bump, and `fresh`
+                    // then sees it and fetches this player's own over it, or
+                    // lands after and is dropped.
+                    //
+                    // That holds only because `fresh` looks at everything
+                    // such a write changes. `BrowseHome` writes twice, a round
+                    // trip apart — the configuration and sidebar, then Home —
+                    // and a choice made between the two left the sidebar and
+                    // the addresses beside it the other player's for good
+                    // while `fresh` looked only at the screens.
+                    if !already {
+                        backend.selections.fetch_add(1, Ordering::SeqCst);
+                    }
                     already
                 };
+                // An Install offered for one player is drawn only while that
+                // player is selected (see `publish_help`), and the page itself
+                // does not change with the choice, so it is drawn again here.
+                if !already
+                    && matches!(
+                        backend.browsing.lock().unwrap().pane,
+                        Pane::HelpDetail(_, _, _, Some(_))
+                    )
+                {
+                    backend.publish_pane();
+                }
                 // Show whatever is already known straight away, and only go to
                 // the network when this is a player whose queue is not held.
                 backend.publish_queue();
@@ -7411,7 +8143,9 @@ async fn run_commands(
                 // Warm the browser for this player, so the tab is not a wait.
                 let fresh = {
                     let browsing = backend.browsing.lock().unwrap();
-                    browsing.device != Some(id) || browsing.trail.is_empty()
+                    browsing.device != Some(id)
+                        || browsing.configured != Some(id)
+                        || browsing.trail.is_empty()
                 };
                 if fresh {
                     let _ = backend.commands.send(Command::BrowseHome);
@@ -7438,14 +8172,23 @@ async fn run_commands(
             }
 
             Command::BrowseHome => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some((id, selection)) = backend.selection() else {
                     continue;
                 };
-                // Already showing this player's screens: leave the trail where
-                // the user left it rather than resetting to the root.
+                // Already showing this player's screens, with its sidebar and
+                // addresses beside them: leave the trail where the user left
+                // it rather than resetting to the root.
+                //
+                // All three, not only the screens. The configuration is
+                // written a round trip before Home, so another player's can
+                // be the one held under this player's trail — see the note on
+                // the bump in `Select` — and skipping then kept it for good.
                 {
                     let browsing = backend.browsing.lock().unwrap();
-                    if browsing.device == Some(id) && !browsing.trail.is_empty() {
+                    if browsing.device == Some(id)
+                        && browsing.configured == Some(id)
+                        && !browsing.trail.is_empty()
+                    {
                         drop(browsing);
                         backend.publish_pane();
                         continue;
@@ -7468,8 +8211,31 @@ async fn run_commands(
                 tokio::spawn(async move {
                     // The player says which screens it has; the app does not have a
                     // list of its own.
-                    let config = client.ui_configuration().await.ok();
-                    let screens = config.as_ref().map(user_screens).unwrap_or_default();
+                    //
+                    // And without that answer there is nothing to write. This
+                    // used to carry on with an empty one, which replaced the
+                    // sidebar and the queue and search addresses with nothing
+                    // while the last player's screens stayed up — and nothing
+                    // put them back, because choosing that player again finds
+                    // its trail still showing and fetches nothing. Leaving it
+                    // all as it was keeps a consistent window, and this player
+                    // is asked again the next time it is chosen.
+                    //
+                    // Numbered as it is asked, for the note on
+                    // `Browsing::configurations`.
+                    let asked = {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        browsing.configurations += 1;
+                        browsing.configurations
+                    };
+                    let config = match client.ui_configuration().await {
+                        Ok(config) => config,
+                        Err(e) => {
+                            tracing::warn!(%id, "could not read its configuration: {e}");
+                            return;
+                        }
+                    };
+                    let screens = user_screens(&config);
                     let root = screens
                         .first()
                         .map(|(_, uri)| uri.clone())
@@ -7478,37 +8244,70 @@ async fn run_commands(
                     // The sidebar's lower half is the Sources screen's own rows,
                     // so it is read once here rather than every time the sidebar
                     // is redrawn.
-                    let sources_uri = config
-                        .as_ref()
-                        .and_then(|c| c.uri("sources"))
-                        .unwrap_or("/ui/Sources")
-                        .to_owned();
+                    let sources_uri = config.uri("sources").unwrap_or("/ui/Sources").to_owned();
                     let sources = client.screen(&sources_uri).await.ok();
 
-                    {
+                    let keeping_trail = {
                         let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.queue_uri = config
-                            .as_ref()
-                            .and_then(|c| c.uri("queue"))
-                            .map(str::to_owned);
-                        browsing.now_playing_menu = config
-                            .as_ref()
-                            .and_then(|c| c.uri("nowPlayingContextMenu"))
-                            .map(str::to_owned);
-                        browsing.queue_menu_uri = config
-                            .as_ref()
-                            .and_then(|c| c.uri("queueItemContextMenu"))
-                            .map(str::to_owned);
-                        browsing.search_uri = config
-                            .as_ref()
-                            .and_then(|c| c.uri("search"))
-                            .map(str::to_owned);
+                        // Another player chosen while these were on their way:
+                        // this is its sidebar and its addresses now, whether or
+                        // not its own replies have arrived yet.
+                        if !backend.still_selected(selection) {
+                            return;
+                        }
+                        // This player's screens are already the ones showing,
+                        // and only what sits beside them was somebody else's:
+                        // chosen, another player's configuration landed, and
+                        // this one was chosen back before that player's Home.
+                        // Putting the sidebar right is the whole repair; the
+                        // trail is where the user left it and stays there.
+                        let keeping_trail =
+                            browsing.device == Some(id) && !browsing.trail.is_empty();
+                        browsing.queue_uri = config.uri("queue").map(str::to_owned);
+                        browsing.configured = Some(id);
+                        browsing.now_playing_menu =
+                            config.uri("nowPlayingContextMenu").map(str::to_owned);
+                        browsing.queue_menu_uri =
+                            config.uri("queueItemContextMenu").map(str::to_owned);
+                        browsing.search_uri = config.uri("search").map(str::to_owned);
                         browsing.screens = screens;
                         browsing.sources = sources;
-                        browsing.highlighted = Some((0, 0));
-                    }
+                        // What is lit is left alone: it describes the trail
+                        // showing, and that is still this player's or still
+                        // the last one's, which `Browsing::lit` keeps off
+                        // this sidebar. Home lights its own entry when it
+                        // lands; see `Arrive::Home`.
+                        //
+                        // Except an entry of this player's own when its
+                        // trail is not the one showing: left from an earlier
+                        // visit, it would light a screen nobody is looking
+                        // at, and Home would take it for a press made since.
+                        //
+                        // And only an entry lit before this configuration was
+                        // asked for. Two can be out at once — a sidebar press
+                        // refused before the first landed asks again — and the
+                        // second reply took the press made between the two for
+                        // a leftover, so Home lit itself over Favourites. Who
+                        // was configured could not tell them apart either: a
+                        // player chosen away and back is still configured, and
+                        // its old entry was kept the same way.
+                        let left_over = browsing
+                            .highlighted
+                            .get(&id)
+                            .is_some_and(|(_, lit_at)| *lit_at < asked);
+                        if !keeping_trail && left_over {
+                            browsing.highlighted.remove(&id);
+                        }
+                        keeping_trail
+                    };
                     backend.publish_sidebar();
-                    open_screen(backend.clone(), id, root, Arrive::Root).await;
+                    // The queue's buttons are read from the address just
+                    // written, and a queue that arrived before it had none to
+                    // read them from.
+                    tokio::spawn(fetch_queue_buttons(backend.clone(), id));
+                    if !keeping_trail {
+                        open_screen(backend.clone(), id, root, Arrive::Home).await;
+                    }
                 });
                 continue;
             }
@@ -7554,7 +8353,7 @@ async fn run_commands(
                             browsing.pane = Pane::Browse;
                             true
                         }
-                        Pane::HelpDetail(_, _, whence) => {
+                        Pane::HelpDetail(_, _, whence, _) => {
                             browsing.pane = match whence {
                                 Whence::Help => Pane::Help,
                                 Whence::Browse => Pane::Browse,
@@ -7562,22 +8361,25 @@ async fn run_commands(
                             };
                             true
                         }
-                        Pane::Settings(trail) if trail.len() > 1 => {
+                        Pane::Settings(_, trail) if trail.len() > 1 => {
                             trail.pop();
                             true
                         }
                         // Back out of a service's sign-in form lands on the
-                        // list of services it was chosen from.
+                        // list of services it was chosen from, and out of the
+                        // WiFi form on the settings page it was chosen on.
+                        // Placeholder or not: the page is kept from the moment
+                        // the form goes up.
                         Pane::Form(page) if page.from.is_some() => {
                             let from = page.from.take();
-                            if let Some(page) = from {
-                                browsing.pane = Pane::Web(page);
+                            if let Some(pane) = from {
+                                browsing.pane = *pane;
                             }
                             true
                         }
                         Pane::Help
-                        | Pane::Settings(_)
-                        | Pane::Web(_)
+                        | Pane::Settings(..)
+                        | Pane::Web(..)
                         | Pane::Form(_)
                         | Pane::Customise(_)
                         | Pane::Playlists(_)
@@ -7614,6 +8416,10 @@ async fn run_commands(
             }
 
             Command::BrowseMenu(index) => {
+                // The menu's lines run on the player it was read from, so it
+                // is only opened for a row of the selected player's screen:
+                // see `Backend::browsing_selected`.
+                let selection = backend.selection();
                 let opened = {
                     let browsing = backend.browsing.lock().unwrap();
                     let item = browsing.current().and_then(|screen| {
@@ -7621,12 +8427,23 @@ async fn run_commands(
                         item_at(screen, &arrangement, index).map(|(_, item)| item.clone())
                     });
 
-                    browsing.device.zip(
-                        item.and_then(|item| item.context_menu)
-                            .and_then(|action| action.uri),
-                    )
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        let showing = browsing.device.is_some();
+                        drop(browsing);
+                        if showing {
+                            refuse_other_players_screen(&backend);
+                        }
+                        continue;
+                    };
+                    item.and_then(|item| item.context_menu)
+                        .and_then(|action| action.uri)
+                        .map(|uri| (id, uri))
                 };
                 let Some((id, uri)) = opened else { continue };
+                // `browsing_selected` said yes, so this is the number it did.
+                let Some((_, selection)) = selection else {
+                    continue;
+                };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -7639,14 +8456,7 @@ async fn run_commands(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     match client.screen(&uri).await {
-                        Ok(menu) => {
-                            {
-                                let mut browsing = backend.browsing.lock().unwrap();
-                                browsing.queue_menu = Some(menu);
-                                browsing.queue_menu_owner = Some(id);
-                            }
-                            backend.publish_queue_menu();
-                        }
+                        Ok(menu) => put_up_menu(&backend, id, selection, menu),
                         Err(e) => {
                             tracing::debug!(%id, "no menu for that row: {e}");
                             say(&backend.ui, "The player offers nothing for that");
@@ -7657,32 +8467,31 @@ async fn run_commands(
             }
 
             Command::QueueMenu(song) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some((id, selection)) = backend.selection() else {
                     continue;
                 };
                 // The player names the endpoint in /ui/Configuration; only the
                 // queue position is ours to add.
-                let base = backend
-                    .browsing
-                    .lock()
-                    .unwrap()
-                    .queue_menu_uri
-                    .clone()
-                    .unwrap_or_else(|| "/ui/queueItemCM".to_owned());
+                //
+                // Its own configuration's, read with `configured` under one
+                // lock, or the default. The address is kept from whichever
+                // player was configured last, which is not this one until its
+                // configuration lands, and never when that fails.
+                let base = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .queue_menu_uri
+                        .clone()
+                        .filter(|_| browsing.configured == Some(id))
+                }
+                .unwrap_or_else(|| "/ui/queueItemCM".to_owned());
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     match client.screen(&format!("{base}?id={song}")).await {
-                        Ok(menu) => {
-                            {
-                                let mut browsing = backend.browsing.lock().unwrap();
-                                browsing.queue_menu = Some(menu);
-                                browsing.queue_menu_owner = Some(id);
-                            }
-                            backend.publish_queue_menu();
-                        }
+                        Ok(menu) => put_up_menu(&backend, id, selection, menu),
                         Err(e) => {
                             tracing::debug!(%id, "no menu for queue item {song}: {e}");
                             say(&backend.ui, "The player offers nothing for that track");
@@ -7706,6 +8515,7 @@ async fn run_commands(
                             None
                         }
                         Some((service, Some(playlist))) => Some((
+                            page.opened,
                             service,
                             bluos::client::PlaylistTarget::Existing {
                                 name: playlist.name,
@@ -7717,8 +8527,10 @@ async fn run_commands(
                 };
 
                 match chosen {
-                    Some((service, target)) => {
-                        let _ = backend.commands.send(Command::PlaylistAdd(service, target));
+                    Some((opened, service, target)) => {
+                        let _ = backend
+                            .commands
+                            .send(Command::PlaylistAdd(opened, service, target));
                     }
                     None => backend.publish_pane(),
                 }
@@ -7733,37 +8545,48 @@ async fn run_commands(
                 // The first group that will make one. There is only ever a
                 // choice of service when the player offers several, and the
                 // field belongs to whichever offered it.
-                let service = {
+                let (opened, service) = {
                     let browsing = backend.browsing.lock().unwrap();
                     let Pane::Playlists(page) = &browsing.pane else {
                         continue;
                     };
-                    page.options
-                        .groups
-                        .iter()
-                        .find(|group| group.can_create)
-                        .and_then(|group| group.service.clone())
+                    (
+                        page.opened,
+                        page.options
+                            .groups
+                            .iter()
+                            .find(|group| group.can_create)
+                            .and_then(|group| group.service.clone()),
+                    )
                 };
                 let _ = backend.commands.send(Command::PlaylistAdd(
+                    opened,
                     service,
                     bluos::client::PlaylistTarget::New(name),
                 ));
                 continue;
             }
 
-            Command::PlaylistAdd(service, target) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                    continue;
-                };
-                let options = {
+            Command::PlaylistAdd(opened, service, target) => {
+                // The player the options came from, not whichever is selected
+                // now: they describe the track in that player's own terms.
+                //
+                // And only from the page the choice was made on. The press
+                // came back through the channel, and another player's
+                // playlists put up in between would lend this service and
+                // playlist id to that player's track.
+                let (id, options) = {
                     let browsing = backend.browsing.lock().unwrap();
                     let Pane::Playlists(page) = &browsing.pane else {
                         continue;
                     };
-                    page.options.clone()
+                    if page.opened != opened {
+                        continue;
+                    }
+                    (page.device, page.options.clone())
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
                 };
 
                 let named = match &target {
@@ -7779,8 +8602,24 @@ async fn run_commands(
                         .await
                     {
                         Ok(()) => {
-                            backend.browsing.lock().unwrap().pane = Pane::Browse;
-                            backend.publish_pane();
+                            // Closes its own page and nothing else. Whatever
+                            // was opened while the add was out — Settings, an
+                            // alarm half edited, a form half typed — is where
+                            // the user went since.
+                            let closed = {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                let own = matches!(
+                                    &browsing.pane,
+                                    Pane::Playlists(page) if page.opened == opened
+                                );
+                                if own {
+                                    browsing.pane = Pane::Browse;
+                                }
+                                own
+                            };
+                            if closed {
+                                backend.publish_pane();
+                            }
                             say(&backend.ui, format!("Added to {named}"));
                         }
                         Err(e) => {
@@ -7792,10 +8631,8 @@ async fn run_commands(
                 continue;
             }
 
-            Command::OpenAlarms => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
+            Command::OpenAlarms(id) => {
+                let selection = backend.selection_of(id);
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -7805,13 +8642,20 @@ async fn run_commands(
                         Ok(list) => {
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
+                                // Answered after the settings page it was
+                                // chosen on has gone, and another player chosen:
+                                // its alarms would replace that player's Home.
+                                if !backend.may_open_for(&browsing, id, selection) {
+                                    return;
+                                }
                                 browsing.pane = Pane::Alarms(Box::new(AlarmsPage {
                                     device: id,
                                     list,
                                     editing: None,
+                                    opened: 0,
                                     picking: Vec::new(),
                                 }));
-                                browsing.highlighted = None;
+                                browsing.highlighted.clear();
                             }
                             backend.publish_sidebar();
                             backend.publish_pane();
@@ -7825,10 +8669,7 @@ async fn run_commands(
                 continue;
             }
 
-            Command::AlarmArm(alarm, on) => {
-                let Some(id) = alarms_owner(&backend) else {
-                    continue;
-                };
+            Command::AlarmArm(id, alarm, on) => {
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -7843,8 +8684,9 @@ async fn run_commands(
                         // from what the player now holds rather than from what
                         // was asked for.
                         Ok(list) => {
-                            replace_alarms(&backend, list);
-                            backend.publish_pane();
+                            if replace_alarms(&backend, id, list) {
+                                backend.publish_pane();
+                            }
                         }
                         Err(e) => say(&backend.ui, format!("could not change the alarm: {e}")),
                     }
@@ -7862,6 +8704,7 @@ async fn run_commands(
                         continue;
                     };
                     page.editing = Some(found.clone());
+                    page.opened = backend.openings.fetch_add(1, Ordering::Relaxed) + 1;
                 }
                 backend.publish_pane();
                 continue;
@@ -7873,6 +8716,7 @@ async fn run_commands(
                     let Pane::Alarms(page) = &mut browsing.pane else {
                         continue;
                     };
+                    page.opened = backend.openings.fetch_add(1, Ordering::Relaxed) + 1;
                     page.editing = Some({
                         // The controller's own defaults: seven in the morning,
                         // a quarter of an hour, and a volume that does not
@@ -7949,7 +8793,13 @@ async fn run_commands(
             }
 
             Command::AlarmPick => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // The tree is the alarm's player's, not the selected one's:
+                // what is chosen from it is saved into that player's alarm.
+                let at = match &backend.browsing.lock().unwrap().pane {
+                    Pane::Alarms(page) => Some((page.device, page.top())),
+                    _ => None,
+                };
+                let Some((id, top)) = at else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -7958,23 +8808,27 @@ async fn run_commands(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     let path = bluos::client::Client::station_root().to_owned();
-                    open_picker(&backend, &client, "Plays".to_owned(), path).await;
+                    open_picker(&backend, &client, id, top, "Plays".to_owned(), path).await;
                 });
                 continue;
             }
 
             Command::AlarmPickRow(at) => {
+                // The row, and the owner and level it was pressed on, from one
+                // look at the page.
                 let chosen = {
                     let browsing = backend.browsing.lock().unwrap();
                     match &browsing.pane {
-                        Pane::Alarms(page) => page
-                            .picking
-                            .last()
-                            .and_then(|level| level.rows.rows.get(at).cloned()),
+                        Pane::Alarms(page) => page.picking.last().and_then(|level| {
+                            let row = level.rows.rows.get(at).cloned()?;
+                            Some((page.device, page.top(), row))
+                        }),
                         _ => None,
                     }
                 };
-                let Some(row) = chosen else { continue };
+                let Some((id, top, row)) = chosen else {
+                    continue;
+                };
 
                 // A leaf is the answer: it goes into the working copy and the
                 // picker comes down, all of it in the app. Nothing is sent to
@@ -8001,29 +8855,31 @@ async fn run_commands(
                     continue;
                 };
 
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
                 let backend = backend.clone();
                 tokio::spawn(async move {
-                    open_picker(&backend, &client, row.text.clone(), path).await;
+                    open_picker(&backend, &client, id, top, row.text.clone(), path).await;
                 });
                 continue;
             }
 
             Command::AlarmSave => {
+                // The copy, its owner and which opening of the editor it was
+                // taken from, all from one lock: the alarm cannot be read off
+                // one player's page and sent to the next one's, and the reply
+                // knows which editor it is the answer to.
                 let editing = {
                     let browsing = backend.browsing.lock().unwrap();
                     match &browsing.pane {
-                        Pane::Alarms(page) => page.editing.clone(),
+                        Pane::Alarms(page) => {
+                            page.editing.clone().map(|a| (page.device, page.opened, a))
+                        }
                         _ => None,
                     }
                 };
-                let Some(alarm) = editing else { continue };
-                let Some(id) = alarms_owner(&backend) else {
+                let Some((id, opened, alarm)) = editing else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -8049,13 +8905,31 @@ async fn run_commands(
                     };
                     match saved {
                         Ok(list) => {
+                            // Saved either way; the page is only put back if
+                            // it is still this player's.
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
-                                if let Pane::Alarms(page) = &mut browsing.pane {
+                                if let Pane::Alarms(page) = &mut browsing.pane
+                                    && page.device == id
+                                {
+                                    // A refreshed list is the player's
+                                    // whichever editor is up over it.
                                     page.list = list;
                                     // Back to the list: the alarm is the
-                                    // player's now, not the copy's.
-                                    page.editing = None;
+                                    // player's now, not the copy's. Only the
+                                    // editor that was saved, though — the save
+                                    // waits its turn in the writes lane and
+                                    // then makes a round trip, and an editor
+                                    // opened since is half a typed alarm the
+                                    // user is still in, not this reply's to
+                                    // throw away. The picker goes with it, or
+                                    // a level would be left drawn over no
+                                    // editor, and the source chosen on it
+                                    // dropped.
+                                    if page.opened == opened {
+                                        page.editing = None;
+                                        page.picking.clear();
+                                    }
                                 }
                             }
                             say(&backend.ui, "Alarm saved");
@@ -8068,23 +8942,25 @@ async fn run_commands(
             }
 
             Command::AlarmDelete => {
+                // The alarm, its owner and its opening from one lock, as Save
+                // does.
                 let editing = {
                     let browsing = backend.browsing.lock().unwrap();
                     match &browsing.pane {
-                        Pane::Alarms(page) => page.editing.as_ref().map(|a| a.id),
+                        Pane::Alarms(page) => page
+                            .editing
+                            .as_ref()
+                            .map(|a| (page.device, page.opened, a.id)),
                         _ => None,
                     }
                 };
                 // Nothing to delete on one that was never saved; closing the
                 // editor is the whole of it.
-                let Some(alarm) = editing.filter(|id| *id != 0) else {
+                let Some((id, opened, alarm)) = editing.filter(|(.., alarm)| *alarm != 0) else {
                     if let Pane::Alarms(page) = &mut backend.browsing.lock().unwrap().pane {
                         page.editing = None;
                     }
                     backend.publish_pane();
-                    continue;
-                };
-                let Some(id) = alarms_owner(&backend) else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
@@ -8098,9 +8974,16 @@ async fn run_commands(
                         Ok(list) => {
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
-                                if let Pane::Alarms(page) = &mut browsing.pane {
+                                if let Pane::Alarms(page) = &mut browsing.pane
+                                    && page.device == id
+                                {
                                     page.list = list;
-                                    page.editing = None;
+                                    // Only the editor the delete was pressed
+                                    // on, for the reason Save's reply gives.
+                                    if page.opened == opened {
+                                        page.editing = None;
+                                        page.picking.clear();
+                                    }
                                 }
                             }
                             say(&backend.ui, "Alarm deleted");
@@ -8121,20 +9004,20 @@ async fn run_commands(
                     browsing
                         .dialog
                         .take()
-                        .and_then(|d| d.choices.into_iter().nth(at))
+                        .and_then(|(id, d)| d.choices.into_iter().nth(at).map(|c| (id, c)))
                 };
                 backend.publish_dialog();
 
                 // Dismissed, or a button that only closes. The player writes
                 // Cancel as an action of type `nil`, so there is nothing to
                 // send and nothing to report.
-                let Some(choice) = chosen.filter(|c| !c.is_cancel()) else {
+                //
+                // Run on the player that asked, not the one selected now: the
+                // button is that player's request.
+                let Some((id, choice)) = chosen.filter(|(_, c)| !c.is_cancel()) else {
                     continue;
                 };
                 let Some(action) = choice.action else {
-                    continue;
-                };
-                let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
                 // Off the loop, like everything else that talks to a player.
@@ -8144,10 +9027,10 @@ async fn run_commands(
             }
 
             Command::ConfirmInput(go) => {
+                // On the player whose input it is, which is the one the
+                // question was about.
                 let pending = backend.browsing.lock().unwrap().pending_input.take();
-                if let (true, Some(action), Some(id)) =
-                    (go, pending, *backend.selected.lock().unwrap())
-                {
+                if let (true, Some((id, action))) = (go, pending) {
                     tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
                 }
                 continue;
@@ -8181,8 +9064,16 @@ async fn run_commands(
             }
 
             Command::OpenSettings(page, step) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // A fresh pane is the selected player's; a step from a page
+                // is the player that page belongs to, whoever is selected now.
+                // The selection is numbered either way, because a fresh pane
+                // arriving after another player was chosen is dropped.
+                let Some((selected, selection)) = backend.selection() else {
                     continue;
+                };
+                let id = match step {
+                    Step::Root => selected,
+                    Step::Deeper(owner) | Step::Reload(owner) => owner,
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
@@ -8201,18 +9092,38 @@ async fn run_commands(
                             match (&mut browsing.pane, step) {
                                 // Deeper and reload both keep whatever is under
                                 // them; only the top of the trail differs.
-                                (Pane::Settings(trail), Step::Deeper) => trail.push(page),
-                                (Pane::Settings(trail), Step::Reload) if !trail.is_empty() => {
+                                //
+                                // And only on the trail they came from. The
+                                // pane may have been left, or replaced by
+                                // another player's settings, while the page
+                                // was on its way; either way there is nothing
+                                // left for it to join, and opening a pane for
+                                // it would put one player's rows under
+                                // another's name.
+                                (Pane::Settings(owner, trail), Step::Deeper(from))
+                                    if *owner == from =>
+                                {
+                                    trail.push(page)
+                                }
+                                (Pane::Settings(owner, trail), Step::Reload(from))
+                                    if *owner == from && !trail.is_empty() =>
+                                {
                                     let top = trail.len() - 1;
                                     trail[top] = page;
                                 }
-                                _ => browsing.pane = Pane::Settings(vec![page]),
+                                (_, Step::Deeper(_) | Step::Reload(_)) => return,
+                                // Checked under the same lock as the write, for
+                                // the reason on `Backend::still_selected`.
+                                (_, Step::Root) if !backend.still_selected(selection) => {
+                                    return;
+                                }
+                                (_, Step::Root) => browsing.pane = Pane::Settings(id, vec![page]),
                             }
                             // Settings and Help are rows of their own below the
                             // list, so nothing in the list is where you are any
                             // more. Leaving the last screen lit says you are on a
                             // screen you are not looking at.
-                            browsing.highlighted = None;
+                            browsing.highlighted.clear();
                             drop(browsing);
                             backend.publish_sidebar();
                             // See the note on `OpenHelp`: the pane flags are
@@ -8248,7 +9159,7 @@ async fn run_commands(
             }
 
             Command::TrackAction(name) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some((id, selection)) = backend.selection() else {
                     continue;
                 };
                 // Read the URL now rather than carrying it from when the
@@ -8272,10 +9183,7 @@ async fn run_commands(
                     match client.follow(&url).await {
                         // Some of these open a shop, and the player asks
                         // before it sends anybody anywhere.
-                        Ok(Some(dialog)) => {
-                            backend.browsing.lock().unwrap().dialog = Some(dialog);
-                            backend.publish_dialog();
-                        }
+                        Ok(Some(dialog)) => offer_dialog(&backend, id, selection, dialog),
                         // Nothing said: the next status carries the new state
                         // and the button redraws itself from it.
                         Ok(None) => {}
@@ -8403,7 +9311,7 @@ async fn run_commands(
                         None => continue,
                     }
                 };
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                let Some((id, selection)) = backend.selection() else {
                     say(&backend.ui, "No player is selected");
                     continue;
                 };
@@ -8416,10 +9324,7 @@ async fn run_commands(
                         // The player asks before discarding a queue, and the
                         // question has to reach somebody: answering it either
                         // way from here is deciding for them.
-                        Ok(Some(dialog)) => {
-                            backend.browsing.lock().unwrap().dialog = Some(dialog);
-                            backend.publish_dialog();
-                        }
+                        Ok(Some(dialog)) => offer_dialog(&backend, id, selection, dialog),
                         Ok(None) => say(
                             &backend.ui,
                             format!(
@@ -8440,19 +9345,19 @@ async fn run_commands(
             Command::SettingEdit(_, Edit::Text(name))
                 if matches!(backend.browsing.lock().unwrap().pane, Pane::EditPreset(_)) =>
             {
-                let asked = {
+                // Sent to the player the preset belongs to. A rename is a
+                // whole-slot replace, so on any other player it would overwrite
+                // a preset rather than rename one.
+                let (id, asked) = {
                     let browsing = backend.browsing.lock().unwrap();
                     let Pane::EditPreset(page) = &browsing.pane else {
                         continue;
                     };
                     let mut preset = page.preset.clone();
                     preset.name = name.trim().to_owned();
-                    (page.slot, preset)
+                    (page.device, (page.slot, preset))
                 };
 
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -8493,7 +9398,7 @@ async fn run_commands(
                         let _ = backend.commands.send(Command::HelpAction(index));
                         continue;
                     }
-                    Pane::Web(_) => {
+                    Pane::Web(..) => {
                         let _ = backend.commands.send(Command::WebAction(index));
                         continue;
                     }
@@ -8508,38 +9413,68 @@ async fn run_commands(
                     _ => {}
                 }
 
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // The row index counts groups-that-are-links and settings, in
+                // the order settings_rows walks them, so the same walk finds it.
+                //
+                // The player comes off the pane with the page, under the same
+                // lock: the rows are that player's, and so is every write and
+                // every step deeper that a press on one of them makes.
+                let owned = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .pane
+                        .settings_owned()
+                        .map(|(owner, page)| (owner, page.clone(), pick(page, index)))
+                };
+                let Some((id, page, chosen)) = owned else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                // The row index counts groups-that-are-links and settings, in
-                // the order settings_rows walks them, so the same walk finds it.
-                let chosen = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    browsing.pane.settings().and_then(|page| pick(page, index))
-                };
 
                 match chosen {
-                    Some(Chosen::Page(id)) => {
+                    Some(Chosen::Page(deeper)) => {
                         let _ = backend
                             .commands
-                            .send(Command::OpenSettings(Some(id), Step::Deeper));
+                            .send(Command::OpenSettings(Some(deeper), Step::Deeper(id)));
                     }
                     Some(Chosen::Alarms) => {
-                        let _ = backend.commands.send(Command::OpenAlarms);
+                        let _ = backend.commands.send(Command::OpenAlarms(id));
                     }
                     Some(Chosen::Sleep) => {
                         let _ = backend.commands.send(Command::Player(id, Action::Sleep));
                     }
                     Some(Chosen::Web(url)) => {
+                        // Resolved against the player's own web UI and held to
+                        // its host, the way OpenForm's fallback is. The
+                        // attribute is the player's to write, and it went to
+                        // the desktop's opener as written: a relative path
+                        // opened nothing, and a rogue device could name
+                        // anything the desktop has a handler for.
+                        let url = match client.web_url(&url) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                tracing::warn!(%id, "refusing to open {url}: {e}");
+                                say(&backend.ui, "That page is not on this player");
+                                continue;
+                            }
+                        };
                         // Except the share configuration, which is a list of
                         // what is mounted and a button to unmount it. That is
                         // worth drawing; the page that adds one asks for a
                         // password and is not.
+                        //
+                        // Both of these are this page's player's, like the
+                        // URL they came from: resolved through its client,
+                        // then read from whoever is selected, they were a
+                        // second player's shares and wireless form under the
+                        // first player's settings.
                         if url.contains("/sharecfg") {
-                            let _ = backend.commands.send(Command::OpenShares);
+                            let _ = backend.commands.send(Command::OpenShares {
+                                device: id,
+                                reload: false,
+                            });
                             continue;
                         }
                         // Joining a wireless network: a list of what the player
@@ -8551,6 +9486,7 @@ async fn run_commands(
                             && path.starts_with("wificfg")
                         {
                             let _ = backend.commands.send(Command::OpenForm {
+                                device: id,
                                 title: "WiFi".to_owned(),
                                 path: format!("/{path}"),
                             });
@@ -8559,39 +9495,36 @@ async fn run_commands(
                         open_in_browser(&backend.ui, url).await;
                     }
                     Some(Chosen::Write(setting, value)) => {
-                        let page = backend.browsing.lock().unwrap().pane.settings().cloned();
-                        if let Some(page) = page {
-                            // Off the loop and in order, for the reason on
-                            // `SettingEdit`.
-                            let mut ticket = backend.writes.enter();
-                            let backend = backend.clone();
-                            tokio::spawn(async move {
-                                ticket.wait().await;
-                                match client.write_setting(&setting, &value).await {
-                                    Ok(()) => {
-                                        // A button leaves nothing behind on the
-                                        // page it was pressed on — no toggle moves,
-                                        // no value changes — so without a word it
-                                        // is indistinguishable from a dead control.
-                                        // Reindexing takes minutes before the
-                                        // player admits it started.
-                                        if setting.kind == Kind::Button {
-                                            say(&backend.ui, format!("{}…", setting.label()));
-                                        }
-                                        // Re-read rather than guess: a write can
-                                        // change more than the one value, and the
-                                        // player is the only one who knows.
-                                        let _ = backend.commands.send(Command::OpenSettings(
-                                            page.page_id.clone(),
-                                            Step::Reload,
-                                        ));
+                        // Off the loop and in order, for the reason on
+                        // `SettingEdit`.
+                        let mut ticket = backend.writes.enter();
+                        let backend = backend.clone();
+                        tokio::spawn(async move {
+                            ticket.wait().await;
+                            match client.write_setting(&setting, &value).await {
+                                Ok(()) => {
+                                    // A button leaves nothing behind on the
+                                    // page it was pressed on — no toggle moves,
+                                    // no value changes — so without a word it
+                                    // is indistinguishable from a dead control.
+                                    // Reindexing takes minutes before the
+                                    // player admits it started.
+                                    if setting.kind == Kind::Button {
+                                        say(&backend.ui, format!("{}…", setting.label()));
                                     }
-                                    Err(e) => {
-                                        say(&backend.ui, format!("{}: {e}", setting.label()));
-                                    }
+                                    // Re-read rather than guess: a write can
+                                    // change more than the one value, and the
+                                    // player is the only one who knows.
+                                    let _ = backend.commands.send(Command::OpenSettings(
+                                        page.page_id.clone(),
+                                        Step::Reload(id),
+                                    ));
                                 }
-                            });
-                        }
+                                Err(e) => {
+                                    say(&backend.ui, format!("{}: {e}", setting.label()));
+                                }
+                            }
+                        });
                     }
                     None => {}
                 }
@@ -8602,7 +9535,7 @@ async fn run_commands(
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
                     browsing.pane = Pane::Help;
-                    browsing.highlighted = None;
+                    browsing.highlighted.clear();
                 }
                 backend.publish_sidebar();
                 // `publish_pane`, not `publish_help`: it draws the same rows
@@ -8617,7 +9550,15 @@ async fn run_commands(
             }
 
             Command::HelpAction(index) if index == UPGRADE_ROW => {
-                let _ = backend.commands.send(Command::UpgradeAsk);
+                // Off the page pressed, which says whose check found the
+                // update. A page without an offer has no Install to press.
+                let offer = match &backend.browsing.lock().unwrap().pane {
+                    Pane::HelpDetail(_, _, _, offer) => *offer,
+                    _ => None,
+                };
+                if let Some(id) = offer {
+                    let _ = backend.commands.send(Command::UpgradeAsk(id));
+                }
                 continue;
             }
 
@@ -8627,7 +9568,14 @@ async fn run_commands(
                     continue;
                 };
                 // The selection out first; see the note on `Backend`.
-                let selected = *backend.selected.lock().unwrap();
+                //
+                // Numbered, because both pages below land a round trip or two
+                // after the press and Help stays up when another player is
+                // chosen. Put up then, the first player's version and update
+                // status sat under the second one's name, with an Install that
+                // would start the second player's upgrade.
+                let selection = backend.selection();
+                let selected = selection.map(|(id, _)| id);
                 let client = selected.and_then(|id| backend.with_entry(id, |e| e.client.clone()));
 
                 // Off the loop, for the reason spelled out on `BrowseHome`.
@@ -8650,11 +9598,22 @@ async fn run_commands(
                             let Some(client) = client else { return };
                             match client.diagnostics().await {
                                 Ok(facts) if !facts.is_empty() => {
-                                    backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
-                                        "Diagnostics".to_owned(),
-                                        facts,
-                                        Whence::Help,
-                                    );
+                                    {
+                                        let mut browsing = backend.browsing.lock().unwrap();
+                                        // With the lock held, for the reason
+                                        // on `Backend::still_selected`.
+                                        if !selection
+                                            .is_some_and(|(_, n)| backend.still_selected(n))
+                                        {
+                                            return;
+                                        }
+                                        browsing.pane = Pane::HelpDetail(
+                                            "Diagnostics".to_owned(),
+                                            facts,
+                                            Whence::Help,
+                                            None,
+                                        );
+                                    }
                                     // As above: asking the player takes as
                                     // long as it takes, and the sidebar is
                                     // live throughout.
@@ -8663,6 +9622,13 @@ async fn run_commands(
                                 // The page is the player's own HTML, so it can
                                 // change under us; offer it rather than nothing.
                                 _ => {
+                                    // Held to the rule the page above is, as
+                                    // the services fallback is: a browser is a
+                                    // window too, and this is the first
+                                    // player's page over the second's name.
+                                    if !selection.is_some_and(|(_, n)| backend.still_selected(n)) {
+                                        return;
+                                    }
                                     let url = client.image_url("/redirectToCp?href=/diagnostics");
                                     open_in_browser(&backend.ui, url).await;
                                 }
@@ -8749,12 +9715,19 @@ async fn run_commands(
 
                             {
                                 let mut browsing = backend.browsing.lock().unwrap();
+                                // As for Diagnostics above.
+                                if !selection.is_some_and(|(_, n)| backend.still_selected(n)) {
+                                    return;
+                                }
+                                // The offer goes up as part of the page and
+                                // names the player checked, so it cannot
+                                // outlive this page or be read for another.
                                 browsing.pane = Pane::HelpDetail(
                                     "Upgrade Check".to_owned(),
                                     facts,
                                     Whence::Help,
+                                    selected.filter(|_| offer),
                                 );
-                                browsing.can_upgrade = offer;
                             }
                             // And this one waits on two round trips.
                             backend.publish_pane();
@@ -8771,10 +9744,11 @@ async fn run_commands(
                 continue;
             }
 
-            Command::OpenForm { title, path } => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
+            Command::OpenForm {
+                device: id,
+                title,
+                path,
+            } => {
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -8782,12 +9756,19 @@ async fn run_commands(
                 // its wireless page makes it scan for access points first, and
                 // that is three and a half seconds of a window that looks like
                 // it ignored the press.
-                show_form(
+                //
+                // Over the page it was chosen on and nothing else; if that has
+                // gone there is no press left to answer.
+                let Some(opened) = show_form(
                     &backend,
+                    id,
+                    Replacing::Page,
                     title.clone(),
                     bluos::forms::Form::default(),
                     "Reading the page…".to_owned(),
-                );
+                ) else {
+                    continue;
+                };
 
                 // Off the loop, for the reason spelled out on `BrowseHome`:
                 // awaiting the round trip here stops the loop reading its
@@ -8799,7 +9780,14 @@ async fn run_commands(
                 tokio::spawn(async move {
                     match client.web_form(&path).await {
                         Ok(Some(form)) => {
-                            show_form(&backend, title, form, String::new());
+                            show_form(
+                                &backend,
+                                id,
+                                Replacing::Form(opened),
+                                title,
+                                form,
+                                String::new(),
+                            );
                         }
                         // No form on it, or a shape this crate cannot read. The
                         // page itself still works, so offer that rather than
@@ -8809,8 +9797,14 @@ async fn run_commands(
                                 tracing::debug!(%id, "could not read {path}: {e}");
                             }
                             // Nothing here to draw, so put the page itself up and
-                            // leave the placeholder behind.
-                            backend.browsing.lock().unwrap().pane = Pane::Browse;
+                            // leave the placeholder behind — if it is still the
+                            // pane showing, and back on the page it was opened
+                            // from. Whatever replaced it in the meantime is not
+                            // this press's to take away, and neither is it to
+                            // open a browser over.
+                            if !close_form(&backend, id, opened) {
+                                return;
+                            }
                             backend.publish_pane();
                             match client.web_url(&path) {
                                 Ok(url) => {
@@ -8863,13 +9857,9 @@ async fn run_commands(
             }
 
             Command::FormPress(at) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                    continue;
-                };
-
+                // Submitted to the player that served the form, read off the
+                // page under the same lock as what is sent: see
+                // `FormPage::device`.
                 let sending = {
                     let browsing = backend.browsing.lock().unwrap();
                     let Some(page) = browsing.pane.form() else {
@@ -8878,6 +9868,8 @@ async fn run_commands(
                     let first = usize::from(!page.note.is_empty()) + page.form.fields.len();
                     page.form.submits.get(at.wrapping_sub(first)).map(|submit| {
                         (
+                            page.device,
+                            page.opened,
                             page.title.clone(),
                             page.form.clone(),
                             page.values.clone(),
@@ -8885,7 +9877,10 @@ async fn run_commands(
                         )
                     })
                 };
-                let Some((title, form, values, submit)) = sending else {
+                let Some((id, opened, title, form, values, submit)) = sending else {
+                    continue;
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
 
@@ -8904,7 +9899,14 @@ async fn run_commands(
                             // screen lead to another without knowing the route.
                             match bluos::forms::parse(&body).into_iter().next() {
                                 Some(next) => {
-                                    show_form(&backend, title, next, bluos::reports::message(&body))
+                                    show_form(
+                                        &backend,
+                                        id,
+                                        Replacing::Form(opened),
+                                        title,
+                                        next,
+                                        bluos::reports::message(&body),
+                                    );
                                 }
                                 None => {
                                     let said = bluos::reports::message(&body);
@@ -8916,7 +9918,10 @@ async fn run_commands(
                                             said
                                         },
                                     );
-                                    backend.browsing.lock().unwrap().pane = Pane::Browse;
+                                    // Off the form it answered, and only that,
+                                    // back to the page it was opened from —
+                                    // read again, since the submit changed it.
+                                    close_answered_form(&backend, id, opened);
                                     backend.publish_pane();
                                 }
                             }
@@ -8938,18 +9943,31 @@ async fn run_commands(
                     continue;
                 }
 
-                let Some(id) = *backend.selected.lock().unwrap() else {
+                // The player the page came from, read with the page: the
+                // setting names its own URL and field, and they are that
+                // player's.
+                let owned = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .pane
+                        .settings_owned()
+                        .map(|(owner, page)| (owner, page.clone()))
+                };
+                let Some((id, page)) = owned else {
                     continue;
                 };
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                let Some(page) = backend.browsing.lock().unwrap().pane.settings().cloned() else {
-                    continue;
-                };
                 let Some(setting) = setting_at(&page, index) else {
                     continue;
                 };
+                // Not written while the player has it dimmed, for the reason
+                // on `pick`: the disabled control is one way in, not the only
+                // one.
+                if !page.is_available(&setting) {
+                    continue;
+                }
 
                 let value = match edit {
                     Edit::Toggle => setting.toggled(),
@@ -8978,9 +9996,10 @@ async fn run_commands(
                             // than the one value — turning tone controls on
                             // brings treble and bass to life — and only the
                             // player knows.
-                            let _ = backend
-                                .commands
-                                .send(Command::OpenSettings(page.page_id.clone(), Step::Reload));
+                            let _ = backend.commands.send(Command::OpenSettings(
+                                page.page_id.clone(),
+                                Step::Reload(id),
+                            ));
                         }
                         Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
                     }
@@ -8992,8 +10011,24 @@ async fn run_commands(
                 let Some(id) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
+                // Every entry below is read out of the player's configuration
+                // — the screens it lists, the rows of its Sources screen — and
+                // run on `id`. Those are the last player's until this one's
+                // configuration arrives, and for as long as it is chosen when
+                // it cannot give one: pressing an input there sent the other
+                // player's capture path to this speaker and stopped it.
+                //
+                // Refused, and the configuration asked for again. A player
+                // that was waking up may well answer the second time, and one
+                // request per press cannot become a loop.
+                let configured = backend.browsing.lock().unwrap().configured == Some(id);
+                if !configured {
+                    say(&backend.ui, "This player has not said what it offers yet");
+                    let _ = backend.commands.send(Command::BrowseHome);
+                    continue;
+                }
                 if kind != 2 {
-                    backend.browsing.lock().unwrap().highlighted = Some((kind, index));
+                    backend.browsing.lock().unwrap().light(id, (kind, index));
                     backend.publish_sidebar();
 
                     // Pressing anything in the sidebar means leaving whatever
@@ -9078,6 +10113,10 @@ async fn run_commands(
                 // Typing is the search; there is no Enter to wait for. Held
                 // back until the typing settles so a word costs one request,
                 // and numbered so that only the last one asked for lands.
+                //
+                // The selection is read now, as the key is typed, rather than
+                // once the typing settles; see `run_search`.
+                let selection = backend.selection();
                 let generation = backend.searches.fetch_add(1, Ordering::Relaxed) + 1;
                 let backend = backend.clone();
                 tokio::spawn(async move {
@@ -9085,7 +10124,7 @@ async fn run_commands(
                     if backend.searches.load(Ordering::Relaxed) != generation {
                         return;
                     }
-                    run_search(backend, query).await;
+                    run_search(backend, query, selection).await;
                 });
                 continue;
             }
@@ -9166,17 +10205,28 @@ async fn run_commands(
             }
 
             Command::QueueButton(at) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
-                let action = backend
+                let selected = *backend.selected.lock().unwrap();
+                // The button is run on the player whose document it came
+                // from, and only while that is the queue on screen. Otherwise
+                // the press was on a row drawn before the selection moved, and
+                // its index means nothing in whatever is there now.
+                let Some((id, action)) = backend
                     .browsing
                     .lock()
                     .unwrap()
                     .queue_screen
                     .as_ref()
-                    .and_then(|screen| screen.buttons.get(at))
-                    .and_then(|button| button.action.clone());
+                    .filter(|(owner, _)| Some(*owner) == selected)
+                    .map(|(owner, screen)| {
+                        let action = screen
+                            .buttons
+                            .get(at)
+                            .and_then(|button| button.action.clone());
+                        (*owner, action)
+                    })
+                else {
+                    continue;
+                };
 
                 // Queue Builder Mode is kept here, not on the player. The call
                 // still goes out — another controller may be listening for it
@@ -9217,10 +10267,8 @@ async fn run_commands(
                 continue;
             }
 
-            Command::OpenServices => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
+            Command::OpenServices { device: id, reload } => {
+                let selection = backend.selection_of(id);
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -9235,8 +10283,23 @@ async fn run_commands(
                     match client.services().await {
                         Ok(services) if !services.is_empty() => {
                             let mut browsing = backend.browsing.lock().unwrap();
-                            browsing.pane = Pane::Web(WebPage::Services(services));
-                            browsing.highlighted = None;
+                            // See `Backend::may_open_for`. A sign-in form
+                            // opened off this list goes to the player it is
+                            // drawn for, so it must not be drawn over another.
+                            // A reload only over the list it is reading again.
+                            let may = if reload {
+                                matches!(
+                                    &browsing.pane,
+                                    Pane::Web(owner, WebPage::Services(_)) if *owner == id
+                                )
+                            } else {
+                                backend.may_open_for(&browsing, id, selection)
+                            };
+                            if !may {
+                                return;
+                            }
+                            browsing.pane = Pane::Web(id, WebPage::Services(services));
+                            browsing.highlighted.clear();
                             drop(browsing);
                             backend.publish_sidebar();
                             // `publish_pane`, not `publish_web`: this lands
@@ -9252,6 +10315,22 @@ async fn run_commands(
                             if let Err(e) = other {
                                 tracing::debug!(%id, "could not read the services page: {e}");
                             }
+                            // Not for a reload, which nobody asked a window
+                            // for. The list already up stays as it is.
+                            if reload {
+                                return;
+                            }
+                            // Held to the same rule as the list it stands in
+                            // for. A browser is a window too, and one opened
+                            // on this player's page after another has been
+                            // chosen is this player's page over that one's.
+                            let may = {
+                                let browsing = backend.browsing.lock().unwrap();
+                                backend.may_open_for(&browsing, id, selection)
+                            };
+                            if !may {
+                                return;
+                            }
                             // A constant, so this cannot be off-player.
                             if let Ok(url) = client.web_url("/services?noheader=1") {
                                 open_in_browser(&backend.ui, url).await;
@@ -9262,10 +10341,8 @@ async fn run_commands(
                 continue;
             }
 
-            Command::OpenShares => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
+            Command::OpenShares { device: id, reload } => {
+                let selection = backend.selection_of(id);
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
@@ -9280,8 +10357,20 @@ async fn run_commands(
                     match client.shares().await {
                         Ok((action, shares)) => {
                             let mut browsing = backend.browsing.lock().unwrap();
-                            browsing.pane = Pane::Web(WebPage::Shares { action, shares });
-                            browsing.highlighted = None;
+                            // As for the services page above.
+                            let may = if reload {
+                                matches!(
+                                    &browsing.pane,
+                                    Pane::Web(owner, WebPage::Shares { .. }) if *owner == id
+                                )
+                            } else {
+                                backend.may_open_for(&browsing, id, selection)
+                            };
+                            if !may {
+                                return;
+                            }
+                            browsing.pane = Pane::Web(id, WebPage::Shares { action, shares });
+                            browsing.highlighted.clear();
                             drop(browsing);
                             backend.publish_sidebar();
                             // As for the services page above.
@@ -9289,6 +10378,17 @@ async fn run_commands(
                         }
                         Err(e) => {
                             tracing::debug!(%id, "could not read the shares page: {e}");
+                            // As for the services page above.
+                            if reload {
+                                return;
+                            }
+                            let may = {
+                                let browsing = backend.browsing.lock().unwrap();
+                                backend.may_open_for(&browsing, id, selection)
+                            };
+                            if !may {
+                                return;
+                            }
                             // A constant, so this cannot be off-player.
                             if let Ok(url) = client.web_url("/sharecfg?noheader=1") {
                                 open_in_browser(&backend.ui, url).await;
@@ -9300,22 +10400,21 @@ async fn run_commands(
             }
 
             Command::WebAction(at) => {
-                let Some(id) = *backend.selected.lock().unwrap() else {
-                    continue;
-                };
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-                    continue;
-                };
-
                 enum Press {
                     /// A page with a form on it, filled in here.
                     Form(String, String),
                     Remove(String, String),
                 }
 
-                let press = {
+                // The player the page was read from, with the row, under one
+                // lock: a share's field is that player's, and so is the form
+                // behind a service.
+                let (id, press) = {
                     let browsing = backend.browsing.lock().unwrap();
-                    match browsing.pane.web() {
+                    let Some(id) = browsing.pane.owner() else {
+                        continue;
+                    };
+                    let press = match browsing.pane.web() {
                         Some(WebPage::Services(services)) => services
                             .get(at)
                             .map(|service| Press::Form(service.name.clone(), service.href.clone())),
@@ -9332,7 +10431,11 @@ async fn run_commands(
                             )),
                         },
                         None => None,
-                    }
+                    };
+                    (id, press)
+                };
+                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                    continue;
                 };
 
                 // Off the loop, but in order: unmounting two shares one after
@@ -9344,7 +10447,11 @@ async fn run_commands(
                     ticket.wait().await;
                     match press {
                         Some(Press::Form(title, path)) => {
-                            let _ = backend.commands.send(Command::OpenForm { title, path });
+                            let _ = backend.commands.send(Command::OpenForm {
+                                device: id,
+                                title,
+                                path,
+                            });
                         }
                         Some(Press::Remove(action, field)) => {
                             match client
@@ -9353,7 +10460,10 @@ async fn run_commands(
                             {
                                 Ok(()) => {
                                     say(&backend.ui, "Share removed");
-                                    let _ = backend.commands.send(Command::OpenShares);
+                                    let _ = backend.commands.send(Command::OpenShares {
+                                        device: id,
+                                        reload: true,
+                                    });
                                 }
                                 Err(e) => {
                                     say(&backend.ui, format!("could not remove {field}: {e}"))
@@ -9376,13 +10486,17 @@ async fn run_commands(
                 // Through the player's own menu rather than by building a
                 // request: it already offers Technical info for whatever is
                 // playing, and it knows the file name this app never sees.
-                let uri = backend
-                    .browsing
-                    .lock()
-                    .unwrap()
-                    .now_playing_menu
-                    .clone()
-                    .unwrap_or_else(|| "/ui/nowPlayingCM".to_owned());
+                //
+                // This player's own address or the default, as for a queue
+                // row's menu.
+                let uri = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing
+                        .now_playing_menu
+                        .clone()
+                        .filter(|_| browsing.configured == Some(id))
+                }
+                .unwrap_or_else(|| "/ui/nowPlayingCM".to_owned());
 
                 // Off the loop, for the reason spelled out on `BrowseHome`.
                 // This one is two round trips deep — the menu, then whatever
@@ -9504,22 +10618,50 @@ async fn run_commands(
             }
 
             Command::OpenSearch => {
+                // Read and let go before the trail is taken, as everywhere.
+                let Some(id) = *backend.selected.lock().unwrap() else {
+                    continue;
+                };
+                // The address is the configured player's, and it is opened on
+                // that player, so it has to be the one selected. Refused the
+                // way a sidebar press is, and before anything is lit: lighting
+                // the last player's Search and then leaving `open_screen` to
+                // decline left the entry lit over that player's Home, and
+                // still lit when it was chosen back.
+                let configured = backend.browsing.lock().unwrap().configured == Some(id);
+                if !configured {
+                    say(&backend.ui, "This player has not said what it offers yet");
+                    let _ = backend.commands.send(Command::BrowseHome);
+                    continue;
+                }
                 let target = {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    let uri = browsing.search_uri.clone();
+                    let uri = browsing
+                        .search_uri
+                        .clone()
+                        .filter(|_| browsing.configured == Some(id));
                     // Light its row, exactly as pressing it would. Reaching a
                     // screen by keyboard and by hand has to leave the sidebar
                     // saying the same thing, or it goes on pointing at Home
                     // while Search is what is on the screen.
+                    //
+                    // Lit for and opened on `id`, the player whose address
+                    // this is, as a sidebar press is — not on the player whose
+                    // screens are showing. The two differ from the moment one
+                    // player's configuration lands until its Home does, and
+                    // for good if that Home never comes: lighting the last
+                    // player's entry with this one's position lit Search over
+                    // that player's Home once it was chosen back, and opening
+                    // on it was declined, so the key did nothing at all.
                     if let Some(at) = uri
                         .as_ref()
                         .and_then(|uri| browsing.screens.iter().position(|(_, u)| u == uri))
                     {
-                        browsing.highlighted = Some((0, at as i32));
+                        browsing.light(id, (0, at as i32));
                     }
-                    uri.zip(browsing.device)
+                    uri
                 };
-                if let Some((uri, id)) = target {
+                if let Some(uri) = target {
                     backend.publish_sidebar();
                     // Deeper, not Root. Pressing Search in the sidebar means
                     // "start here" and clears the trail, but reaching it with a
@@ -9735,15 +10877,25 @@ async fn run_commands(
             }
 
             Command::BrowseHeader(at) => {
+                // "Play all" plays on the player browsed, so only while that is
+                // the one selected: see `Backend::browsing_selected`.
+                let selection = backend.selection();
                 let found = {
                     let browsing = backend.browsing.lock().unwrap();
-                    browsing.device.zip(
-                        browsing
-                            .current()
-                            .and_then(|screen| screen.header.as_ref())
-                            .and_then(|header| header.buttons.get(at))
-                            .and_then(|button| button.action.clone()),
-                    )
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        let showing = browsing.device.is_some();
+                        drop(browsing);
+                        if showing {
+                            refuse_other_players_screen(&backend);
+                        }
+                        continue;
+                    };
+                    browsing
+                        .current()
+                        .and_then(|screen| screen.header.as_ref())
+                        .and_then(|header| header.buttons.get(at))
+                        .and_then(|button| button.action.clone())
+                        .map(|action| (id, action))
                 };
                 if let Some((id, action)) = found {
                     tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
@@ -9752,25 +10904,34 @@ async fn run_commands(
             }
 
             Command::BrowseSection(at) => {
+                // As for the header's buttons above.
+                let selection = backend.selection();
                 let found = {
                     let browsing = backend.browsing.lock().unwrap();
-                    browsing.device.zip(
-                        browsing
-                            .current()
-                            .and_then(|screen| screen.sections.get(at))
-                            .and_then(|section| {
-                                // An empty section is its own action; a shelf
-                                // with content puts one on its heading instead.
-                                if section.items.is_empty() {
-                                    section.action.clone()
-                                } else {
-                                    section
-                                        .menu_actions
-                                        .first()
-                                        .and_then(|menu| menu.action.clone())
-                                }
-                            }),
-                    )
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        let showing = browsing.device.is_some();
+                        drop(browsing);
+                        if showing {
+                            refuse_other_players_screen(&backend);
+                        }
+                        continue;
+                    };
+                    browsing
+                        .current()
+                        .and_then(|screen| screen.sections.get(at))
+                        .and_then(|section| {
+                            // An empty section is its own action; a shelf
+                            // with content puts one on its heading instead.
+                            if section.items.is_empty() {
+                                section.action.clone()
+                            } else {
+                                section
+                                    .menu_actions
+                                    .first()
+                                    .and_then(|menu| menu.action.clone())
+                            }
+                        })
+                        .map(|action| (id, action))
                 };
                 if let Some((id, action)) = found {
                     tokio::spawn(run_action(backend.clone(), id, action, Arrive::Deeper));
@@ -9886,18 +11047,17 @@ async fn run_commands(
 
                 // The presets are the player's, so their new order is a
                 // request rather than a file.
-                if let Some(prid) = arranged.2 {
+                if let Some((owner, prid)) = arranged.2 {
                     let slots: Vec<u32> =
                         arranged.1.iter().filter_map(|id| id.parse().ok()).collect();
                     let moves = bluos::screen::reordering(&slots);
 
-                    let addressed =
-                        (slots.len() == arranged.1.len())
-                            .then_some(())
-                            .and_then(|()| {
-                                let id = (*backend.selected.lock().unwrap())?;
-                                backend.with_entry(id, |e| e.client.clone())
-                            });
+                    // To the player the slots were read from, not whichever
+                    // is selected now: the permutation only means anything
+                    // against the list it was made from.
+                    let addressed = (slots.len() == arranged.1.len())
+                        .then(|| backend.with_entry(owner, |e| e.client.clone()))
+                        .flatten();
                     let Some(client) = addressed else {
                         // Refusing rather than sending part of it: every slot
                         // has to be in the permutation or the ones left out
@@ -10064,19 +11224,29 @@ async fn run_commands(
 /// a word the press reads as having done nothing, which is exactly the
 /// complaint the queue menu used to draw.
 async fn open_in_browser(ui: &slint::Weak<AppWindow>, url: String) {
+    // Web pages and nothing else. `open` hands whatever it is given to the
+    // desktop's handler for that scheme, so `file://` opens a local file,
+    // `smb://` mounts a share, and every other registered protocol is a
+    // program started on a player's say-so. Checked here rather than at each
+    // call site, because a call site that forgot was exactly how a settings
+    // row came to reach this with whatever its `<webview>` said.
+    let Some(parsed) = web_page(&url) else {
+        tracing::warn!("refusing to open {url}: not a web page");
+        say(ui, "That link is not a web page");
+        return;
+    };
     tracing::info!("opening {url} in a browser");
 
-    // Named in the message rather than left to the user to guess. Two of these
-    // call sites carry a URL the player chose, unfiltered — the Info link and
-    // the webpage action — and a controller sending a browser somewhere on an
-    // adopted player's say-so should at least say where. Sign-in pages are
-    // genuinely on someone else's site, so refusing off-player destinations
-    // outright would break what this is for; showing them costs nothing.
-    let host = reqwest::Url::parse(&url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned));
+    // Named in the message rather than left to the user to guess. Several of
+    // these call sites carry a URL the player chose — the Info link and the
+    // webpage action anywhere at all, a settings `<webview>` only on the
+    // player — and a controller sending a browser somewhere on an adopted
+    // player's say-so should at least say where. Sign-in pages are genuinely
+    // on someone else's site, so refusing off-player destinations outright
+    // would break what this is for; showing them costs nothing.
+    let host = parsed.host_str().map(str::to_owned);
 
-    match tokio::task::spawn_blocking(move || open::that_detached(url)).await {
+    match tokio::task::spawn_blocking(move || launch_browser(url)).await {
         Ok(Ok(())) => match host {
             Some(host) => say(ui, format!("Opened {host} in your browser")),
             None => say(ui, "Opened in your browser"),
@@ -10090,6 +11260,59 @@ async fn open_in_browser(ui: &slint::Weak<AppWindow>, url: String) {
         Err(e) => {
             tracing::warn!("browser launch did not finish: {e}");
             say(ui, "Could not open your browser");
+        }
+    }
+}
+
+/// Hand a checked web page to the desktop.
+#[cfg(not(test))]
+fn launch_browser(url: String) -> std::io::Result<()> {
+    open::that_detached(url)
+}
+
+/// The pages tests would have opened in a browser.
+///
+/// Written down instead of opened. A test that reaches a browser fallback must
+/// not start a browser on the machine running it, and a fallback taken where
+/// it should not be is what some of them look for.
+#[cfg(test)]
+static OPENED_IN_BROWSER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn launch_browser(url: String) -> std::io::Result<()> {
+    OPENED_IN_BROWSER.lock().unwrap().push(url);
+    Ok(())
+}
+
+/// The URL, if it is something a browser is for: http or https, with a host.
+fn web_page(url: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(url)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+}
+
+#[cfg(test)]
+mod web_page_tests {
+    use super::web_page;
+
+    /// What reaches the desktop's opener. A player picks several of these
+    /// URLs, and the opener starts whatever handles the scheme.
+    #[test]
+    fn only_a_web_page_goes_to_the_browser() {
+        // Off the player is fine: sign-in pages live on the service's site.
+        assert!(web_page("https://accounts.example.com/signin").is_some());
+        assert!(web_page("http://10.0.0.155/sharecfg?noheader=1").is_some());
+
+        for url in [
+            "file:///etc/passwd",
+            "smb://10.0.0.155/share",
+            "ms-settings:network",
+            "javascript:alert(1)",
+            "/sharecfg?noheader=1",
+            "http://",
+            "",
+        ] {
+            assert!(web_page(url).is_none(), "{url:?} would have been opened");
         }
     }
 }
@@ -11249,5 +12472,2169 @@ mod tests {
         assert_eq!(quality_label("128kbps"), "128KBPS", "not a bare number");
         assert_eq!(quality_label("-1"), "-1");
         assert_eq!(quality_label("1.5"), "1.5");
+    }
+}
+
+/// Replies that come back for a player after another has been chosen.
+///
+/// Driven through the command loop rather than by calling `open_screen` with
+/// the answer already in hand, because the fault lived in the gap between the
+/// two: a `Select` handled while a reply was still out.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use fake_player::{Player, fixtures};
+
+    /// A backend with no window behind it.
+    ///
+    /// Every publish goes through `invoke_from_event_loop`, which answers
+    /// `NoEventLoopProvider` where there is no event loop and does nothing
+    /// else, so the browsing state is what a test reads. Nothing here reads or
+    /// writes the user's own config or cache: the orders and recent searches
+    /// start empty, and the artwork cache is kept in memory.
+    fn backend(http: &reqwest::Client) -> (Backend, mpsc::UnboundedReceiver<Command>) {
+        let (commands, rx) = mpsc::unbounded_channel();
+        let backend = Backend {
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            selected: Arc::new(Mutex::new(None)),
+            selections: Arc::new(AtomicU64::new(0)),
+            commands,
+            ui: slint::Weak::default(),
+            artwork: Arc::new(Artwork::in_memory(http.clone(), Default::default())),
+            browsing: Arc::new(Mutex::new(Browsing::default())),
+            known: Arc::new(Mutex::new(Vec::new())),
+            writes: Arc::new(lane::Lane::default()),
+            searches: Arc::new(AtomicU64::new(0)),
+            forms: Arc::new(AtomicU64::new(0)),
+            openings: Arc::new(AtomicU64::new(0)),
+            sent_transport: Arc::new(AtomicU64::new(0)),
+            sent_queue: Arc::new(AtomicU64::new(0)),
+            sent_players: Arc::new(AtomicU64::new(0)),
+            sent_settings: Arc::new(AtomicU64::new(0)),
+            told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            update_offer: Arc::new(Mutex::new(None)),
+            sent_browse: Arc::new(AtomicU64::new(0)),
+            sent_index: Arc::new(AtomicU64::new(0)),
+            sent_era: Arc::new(AtomicU64::new(0)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orders: Arc::new(Mutex::new(order::Orders::new())),
+        };
+        (backend, rx)
+    }
+
+    /// Put a player in the registry the way `track` would, without the
+    /// long-poll and the remembered-players file that come with it.
+    fn add(backend: &Backend, player: &Player, http: &reqwest::Client) {
+        backend.registry.lock().unwrap().insert(
+            player.id(),
+            Entry {
+                client: Client::with_http(player.id(), http.clone()),
+                upgrading: false,
+                view: Device::default(),
+                status: None,
+                status_at: None,
+                queue: None,
+                sync: None,
+                cover_url: None,
+                card_cover: None,
+            },
+        );
+    }
+
+    /// Two players and the loop that carries commands to them.
+    async fn two_players() -> (Backend, Player, Player) {
+        // As `run` does, before the first client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let first = Player::start().await;
+        let second = Player::start().await;
+        let (backend, rx) = backend(&http);
+        add(&backend, &first, &http);
+        add(&backend, &second, &http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+        (backend, first, second)
+    }
+
+    /// Wait for something the backend does off the loop, or fail saying what.
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn device(backend: &Backend) -> Option<DeviceId> {
+        backend.browsing.lock().unwrap().device
+    }
+
+    fn asked(player: &Player, path: &str) -> usize {
+        player
+            .asked()
+            .iter()
+            .filter(|seen| seen.split('?').next() == Some(path))
+            .count()
+    }
+
+    /// How long a slow player sits on its reply, and how long a test waits
+    /// past that for the reply to have been dealt with.
+    const SLOW: Duration = Duration::from_millis(400);
+    const SETTLED: Duration = Duration::from_millis(600);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_home_does_not_take_the_pane_from_the_player_chosen_after_it() {
+        let (backend, slow, quick) = two_players().await;
+        // One screen fewer, so whose sidebar is showing can be told apart.
+        quick.serve(
+            "/ui/Configuration",
+            fixtures::configuration()
+                .replace(r#"<item id="favourites" URI="/ui/Favourites"/>"#, ""),
+        );
+        slow.delay("/ui/Configuration", SLOW);
+
+        let _ = backend.commands.send(Command::Select(slow.id()));
+        until("the slow player to be asked", || {
+            slow.asked_for("/ui/Configuration")
+        })
+        .await;
+        let _ = backend.commands.send(Command::Select(quick.id()));
+        until("the quick player's Home", || {
+            device(&backend) == Some(quick.id())
+        })
+        .await;
+
+        // The slow player's answer arrives now, after the choice has moved on.
+        tokio::time::sleep(SETTLED).await;
+
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(
+            browsing.device,
+            Some(quick.id()),
+            "the pane stays with the choice"
+        );
+        assert_eq!(browsing.trail.len(), 1);
+        assert_eq!(
+            browsing
+                .screens
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            ["Home", "Search"],
+            "and so does the sidebar"
+        );
+    }
+
+    /// A deeper screen asked for from one player and answered after another
+    /// was chosen: the same hole as Home, reached by pressing a row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_screen_opened_before_choosing_another_player_is_not_shown() {
+        let (backend, first, second) = two_players().await;
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's Home", || {
+            device(&backend) == Some(first.id())
+        })
+        .await;
+
+        first.delay("/ui/Home", SLOW);
+        let opening = tokio::spawn(open_screen(
+            backend.clone(),
+            first.id(),
+            "/ui/Home".to_owned(),
+            Arrive::Deeper,
+        ));
+        until("the deeper screen to be asked for", || {
+            asked(&first, "/ui/Home") == 2
+        })
+        .await;
+
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player's Home", || {
+            device(&backend) == Some(second.id())
+        })
+        .await;
+        opening.await.expect("the open finishes");
+
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(browsing.device, Some(second.id()));
+        assert_eq!(
+            browsing.trail.len(),
+            1,
+            "nothing pushed onto the second player's trail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_that_cannot_say_what_it_offers_leaves_the_last_one_showing() {
+        let (backend, first, second) = two_players().await;
+        second.forget("/ui/Configuration");
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's Home", || {
+            device(&backend) == Some(first.id())
+        })
+        .await;
+
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player to be asked", || {
+            second.asked_for("/ui/Configuration")
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        {
+            let browsing = backend.browsing.lock().unwrap();
+            assert_eq!(browsing.screens.len(), 3, "the sidebar is not emptied");
+            assert_eq!(browsing.queue_uri.as_deref(), Some("/ui/playQueue"));
+            assert_eq!(browsing.search_uri.as_deref(), Some("/ui/Search"));
+            assert_eq!(browsing.device, Some(first.id()));
+        }
+
+        // And it is asked again the next time it is chosen.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        let _ = backend.commands.send(Command::Select(first.id()));
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player's Home", || {
+            device(&backend) == Some(second.id())
+        })
+        .await;
+    }
+
+    /// Choose a player and wait for its Home to be the screen showing.
+    async fn choose(backend: &Backend, player: &Player) {
+        let _ = backend.commands.send(Command::Select(player.id()));
+        until("the chosen player's Home", || {
+            device(backend) == Some(player.id())
+        })
+        .await;
+    }
+
+    /// Choose a player whose Home never comes, and wait until it has tried.
+    ///
+    /// A Home arriving takes the pane back to browsing, so this is how a pane
+    /// read from one player stays up with another selected: the state every
+    /// test below is about. A player that cannot say what screens it has
+    /// leaves the window exactly like this for as long as it is chosen, and
+    /// any player leaves it like this until its Home lands.
+    async fn choose_without_home(backend: &Backend, player: &Player) {
+        player.forget("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(player.id()));
+        until("the player to be selected and asked", || {
+            backend.is_selected(player.id()) && player.asked_for("/ui/Configuration")
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+    }
+
+    fn settings_owner(backend: &Backend) -> Option<DeviceId> {
+        let browsing = backend.browsing.lock().unwrap();
+        browsing.pane.settings_owned().map(|(owner, _)| owner)
+    }
+
+    fn settings_depth(backend: &Backend) -> usize {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Settings(_, trail) => trail.len(),
+            _ => 0,
+        }
+    }
+
+    /// A settings page with one switch on it.
+    const ONE_SWITCH: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="eq-switch" name="eq-switch" displayName="Tone Controls" url="/alsa_setting" class="boolean" value="OFF"/>
+</settings>"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setting_is_written_to_the_player_whose_page_is_showing() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Settings", ONE_SWITCH);
+        second.serve("/Settings", ONE_SWITCH);
+
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        choose_without_home(&backend, &second).await;
+        // A press on the row, and a change of its value: the two ways a
+        // settings row writes.
+        let _ = backend.commands.send(Command::SettingAction(0));
+        let _ = backend.commands.send(Command::SettingEdit(0, Edit::Toggle));
+        until("both writes", || asked(&first, "/alsa_setting") == 2).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            asked(&second, "/alsa_setting"),
+            0,
+            "nothing is written to the player selected now"
+        );
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+    }
+
+    /// A switch, and two settings that need it on while it is off: a button,
+    /// and another switch. Each writes somewhere of its own, so a write that
+    /// should not have happened is told apart from the one that should.
+    const DIMMED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="eq-switch" name="eq-switch" displayName="Tone Controls" url="/alsa_setting" class="boolean" value="OFF"/>
+  <setting id="reset" name="reset" displayName="Reset All" url="/reset_setting" class="button">
+    <dependsOn name="eq-switch" value="ON"/>
+  </setting>
+  <setting id="loudness" name="loudness" displayName="Loudness" url="/loudness_setting" class="boolean" value="OFF">
+    <dependsOn name="eq-switch" value="ON"/>
+  </setting>
+</settings>"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setting_the_player_has_dimmed_is_not_written() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Settings", DIMMED);
+
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+
+        // Every way a row writes, on the two rows the player has dimmed: the
+        // press that reaches a button row when its pill refuses it, and the
+        // press and the edit on a switch.
+        let _ = backend.commands.send(Command::SettingAction(1));
+        let _ = backend.commands.send(Command::SettingAction(2));
+        let _ = backend.commands.send(Command::SettingEdit(2, Edit::Toggle));
+        // Then one that is allowed, so there is something to wait for: the
+        // writes run in the order they were sent.
+        let _ = backend.commands.send(Command::SettingAction(0));
+        until("the write that is allowed", || {
+            asked(&player, "/alsa_setting") == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            asked(&player, "/reset_setting"),
+            0,
+            "the button is not pressed"
+        );
+        assert_eq!(
+            asked(&player, "/loudness_setting"),
+            0,
+            "the switch is not written"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settings_asked_for_before_choosing_another_player_are_not_shown() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+
+        first.delay("/Settings", SLOW);
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings to be asked for", || {
+            first.asked_for("/Settings")
+        })
+        .await;
+        choose(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            settings_owner(&backend),
+            None,
+            "the player left behind does not put its settings over the one chosen"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_page_joins_only_the_trail_it_was_asked_from() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+
+        // A re-read of the first player's page still belongs on its trail,
+        // whoever is selected: the pane is still that player's.
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Reload(first.id())));
+        until("the page to be read again", || {
+            asked(&first, "/Settings") == 2
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+        assert_eq!(settings_depth(&backend), 1);
+
+        // Once the pane is the second player's, a page of the first one's has
+        // nothing to join.
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the second player's settings", || {
+            settings_owner(&backend) == Some(second.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::OpenSettings(
+            Some("audio".to_owned()),
+            Step::Deeper(first.id()),
+        ));
+        until("the deeper page to be asked for", || {
+            first.asked_for("/Settings?id=audio")
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(settings_owner(&backend), Some(second.id()));
+        assert_eq!(
+            settings_depth(&backend),
+            1,
+            "nothing pushed onto the second player's trail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preset_is_renamed_on_the_player_it_belongs_to() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+
+        let edit = bluos::Action {
+            kind: ActionKind::DeepLink,
+            uri: Some(
+                "/edit-preset/3?id=3&image=&name=Groove+Salad\
+                 &url=http%3A%2F%2Fice1.somafm.com%2Fgroovesalad-128-mp3"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        run_action(backend.clone(), first.id(), edit, Arrive::Deeper).await;
+        assert!(matches!(
+            &backend.browsing.lock().unwrap().pane,
+            Pane::EditPreset(page) if page.device == first.id()
+        ));
+
+        choose_without_home(&backend, &second).await;
+        let _ = backend
+            .commands
+            .send(Command::SettingEdit(0, Edit::Text("Salad".to_owned())));
+        until("the rename", || first.asked_for("/SetPreset")).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/SetPreset"),
+            "no slot is overwritten on the player selected now"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presets_are_reordered_on_the_player_they_were_read_from() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        backend.browsing.lock().unwrap().pane = Pane::Customise(CustomisePage {
+            screen: "presets".to_owned(),
+            title: "Reorder Presets".to_owned(),
+            rows: vec![
+                ("2".to_owned(), "Second".to_owned()),
+                ("1".to_owned(), "First".to_owned()),
+            ],
+            presets: Some((first.id(), 34)),
+        });
+        let _ = backend.commands.send(Command::CustomiseSave);
+        until("the reorder", || first.asked_for("/Presets/edit")).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/Presets/edit"),
+            "the player selected now keeps its order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_question_is_answered_on_the_player_that_asked_it() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Ask", fixtures::replace_queue_dialog());
+        choose(&backend, &first).await;
+
+        let asking = bluos::Action {
+            kind: ActionKind::PlayerLink,
+            uri: Some("/Ask".to_owned()),
+            ..Default::default()
+        };
+        run_action(backend.clone(), first.id(), asking, Arrive::Deeper).await;
+        assert_eq!(
+            backend
+                .browsing
+                .lock()
+                .unwrap()
+                .dialog
+                .as_ref()
+                .map(|(owner, _)| *owner),
+            Some(first.id())
+        );
+
+        choose_without_home(&backend, &second).await;
+        // "Replace", which carries an add of the first player's own file.
+        let _ = backend.commands.send(Command::DialogPress(0));
+        until("the answer", || first.asked_for("/Add?playnow=1")).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/Add"),
+            "the player selected now plays nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_confirmed_input_switches_the_player_it_was_asked_about() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Status", fixtures::status_playing());
+        choose(&backend, &first).await;
+
+        // Only asked about while something plays.
+        let client = backend
+            .with_entry(first.id(), |e| e.client.clone())
+            .expect("the first player");
+        let status = client.status().await.expect("a status");
+        if let Some(entry) = backend.registry.lock().unwrap().get_mut(&first.id()) {
+            entry.status = Some(status);
+        }
+        let input = bluos::Action {
+            kind: ActionKind::PlayerLink,
+            uri: Some("/Play?url=Capture%3Abluez%3Abt".to_owned()),
+            ..Default::default()
+        };
+        assert!(ask_before_input(&backend, first.id(), &input, "Bluetooth"));
+
+        choose_without_home(&backend, &second).await;
+        let _ = backend.commands.send(Command::ConfirmInput(true));
+        until("the switch", || first.asked_for("/Play?url=Capture")).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/Play?url=Capture"),
+            "the player selected now keeps playing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_track_is_filed_on_the_player_that_offered_the_playlists() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        backend.browsing.lock().unwrap().pane = playlists_page(first.id(), 1);
+        let _ = backend.commands.send(Command::PlaylistAdd(
+            1,
+            None,
+            bluos::client::PlaylistTarget::New("Mix".to_owned()),
+        ));
+        until("the add", || first.asked_for("/AddToPlaylist")).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/AddToPlaylist"),
+            "nothing is filed on the player selected now"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_question_that_lands_after_choosing_another_player_is_not_put_up() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Ask", fixtures::replace_queue_dialog());
+        first.delay("/Ask", SLOW);
+        choose(&backend, &first).await;
+
+        let asking = bluos::Action {
+            kind: ActionKind::PlayerLink,
+            uri: Some("/Ask".to_owned()),
+            ..Default::default()
+        };
+        tokio::spawn(run_action(
+            backend.clone(),
+            first.id(),
+            asking,
+            Arrive::Deeper,
+        ));
+        until("the question to be asked for", || first.asked_for("/Ask")).await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            backend.browsing.lock().unwrap().dialog.is_none(),
+            "the first player's Replace is not offered over the second player's queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn playlists_offered_after_choosing_another_player_are_not_shown() {
+        let (backend, first, second) = two_players().await;
+        first.serve(
+            "/AddToPlaylistOptions",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<addToPlaylistOptions service="LocalMusic">
+  <urlPath>/AddToPlaylist</urlPath>
+  <requestParameter>songid=%2Fmusic%2Fa.flac</requestParameter>
+  <playlists service="LocalMusic" serviceName="BluOS" create="1"></playlists>
+</addToPlaylistOptions>"#,
+        );
+        first.delay("/AddToPlaylistOptions", SLOW);
+        choose(&backend, &first).await;
+
+        let filing = bluos::Action {
+            kind: ActionKind::Browse,
+            uri: Some("/AddToPlaylistOptions?service=LocalMusic&songid=a".to_owned()),
+            result_type: Some("AddToPlaylistOptions".to_owned()),
+            ..Default::default()
+        };
+        tokio::spawn(run_action(
+            backend.clone(),
+            first.id(),
+            filing,
+            Arrive::Deeper,
+        ));
+        until("the options to be asked for", || {
+            first.asked_for("/AddToPlaylistOptions")
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !matches!(backend.browsing.lock().unwrap().pane, Pane::Playlists(_)),
+            "the first player's playlists are not drawn under the second player"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preset_is_not_opened_for_renaming_over_another_player() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        // A press on the first player's screen, which is still the one
+        // showing while the second player's Home has not come.
+        let edit = bluos::Action {
+            kind: ActionKind::DeepLink,
+            uri: Some("/edit-preset/3?id=3&image=&name=Groove+Salad&url=http%3A%2F%2Fa".to_owned()),
+            ..Default::default()
+        };
+        run_action(backend.clone(), first.id(), edit, Arrive::Deeper).await;
+
+        assert!(
+            !matches!(backend.browsing.lock().unwrap().pane, Pane::EditPreset(_)),
+            "the first player's preset is not offered under the second player's name"
+        );
+    }
+
+    /// Open a player's alarms, and its one alarm in the editor.
+    async fn open_alarm(backend: &Backend, player: &Player) {
+        let _ = backend.commands.send(Command::OpenAlarms(player.id()));
+        until("the alarms", || alarms_owner(backend) == Some(player.id())).await;
+        let _ = backend.commands.send(Command::AlarmOpen(1));
+        until("the editor", || {
+            matches!(
+                &backend.browsing.lock().unwrap().pane,
+                Pane::Alarms(page) if page.editing.is_some()
+            )
+        })
+        .await;
+    }
+
+    fn picker_depth(backend: &Backend) -> usize {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Alarms(page) => page.picking.len(),
+            _ => 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarm_source_is_chosen_from_the_player_whose_alarm_it_is() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        let _ = backend.commands.send(Command::AlarmPick);
+        until("the picker", || picker_depth(&backend) == 1).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(first.asked_for("/RadioBrowse"));
+        assert!(
+            !second.asked_for("/RadioBrowse"),
+            "the player selected now is not where the alarm's source comes from"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_answered_after_back_does_not_reopen_the_picker() {
+        let (backend, first, _second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+
+        let _ = backend.commands.send(Command::AlarmPick);
+        until("the picker", || picker_depth(&backend) == 1).await;
+
+        // "Inputs", the row on the first level that leads somewhere.
+        first.delay("/RadioBrowse", SLOW);
+        let _ = backend.commands.send(Command::AlarmPickRow(1));
+        until("the folder to be asked for", || {
+            asked(&first, "/RadioBrowse") == 2
+        })
+        .await;
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the picker to close", || picker_depth(&backend) == 0).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            picker_depth(&backend),
+            0,
+            "a late folder does not put the picker back up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_alarm_does_not_land_on_another_players_page() {
+        alarms_answered_late_stay_with_their_player(|_| Command::AlarmSave).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_alarm_does_not_land_on_another_players_page() {
+        alarms_answered_late_stay_with_their_player(|_| Command::AlarmDelete).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_armed_alarm_does_not_land_on_another_players_page() {
+        // The id the first player's list carries. The command names its
+        // player itself, as the list's toggle does.
+        alarms_answered_late_stay_with_their_player(|owner| Command::AlarmArm(owner, 1, false))
+            .await;
+    }
+
+    /// Send a write on the first player's alarm, choose the second player and
+    /// open its alarms while the answer is still on its way, and check the
+    /// first player's list is not put on the second player's page.
+    ///
+    /// Every alarm write answers with the whole list, so each of them is a
+    /// way for one player's alarms to be drawn, and then toggled, as another's.
+    async fn alarms_answered_late_stay_with_their_player(write: impl FnOnce(DeviceId) -> Command) {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+
+        // Long enough to choose the other player and open its alarms while
+        // the write is still on its way.
+        let late = SLOW * 4;
+        first.delay("/Alarms", late);
+        let saving = Instant::now();
+        let _ = backend.commands.send(write(first.id()));
+        until("the write", || asked(&first, "/Alarms") == 2).await;
+
+        choose_without_home(&backend, &second).await;
+        let _ = backend.commands.send(Command::OpenAlarms(second.id()));
+        until("the second player's alarms", || {
+            alarms_owner(&backend) == Some(second.id())
+        })
+        .await;
+        tokio::time::sleep((saving + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        let browsing = backend.browsing.lock().unwrap();
+        let Pane::Alarms(page) = &browsing.pane else {
+            panic!("the alarms pane went away");
+        };
+        assert_eq!(page.device, second.id());
+        assert!(
+            page.list.alarms.is_empty(),
+            "the first player's alarm is not listed as the second's"
+        );
+    }
+
+    /// Which opening of the alarm editor is on screen, when one is.
+    fn editor_opened(backend: &Backend) -> Option<u64> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Alarms(page) if page.editing.is_some() => Some(page.opened),
+            _ => None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_alarm_does_not_close_the_editor_opened_since() {
+        alarm_writes_close_only_the_editor_they_were_pressed_on(Command::AlarmSave).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_alarm_does_not_close_the_editor_opened_since() {
+        alarm_writes_close_only_the_editor_they_were_pressed_on(Command::AlarmDelete).await;
+    }
+
+    /// Press a write on one opening of the editor, go Back and open the alarm
+    /// again while the answer is still out, and check the editor the user is
+    /// in now is left alone.
+    ///
+    /// Both writes wait in the writes lane before their round trip, and both
+    /// used to close the editor on the player alone. On a slow player that
+    /// threw away the time, days and volume typed into the editor opened
+    /// since — under a toast saying the alarm was saved — and left the source
+    /// picker drawn over no editor at all, so a source chosen on it went
+    /// nowhere.
+    async fn alarm_writes_close_only_the_editor_they_were_pressed_on(write: Command) {
+        let (backend, first, _second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+        let pressed = editor_opened(&backend).expect("the editor the write is pressed on");
+
+        // Long enough to leave the editor and open it again while the write
+        // is still on its way.
+        let late = SLOW * 4;
+        first.delay("/Alarms", late);
+        let writing = Instant::now();
+        let _ = backend.commands.send(write);
+        until("the write", || asked(&first, "/Alarms") == 2).await;
+
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the editor to close", || editor_opened(&backend).is_none()).await;
+        let _ = backend.commands.send(Command::AlarmOpen(1));
+        until("the alarm to be opened again", || {
+            editor_opened(&backend).is_some_and(|opened| opened != pressed)
+        })
+        .await;
+        // With the source picker over it, which belongs to this editor and
+        // not to the one the write was pressed on.
+        let _ = backend.commands.send(Command::AlarmPick);
+        until("the picker", || picker_depth(&backend) == 1).await;
+        let since = editor_opened(&backend).expect("the editor opened since");
+        tokio::time::sleep((writing + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        assert_eq!(
+            editor_opened(&backend),
+            Some(since),
+            "the reply closes the editor it was pressed on, not the one opened since"
+        );
+        assert_eq!(
+            picker_depth(&backend),
+            1,
+            "and leaves that editor's picker where the user left it"
+        );
+    }
+
+    /// A queue document with one button on it: Clear, as older firmware
+    /// writes it, without the ask.
+    const QUEUE_WITH_CLEAR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<queue offset="0" total="1" id="7">
+  <button text="Clear" icon="/images/ui/btn_clear_queue.png">
+    <action type="player-link" URI="/Clear"/>
+  </button>
+</queue>"#;
+
+    fn queue_buttons_owner(backend: &Backend) -> Option<DeviceId> {
+        let browsing = backend.browsing.lock().unwrap();
+        browsing.queue_screen.as_ref().map(|(owner, _)| *owner)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_button_runs_only_on_the_queue_it_was_read_from() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        // Whatever reads choosing started have finished, so the document
+        // below is only served to the read this test makes.
+        tokio::time::sleep(SETTLED).await;
+
+        first.serve("/ui/playQueue", QUEUE_WITH_CLEAR);
+        first.delay("/ui/playQueue", SLOW);
+        let before = asked(&first, "/ui/playQueue");
+        let reading = tokio::spawn(fetch_queue_buttons(backend.clone(), first.id()));
+        until("the buttons to be asked for", || {
+            asked(&first, "/ui/playQueue") > before
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        reading.await.expect("the read finishes");
+
+        assert_eq!(
+            queue_buttons_owner(&backend),
+            None,
+            "the first player's buttons are not kept under the second's queue"
+        );
+        let _ = backend.commands.send(Command::QueueButton(0));
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !second.asked_for("/Clear"),
+            "the player selected now keeps its queue"
+        );
+        assert!(!first.asked_for("/Clear"));
+
+        // Back on the first player its buttons are read and work as before.
+        first.delay("/ui/playQueue", Duration::ZERO);
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's buttons", || {
+            queue_buttons_owner(&backend) == Some(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::QueueButton(0));
+        until("the clear", || first.asked_for("/Clear")).await;
+        assert!(!second.asked_for("/Clear"));
+
+        // The first player's buttons are still held when the second player
+        // is chosen, until that one's own document arrives. A press on the
+        // row drawn before the move is refused rather than run on either.
+        choose_without_home(&backend, &second).await;
+        assert_eq!(queue_buttons_owner(&backend), Some(first.id()));
+        let _ = backend.commands.send(Command::QueueButton(0));
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            asked(&first, "/Clear"),
+            1,
+            "the first player is not cleared again"
+        );
+        assert!(!second.asked_for("/Clear"));
+    }
+
+    fn configured(backend: &Backend) -> Option<DeviceId> {
+        backend.browsing.lock().unwrap().configured
+    }
+
+    /// The sidebar entry drawn lit.
+    fn lit(backend: &Backend) -> Option<(i32, i32)> {
+        backend.browsing.lock().unwrap().lit()
+    }
+
+    /// Choose a player, and press Favourites in its sidebar while its Home is
+    /// still on the way; each reply held back by the time given.
+    ///
+    /// Whichever lands first, the window ends on Favourites with Favourites
+    /// lit — the press is the last thing asked for.
+    async fn press_favourites_before_home(home: Duration, favourites: Duration) {
+        let (backend, _, player) = two_players().await;
+        player.serve("/ui/Favourites", fixtures::home());
+        player.delay("/ui/Home", home);
+        player.delay("/ui/Favourites", favourites);
+
+        let _ = backend.commands.send(Command::Select(player.id()));
+        until("its Home to be asked for", || {
+            asked(&player, "/ui/Home") > 0
+        })
+        .await;
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("Favourites to be asked for", || {
+            asked(&player, "/ui/Favourites") > 0
+        })
+        .await;
+        assert_eq!(lit(&backend), Some((0, 1)), "the press lights at once");
+        tokio::time::sleep(home.max(favourites) + SETTLED).await;
+
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(browsing.device, Some(player.id()));
+        assert_eq!(
+            browsing
+                .trail
+                .iter()
+                .map(|c| c.uri.as_str())
+                .collect::<Vec<_>>(),
+            ["/ui/Favourites"],
+            "the screen pressed for is the one showing"
+        );
+        assert_eq!(
+            browsing.lit(),
+            Some((0, 1)),
+            "and it is the entry lit, not Home"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_lands_before_a_press_does_not_unlight_it() {
+        press_favourites_before_home(SLOW, SLOW * 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_lands_after_a_press_is_not_shown() {
+        press_favourites_before_home(SLOW, Duration::ZERO).await;
+    }
+
+    /// Chosen, the second player's configuration lands and its Home does not
+    /// yet; the first player is chosen back in between. The first player's
+    /// screens never left, so only what sits beside them has to be put right —
+    /// and without asking again, nothing ever did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn choosing_back_before_the_other_players_home_puts_its_own_sidebar_back() {
+        let (backend, first, second) = two_players().await;
+        // One screen fewer, so whose sidebar is showing can be told apart.
+        second.serve(
+            "/ui/Configuration",
+            fixtures::configuration()
+                .replace(r#"<item id="favourites" URI="/ui/Favourites"/>"#, ""),
+        );
+        first.serve("/ui/Favourites", fixtures::home());
+        choose(&backend, &first).await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(lit(&backend), Some((0, 0)), "a player's Home lights Home");
+        // Somewhere other than Home, so what is lit says whose trail it is.
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("the first player's Favourites", || {
+            asked(&first, "/ui/Favourites") > 0
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        let homes = asked(&first, "/ui/Home");
+        let buttons = asked(&first, "/ui/playQueue");
+
+        second.delay("/ui/Home", SLOW);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player's configuration", || {
+            configured(&backend) == Some(second.id())
+        })
+        .await;
+        // Its sidebar is up and its Home is not. The first player's Favourites
+        // is second in its list and Search is second in this one, so an index
+        // carried across would light Search. The same holds for good when
+        // that Home never comes.
+        {
+            let browsing = backend.browsing.lock().unwrap();
+            assert_eq!(browsing.screens.len(), 2);
+            assert_eq!(browsing.device, Some(first.id()));
+            assert_eq!(
+                browsing.lit(),
+                None,
+                "the first player's Favourites does not light the second's Search"
+            );
+        }
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's configuration again", || {
+            configured(&backend) == Some(first.id())
+        })
+        .await;
+        // The second player's Home arrives now, and is dropped.
+        tokio::time::sleep(SETTLED).await;
+
+        {
+            let browsing = backend.browsing.lock().unwrap();
+            assert_eq!(browsing.device, Some(first.id()));
+            assert_eq!(browsing.configured, Some(first.id()));
+            assert_eq!(
+                browsing.screens.len(),
+                3,
+                "the sidebar is the first player's"
+            );
+            assert_eq!(browsing.trail.len(), 1);
+            assert_eq!(browsing.trail[0].uri, "/ui/Favourites");
+            assert_eq!(
+                browsing.lit(),
+                Some((0, 1)),
+                "and it lights the screen showing, not Home"
+            );
+        }
+        assert_eq!(
+            asked(&first, "/ui/Home"),
+            homes,
+            "the trail is left where it was rather than started again"
+        );
+        assert!(
+            asked(&first, "/ui/playQueue") > buttons,
+            "and the queue's buttons are read from the first player's address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_of_the_last_players_screen_does_not_play_on_it() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        // "A Song", the first row of the first player's Home, still showing.
+        let _ = backend.commands.send(Command::BrowseActivate(0));
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !first.asked_for("/ui/prf"),
+            "the player not selected does not start playing"
+        );
+        assert!(!second.asked_for("/ui/prf"));
+    }
+
+    /// A Sources screen with one input on it, for the sidebar's lower half.
+    const ONE_INPUT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<screen screenTitle="Sources" id="screen-sources">
+  <row id="inputs" title="Inputs">
+    <source text="Line In" image="/images/in.png">
+      <action type="player-link" URI="/Play?url=Capture%3Ahw%3Ain"/>
+    </source>
+  </row>
+</screen>"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_input_in_the_last_players_sidebar_is_not_switched_to_on_this_one() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/ui/Sources", ONE_INPUT);
+        second.serve("/ui/Sources", ONE_INPUT);
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        let _ = backend.commands.send(Command::Sidebar(1, 0));
+        until("the configuration to be asked for again", || {
+            asked(&second, "/ui/Configuration") == 2
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !second.asked_for("/Play?"),
+            "the first player's input is not sent to the second"
+        );
+        assert!(!first.asked_for("/Play?"));
+
+        // Once the player answers, its own sidebar works.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        let _ = backend.commands.send(Command::Sidebar(1, 0));
+        until("the second player's configuration", || {
+            configured(&backend) == Some(second.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::Sidebar(1, 0));
+        until("the input", || second.asked_for("/Play?")).await;
+        assert!(!first.asked_for("/Play?"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alarms_answered_after_another_player_is_chosen_are_not_shown() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+
+        first.delay("/Alarms", SLOW);
+        let _ = backend.commands.send(Command::OpenAlarms(first.id()));
+        until("the alarms to be asked for", || first.asked_for("/Alarms")).await;
+        choose(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            alarms_owner(&backend),
+            None,
+            "the first player's alarms do not replace the second player's Home"
+        );
+    }
+
+    /// The web pages are on the player's port 80, which the fake does not
+    /// serve, so the rule a form lands by is exercised on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_form_goes_up_only_over_its_own_players_page() {
+        let (backend, first, second) = two_players().await;
+        let put = |player: &Player, replacing| {
+            show_form(
+                &backend,
+                player.id(),
+                replacing,
+                "Form".to_owned(),
+                bluos::forms::Form::default(),
+                String::new(),
+            )
+        };
+        let showing = || match &backend.browsing.lock().unwrap().pane {
+            Pane::Form(page) => Some((page.device, page.from.is_some())),
+            _ => None,
+        };
+
+        let shares = || {
+            backend.browsing.lock().unwrap().pane = Pane::Web(
+                first.id(),
+                WebPage::Shares {
+                    action: None,
+                    shares: Vec::new(),
+                },
+            );
+        };
+
+        shares();
+        assert_eq!(
+            put(&second, Replacing::Page),
+            None,
+            "not over another player's page"
+        );
+        let wifi = put(&first, Replacing::Page).expect("over its own page");
+        assert_eq!(showing(), Some((first.id(), true)));
+
+        assert_eq!(
+            put(&second, Replacing::Form(wifi)),
+            None,
+            "not over another player's form"
+        );
+        assert_eq!(put(&first, Replacing::Form(wifi)), Some(wifi));
+        assert_eq!(
+            showing(),
+            Some((first.id(), true)),
+            "the answer keeps the page Back returns to"
+        );
+
+        // Back, and another of the same player's forms opened in its place.
+        shares();
+        assert_eq!(
+            put(&first, Replacing::Form(wifi)),
+            None,
+            "an answer does not reopen a form that was left"
+        );
+        let service = put(&first, Replacing::Page).expect("over its own page");
+        assert_ne!(service, wifi);
+        assert_eq!(
+            put(&first, Replacing::Form(wifi)),
+            None,
+            "an answer for one form does not land on another of the same player's"
+        );
+        assert_eq!(put(&first, Replacing::Form(service)), Some(service));
+
+        backend.browsing.lock().unwrap().pane = Pane::Browse;
+        assert_eq!(put(&first, Replacing::Form(service)), None);
+        assert_eq!(put(&first, Replacing::Page), None);
+    }
+
+    /// Back out of the placeholder of a form opened on a settings page, while
+    /// the player is still answering: the page it was opened on, not Home,
+    /// and the answer arriving afterwards does not put the form back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn back_out_of_a_form_returns_to_the_settings_page_it_was_opened_on() {
+        let (backend, first, _) = two_players().await;
+        backend.browsing.lock().unwrap().pane =
+            Pane::Settings(first.id(), vec![SettingsPage::default()]);
+        let wifi = show_form(
+            &backend,
+            first.id(),
+            Replacing::Page,
+            "WiFi".to_owned(),
+            bluos::forms::Form::default(),
+            "Reading the page…".to_owned(),
+        )
+        .expect("over its own settings page");
+
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the settings page to be back", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        assert_eq!(
+            show_form(
+                &backend,
+                first.id(),
+                Replacing::Form(wifi),
+                "WiFi".to_owned(),
+                bluos::forms::Form::default(),
+                String::new(),
+            ),
+            None,
+            "the scan landing late does not reopen the form"
+        );
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+    }
+
+    /// The search key, with a player chosen that has not said what it offers,
+    /// while the last player's Home is still showing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_key_lights_nothing_for_a_player_that_is_not_configured() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        until("the first player's Home to be lit", || {
+            lit(&backend) == Some((0, 0))
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+
+        let _ = backend.commands.send(Command::OpenSearch);
+        until("the configuration to be asked for again", || {
+            asked(&second, "/ui/Configuration") == 2
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            lit(&backend),
+            Some((0, 0)),
+            "the last player's Search is not lit over its Home"
+        );
+        assert!(!first.asked_for("/ui/Search"));
+        assert!(!second.asked_for("/ui/Search"));
+
+        // Nor once that player is chosen back.
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's configuration", || {
+            configured(&backend) == Some(first.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(lit(&backend), Some((0, 0)));
+    }
+
+    /// The search key, with a player chosen whose configuration has landed and
+    /// whose Home has not, so the last player's screens are still the ones
+    /// showing: it searches the player it was asked of, and lights nothing of
+    /// the last one's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_key_opens_on_the_player_chosen_before_its_home_lands() {
+        let (backend, first, second) = two_players().await;
+        second.serve("/ui/Search", fixtures::home());
+        choose(&backend, &first).await;
+        until("the first player's Home to be lit", || {
+            lit(&backend) == Some((0, 0))
+        })
+        .await;
+
+        second.delay("/ui/Home", Duration::from_secs(1));
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player's configuration", || {
+            configured(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(device(&backend), Some(first.id()), "its Home is held back");
+
+        let _ = backend.commands.send(Command::OpenSearch);
+        until("Search on the second player", || {
+            device(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(lit(&backend), Some((0, 2)), "its own Search entry");
+        assert!(!first.asked_for("/ui/Search"));
+
+        // The first player chosen back, and the second one's Home left to
+        // land after it: the first player's Home, with Home lit.
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's Home", || {
+            configured(&backend) == Some(first.id()) && device(&backend) == Some(first.id())
+        })
+        .await;
+        until("the second player's Home to be asked", || {
+            second.asked_for("/ui/Home")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1) + SETTLED).await;
+        assert_eq!(device(&backend), Some(first.id()));
+        assert_eq!(lit(&backend), Some((0, 0)));
+    }
+
+    /// As above, with a Home that never comes: the last player's screens stay
+    /// up for as long as this one is chosen, and choosing it back keeps them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_key_lights_no_search_over_the_last_players_home() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        until("the first player's Home to be lit", || {
+            lit(&backend) == Some((0, 0))
+        })
+        .await;
+
+        second.forget("/ui/Home");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player's configuration", || {
+            configured(&backend) == Some(second.id())
+        })
+        .await;
+        until("its Home to be asked for", || second.asked_for("/ui/Home")).await;
+
+        let _ = backend.commands.send(Command::OpenSearch);
+        until("Search to be asked of the second player", || {
+            asked(&second, "/ui/Search") == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert!(!first.asked_for("/ui/Search"));
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's configuration", || {
+            configured(&backend) == Some(first.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(device(&backend), Some(first.id()), "its trail is kept");
+        assert_eq!(
+            lit(&backend),
+            Some((0, 0)),
+            "its own Home is lit, not Search and not nothing"
+        );
+    }
+
+    /// A form closed by its own reply rather than by Back — a submit with no
+    /// next step — goes back to the settings page it was opened on, and only
+    /// the form the reply was for is closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_form_closed_by_its_reply_returns_to_the_settings_page_it_was_opened_on() {
+        let (backend, first, _) = two_players().await;
+        backend.browsing.lock().unwrap().pane =
+            Pane::Settings(first.id(), vec![SettingsPage::default()]);
+        let wifi = show_form(
+            &backend,
+            first.id(),
+            Replacing::Page,
+            "WiFi".to_owned(),
+            bluos::forms::Form::default(),
+            "Reading the page…".to_owned(),
+        )
+        .expect("over its own settings page");
+
+        assert!(!close_form(&backend, first.id(), wifi + 1));
+        assert!(matches!(
+            backend.browsing.lock().unwrap().pane,
+            Pane::Form(_)
+        ));
+        assert!(close_form(&backend, first.id(), wifi));
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+        assert!(
+            !close_form(&backend, first.id(), wifi),
+            "the page put back is not closed again"
+        );
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+    }
+
+    /// A form the player answered with no next step puts back the page it was
+    /// opened from as the player has it now, not as it was before the submit:
+    /// the settings page is read again, and so is the services list.
+    ///
+    /// Driven through `close_answered_form` rather than a submit: a form goes
+    /// to the player's web port, which a fake on a port of its own cannot be.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_form_closed_by_its_reply_reads_its_page_again() {
+        let (backend, first, _) = two_players().await;
+        first.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        let form = |backend: &Backend| {
+            show_form(
+                backend,
+                first.id(),
+                Replacing::Page,
+                "WiFi".to_owned(),
+                bluos::forms::Form::default(),
+                String::new(),
+            )
+            .expect("over its own page")
+        };
+        let wifi = form(&backend);
+        close_answered_form(&backend, first.id(), wifi + 1);
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(asked(&first, "/Settings"), 1, "not the form it was for");
+
+        close_answered_form(&backend, first.id(), wifi);
+        until("the settings page to be read again", || {
+            asked(&first, "/Settings") == 2
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+        assert_eq!(settings_depth(&backend), 1, "read again, not pushed");
+
+        first.serve(
+            "/redirectToCp",
+            r#"<ul><li id="Tidal"><a href="/tidal">TIDAL<span class="bs-list-logo"></span></a></li></ul>"#,
+        );
+        backend.browsing.lock().unwrap().pane =
+            Pane::Web(first.id(), WebPage::Services(Vec::new()));
+        let sign_in = form(&backend);
+        close_answered_form(&backend, first.id(), sign_in);
+        until("the services list to be read again", || {
+            matches!(
+                &backend.browsing.lock().unwrap().pane,
+                Pane::Web(owner, WebPage::Services(list))
+                    if *owner == first.id() && list.len() == 1
+            )
+        })
+        .await;
+    }
+
+    /// A form whose page cannot be read, opened from settings: the placeholder
+    /// comes down onto the settings page, not Home.
+    ///
+    /// The address is off the player, so it is refused before any request and
+    /// no browser is opened for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_form_returns_to_the_settings_page_it_was_opened_on() {
+        let (backend, first, _) = two_players().await;
+        backend.browsing.lock().unwrap().pane =
+            Pane::Settings(first.id(), vec![SettingsPage::default()]);
+
+        let _ = backend.commands.send(Command::OpenForm {
+            device: first.id(),
+            title: "WiFi".to_owned(),
+            path: "http://192.0.2.1/wifi".to_owned(),
+        });
+        until("the form to go up and come down again", || {
+            backend.forms.load(Ordering::Relaxed) == 1
+                && settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+    }
+
+    /// A context menu with one line on it.
+    const ONE_LINE_MENU: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<contextMenu title="A Song" version="1">
+  <item text="Remove">
+    <action type="player-link" URI="/Delete?id=0"></action>
+  </item>
+</contextMenu>"#;
+
+    fn menu_owner(backend: &Backend) -> Option<DeviceId> {
+        let browsing = backend.browsing.lock().unwrap();
+        browsing.queue_menu.as_ref().and(browsing.queue_menu_owner)
+    }
+
+    fn close_menu(backend: &Backend) {
+        let mut browsing = backend.browsing.lock().unwrap();
+        browsing.queue_menu = None;
+        browsing.queue_menu_owner = None;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_rows_menu_that_lands_after_choosing_another_player_is_not_opened() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/ui/queueCM", ONE_LINE_MENU);
+        choose(&backend, &first).await;
+        tokio::time::sleep(SETTLED).await;
+
+        // Answered in time, it opens: what is dropped below is dropped for
+        // being late, not for being unreadable.
+        let _ = backend.commands.send(Command::QueueMenu(0));
+        until("the menu", || menu_owner(&backend) == Some(first.id())).await;
+        close_menu(&backend);
+
+        first.delay("/ui/queueCM", SLOW);
+        let _ = backend.commands.send(Command::QueueMenu(0));
+        until("the menu to be asked for again", || {
+            asked(&first, "/ui/queueCM") == 2
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            menu_owner(&backend),
+            None,
+            "the first player's track menu is not opened over the second player's queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browse_rows_menu_that_lands_after_choosing_another_player_is_not_opened() {
+        let (backend, first, second) = two_players().await;
+        // "A Song", the first row, with dots.
+        first.serve(
+            "/ui/Home",
+            fixtures::home().replacen(
+                "</item>",
+                r#"<contextMenu type="browse" URI="/ui/rowCM" resultType="contextMenu"></contextMenu></item>"#,
+                1,
+            ),
+        );
+        first.serve("/ui/rowCM", ONE_LINE_MENU);
+        choose(&backend, &first).await;
+
+        let _ = backend.commands.send(Command::BrowseMenu(0));
+        until("the menu", || menu_owner(&backend) == Some(first.id())).await;
+        close_menu(&backend);
+
+        first.delay("/ui/rowCM", SLOW);
+        let _ = backend.commands.send(Command::BrowseMenu(0));
+        until("the menu to be asked for again", || {
+            asked(&first, "/ui/rowCM") == 2
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            menu_owner(&backend),
+            None,
+            "the first player's row menu is not opened over the second player"
+        );
+    }
+
+    /// The addresses held are the last configured player's until this one's
+    /// configuration lands, which here it never does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn menus_on_a_player_not_yet_configured_are_not_asked_for_at_anothers_address() {
+        let (backend, first, second) = two_players().await;
+        first.serve(
+            "/ui/Configuration",
+            fixtures::configuration()
+                .replace("/ui/queueCM", "/ui/firstQueueCM")
+                .replace("/ui/nowPlayingCM", "/ui/firstNowCM"),
+        );
+        choose(&backend, &first).await;
+        choose_without_home(&backend, &second).await;
+
+        let _ = backend.commands.send(Command::QueueMenu(0));
+        let _ = backend.commands.send(Command::NowPlayingInfo);
+        until("both menus to be asked for", || {
+            second.asked_for("/ui/queueItemCM") && second.asked_for("/ui/nowPlayingCM")
+        })
+        .await;
+        assert!(
+            !second.asked_for("/ui/firstQueueCM") && !second.asked_for("/ui/firstNowCM"),
+            "the first player's addresses are not used on the second"
+        );
+    }
+
+    /// A sidebar press refused while the configuration is out asks for it
+    /// again, so two replies land for one choice. Favourites pressed between
+    /// them is a press of this player's, and the second must not take it for
+    /// a leftover.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_configuration_does_not_unlight_a_press_made_after_the_first() {
+        let (backend, _, player) = two_players().await;
+        player.serve("/ui/Favourites", fixtures::home());
+        player.delay("/ui/Configuration", SLOW);
+        player.delay("/ui/Home", SLOW);
+        player.delay("/ui/Favourites", SLOW);
+
+        let _ = backend.commands.send(Command::Select(player.id()));
+        until("its configuration to be asked for", || {
+            asked(&player, "/ui/Configuration") == 1
+        })
+        .await;
+        tokio::time::sleep(SLOW / 2).await;
+        let _ = backend.commands.send(Command::Sidebar(0, 0));
+        until("the configuration to be asked for again", || {
+            asked(&player, "/ui/Configuration") == 2
+        })
+        .await;
+        until("the first configuration", || {
+            configured(&backend) == Some(player.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("Favourites to be asked for", || {
+            asked(&player, "/ui/Favourites") > 0
+        })
+        .await;
+        tokio::time::sleep(SLOW + SETTLED).await;
+
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(
+            browsing
+                .trail
+                .iter()
+                .map(|c| c.uri.as_str())
+                .collect::<Vec<_>>(),
+            ["/ui/Favourites"]
+        );
+        assert_eq!(
+            browsing.lit(),
+            Some((0, 1)),
+            "the entry lit is the screen showing, not Home"
+        );
+    }
+
+    /// Driven through `close_answered_form`, for the reason given on the test
+    /// above that reads the page again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_services_list_read_again_does_not_come_back_over_where_the_user_went() {
+        let (backend, first, _) = two_players().await;
+        choose(&backend, &first).await;
+        first.serve(
+            "/redirectToCp",
+            r#"<ul><li id="Tidal"><a href="/tidal">TIDAL<span class="bs-list-logo"></span></a></li></ul>"#,
+        );
+        first.delay("/redirectToCp", SLOW);
+        backend.browsing.lock().unwrap().pane =
+            Pane::Web(first.id(), WebPage::Services(Vec::new()));
+        let sign_in = show_form(
+            &backend,
+            first.id(),
+            Replacing::Page,
+            "TIDAL".to_owned(),
+            bluos::forms::Form::default(),
+            String::new(),
+        )
+        .expect("over its own page");
+
+        close_answered_form(&backend, first.id(), sign_in);
+        until("the services list to be asked for", || {
+            first.asked_for("/redirectToCp")
+        })
+        .await;
+        // Back, while the list is on its way.
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the list to be left", || {
+            matches!(backend.browsing.lock().unwrap().pane, Pane::Browse)
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            matches!(backend.browsing.lock().unwrap().pane, Pane::Browse),
+            "the list read again is not put back over the screen Back went to"
+        );
+    }
+
+    fn help_detail(backend: &Backend) -> bool {
+        matches!(backend.browsing.lock().unwrap().pane, Pane::HelpDetail(..))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn diagnostics_that_land_after_choosing_another_player_are_not_shown() {
+        let (backend, first, second) = two_players().await;
+        // Readable, so what is dropped below is dropped for being late and
+        // no browser is ever offered in its place.
+        first.serve(
+            "/redirectToCp",
+            r#"<div class="ui-grid-a"><div class="ui-block-a">BluOS Version:</div>
+<div class="ui-block-b">4.16.6</div></div>"#,
+        );
+        choose(&backend, &first).await;
+        let row = HELP_ENTRIES
+            .iter()
+            .position(|(_, kind, _, _)| *kind == HelpKind::Diagnostics)
+            .expect("a Diagnostics row");
+
+        let _ = backend.commands.send(Command::HelpAction(row));
+        until("the first player's diagnostics", || help_detail(&backend)).await;
+        backend.browsing.lock().unwrap().pane = Pane::Help;
+
+        first.delay("/redirectToCp", SLOW);
+        let _ = backend.commands.send(Command::HelpAction(row));
+        until("the diagnostics to be asked for again", || {
+            asked(&first, "/redirectToCp") == 2
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !help_detail(&backend),
+            "the first player's facts are not shown under the second player"
+        );
+    }
+
+    /// Whose alarms the open pane belongs to.
+    fn alarms_owner(backend: &Backend) -> Option<DeviceId> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Alarms(page) => Some(page.device),
+            _ => None,
+        }
+    }
+
+    /// A page offering to file one of `device`'s tracks, as opening `opened`.
+    fn playlists_page(device: DeviceId, opened: u64) -> Pane {
+        Pane::Playlists(Box::new(PlaylistPage {
+            device,
+            opened,
+            title: "Add to playlist".to_owned(),
+            options: bluos::playlists::AddToPlaylist {
+                url_path: "/AddToPlaylist".to_owned(),
+                parameters: vec![("file".to_owned(), "/music/a.flac".to_owned())],
+                ..Default::default()
+            },
+            naming: false,
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_track_filed_late_does_not_close_the_page_the_user_went_to() {
+        let (backend, first, _) = two_players().await;
+        first.serve("/AddToPlaylist", "<addToPlaylist/>");
+        first.delay("/AddToPlaylist", SLOW);
+        choose(&backend, &first).await;
+
+        backend.browsing.lock().unwrap().pane = playlists_page(first.id(), 1);
+        let _ = backend.commands.send(Command::PlaylistAdd(
+            1,
+            None,
+            bluos::client::PlaylistTarget::New("Mix".to_owned()),
+        ));
+        until("the add", || first.asked_for("/AddToPlaylist")).await;
+        // Settings, opened while the add is on its way.
+        backend.browsing.lock().unwrap().pane =
+            Pane::Settings(first.id(), vec![SettingsPage::default()]);
+        tokio::time::sleep(SLOW + SETTLED).await;
+
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "the add closes its own page, not the one opened since"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_playlist_chosen_on_one_page_is_not_added_from_the_next() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+
+        // Chosen on opening 1, the first player's. The second player's
+        // playlists went up before the add was handled.
+        backend.browsing.lock().unwrap().pane = playlists_page(second.id(), 2);
+        let _ = backend.commands.send(Command::PlaylistAdd(
+            1,
+            None,
+            bluos::client::PlaylistTarget::New("Mix".to_owned()),
+        ));
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !second.asked_for("/AddToPlaylist"),
+            "a choice made on one player's page is not sent with another's track"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_answered_after_the_picker_is_opened_again_does_not_join_it() {
+        let (backend, first, _second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+
+        let _ = backend.commands.send(Command::AlarmPick);
+        until("the picker", || picker_depth(&backend) == 1).await;
+
+        // "Inputs", the row on the first level that leads somewhere.
+        first.delay("/RadioBrowse", SLOW * 2);
+        let _ = backend.commands.send(Command::AlarmPickRow(1));
+        until("the folder to be asked for", || {
+            asked(&first, "/RadioBrowse") == 2
+        })
+        .await;
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the picker to close", || picker_depth(&backend) == 0).await;
+        // Plays again, answered at once, while the folder is still out. Its
+        // top level is at the depth the folder was pressed at.
+        first.delay("/RadioBrowse", Duration::ZERO);
+        let _ = backend.commands.send(Command::AlarmPick);
+        until("the picker to open again", || picker_depth(&backend) == 1).await;
+        tokio::time::sleep(SLOW * 2 + SETTLED).await;
+
+        assert_eq!(
+            picker_depth(&backend),
+            1,
+            "a folder pressed on the picker closed by Back is not put over the new one"
+        );
+    }
+
+    /// What a player with firmware waiting answers, to the page and the check.
+    const UPGRADE_WAITING: &str =
+        r#"<upgrade inProgress="false" available="true" version="4.18.2"/>"#;
+
+    fn help_row(kind: HelpKind) -> usize {
+        HELP_ENTRIES
+            .iter()
+            .position(|(_, entry, _, _)| *entry == kind)
+            .expect("a Help row")
+    }
+
+    /// The player an Install on the page showing is for, if it offers one.
+    fn install_offered(backend: &Backend) -> Option<DeviceId> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::HelpDetail(_, _, _, offer) => *offer,
+            _ => None,
+        }
+    }
+
+    fn upgrade_asked(backend: &Backend) -> Option<DeviceId> {
+        backend.browsing.lock().unwrap().upgrade_asked
+    }
+
+    /// Whether a player was told to install, as opposed to asked about it.
+    fn upgrade_started(player: &Player) -> bool {
+        player
+            .asked()
+            .iter()
+            .any(|seen| seen.starts_with("/upgrade?") && seen.contains("upgrade=this"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_on_an_upgrade_check_runs_only_on_the_player_it_checked() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/upgrade", UPGRADE_WAITING);
+        second.serve("/upgrade", UPGRADE_WAITING);
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::HelpAction(help_row(HelpKind::Upgrade)));
+        until("the first player's check to offer Install", || {
+            install_offered(&backend) == Some(first.id())
+        })
+        .await;
+
+        // Asked about the first player, and another chosen under the question.
+        let _ = backend.commands.send(Command::HelpAction(UPGRADE_ROW));
+        until("the question", || {
+            upgrade_asked(&backend) == Some(first.id())
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        let _ = backend.commands.send(Command::UpgradeAnswer(true));
+        tokio::time::sleep(SETTLED).await;
+        assert!(!upgrade_started(&first) && !upgrade_started(&second));
+
+        // The page is still up under the second player. Install asks nothing.
+        let _ = backend.commands.send(Command::HelpAction(UPGRADE_ROW));
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(upgrade_asked(&backend), None);
+        let _ = backend.commands.send(Command::UpgradeAnswer(true));
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !upgrade_started(&second),
+            "the player chosen since is not updated off the first player's check"
+        );
+        assert!(!upgrade_started(&first));
+
+        // With the player it checked selected again, it does run, there.
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player to be selected", || {
+            backend.is_selected(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::HelpAction(UPGRADE_ROW));
+        until("the question", || {
+            upgrade_asked(&backend) == Some(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::UpgradeAnswer(true));
+        until("the first player's update", || upgrade_started(&first)).await;
+        assert!(!upgrade_started(&second));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_is_not_offered_on_the_next_help_page() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/upgrade", UPGRADE_WAITING);
+        second.serve("/upgrade", UPGRADE_WAITING);
+        second.serve(
+            "/redirectToCp",
+            r#"<div class="ui-grid-a"><div class="ui-block-a">BluOS Version:</div>
+<div class="ui-block-b">4.16.6</div></div>"#,
+        );
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::HelpAction(help_row(HelpKind::Upgrade)));
+        until("the first player's check to offer Install", || {
+            install_offered(&backend) == Some(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("Help", || {
+            matches!(backend.browsing.lock().unwrap().pane, Pane::Help)
+        })
+        .await;
+
+        choose(&backend, &second).await;
+        let _ = backend
+            .commands
+            .send(Command::HelpAction(help_row(HelpKind::Diagnostics)));
+        until("the second player's diagnostics", || help_detail(&backend)).await;
+        assert_eq!(install_offered(&backend), None);
+
+        let _ = backend.commands.send(Command::HelpAction(UPGRADE_ROW));
+        tokio::time::sleep(SETTLED).await;
+        let _ = backend.commands.send(Command::UpgradeAnswer(true));
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !upgrade_started(&second),
+            "an Install left from one player's check is not pressed on another's page"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upgrade_check_that_lands_after_choosing_another_player_is_not_shown() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/upgrade", UPGRADE_WAITING);
+        first.delay("/upgrade", SLOW);
+        choose(&backend, &first).await;
+
+        let _ = backend
+            .commands
+            .send(Command::HelpAction(help_row(HelpKind::Upgrade)));
+        until("the check to be asked for", || first.asked_for("/upgrade")).await;
+        choose_without_home(&backend, &second).await;
+        // Two round trips, each held back.
+        tokio::time::sleep(SLOW * 2 + SETTLED).await;
+
+        assert!(
+            !help_detail(&backend),
+            "the first player's update is not shown under the second player"
+        );
+        assert_eq!(install_offered(&backend), None);
+    }
+
+    /// The pages that would have been opened in a browser on `player`'s
+    /// control port.
+    fn opened_on(player: &Player) -> Vec<String> {
+        let address = player.address().to_string();
+        OPENED_IN_BROWSER
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|url| url.contains(&address))
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreadable_diagnostics_that_land_after_choosing_another_player_open_no_browser() {
+        let (backend, first, second) = two_players().await;
+        // Not served, so the page cannot be read and the fallback is taken.
+        first.delay("/redirectToCp", SLOW);
+        choose(&backend, &first).await;
+        let row = help_row(HelpKind::Diagnostics);
+
+        let _ = backend.commands.send(Command::HelpAction(row));
+        until("the diagnostics to be asked for", || {
+            first.asked_for("/redirectToCp")
+        })
+        .await;
+        choose_without_home(&backend, &second).await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            opened_on(&first),
+            Vec::<String>::new(),
+            "the first player's page is not opened while the second is selected"
+        );
+
+        // Pressed with the first player selected, the fallback is taken.
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player to be selected", || {
+            backend.is_selected(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::HelpAction(row));
+        until("the browser", || !opened_on(&first).is_empty()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_list_read_again_that_cannot_be_read_opens_no_browser() {
+        let (backend, first, _) = two_players().await;
+        choose(&backend, &first).await;
+        // The services list is not served on this player. The shares page
+        // is read from port 80 on the player's host, where nothing answers.
+        let fallbacks = || {
+            OPENED_IN_BROWSER
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|url| url.contains("/services?noheader") || url.contains("/sharecfg"))
+                .count()
+        };
+
+        backend.browsing.lock().unwrap().pane =
+            Pane::Web(first.id(), WebPage::Services(Vec::new()));
+        let _ = backend.commands.send(Command::OpenServices {
+            device: first.id(),
+            reload: true,
+        });
+        until("the services list to be asked for", || {
+            first.asked_for("/redirectToCp")
+        })
+        .await;
+        backend.browsing.lock().unwrap().pane = Pane::Web(
+            first.id(),
+            WebPage::Shares {
+                action: None,
+                shares: Vec::new(),
+            },
+        );
+        let _ = backend.commands.send(Command::OpenShares {
+            device: first.id(),
+            reload: true,
+        });
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            fallbacks(),
+            0,
+            "a reload nobody asked a window for opens none"
+        );
+
+        // Opened rather than reloaded, both fall back to the browser.
+        let _ = backend.commands.send(Command::OpenServices {
+            device: first.id(),
+            reload: false,
+        });
+        let _ = backend.commands.send(Command::OpenShares {
+            device: first.id(),
+            reload: false,
+        });
+        until("both fallbacks", || fallbacks() == 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_press_left_from_before_choosing_away_and_back_is_not_lit_on_home() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/ui/Favourites", fixtures::home());
+        first.delay("/ui/Home", SLOW);
+        first.delay("/ui/Favourites", SLOW);
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("its configuration", || {
+            configured(&backend) == Some(first.id())
+        })
+        .await;
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("Favourites to be asked for", || {
+            asked(&first, "/ui/Favourites") > 0
+        })
+        .await;
+        // Another chosen before either lands, so both are dropped, and then
+        // this one again. It is still the player configured.
+        choose_without_home(&backend, &second).await;
+        assert_eq!(configured(&backend), Some(first.id()));
+        first.delay("/ui/Home", Duration::ZERO);
+        choose(&backend, &first).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            lit(&backend),
+            Some((0, 0)),
+            "Home is showing, so Home is lit, not the press dropped before"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_press_whose_screen_failed_is_not_lit_on_the_home_asked_for_again() {
+        let (backend, first, _) = two_players().await;
+        // Neither Home nor Favourites is served.
+        first.forget("/ui/Home");
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("its Home to be asked for", || {
+            asked(&first, "/ui/Home") == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("Favourites to be asked for", || {
+            asked(&first, "/ui/Favourites") == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            lit(&backend),
+            Some((0, 1)),
+            "a failed screen leaves its entry lit"
+        );
+
+        // Its card pressed again, and Home answers this time.
+        first.serve("/ui/Home", fixtures::home());
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("its Home", || device(&backend) == Some(first.id())).await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(lit(&backend), Some((0, 0)));
     }
 }

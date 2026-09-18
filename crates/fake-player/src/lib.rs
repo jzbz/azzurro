@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,6 +52,13 @@ struct State {
     heads: Vec<String>,
     /// A `X-Sovi-Ui-Context` to put on every reply, if the test wants one.
     context: Option<String>,
+    /// How long to sit on a request before answering it, by path.
+    ///
+    /// A real player is not instant, and one that is waking or busy can take
+    /// seconds. Whatever the app does while a reply is on its way — the user
+    /// choosing another player, most of all — is only reachable in a test if
+    /// the reply can be made to arrive late.
+    delays: HashMap<String, Duration>,
 }
 
 /// A player on the loopback.
@@ -75,6 +83,7 @@ impl Player {
             seen: Vec::new(),
             heads: Vec::new(),
             context: None,
+            delays: HashMap::new(),
         }));
 
         // Port zero: the kernel picks a free one, so tests can run at the same
@@ -118,6 +127,18 @@ impl Player {
     /// Stop answering a path at all, so it 404s.
     pub fn forget(&self, path: &str) {
         self.state.lock().unwrap().routes.remove(path);
+    }
+
+    /// Answer a path only after `by` has passed, from here on.
+    ///
+    /// The request is recorded as asked for the moment it arrives, so a test
+    /// can tell a reply that is on its way from one that was never sent for.
+    pub fn delay(&self, path: &str, by: Duration) {
+        self.state
+            .lock()
+            .unwrap()
+            .delays
+            .insert(path.to_owned(), by);
     }
 
     /// Everything asked for so far, path and query, in order.
@@ -192,12 +213,22 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
         .to_owned();
     let path = target.split('?').next().unwrap_or_default().to_owned();
 
-    let (body, context) = {
+    let (body, context, delay) = {
         let mut state = state.lock().unwrap();
         state.seen.push(target.clone());
         state.heads.push(head.clone());
-        (state.routes.get(&path).cloned(), state.context.clone())
+        (
+            state.routes.get(&path).cloned(),
+            state.context.clone(),
+            state.delays.get(&path).copied(),
+        )
     };
+
+    // Read which route to answer before waiting, and the body too: what a
+    // player sends is what it had when it was asked.
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
 
     let carried = match &context {
         Some(value) => format!("X-Sovi-Ui-Context: {value}\r\n"),

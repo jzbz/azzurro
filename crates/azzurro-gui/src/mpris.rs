@@ -11,7 +11,7 @@
 //! into the same channel the window's buttons use, so a D-Bus caller and a
 //! click are indistinguishable by the time they reach a player.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bluos::{DeviceId, Repeat, Status};
@@ -22,6 +22,7 @@ use mpris_server::{
 };
 use tokio::sync::mpsc;
 
+use crate::artwork::Artwork;
 use crate::{Action, Command, Registry};
 
 /// A position report this far from what the last one implied is treated as a
@@ -73,6 +74,7 @@ impl Bridge {
         name: String,
         registry: Registry,
         commands: mpsc::UnboundedSender<Command>,
+        artwork: Arc<Artwork>,
     ) -> Option<Self> {
         // `org.mpris.MediaPlayer2.azzurro.instance<pid>_<n>`. The spec wants a
         // unique suffix and suggests a process id; the index disambiguates the
@@ -86,6 +88,8 @@ impl Bridge {
             name,
             registry,
             commands,
+            artwork,
+            art: Mutex::new(None),
         };
 
         match Server::new(&suffix, exported).await {
@@ -105,7 +109,7 @@ impl Bridge {
 
     /// Announce whatever changed since the last status.
     pub async fn publish(&self, status: &Status) {
-        let art = self.server.imp().art_url(status);
+        let art = self.server.imp().art_url(status).await;
         let current = Announced {
             playback: playback_status(status),
             loop_status: loop_status(status),
@@ -347,6 +351,12 @@ struct Exported {
     name: String,
     registry: Registry,
     commands: mpsc::UnboundedSender<Command>,
+    /// Where covers already fetched are kept, and the rule for those that
+    /// are not.
+    artwork: Arc<Artwork>,
+    /// The player's URL for the cover last published, and what the desktop
+    /// was given for it.
+    art: Mutex<Option<(String, Option<String>)>>,
 }
 
 impl Exported {
@@ -357,10 +367,39 @@ impl Exported {
         Some((entry.status.clone()?, entry.status_at?))
     }
 
-    fn art_url(&self, status: &Status) -> Option<String> {
+    /// The cover's URL as the player named it, resolved against the player.
+    fn player_art(&self, status: &Status) -> Option<String> {
         let art = status.artwork()?;
         let guard = self.registry.lock().unwrap();
         Some(guard.get(&self.id)?.client.image_url(art))
+    }
+
+    /// The cover as the shell should fetch it, which is not always the URL the
+    /// player named: see [`Artwork::for_desktop`]. Remembered, for
+    /// [`Self::remembered_art`].
+    ///
+    /// Called from `publish`, which runs on a tokio task.
+    async fn art_url(&self, status: &Status) -> Option<String> {
+        let url = self.player_art(status)?;
+        let offered = self.artwork.for_desktop(&url).await;
+        *self.art.lock().unwrap() = Some((url, offered.clone()));
+        offered
+    }
+
+    /// The same answer for a D-Bus caller, without the runtime `art_url` needs.
+    ///
+    /// Property reads arrive on zbus's own executor thread, and the disk check
+    /// there panicked the thread and left the caller waiting — which in a
+    /// release build, where a panic aborts, would have taken the app with it.
+    /// So this reuses what `publish` last worked out for the same cover, and
+    /// for a cover it has not seen yet it offers the URL only where the
+    /// address rule would, which needs no disk.
+    fn remembered_art(&self, status: &Status) -> Option<String> {
+        let url = self.player_art(status)?;
+        match &*self.art.lock().unwrap() {
+            Some((seen, offered)) if *seen == url => offered.clone(),
+            _ => self.artwork.offered(&url),
+        }
     }
 
     fn send(&self, action: Action) -> fdo::Result<()> {
@@ -543,7 +582,7 @@ impl PlayerInterface for Exported {
     async fn metadata(&self) -> fdo::Result<Metadata> {
         Ok(match self.snapshot() {
             Some((status, _)) => {
-                let art = self.art_url(&status);
+                let art = self.remembered_art(&status);
                 metadata(&status, art)
             }
             None => Metadata::new(),
