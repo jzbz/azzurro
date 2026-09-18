@@ -12985,12 +12985,40 @@ mod selection_tests {
     }
 
     /// Wait for something the backend does off the loop, or fail saying what.
-    async fn until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    async fn until(what: &str, done: impl FnMut() -> bool) {
+        until_within(Duration::from_secs(5), what, done).await;
+    }
+
+    /// The same, for something that has to wait out a network timeout first.
+    ///
+    /// Five seconds is plenty for anything answered on the loopback, and it is
+    /// also exactly the client's connect timeout, so a step that waits for a
+    /// connection to fail has no room left. A host that drops the connection
+    /// rather than refusing it — a Windows runner, against a port nothing
+    /// listens on — then takes the whole timeout, and the wait fails on a
+    /// machine where nothing is wrong.
+    async fn until_within(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The browser list, emptied, for this test alone.
+    ///
+    /// [`OPENED_IN_BROWSER`] is one list for the whole process, so two tests
+    /// that open a browser at the same time see each other's entries: one
+    /// counting its own two fallbacks waits for a count that another test has
+    /// already pushed past. Every test that reads the list or can add to it
+    /// holds this for as long as it runs.
+    /// Tokio's mutex rather than the standard one, because these tests hold it
+    /// across their awaits, which is what the standard one must never be.
+    async fn watching_the_browser() -> tokio::sync::MutexGuard<'static, ()> {
+        static BROWSER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let held = BROWSER_TESTS.lock().await;
+        OPENED_IN_BROWSER.lock().unwrap().clear();
+        held
     }
 
     fn device(backend: &Backend) -> Option<DeviceId> {
@@ -14620,6 +14648,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn diagnostics_that_land_after_choosing_another_player_are_not_shown() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, second) = two_players().await;
         // Readable, so what is dropped below is dropped for being late and
         // no browser is ever offered in its place.
@@ -14789,6 +14819,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn install_on_an_upgrade_check_runs_only_on_the_player_it_checked() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, second) = two_players().await;
         first.serve("/upgrade", UPGRADE_WAITING);
         second.serve("/upgrade", UPGRADE_WAITING);
@@ -14842,6 +14874,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn install_is_not_offered_on_the_next_help_page() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, second) = two_players().await;
         first.serve("/upgrade", UPGRADE_WAITING);
         second.serve("/upgrade", UPGRADE_WAITING);
@@ -14883,6 +14917,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_upgrade_check_that_lands_after_choosing_another_player_is_not_shown() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, second) = two_players().await;
         first.serve("/upgrade", UPGRADE_WAITING);
         first.delay("/upgrade", SLOW);
@@ -14918,6 +14954,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unreadable_diagnostics_that_land_after_choosing_another_player_open_no_browser() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, second) = two_players().await;
         // Not served, so the page cannot be read and the fallback is taken.
         first.delay("/redirectToCp", SLOW);
@@ -14949,6 +14987,8 @@ mod selection_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_list_read_again_that_cannot_be_read_opens_no_browser() {
+        // The browser list is one list for the process; this test wants it alone.
+        let _browser = watching_the_browser().await;
         let (backend, first, _) = two_players().await;
         choose(&backend, &first).await;
         // The services list is not served on this player. The shares page
@@ -14999,7 +15039,13 @@ mod selection_tests {
             device: first.id(),
             reload: false,
         });
-        until("both fallbacks", || fallbacks() == 2).await;
+        // Thirty seconds, not five: the shares page is read from port 80 on the
+        // player's host, and a host that drops rather than refuses makes that
+        // fallback wait out the client's connect timeout first.
+        until_within(Duration::from_secs(30), "both fallbacks", || {
+            fallbacks() == 2
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
