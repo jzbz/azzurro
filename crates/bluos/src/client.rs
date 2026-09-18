@@ -37,6 +37,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// against its own thirty-second default.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long to wait for a connection to open, separately from the reply.
+///
+/// Without it, opening a connection is bounded only by the request's own
+/// timeout, and for the status poll that is 115 seconds. A player that has
+/// dropped off the network, or a route that swallows SYNs rather than refusing
+/// them, then cost almost two minutes per retry before the app could say it
+/// was gone. A player on the same LAN answers a SYN in milliseconds; five
+/// seconds allows for Wi-Fi waking up and nothing else. Public so the cover
+/// art client can use the same figure.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The largest reply worth reading from a player.
 ///
 /// The timeout above bounds how *long* a body may take to arrive, not how
@@ -189,7 +200,15 @@ const MAX_HOPS: usize = 5;
 /// the policy per request — `Request::extensions` is private, so there is no
 /// way to tag one — which is exactly why the two want separate clients.
 pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    builder().build()
+}
+
+/// Everything [`http_client`] sets, not yet built. Apart so a test can read
+/// the settings back: a built client does not print its timeouts, and a
+/// builder does.
+fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             // Never empty: the URL being redirected away from is pushed before
             // the policy is consulted, so at the first hop this holds one.
@@ -214,7 +233,6 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
                 None => attempt.follow(),
             }
         }))
-        .build()
 }
 
 /// Which playlist an add is aimed at.
@@ -446,10 +464,15 @@ impl Client {
             return Err(oversized());
         }
 
+        // reqwest hands back a body error with no URL on it, so without this
+        // a web page cut off halfway read as a failure on the control port,
+        // with no path to say which of several requests it was.
+        let url = response.url().clone();
         let mut buffer = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|source| Error::Http {
+        while let Some(chunk) = response.chunk().await.map_err(|cause| Error::Http {
             device: self.id,
-            source,
+            cause: cause.with_url(url.clone()),
+            body: String::new(),
         })? {
             if buffer.len() + chunk.len() > MAX_BODY {
                 return Err(oversized());
@@ -459,6 +482,30 @@ impl Client {
 
         Ok(String::from_utf8(buffer)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+    }
+
+    /// Send a request, and hand back the response only if the player took it.
+    ///
+    /// A 4xx or 5xx is an error, as `error_for_status` makes it, but the body
+    /// is read first rather than dropped with the response. The player
+    /// explains itself there — the preset reorder route answers a malformed
+    /// write with `must be application/json` — and an error that says only
+    /// "400 Bad Request" leaves nobody able to tell which mistake it was.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let response = request.send().await.map_err(|cause| Error::Http {
+            device: self.id,
+            cause,
+            body: String::new(),
+        })?;
+
+        let Some(cause) = response.error_for_status_ref().err() else {
+            return Ok(response);
+        };
+        Err(Error::Http {
+            device: self.id,
+            cause,
+            body: explanation(response).await,
+        })
     }
 
     async fn get_text(
@@ -481,14 +528,7 @@ impl Client {
             request = request.header(UI_CONTEXT, context);
         }
 
-        let response = request
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })?;
+        let response = self.send(request).await?;
 
         self.remember_context(&response);
         self.body(response).await
@@ -565,11 +605,19 @@ impl Client {
     pub async fn sync_or_upgrade(&self) -> Result<Sync> {
         let body = self.get_text("/SyncStatus", &[], REQUEST_TIMEOUT).await?;
 
+        // A `<SyncStatus>` that will not deserialize is the same failure
+        // `sync_status` reports, and reported the same way: as XML the player
+        // sent, with the start of it, so the poll can tell a player that
+        // answered from one that did not.
         match crate::upgrade::in_sync_status(&body)? {
             Some(progress) => Ok(Sync::Upgrading(progress)),
             None => quick_xml::de::from_str(&body)
                 .map(|status| Sync::Status(Box::new(status)))
-                .map_err(|e| Error::Screen(format!("SyncStatus: {e}"))),
+                .map_err(|source| Error::Xml {
+                    device: self.id,
+                    source,
+                    body: snippet(&body),
+                }),
         }
     }
 
@@ -598,23 +646,20 @@ impl Client {
     /// hard-coding that, the redirect is followed and the address it lands on
     /// is what the returned document carries as its base, so a write goes back
     /// to wherever the read came from.
+    ///
+    /// `page` is an id as the player wrote it, decoded, and is encoded here: a
+    /// group's id comes out of an attribute, and one with a space or an `&` in
+    /// it would otherwise have split the query.
     pub async fn settings(&self, page: Option<&str>) -> Result<Settings> {
-        let path = match page {
-            Some(id) => format!("/Settings?id={id}"),
-            None => "/Settings".to_owned(),
-        };
-
-        let response = self
+        let mut request = self
             .http
-            .get(self.resolve(&self.base, &path)?)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })?;
+            .get(self.resolve(&self.base, "/Settings")?)
+            .timeout(REQUEST_TIMEOUT);
+        if let Some(id) = page {
+            request = request.query(&[("id", id)]);
+        }
+
+        let response = self.send(request).await?;
 
         let landed = response.url().clone();
         let base = format!("{}://{}", landed.scheme(), landed.authority());
@@ -638,7 +683,7 @@ impl Client {
     /// against. Taking it would suggest otherwise.
     pub async fn write_setting(&self, setting: &Setting, value: &str) -> Result<()> {
         let (Some(url), Some(name)) = (setting.url.as_deref(), setting.name.as_deref()) else {
-            return Err(Error::Screen(format!(
+            return Err(Error::Refused(format!(
                 "the setting {:?} says nothing about where to write it",
                 setting.id
             )));
@@ -648,19 +693,13 @@ impl Client {
         // this crate ever sends, and it is two strings.
         let body = format!("{{{}:{}}}", json_string(name), json_string(value));
 
-        self.http
+        let request = self
+            .http
             .post(self.resolve(&self.base, url)?)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(REQUEST_TIMEOUT)
-            .body(body)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map(drop)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
+            .body(body);
+        self.send(request).await.map(drop)
     }
 
     /// Ask the player whether there is firmware to install.
@@ -750,12 +789,12 @@ impl Client {
         let ready = self.upgrade_available_for(member).await?;
 
         if ready.in_progress {
-            return Err(Error::Screen(
+            return Err(Error::Refused(
                 "an upgrade is already running on this player".to_owned(),
             ));
         }
         if !ready.available {
-            return Err(Error::Screen(
+            return Err(Error::Refused(
                 "the player says it has no upgrade to install".to_owned(),
             ));
         }
@@ -800,17 +839,8 @@ impl Client {
     }
 
     async fn get_web(&self, path: &str) -> Result<String> {
-        let response = self
-            .http
-            .get(self.web_url(path)?)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })?;
+        let request = self.http.get(self.web_url(path)?).timeout(REQUEST_TIMEOUT);
+        let response = self.send(request).await?;
 
         self.body(response).await
     }
@@ -841,30 +871,7 @@ impl Client {
         values: &std::collections::BTreeMap<String, String>,
         pressed: &crate::forms::Submit,
     ) -> Result<String> {
-        let mut body = String::new();
-        // Hidden first, then what was filled in, then the button. The player
-        // reads the last of a repeated name, and nothing here repeats, but the
-        // order is the page's own and worth keeping.
-        let pairs = form
-            .hidden
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .chain(values.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            // A nameless button contributes nothing to the body; it is the only
-            // thing its form does, so pressing it is the whole message.
-            .chain(
-                (!pressed.name.is_empty())
-                    .then_some((pressed.name.as_str(), pressed.label.as_str())),
-            );
-
-        for (key, value) in pairs {
-            if !body.is_empty() {
-                body.push('&');
-            }
-            body.push_str(&percent_encoding::utf8_percent_encode(key, FORM_FIELD).to_string());
-            body.push('=');
-            body.push_str(&percent_encoding::utf8_percent_encode(value, FORM_FIELD).to_string());
-        }
+        let body = form_body(form, values, pressed);
 
         let url = self.web_url(&form.action)?;
         let request = if form.post {
@@ -885,15 +892,7 @@ impl Client {
             request
         };
 
-        let response = request
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })?;
+        let response = self.send(request.timeout(REQUEST_TIMEOUT)).await?;
 
         self.body(response).await
     }
@@ -937,22 +936,16 @@ impl Client {
             body.push_str("=on");
         }
 
-        self.http
+        let request = self
+            .http
             .post(self.web_url(action)?)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             )
             .timeout(REQUEST_TIMEOUT)
-            .body(body)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
-            .map(drop)
+            .body(body);
+        self.send(request).await.map(drop)
     }
 
     /// One track's technical details, as label and value.
@@ -1148,7 +1141,9 @@ impl Client {
     /// crate has no business inventing either.
     pub async fn save_preset(&self, preset: &crate::screen::Preset) -> Result<()> {
         let Some(url) = preset.url.as_deref() else {
-            return Err(Error::Screen("a preset needs something to play".to_owned()));
+            return Err(Error::Refused(
+                "a preset needs something to play".to_owned(),
+            ));
         };
         let mut query: Vec<(&str, &str)> = vec![("url", url)];
         if !preset.name.is_empty() {
@@ -1180,7 +1175,9 @@ impl Client {
     /// field left out is a field cleared.
     pub async fn edit_preset(&self, slot: u32, preset: &crate::screen::Preset) -> Result<()> {
         let Some(url) = preset.url.as_deref() else {
-            return Err(Error::Screen("a preset needs something to play".to_owned()));
+            return Err(Error::Refused(
+                "a preset needs something to play".to_owned(),
+            ));
         };
         let slot = slot.to_string();
         let mut query: Vec<(&str, &str)> = vec![("id", &slot), ("url", url)];
@@ -1224,19 +1221,13 @@ impl Client {
         let body = format!("{{\"prid\":{prid},\"ordering\":[{}]}}", ordering.join(","));
 
         let url = format!("/Presets/edit?prid={prid}");
-        self.http
+        let request = self
+            .http
             .post(self.resolve(&self.base, &url)?)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .timeout(REQUEST_TIMEOUT)
-            .body(body)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map(drop)
-            .map_err(|source| Error::Http {
-                device: self.id,
-                source,
-            })
+            .body(body);
+        self.send(request).await.map(drop)
     }
 
     /// Play a stream the caller names, rather than one the player offered.
@@ -1427,13 +1418,62 @@ fn json_string(raw: &str) -> String {
 }
 
 impl From<reqwest::Error> for Error {
-    fn from(source: reqwest::Error) -> Self {
+    fn from(cause: reqwest::Error) -> Self {
         // Only reachable from client construction, which has no device yet.
         Error::Http {
             device: DeviceId::at(std::net::Ipv4Addr::UNSPECIFIED),
-            source,
+            cause,
+            body: String::new(),
         }
     }
+}
+
+/// What a player said alongside a 4xx or 5xx, cut to fit an error message.
+///
+/// Read only as far as a message needs: this is a reply the caller has
+/// already decided is a failure, so there is nothing further in it worth
+/// waiting for. A body that cannot be read is no explanation, not a second
+/// error.
+async fn explanation(mut response: reqwest::Response) -> String {
+    const ENOUGH: usize = 1024;
+    let status = response.status();
+    let mut buffer = Vec::new();
+    while buffer.len() < ENOUGH {
+        match response.chunk().await {
+            Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    told(status, &String::from_utf8_lossy(&buffer))
+}
+
+/// The part of an error reply's body worth putting in a message.
+///
+/// The port-80 web server is likely to answer a missing route with a small
+/// HTML page, and markup in a toast is noise, so a body that starts as a tag
+/// has its tags taken off; one that does not is left alone, because a plain
+/// reason may well contain a `<`. Whitespace is folded either way, since a
+/// line break would split a toast.
+///
+/// What is left is dropped if it only says the status again — `404 Not Found
+/// Not Found`, from a page's title and heading — because the message already
+/// says that. Anything more, `must be application/json`, is kept.
+fn told(status: reqwest::StatusCode, body: &str) -> String {
+    let body = body.trim_start();
+    let text = if body.starts_with('<') {
+        crate::reports::strip_tags(body)
+    } else {
+        body.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    let mut rest = text.to_lowercase().replace(status.as_str(), "");
+    if let Some(words) = status.canonical_reason() {
+        rest = rest.replace(&words.to_lowercase(), "");
+    }
+    if !rest.chars().any(char::is_alphanumeric) {
+        return String::new();
+    }
+    snippet(&text)
 }
 
 /// The head of a response, for an error message.
@@ -1532,8 +1572,218 @@ fn upgrade_query(scope: &str, member: Option<crate::DeviceId>) -> Vec<(&'static 
     query
 }
 
+/// A filled-in form, encoded the way a browser would post it.
+///
+/// `values` holds what was typed or chosen, by field name. A switch's entry is
+/// only whether it is on — anything but empty — because what a ticked box
+/// sends is the page's business, not the editor's: its own `value`, kept on
+/// the [`crate::forms::Field`]. An unticked box sends nothing at all. Posting
+/// `name=` for it, as this used to, told the player it was set.
+///
+/// A set of radios with none checked sends nothing either, and for the same
+/// reason. The editor holds no entry for it until one is picked, so it is not
+/// among `values` to send; a radio or option whose own value is `""` and that
+/// was checked, picked or selected still sends `name=`, as a browser does. An
+/// empty entry that is none of the field's own values is not a pick at all and
+/// is left out too, so a caller holding an unset group as empty posts nothing
+/// for it either.
+fn form_body(
+    form: &crate::forms::Form,
+    values: &std::collections::BTreeMap<String, String>,
+    pressed: &crate::forms::Submit,
+) -> String {
+    let fields: std::collections::BTreeMap<&str, &crate::forms::Field> = form
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect();
+
+    let mut body = String::new();
+    // Hidden first, then what was filled in, then the button. The player
+    // reads the last of a repeated name, and nothing here repeats, but the
+    // order is the page's own and worth keeping.
+    let pairs = form
+        .hidden
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .chain(
+            values
+                .iter()
+                .filter_map(|(k, v)| match fields.get(k.as_str()) {
+                    Some(field) if field.kind == crate::forms::Kind::Switch => {
+                        (!v.is_empty()).then_some((k.as_str(), field.value.as_str()))
+                    }
+                    Some(field)
+                        if field.kind == crate::forms::Kind::Choice
+                            && v.is_empty()
+                            && !field.choices.iter().any(|c| c.value.is_empty()) =>
+                    {
+                        None
+                    }
+                    _ => Some((k.as_str(), v.as_str())),
+                }),
+        )
+        // A nameless button contributes nothing to the body; it is the only
+        // thing its form does, so pressing it is the whole message.
+        .chain(
+            (!pressed.name.is_empty()).then_some((pressed.name.as_str(), pressed.label.as_str())),
+        );
+
+    for (key, value) in pairs {
+        if !body.is_empty() {
+            body.push('&');
+        }
+        body.push_str(&percent_encoding::utf8_percent_encode(key, FORM_FIELD).to_string());
+        body.push('=');
+        body.push_str(&percent_encoding::utf8_percent_encode(value, FORM_FIELD).to_string());
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A ticked box sends the value the page gave it and an unticked one sends
+    /// nothing, whatever the editor holds for either.
+    #[test]
+    fn a_form_posts_switches_the_way_a_browser_does() {
+        use crate::forms::{Choice, Field, Form, Kind, Submit};
+
+        let form = Form {
+            action: "/x".to_owned(),
+            post: true,
+            fields: vec![
+                Field {
+                    name: "on".to_owned(),
+                    kind: Kind::Switch,
+                    value: "1".to_owned(),
+                    ..Field::default()
+                },
+                Field {
+                    name: "off".to_owned(),
+                    kind: Kind::Switch,
+                    value: "on".to_owned(),
+                    checked: true,
+                    ..Field::default()
+                },
+                Field {
+                    name: "user".to_owned(),
+                    ..Field::default()
+                },
+                Field {
+                    name: "band".to_owned(),
+                    kind: Kind::Choice,
+                    choices: vec![choice("2g"), choice("5g")],
+                    ..Field::default()
+                },
+                Field {
+                    name: "carrier".to_owned(),
+                    kind: Kind::Choice,
+                    choices: vec![
+                        Choice {
+                            selected: true,
+                            ..choice("")
+                        },
+                        choice("att"),
+                    ],
+                    ..Field::default()
+                },
+            ],
+            hidden: [("service".to_owned(), "Qobuz".to_owned())].into(),
+            submits: Vec::new(),
+        };
+        let mut values: std::collections::BTreeMap<String, String> = [
+            ("on".to_owned(), "on".to_owned()),
+            ("off".to_owned(), String::new()),
+            ("user".to_owned(), String::new()),
+            ("band".to_owned(), String::new()),
+            ("carrier".to_owned(), String::new()),
+        ]
+        .into();
+        let pressed = Submit {
+            name: "login".to_owned(),
+            label: "Login".to_owned(),
+        };
+
+        // `off` is absent though the page had it ticked: what goes back is
+        // what the editor holds now. An empty text field still goes back empty.
+        // Radios nobody checked are absent too, while a select whose chosen
+        // option is the empty one says so, both as a browser does.
+        assert_eq!(
+            super::form_body(&form, &values, &pressed),
+            "service=Qobuz&carrier=&on=1&user=&login=Login"
+        );
+
+        // Once one is picked, it goes.
+        values.insert("band".to_owned(), "5g".to_owned());
+        assert_eq!(
+            super::form_body(&form, &values, &pressed),
+            "service=Qobuz&band=5g&carrier=&on=1&user=&login=Login"
+        );
+    }
+
+    /// A radio whose own value is empty is sent only once it is picked. Until
+    /// then the group holds no entry, which is what a browser sends for it.
+    #[test]
+    fn an_empty_valued_radio_is_sent_only_once_picked() {
+        use crate::forms::{Field, Form, Kind, Submit};
+
+        let form = Form {
+            action: "/x".to_owned(),
+            post: true,
+            fields: vec![Field {
+                name: "mode".to_owned(),
+                kind: Kind::Choice,
+                choices: vec![choice(""), choice("x")],
+                ..Field::default()
+            }],
+            ..Form::default()
+        };
+        let pressed = Submit::default();
+        let mut values = std::collections::BTreeMap::new();
+
+        assert_eq!(super::form_body(&form, &values, &pressed), "");
+        values.insert("mode".to_owned(), String::new());
+        assert_eq!(super::form_body(&form, &values, &pressed), "mode=");
+    }
+
+    fn choice(value: &str) -> crate::forms::Choice {
+        crate::forms::Choice {
+            value: value.to_owned(),
+            label: value.to_owned(),
+            selected: false,
+        }
+    }
+
+    /// An error page's markup comes off, and a page that only restates the
+    /// status is no explanation at all.
+    #[test]
+    fn an_error_page_is_read_for_what_it_adds() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        assert_eq!(
+            told(
+                not_found,
+                "<html><head><title>404 Not Found</title></head>\n<body><h1>Not Found</h1></body></html>"
+            ),
+            ""
+        );
+        assert_eq!(
+            told(
+                not_found,
+                "<!DOCTYPE html><html><body><p>no preset&#34;3&#34;</p></body></html>"
+            ),
+            "no preset\"3\""
+        );
+        // Not markup, so kept whole, `<` and all.
+        assert_eq!(
+            told(
+                reqwest::StatusCode::BAD_REQUEST,
+                "must be\n  < 10 &amp; json"
+            ),
+            "must be < 10 &amp; json"
+        );
+        assert_eq!(told(not_found, "  \n"), "");
+    }
 
     #[test]
     fn a_zone_out_of_every_form_it_is_written_in() {
@@ -1821,7 +2071,158 @@ mod tests {
             .await
             .expect_err("a host change was followed");
         assert!(
-            matches!(&err, Error::Http { source, .. } if source.is_redirect()),
+            matches!(&err, Error::Http { cause, .. } if cause.is_redirect()),
+            "wrong error: {err:?}"
+        );
+    }
+
+    /// A 4xx with the player's reason in the body — the shape the preset
+    /// reorder route answers a malformed write with.
+    #[tokio::test]
+    async fn a_refused_request_says_what_the_player_said() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            drain(&mut socket).await;
+            let body = "must be\n  application/json";
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+        });
+
+        let err = client_at(addr)
+            .get_text("/Presets/edit", &[("prid", "3")], REQUEST_TIMEOUT)
+            .await
+            .expect_err("a 400 is a failure");
+        // Which route answered, but not its query: a form sent as a GET puts
+        // what was typed there.
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "request to {addr}/Presets/edit failed: it answered 400 Bad Request: must be application/json"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_fails_says_why() {
+        // Bound and let go, so nothing is listening there.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let err = client_at(addr)
+            .get_text("/Status", &[], REQUEST_TIMEOUT)
+            .await
+            .expect_err("nothing is listening");
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!("request to {addr}/Status failed: ")),
+            "{message}"
+        );
+        assert!(
+            message.to_lowercase().contains("refused"),
+            "the reason, not only that it failed: {message}"
+        );
+        // Once, in the message. A chain printer — the CLI's — would otherwise
+        // say it a second time.
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn a_connection_that_never_opens_is_given_up_on_early() {
+        // Nothing to observe short of a network that drops SYNs, so this
+        // checks the setting is on what `http_client` builds from.
+        let settings = format!("{:?}", builder());
+        assert!(
+            settings.contains(&format!("connect_timeout: {CONNECT_TIMEOUT:?}")),
+            "{settings}"
+        );
+    }
+
+    /// What giving up early reads as. A resolver that never answers stands in
+    /// for a route that swallows SYNs: the same deadline covers both, and this
+    /// way nothing is sent anywhere.
+    #[tokio::test]
+    async fn a_connection_that_times_out_says_it_never_opened() {
+        struct Never;
+        impl reqwest::dns::Resolve for Never {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = builder()
+            .connect_timeout(Duration::from_millis(50))
+            .dns_resolver(Never)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let cause = http
+            .get("http://player.invalid:11000/Status")
+            .send()
+            .await
+            .expect_err("nothing answers");
+        let err = Error::Http {
+            device: "127.0.0.1:11000".parse().unwrap(),
+            cause,
+            body: String::new(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "request to player.invalid:11000/Status failed: could not connect: timed out"
+        );
+    }
+
+    /// A reply that stops short fails while its body is read, where reqwest
+    /// keeps no URL, and the message still says which request it was.
+    #[tokio::test]
+    async fn a_reply_cut_off_halfway_says_which_request_it_was() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            drain(&mut socket).await;
+            // A hundred bytes promised, eight sent, and the socket dropped.
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n<status>")
+                .await;
+        });
+
+        let err = client_at(addr)
+            .get_text("/Status", &[], REQUEST_TIMEOUT)
+            .await
+            .expect_err("the body stops short");
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!("request to {addr}/Status failed: ")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_status_that_will_not_read_is_xml_the_player_sent() {
+        // The right root, missing the name and model every one carries.
+        let addr = serve(r#"<SyncStatus etag="1"/>"#, 0).await;
+        let err = client_at(addr)
+            .sync_or_upgrade()
+            .await
+            .expect_err("nothing to build a status from");
+        assert!(
+            matches!(&err, Error::Xml { body, .. } if body.contains("SyncStatus")),
             "wrong error: {err:?}"
         );
     }

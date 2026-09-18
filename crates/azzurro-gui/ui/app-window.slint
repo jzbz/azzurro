@@ -3250,6 +3250,19 @@ export component AppWindow inherits Window {
                             // was inserted above the view after the fact.
                             property <bool> settling: false;
 
+                            // The same hold for End, which aims at the bottom
+                            // rather than at an offset. End cannot be worked out
+                            // once when it is asked: a fetched last window
+                            // replaces the rows in the same turn as the ask, but
+                            // the list is only measured when it is next drawn, so
+                            // the height End reads is the old window's. Jumping
+                            // from a letter's seven rows to the last thirty put
+                            // the view at the top of those thirty, and nothing
+                            // moved it again. Re-aimed here on every measure
+                            // instead, which also keeps the last row on screen
+                            // when the artwork makes the rows taller.
+                            property <bool> settling-end: false;
+
                             changed viewport-y => {
                                 if (self.viewport-height + self.viewport-y - self.height < 900px) {
                                     root.browse-more();
@@ -3271,6 +3284,9 @@ export component AppWindow inherits Window {
                             changed viewport-height => {
                                 if (self.settling) {
                                     self.viewport-y = -root.browse-jump-y * 1px;
+                                }
+                                if (self.settling-end) {
+                                    self.viewport-y = min(0px, self.height - self.viewport-height);
                                 }
                                 if (self.viewport-height + self.viewport-y - self.height < 900px) {
                                     root.browse-more();
@@ -3305,12 +3321,15 @@ export component AppWindow inherits Window {
                             // handler because `browse-list` cannot be named
                             // from outside the `if` that builds it.
                             //
-                            // Both give up the settling pin: the reader has
-                            // said where they want to be, and rows growing a
-                            // moment later must not overrule them.
+                            // Home gives up both pins: the reader has said
+                            // where they want to be, and rows growing a moment
+                            // later must not overrule them. End trades the
+                            // jump's pin for its own, since the rows it goes to
+                            // may not have been measured yet.
                             property <int> to-top: root.browse-to-top;
                             changed to-top => {
                                 browse-list.settling = false;
+                                browse-list.settling-end = false;
                                 browse-list.viewport-y = 0;
                             }
 
@@ -3319,6 +3338,10 @@ export component AppWindow inherits Window {
                                 browse-list.settling = false;
                                 browse-list.viewport-y = min(0px,
                                     browse-list.height - browse-list.viewport-height);
+                                // Right when the rows are already measured, and
+                                // put right on the next measure when they are
+                                // not. See `settling-end` on the list.
+                                browse-list.settling-end = true;
                             }
 
                             // A screenful at a time. Clamped at both ends so
@@ -3327,6 +3350,7 @@ export component AppWindow inherits Window {
                             property <int> paged: root.browse-page;
                             changed paged => {
                                 browse-list.settling = false;
+                                browse-list.settling-end = false;
                                 browse-list.viewport-y = clamp(
                                     browse-list.viewport-y
                                         + (root.browse-page-down
@@ -3339,10 +3363,22 @@ export component AppWindow inherits Window {
 
                             property <int> at: root.browse-jumped;
                             changed at => {
+                                browse-list.settling-end = false;
                                 browse-list.viewport-y = -root.browse-jump-y * 1px;
                                 // Held there until the rows stop changing size
                                 // under it. See `settling` on the list.
                                 browse-list.settling = true;
+                                // Asked here as well as on the list's own
+                                // changes. A fetched window the same size as the
+                                // one it replaced, landing where the view already
+                                // was, moves neither the scroll nor the height, and
+                                // a window too short to scroll would then never ask
+                                // for the page after it. The backend ignores the ask
+                                // when there is nothing further or one is out.
+                                if (browse-list.viewport-height + browse-list.viewport-y
+                                        - browse-list.height < 900px) {
+                                    root.browse-more();
+                                }
                             }
 
                             // The settling window is given up after half a
@@ -3363,6 +3399,18 @@ export component AppWindow inherits Window {
                                 running: browse-list.settling;
                                 triggered => {
                                     browse-list.settling = false;
+                                }
+                            }
+
+                            // End's hold, given up the same way. A timer of
+                            // its own so that End pressed just after a jump
+                            // gets its whole half second rather than what was
+                            // left of the jump's.
+                            Timer {
+                                interval: 500ms;
+                                running: browse-list.settling-end;
+                                triggered => {
+                                    browse-list.settling-end = false;
                                 }
                             }
                         }

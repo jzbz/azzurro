@@ -92,6 +92,10 @@ pub struct Screen {
     /// Some lists count instead of pointing. A library's Songs answers
     /// `total="2062"` and **no `<nextLink>` at all**, and expects the client to
     /// ask for the next page by number. See [`continuation`].
+    ///
+    /// Both describe one section, not the screen: the one [`Screen::paged`]
+    /// returns. A Songs page can put its sort options above the thirty songs,
+    /// and those three are no part of the count.
     pub offset: Option<u32>,
     pub total: Option<u32>,
     pub sections: Vec<Section>,
@@ -111,6 +115,40 @@ impl Screen {
 
     pub fn is_empty(&self) -> bool {
         self.sections.iter().all(|s| s.items.is_empty())
+    }
+
+    /// The section `offset` and `total` count, when the player gave them.
+    pub fn paged(&self) -> Option<&Section> {
+        self.sections.iter().rev().find(|s| s.paged)
+    }
+
+    /// Which section the rest of a long list belongs in: the one the count
+    /// describes, or — for a list that only points and says nothing of its
+    /// length — the last, which is where such a list has always been kept.
+    ///
+    /// An index rather than a reference so a caller can both measure what
+    /// comes before it and change it.
+    pub fn window(&self) -> Option<usize> {
+        self.sections
+            .iter()
+            .rposition(|s| s.paged)
+            .or_else(|| self.sections.len().checked_sub(1))
+    }
+
+    /// Take a page's rows out of it, to be put onto the screen it continues.
+    ///
+    /// Only the counted section's where there is one. A page asked for by
+    /// number is the whole screen again, sort options and all, and grafting
+    /// every row of it would repeat those options between every page of songs.
+    pub fn take_page(&mut self) -> Vec<Item> {
+        match self.sections.iter().rposition(|s| s.paged) {
+            Some(at) => std::mem::take(&mut self.sections[at].items),
+            None => self
+                .sections
+                .iter_mut()
+                .flat_map(|section| std::mem::take(&mut section.items))
+                .collect(),
+        }
     }
 
     /// Whether this screen has gone stale.
@@ -168,6 +206,12 @@ pub struct Section {
     /// also a way in, and the official controller draws those as plain rows
     /// with a chevron rather than as empty shelves.
     pub action: Option<Action>,
+    /// Whether this is the list the screen's `offset` and `total` are about.
+    ///
+    /// Set on the section whose `<list>` carried them, and on only one: where
+    /// two lists both say, the last is the one kept, as it is for the numbers
+    /// themselves.
+    pub paged: bool,
     pub items: Vec<Item>,
 }
 
@@ -692,6 +736,7 @@ fn start(
         }
 
         "row" | "selectorMenu" => {
+            close_loose(stack, screen, section);
             *section = Some(Section {
                 kind: if name == "row" {
                     SectionKind::Row
@@ -723,21 +768,38 @@ fn start(
             }
             // Kept whichever level the list is at: a grouped list is the root
             // of its own document, and a plain one sits inside a <screen>.
-            if let Some(offset) = a.remove("offset").and_then(|v| v.parse().ok()) {
-                screen.offset = Some(offset);
+            let offset: Option<u32> = a.remove("offset").and_then(|v| v.parse().ok());
+            let total: Option<u32> = a.remove("total").and_then(|v| v.parse().ok());
+            if offset.is_some() {
+                screen.offset = offset;
             }
-            if let Some(total) = a.remove("total").and_then(|v| v.parse().ok()) {
-                screen.total = Some(total);
+            if total.is_some() {
+                screen.total = total;
             }
-            if section.is_some() {
+            // What the stack says is open, not whether `section` is `Some`: a
+            // section loose items opened is `Some` too, and a root <list>
+            // after them was read as grouped inside it and lost its id.
+            if in_any_section(stack) {
                 stack.push(Ctx::NestedList);
             } else {
+                close_loose(stack, screen, section);
                 *section = Some(Section {
                     kind: SectionKind::List,
                     id: a.remove("id"),
                     ..Default::default()
                 });
                 stack.push(Ctx::Section);
+            }
+            // The numbers are about this list's rows and nobody else's. Counted
+            // against the whole screen, a sort menu above the songs made the
+            // next page start three songs late.
+            if (offset.is_some() || total.is_some())
+                && let Some(open) = section.as_mut()
+            {
+                for earlier in &mut screen.sections {
+                    earlier.paged = false;
+                }
+                open.paged = true;
             }
         }
 
@@ -945,6 +1007,31 @@ fn in_section(stack: &[Ctx]) -> bool {
     matches!(stack.last(), Some(Ctx::Section | Ctx::NestedList))
 }
 
+/// Whether a tag opened a section anywhere around here, however deep.
+fn in_any_section(stack: &[Ctx]) -> bool {
+    stack
+        .iter()
+        .any(|ctx| matches!(ctx, Ctx::Section | Ctx::NestedList))
+}
+
+/// File away the section loose items opened, before a real one replaces it.
+///
+/// Items straight under the root get a section that no tag opened and none
+/// will close, so nothing else ever pushes it. A `<row>` starting after them
+/// used to overwrite it: a search screen that puts its box first and a shelf
+/// of recent searches after it lost the box, and searching then found nowhere
+/// to put the query.
+fn close_loose(stack: &[Ctx], screen: &mut Screen, section: &mut Option<Section>) {
+    if in_any_section(stack) {
+        return;
+    }
+    if let Some(loose) = section.take()
+        && !loose.items.is_empty()
+    {
+        screen.sections.push(loose);
+    }
+}
+
 pub(crate) fn action(element: &str, mut a: BTreeMap<String, String>) -> Action {
     let declared = a.remove("type").unwrap_or_default();
     let kind = match declared.as_str() {
@@ -999,16 +1086,27 @@ pub fn appending(uri: &str) -> Option<String> {
     // playing; only `u` decides it.
     let mut parts: Vec<String> = Vec::new();
     let mut changed = false;
+    let mut wrapped = false;
 
     for pair in query.split('&') {
         match pair.split_once('=') {
             Some(("u", encoded)) => {
+                wrapped = true;
                 let (inner, dropped) = without_playnow(encoded);
                 changed |= dropped;
                 parts.push(format!("u={inner}"));
             }
             _ => parts.push(pair.to_owned()),
         }
+    }
+
+    // Wrapped, and the command inside does not say to play now: a station's
+    // `/Play?url=…`, which has no queue to go on the end of. Its `a` can still
+    // mention `playnow` — the shelf's bookkeeping — and stripping it there
+    // changed nothing the player acts on, so the station replaced what was
+    // playing while the app said it had been added to the end.
+    if wrapped && !changed {
+        return None;
     }
 
     // A bare command, not wrapped: `/Add?playnow=1&file=…` on its own.
@@ -1324,7 +1422,14 @@ pub fn continuation(uri: &str, screen: &Screen) -> Option<String> {
     }
     let total = screen.total?;
     let offset = screen.offset.unwrap_or(0);
-    let held = screen.items().count() as u32;
+    // The counted list's rows only. A sort menu sharing the page is three rows
+    // the player did not count, and adding them asked for page two three songs
+    // late. A screen built without saying which section is counted is taken
+    // as a whole, which is all it could mean.
+    let held = screen
+        .paged()
+        .map_or_else(|| screen.items().count(), |section| section.items.len())
+        as u32;
     if held == 0 {
         return None;
     }
@@ -2545,6 +2650,18 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_station_is_not_rewritten_through_its_bookkeeping() {
+        // A station on a shelf whose `a` mentions playing. The command that
+        // decides is `/Play`, which cannot be put on the end of anything, so
+        // stripping `playnow` out of `a` turned a replace into a replace that
+        // the app then called an append.
+        let station = "/ui/prf?a=category%3DRECENT%26playnow%3D1%26where%3Dlast&t=1\
+                       &u=%2FPlay%3Furl%3DRadioParadise%253A%252F0%253A20";
+        assert_eq!(appending(station), None);
+        assert!(starts_playing(station), "it does still play");
+    }
+
+    #[test]
     fn a_bare_add_is_rewritten_too() {
         let appended = appending("/Add?playnow=1&file=%2Fx.flac").expect("plays");
         assert_eq!(appended, "/Add?file=%2Fx.flac");
@@ -2634,6 +2751,151 @@ mod tests {
         );
         assert_eq!(screen.menu_actions.len(), 1);
         assert_eq!(screen.buttons.len(), 1);
+    }
+
+    /// A search box first and a shelf after it. The box sits loose under the
+    /// root, so the parser opened a section of its own to hold it, and the
+    /// `<row>` that followed replaced that section without filing it.
+    #[test]
+    fn loose_items_survive_a_row_that_follows_them() {
+        let doc = r#"<screen screenTitle="Search">
+            <search prompt="Search..." parameterName="q" type="browse" URI="/ui/Search?forService=LocalMusic"/>
+            <row title="Recent">
+                <item title="van halen"><action type="browse" URI="/ui/Search?q=van+halen"/></item>
+            </row>
+        </screen>"#;
+        let screen = parse(doc).expect("parses");
+
+        assert_eq!(screen.sections.len(), 2, "{:?}", screen.sections);
+        assert_eq!(
+            screen.items().find_map(Item::search_parameter),
+            Some("q"),
+            "the search box was dropped, and a search had nowhere to go"
+        );
+        assert_eq!(screen.sections[1].title.as_deref(), Some("Recent"));
+        assert_eq!(screen.sections[1].items.len(), 1);
+
+        // A selector menu is the other tag that starts a section.
+        let picker = parse(
+            r#"<screen><item title="Loose"/><selectorMenu menuTitle="Sort"><item text="A"/></selectorMenu></screen>"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            picker.items().filter_map(Item::label).collect::<Vec<_>>(),
+            vec!["Loose", "A"]
+        );
+    }
+
+    /// And a `<list>` after loose items is a list of its own, not a group
+    /// inside the section they opened.
+    #[test]
+    fn a_list_after_loose_items_is_its_own_section() {
+        let doc = r#"<screen>
+            <infoPanel text="Shuffled"/>
+            <list id="songs" offset="0" total="40"><item title="One"/><item title="Two"/></list>
+        </screen>"#;
+        let screen = parse(doc).expect("parses");
+
+        assert_eq!(screen.sections.len(), 2, "{:?}", screen.sections);
+        assert_eq!(screen.sections[0].items.len(), 1);
+        let songs = &screen.sections[1];
+        assert_eq!(songs.id.as_deref(), Some("songs"), "the list lost its id");
+        assert_eq!(songs.kind, SectionKind::List);
+        assert!(songs.paged && !screen.sections[0].paged);
+        assert_eq!(
+            continuation("/ui/x", &screen).as_deref(),
+            Some("/ui/x?listContinuation=2"),
+            "the info panel is not one of the forty"
+        );
+    }
+
+    /// A Songs page with its sort options above the songs. `offset` and
+    /// `total` describe the thirty songs; the three options are not in the
+    /// count.
+    const SORTED_SONGS_HEAD: &str = r#"<screen screenTitle="Songs">
+        <selectorMenu menuTitle="Sort by">
+            <item text="Name"/><item text="Artist"/><item text="Album"/>
+        </selectorMenu>
+        <list offset="0" total="2062">"#;
+
+    fn sorted_songs(offset: u32, rows: u32, after: &str) -> String {
+        let songs: String = (offset..offset + rows)
+            .map(|n| format!(r#"<item title="song {n}"/>"#))
+            .collect();
+        format!("{SORTED_SONGS_HEAD}{songs}</list>{after}</screen>")
+            .replace(r#"offset="0""#, &format!(r#"offset="{offset}""#))
+    }
+
+    #[test]
+    fn a_sort_menu_beside_a_counted_list_is_not_counted() {
+        let screen = parse(&sorted_songs(0, 30, "")).expect("parses");
+        assert_eq!(screen.items().count(), 33);
+        assert_eq!(
+            continuation("/ui/browseGrouped?type=Song", &screen).as_deref(),
+            Some("/ui/browseGrouped?type=Song&listContinuation=30"),
+            "counting the sort options skips songs 30 to 32"
+        );
+
+        // The same after a jump has put a later window in the section: the
+        // options are still there, and still not songs.
+        let jumped = parse(&sorted_songs(600, 30, "")).expect("parses");
+        assert_eq!(
+            continuation("/ui/browseGrouped?type=Song", &jumped).as_deref(),
+            Some("/ui/browseGrouped?type=Song&listContinuation=630")
+        );
+    }
+
+    #[test]
+    fn the_rest_of_a_list_goes_in_the_list_and_not_the_section_after_it() {
+        let screen = parse(&sorted_songs(
+            0,
+            30,
+            r#"<row title="More like this"><item title="An album"/></row>"#,
+        ))
+        .expect("parses");
+
+        assert_eq!(screen.sections.len(), 3);
+        assert_eq!(screen.window(), Some(1), "the songs, not the trailing row");
+        assert_eq!(screen.paged().map(|s| s.items.len()), Some(30));
+
+        // A page asked for by number is the whole screen again. Only its songs
+        // are the continuation.
+        let mut page = parse(&sorted_songs(30, 30, "")).expect("parses");
+        let rows = page.take_page();
+        assert_eq!(rows.len(), 30);
+        assert_eq!(rows[0].label(), Some("song 30"));
+
+        // A list that only points names no section, so everything it brought
+        // is the continuation and it lands where it always has.
+        let mut pointed = parse(
+            r#"<screen><list><item title="a"/></list><list><item title="b"/></list></screen>"#,
+        )
+        .expect("parses");
+        assert_eq!(pointed.window(), Some(1));
+        assert_eq!(pointed.take_page().len(), 2);
+    }
+
+    #[test]
+    fn only_the_last_list_that_counts_is_the_counted_one() {
+        let screen = parse(
+            r#"<screen>
+                 <list offset="0" total="5"><item title="a"/></list>
+                 <list offset="0" total="90"><item title="b"/><item title="c"/></list>
+               </screen>"#,
+        )
+        .expect("parses");
+        assert_eq!(screen.total, Some(90));
+        assert_eq!(
+            screen.sections.iter().map(|s| s.paged).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+
+        // A counting list grouped inside a row marks the row.
+        let grouped = parse(
+            r#"<screen><row title="Songs"><list offset="0" total="9"><item title="a"/></list></row></screen>"#,
+        )
+        .expect("parses");
+        assert!(grouped.sections[0].paged);
     }
 
     /// The same two elements inside a real `<row>` still belong to it.

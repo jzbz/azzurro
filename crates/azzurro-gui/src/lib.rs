@@ -816,6 +816,12 @@ struct Crumb {
     /// searching started — and the query is kept because that is what goes on
     /// the recent list once the search turns out to have been worth making.
     query: Option<String>,
+    /// How many rows the player sends at a time, as the first page showed.
+    ///
+    /// The rows held stop saying so once a second page has been grafted on,
+    /// and the End key needs the page and not the pile: ninety held of 2062
+    /// aimed the last window at 1972 and showed rows that end thirty short.
+    page: u32,
 }
 
 impl Browsing {
@@ -2349,6 +2355,10 @@ async fn run(
     let players: artwork::Players = Default::default();
 
     let art = match reqwest::Client::builder()
+        // The protocol client's figure, for its reason: a cover whose host
+        // swallows the SYN would otherwise hold a fetch permit until the whole
+        // fetch timed out.
+        .connect_timeout(bluos::client::CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom({
             let players = players.clone();
             move |attempt| {
@@ -4041,11 +4051,7 @@ impl Backend {
                     _ => held.clone(),
                 },
                 options: field.choices.iter().map(|c| c.label.clone()).collect(),
-                option_index: field
-                    .choices
-                    .iter()
-                    .position(|c| c.value == held)
-                    .unwrap_or(0) as i32,
+                option_index: drawn_choice(field, values.get(&field.name).map(String::as_str)),
                 available: true,
                 ..SettingData::blank()
             });
@@ -4759,9 +4765,7 @@ impl Backend {
             // Whether the window is looking at a slice of something longer.
             // Home and End mean a fetch on one of these and a scroll on a list
             // held whole, and only the window knows how tall its own pane is.
-            let paged = browsing
-                .current()
-                .is_some_and(|screen| !screen.index.is_empty() || screen.next.is_some());
+            let paged = browsing.current().is_some_and(holds_a_window);
             let ui = self.ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui.upgrade() {
@@ -4769,13 +4773,15 @@ impl Backend {
                 }
             });
             browsing.derived = match browsing.current() {
-                Some(screen) if screen.index.is_empty() && screen.next.is_none() => {
+                Some(screen) if !holds_a_window(screen) => {
                     collate(&mut blocks);
                     derived_index(&blocks)
                 }
                 // A list the player indexed uses the player's own offsets, and
                 // one still arriving cannot be indexed from the part in hand:
-                // the letters would stop wherever the paging had got to.
+                // the letters would stop wherever the paging had got to. Nor
+                // can the last window of one, which has nothing left to page
+                // on but is still thirty rows of two thousand.
                 _ => Vec::new(),
             };
         }
@@ -4868,6 +4874,20 @@ impl Backend {
             if let Some(ui) = ui.upgrade() {
                 ui.set_browse_jump_y(y);
                 ui.set_browse_jumped(ui.get_browse_jumped().wrapping_add(1));
+            }
+        });
+    }
+
+    /// Put the bottom of the rows held at the bottom of the pane.
+    ///
+    /// What End does to a list held whole, sent from here for a fetched last
+    /// window: the window alone knows how tall the rows came out, so it is told
+    /// to go to the end rather than handed a number.
+    fn scroll_browse_to_end(&self) {
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_browse_to_end(ui.get_browse_to_end().wrapping_add(1));
             }
         });
     }
@@ -5678,15 +5698,23 @@ fn screen_label(id: &str) -> String {
 /// `/Settings?id=capture` names one page; a bare `/Settings` means the top of
 /// the settings menu, which is `None` rather than "not a settings page" — hence
 /// the two layers of `Option`.
+///
+/// The id comes back decoded. It was read off a URI, where it is still
+/// percent-encoded, and `Client::settings` encodes whatever it is handed —
+/// as it has to, since the other callers pass an id straight from an
+/// attribute. Passing it on as it stood would encode it twice.
 fn settings_page(uri: &str) -> Option<Option<String>> {
     let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
     if !path.eq_ignore_ascii_case("/Settings") {
         return None;
     }
-    Some(query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == "id").then(|| value.to_owned())
-    }))
+    let mut url = reqwest::Url::parse("http://player/").expect("a constant URL parses");
+    url.set_query(Some(query));
+    Some(
+        url.query_pairs()
+            .find(|(key, _)| key == "id")
+            .map(|(_, value)| value.into_owned()),
+    )
 }
 
 /// Broadcast for players and adopt whatever answers.
@@ -5806,7 +5834,16 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                         query.clone()
                     }
                 };
-                browsing.trail.push(Crumb { uri, screen, query });
+                let page = screen
+                    .paged()
+                    .map_or_else(|| screen.items().count(), |section| section.items.len())
+                    as u32;
+                browsing.trail.push(Crumb {
+                    uri,
+                    screen,
+                    query,
+                    page,
+                });
                 browsing.moved_on();
             }
             // The whole pane, not only the browse rows. Opening a screen is
@@ -5934,6 +5971,58 @@ fn next_after_page(asked: &str, arrived: Option<String>, brought: usize) -> Opti
     match arrived {
         Some(cursor) if cursor == asked => None,
         other => other,
+    }
+}
+
+/// Put a page of a long list's rows into the list, on the screen it belongs to.
+///
+/// The list is the section the count describes, which need not be the last
+/// one: with a shelf after the songs, a page put into the last section grew
+/// the shelf, and a jump replaced it and left the songs where they were. A
+/// jump replaces the window it moved away from; paging on adds to it.
+fn put_page(screen: &mut Screen, rows: Vec<bluos::screen::Item>, replace: bool) {
+    let Some(section) = screen.window().and_then(|at| screen.sections.get_mut(at)) else {
+        return;
+    };
+    if replace {
+        section.items = rows;
+    } else {
+        section.items.extend(rows);
+    }
+}
+
+/// Whether a screen holds only a window on a longer list, so that Home and End
+/// are fetches rather than scrolls.
+///
+/// A cursor or an index says so, and so does a count that runs past the rows
+/// in hand. The count is the one that matters after End: the last window of a
+/// counted list has nothing left to page on, and one with no index to fall
+/// back on then read as held whole. Home scrolled to the top of those thirty
+/// rows instead of fetching the first, and nothing moved the view out of them.
+fn holds_a_window(screen: &Screen) -> bool {
+    // The counted section's rows, measured as `continuation` measures them.
+    let held = screen
+        .paged()
+        .map_or_else(|| screen.items().count(), |section| section.items.len())
+        as u32;
+    !screen.index.is_empty()
+        || screen.next.is_some()
+        || screen.offset.is_some_and(|offset| offset > 0)
+        || screen.total.is_some_and(|total| total > held)
+}
+
+/// Where the window Home or End asks for starts, on a paged list.
+///
+/// One page back from the end, not everything held back from it: after
+/// scrolling through three pages the second measure lands sixty rows short of
+/// the last. Counted lists only for End. A list that hands out a cursor says
+/// nothing about how long it is, so its end cannot be aimed at — paging
+/// forward is the only way there.
+fn end_offset(crumb: &Crumb, to_end: bool) -> Option<u32> {
+    match crumb.screen.total {
+        Some(total) if to_end => Some(total.saturating_sub(crumb.page.max(1))),
+        _ if !to_end => Some(0),
+        _ => None,
     }
 }
 
@@ -6130,24 +6219,7 @@ fn show_form(
     form: bluos::forms::Form,
     note: String,
 ) -> Option<u64> {
-    let values = form
-        .fields
-        .iter()
-        .filter(|field| field.kind != bluos::forms::Kind::Password)
-        .map(|field| {
-            let value = if field.value.is_empty() {
-                field
-                    .choices
-                    .iter()
-                    .find(|c| c.selected)
-                    .map(|c| c.value.clone())
-                    .unwrap_or_default()
-            } else {
-                field.value.clone()
-            };
-            (field.name.clone(), value)
-        })
-        .collect();
+    let values = form_values(&form);
 
     let opened = {
         let mut browsing = backend.browsing.lock().unwrap();
@@ -6194,6 +6266,56 @@ fn show_form(
     Some(opened)
 }
 
+/// What a form's fields hold before anybody touches them, by name.
+///
+/// A switch holds only whether it is on — `on` or empty, the two states
+/// `Edit::Toggle` flips between — and not the value it would send. Its `value`
+/// is what a ticked box posts, which a box arrives with whether it is ticked
+/// or not; seeded from that, a box with `value="1"` drew itself on when the
+/// page had it off. `submit_form` swaps in the page's own value on the way out.
+///
+/// A set of radios with none checked holds nothing at all, not an empty value.
+/// Empty is a value a radio can really carry — `value=""` — so holding the
+/// unset group as empty drew it on that radio and posted `name=` for a group
+/// nobody had picked from. Absent until something is picked, it cannot be
+/// mistaken for a pick.
+fn form_values(form: &bluos::forms::Form) -> BTreeMap<String, String> {
+    form.fields
+        .iter()
+        .filter(|field| field.kind != bluos::forms::Kind::Password)
+        .filter_map(|field| {
+            let value = if field.kind == bluos::forms::Kind::Switch {
+                if field.checked { "on" } else { "" }.to_owned()
+            } else if field.kind == bluos::forms::Kind::Choice && field.value.is_empty() {
+                field
+                    .choices
+                    .iter()
+                    .find(|c| c.selected)
+                    .map(|c| c.value.clone())?
+            } else {
+                field.value.clone()
+            };
+            Some((field.name.clone(), value))
+        })
+        .collect()
+}
+
+/// Which of a form field's choices its row is drawn on, or -1 for none.
+///
+/// A radio group with nothing checked holds no value (see `form_values`) and
+/// sends nothing (see `form_body`), so it is drawn with nothing chosen.
+/// Falling back to the first choice drew the list on `MP3` while the form
+/// posted no quality at all. A `<select>` never reaches this: the parser marks
+/// its first option selected when the page marks none, which is what a
+/// browser sends. The -1 holds on screen because a changed form replaces the
+/// whole settings model; the ComboBox only clamps its index when the model
+/// under a live row changes, and picking the first choice from -1 still fires
+/// `selected`.
+fn drawn_choice(field: &bluos::forms::Field, held: Option<&str>) -> i32 {
+    held.and_then(|held| field.choices.iter().position(|c| c.value == held))
+        .map_or(-1, |at| at as i32)
+}
+
 /// Ask about a player's firmware, through its leader if it will not answer.
 ///
 /// Direct is the confirmed route and is always tried first, so nothing that
@@ -6215,7 +6337,7 @@ async fn ask_about_firmware(
     id: DeviceId,
 ) -> bluos::Result<(Client, Option<DeviceId>, bluos::upgrade::Availability)> {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
-        return Err(bluos::Error::Screen("no such player".to_owned()));
+        return Err(bluos::Error::Refused("no such player".to_owned()));
     };
 
     let direct = client.upgrade_available().await;
@@ -7474,12 +7596,69 @@ fn base_letter(c: char) -> char {
     }
 }
 
+/// Put the window a jump fetched in place of the one on screen.
+///
+/// `false` when it no longer belongs there, or brought nothing, and the screen
+/// is as it was.
+fn land_jump(browsing: &mut Browsing, mut page: Screen, offset: u32, era: u64, jump: u64) -> bool {
+    // The screen may have gone while the request was out, exactly as a
+    // page of it may — and another jump may have overtaken this one.
+    if browsing.era != era || browsing.jumps != jump {
+        return false;
+    }
+    let Some(crumb) = browsing.trail.last_mut() else {
+        return false;
+    };
+
+    // The list's rows, into the list. The page is the whole screen again,
+    // and the section last on the crumb need not be the list: with a shelf
+    // after the songs, the jump replaced the shelf and left the songs.
+    let arriving = page.take_page();
+    if arriving.is_empty() {
+        return false;
+    }
+    let brought = arriving.len();
+    put_page(&mut crumb.screen, arriving, true);
+
+    // Where the window now starts, which is what tells `continuation` where
+    // the next page begins. Without this the list would page from zero
+    // again and repeat everything up to the letter.
+    crumb.screen.offset = page.offset.or(Some(offset));
+    // Cleared first: `continuation` refuses to build one for a screen that
+    // already has a cursor, and the cursor still on the crumb is the old
+    // window's. Leaving it in place made the fallback return None for the
+    // one list kind it exists for — a library's Songs, which counts rather
+    // than points — and the list was then stuck with nothing to page on.
+    crumb.screen.next = None;
+    crumb.screen.next = page
+        .next
+        .or_else(|| bluos::screen::continuation(&crumb.uri, &crumb.screen));
+    // A continuation carries the index too, but an empty one is not a
+    // reason to throw away the letters already on screen.
+    if !page.index.is_empty() {
+        crumb.screen.index = page.index;
+    }
+
+    // Claimed again now the window has changed. A page asked for while this
+    // jump was out took the count as it stood after the jump claimed it, so
+    // the check a page makes on landing passed, and the old window's next
+    // thirty rows went on after the new window's last: songs 60 to 89 below
+    // song 2061, with a cursor that went on paging from there.
+    browsing.jumps += 1;
+    tracing::debug!(offset, brought, "jumped the list");
+    true
+}
+
 /// Fetch the page a letter starts on and put it on screen.
 ///
 /// One request rather than paging up to the letter: a page is thirty rows
 /// whatever is asked for, a fetch at any offset takes about thirty
 /// milliseconds, and the alternative is seventy requests to reach the end of
 /// the Songs list.
+///
+/// `to_end` is whether the view lands on the last of the new rows rather than
+/// the first: End wants to see where the list stops, a letter or Home where it
+/// starts.
 async fn jump_to_letter(
     backend: Backend,
     client: Client,
@@ -7487,6 +7666,7 @@ async fn jump_to_letter(
     offset: u32,
     era: u64,
     jump: u64,
+    to_end: bool,
 ) {
     let asked = bluos::screen::jump_to(&uri, offset);
     let page = match client.screen(&asked).await {
@@ -7497,52 +7677,29 @@ async fn jump_to_letter(
         }
     };
 
-    {
-        let mut browsing = backend.browsing.lock().unwrap();
-        // The screen may have gone while the request was out, exactly as a
-        // page of it may — and another jump may have overtaken this one.
-        if browsing.era != era || browsing.jumps != jump {
-            return;
-        }
-        let Some(crumb) = browsing.trail.last_mut() else {
-            return;
-        };
-
-        let arriving: Vec<_> = page
-            .sections
-            .into_iter()
-            .flat_map(|section| section.items)
-            .collect();
-        if arriving.is_empty() {
-            return;
-        }
-        let brought = arriving.len();
-        if let Some(section) = crumb.screen.sections.last_mut() {
-            section.items = arriving;
-        }
-
-        // Where the window now starts, which is what tells `continuation` where
-        // the next page begins. Without this the list would page from zero
-        // again and repeat everything up to the letter.
-        crumb.screen.offset = page.offset.or(Some(offset));
-        // Cleared first: `continuation` refuses to build one for a screen that
-        // already has a cursor, and the cursor still on the crumb is the old
-        // window's. Leaving it in place made the fallback return None for the
-        // one list kind it exists for — a library's Songs, which counts rather
-        // than points — and the list was then stuck with nothing to page on.
-        crumb.screen.next = None;
-        crumb.screen.next = page
-            .next
-            .or_else(|| bluos::screen::continuation(&crumb.uri, &crumb.screen));
-        // A continuation carries the index too, but an empty one is not a
-        // reason to throw away the letters already on screen.
-        if !page.index.is_empty() {
-            crumb.screen.index = page.index;
-        }
-        tracing::debug!(offset, brought, "jumped the list");
+    if !land_jump(
+        &mut backend.browsing.lock().unwrap(),
+        page,
+        offset,
+        era,
+        jump,
+    ) {
+        return;
     }
 
     backend.publish_browse();
+    // Then move the view onto them, after the rows so it moves over the new
+    // ones. Replacing a ListView's model leaves the Flickable where it was,
+    // and a list is only asked to grow when its scroll or its height changes.
+    // Thirty rows swapped for thirty from a view already at the bottom changes
+    // neither, so the window sat on the old window's last rows with nothing
+    // left to scroll and never asked for the next page: after End, Home and M
+    // both stuck there until PageUp moved it.
+    if to_end {
+        backend.scroll_browse_to_end();
+    } else {
+        backend.scroll_browse_to(0.0);
+    }
     // The rows are all new, so the artwork walk starts at the top of them.
     if let Some(id) = backend.browsing.lock().unwrap().device {
         tokio::spawn(load_browse_thumbnails(backend.clone(), id, 0));
@@ -10574,18 +10731,10 @@ async fn run_commands(
                 // is the only one that knows how tall the pane is.
                 let target = {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    let held = browsing
-                        .current()
-                        .map(|screen| screen.items().count() as u32)
-                        .unwrap_or(0);
-                    let offset = match browsing.current().and_then(|s| s.total) {
-                        // Counted lists only. A list that hands out a cursor
-                        // says nothing about how long it is, so its end cannot
-                        // be aimed at — paging forward is the only way there.
-                        Some(total) if to_end => Some(total.saturating_sub(held.max(1))),
-                        _ if !to_end => Some(0),
-                        _ => None,
-                    };
+                    let offset = browsing
+                        .trail
+                        .last()
+                        .and_then(|crumb| end_offset(crumb, to_end));
                     match offset {
                         None => None,
                         Some(offset) => {
@@ -10613,6 +10762,7 @@ async fn run_commands(
                     offset,
                     era,
                     jump,
+                    to_end,
                 ));
                 continue;
             }
@@ -10731,6 +10881,7 @@ async fn run_commands(
                     offset,
                     era,
                     jump,
+                    false,
                 ));
                 continue;
             }
@@ -10768,7 +10919,7 @@ async fn run_commands(
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     match client.screen(&next).await {
-                        Ok(more) => {
+                        Ok(mut more) => {
                             // The screen this page belongs to may be gone: the
                             // request went out off the loop, and a press or a
                             // staleness refresh in the meantime pushes a crumb of
@@ -10792,7 +10943,16 @@ async fn run_commands(
                                 let Some(crumb) = browsing.trail.last_mut() else {
                                     return;
                                 };
-                                had = crumb.screen.items().count();
+                                // Where the new rows will start, which is the
+                                // end of the list rather than of the screen
+                                // when a shelf follows it.
+                                let window = crumb.screen.window();
+                                had = window.map_or(0, |at| {
+                                    crumb.screen.sections[..=at]
+                                        .iter()
+                                        .map(|section| section.items.len())
+                                        .sum()
+                                });
 
                                 // Worked out before the page is taken apart,
                                 // because it needs the page's own rows.
@@ -10810,15 +10970,14 @@ async fn run_commands(
                                 // continued, and a heading between page one and
                                 // page two would be inventing a division the
                                 // player never made.
-                                let arriving: Vec<_> = more
-                                    .sections
-                                    .into_iter()
-                                    .flat_map(|section| section.items)
-                                    .collect();
+                                //
+                                // Only the list's rows, and into the list: a
+                                // page asked for by number repeats the sort
+                                // options above it, and a shelf after the list
+                                // is not where the list goes on.
+                                let arriving = more.take_page();
                                 let brought = arriving.len();
-                                if let Some(section) = crumb.screen.sections.last_mut() {
-                                    section.items.extend(arriving);
-                                }
+                                put_page(&mut crumb.screen, arriving, false);
                                 let onward = next_after_page(&next, pointed.or(counted), brought);
                                 tracing::debug!(
                                     %id,
@@ -11355,6 +11514,100 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
 }
 
 #[cfg(test)]
+mod form_value_tests {
+    use super::{drawn_choice, form_values};
+
+    #[test]
+    fn a_form_is_seeded_with_what_the_page_showed() {
+        let form = bluos::forms::parse(
+            r#"<form action="/x">
+                 <input type="checkbox" name="off" value="1"/>
+                 <input type="checkbox" name="ticked" value="1" checked/>
+                 <select name="essid"><option value="one">one</option><option value="two">two</option></select>
+                 <input type="password" name="key" value="kept"/>
+               </form>"#,
+        )
+        .pop()
+        .expect("a form");
+        let values = form_values(&form);
+
+        // A box's own value is what it sends, not whether it is ticked.
+        assert_eq!(values.get("off").map(String::as_str), Some(""));
+        assert_eq!(values.get("ticked").map(String::as_str), Some("on"));
+        // Nothing selected is the first network, as drawn.
+        assert_eq!(values.get("essid").map(String::as_str), Some("one"));
+        assert!(!values.contains_key("key"), "a password is never seeded");
+    }
+
+    /// A radio group with nothing checked sends nothing, so it is drawn with
+    /// nothing chosen rather than on a first choice the form will not post.
+    #[test]
+    fn a_radio_group_with_nothing_checked_is_drawn_on_nothing() {
+        let form = bluos::forms::parse(
+            r#"<form action="/x">
+                 <input type="radio" name="quality" value="MP3"/>
+                 <input type="radio" name="quality" value="CD"/>
+                 <select name="essid"><option value="one">one</option><option value="two">two</option></select>
+                 <input type="radio" name="rate" value="44"/>
+                 <input type="radio" name="rate" value="48" checked/>
+               </form>"#,
+        )
+        .pop()
+        .expect("a form");
+        let values = form_values(&form);
+        let drawn = |name: &str| {
+            let field = form.fields.iter().find(|f| f.name == name).expect(name);
+            drawn_choice(field, values.get(name).map(String::as_str))
+        };
+
+        assert!(
+            !values.contains_key("quality"),
+            "nothing checked holds nothing"
+        );
+        assert_eq!(drawn("quality"), -1);
+        assert_eq!(drawn("essid"), 0);
+        assert_eq!(drawn("rate"), 1);
+    }
+
+    /// A radio whose own value is empty is still a radio nobody checked. Held
+    /// as an empty string, the group was drawn on it and posted `mode=`.
+    #[test]
+    fn an_empty_valued_radio_is_not_chosen_until_it_is_picked() {
+        let form = bluos::forms::parse(
+            r#"<form action="/x">
+                 <input type="radio" name="mode" value=""/>
+                 <input type="radio" name="mode" value="x"/>
+                 <input type="radio" name="kept" value="" checked/>
+                 <input type="radio" name="kept" value="y"/>
+               </form>"#,
+        )
+        .pop()
+        .expect("a form");
+        let mut values = form_values(&form);
+        let field = |name: &str| form.fields.iter().find(|f| f.name == name).expect(name);
+
+        assert!(!values.contains_key("mode"));
+        assert_eq!(
+            drawn_choice(field("mode"), values.get("mode").map(String::as_str)),
+            -1
+        );
+        // Checked, the empty radio is a choice like any other.
+        assert_eq!(values.get("kept").map(String::as_str), Some(""));
+        assert_eq!(
+            drawn_choice(field("kept"), values.get("kept").map(String::as_str)),
+            0
+        );
+
+        // Picking it is what `Edit::Choose` does: the value goes into the map.
+        values.insert("mode".to_owned(), String::new());
+        assert_eq!(
+            drawn_choice(field("mode"), values.get("mode").map(String::as_str)),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
 mod queue_paging_tests {
     use super::page_belongs;
 
@@ -11798,6 +12051,32 @@ mod index_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// An id read off a URI is still encoded, and the client encodes what it
+    /// is given, so it has to come out of here decoded or it is encoded twice.
+    #[test]
+    fn a_settings_page_id_comes_out_of_its_uri_decoded() {
+        use super::settings_page;
+
+        assert_eq!(
+            settings_page("/Settings?id=capture"),
+            Some(Some("capture".to_owned()))
+        );
+        assert_eq!(
+            settings_page("/Settings?id=a%20b%26c&other=1"),
+            Some(Some("a b&c".to_owned()))
+        );
+        assert_eq!(
+            settings_page("/Settings"),
+            Some(None),
+            "the top of the menu"
+        );
+        assert_eq!(
+            settings_page("/Browse?id=capture"),
+            None,
+            "not settings at all"
+        );
+    }
 
     /// The window, driven the way a hand drives it.
     ///
@@ -12305,6 +12584,156 @@ mod tests {
     #[test]
     fn a_page_with_no_cursor_is_the_end_as_it_always_was() {
         assert_eq!(next_after_page("/ui/x?page=4", None, 30), None);
+    }
+
+    fn song(title: &str) -> bluos::screen::Item {
+        bluos::screen::Item {
+            title: Some(title.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// A library's Songs as the player draws it, holding `held` of 2062: its
+    /// sort options above the counted list and a shelf after it.
+    fn songs_crumb(held: usize) -> Crumb {
+        use bluos::screen::Section;
+
+        let rows = |name: &str, n: usize| (0..n).map(|i| song(&format!("{name} {i}"))).collect();
+        Crumb {
+            uri: "/ui/browseGrouped?type=Song".to_owned(),
+            screen: Screen {
+                offset: Some(0),
+                total: Some(2062),
+                sections: vec![
+                    Section {
+                        items: rows("sort", 3),
+                        ..Default::default()
+                    },
+                    Section {
+                        paged: true,
+                        items: rows("song", held),
+                        ..Default::default()
+                    },
+                    Section {
+                        kind: SectionKind::Row,
+                        items: rows("shelf", 1),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            query: None,
+            page: 30,
+        }
+    }
+
+    #[test]
+    fn end_aims_one_page_back_from_the_end_however_much_is_held() {
+        let mut crumb = songs_crumb(90);
+        // Ninety held back from the end aimed at 1972, and the window it
+        // brought ended thirty short of the last song.
+        assert_eq!(end_offset(&crumb, true), Some(2032));
+        assert_eq!(end_offset(&crumb, false), Some(0));
+
+        // A list that only points has no end to aim at, though it has a top.
+        crumb.screen.total = None;
+        assert_eq!(end_offset(&crumb, true), None);
+        assert_eq!(end_offset(&crumb, false), Some(0));
+    }
+
+    /// The last thirty songs, as End brings them back: a counted window with
+    /// no cursor and, for a list the player sent no index for, no index.
+    fn last_window() -> Screen {
+        use bluos::screen::Section;
+
+        Screen {
+            offset: Some(2032),
+            total: Some(2062),
+            sections: vec![Section {
+                paged: true,
+                items: (2032..2062).map(|i| song(&format!("song {i}"))).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_counted_list_on_its_last_window_is_still_a_window() {
+        let mut browsing = Browsing::default();
+        browsing.trail.push(songs_crumb(90));
+
+        // End, as the command claims it.
+        browsing.jumps += 1;
+        let (era, jump) = (browsing.era, browsing.jumps);
+        let offset = end_offset(browsing.trail.last().unwrap(), true).unwrap();
+        assert!(land_jump(&mut browsing, last_window(), offset, era, jump));
+
+        let crumb = browsing.trail.last().unwrap();
+        // Nothing left to page on and no index, which read as a list held
+        // whole: Home scrolled these thirty rows instead of fetching the top.
+        assert_eq!(crumb.screen.next, None);
+        assert!(crumb.screen.index.is_empty());
+        assert!(holds_a_window(&crumb.screen));
+        assert_eq!(end_offset(crumb, false), Some(0));
+
+        // A list that arrived whole is still held whole, counted or not.
+        let whole = |total: Option<u32>| Screen {
+            offset: total.map(|_| 0),
+            total,
+            sections: vec![bluos::screen::Section {
+                items: (0..175).map(|i| song(&format!("genre {i}"))).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!holds_a_window(&whole(None)));
+        assert!(!holds_a_window(&whole(Some(175))));
+    }
+
+    #[test]
+    fn a_page_asked_for_while_a_jump_is_out_does_not_land_on_the_jumped_window() {
+        let mut browsing = Browsing::default();
+        let mut crumb = songs_crumb(60);
+        crumb.screen.next = Some("/ui/browseGrouped?type=Song&listContinuation=60".to_owned());
+        browsing.trail.push(crumb);
+
+        // End claims the count, then a scroll asks for the old window's next
+        // page before End's request comes back, and takes the same count.
+        browsing.jumps += 1;
+        let (era, jump) = (browsing.era, browsing.jumps);
+        let asked_more = browsing.jumps;
+
+        assert!(land_jump(&mut browsing, last_window(), 2032, era, jump));
+        // The check `BrowseMore` makes when its page arrives.
+        assert_ne!(
+            browsing.jumps, asked_more,
+            "rows 60 to 89 would go on after song 2061"
+        );
+    }
+
+    #[test]
+    fn a_page_goes_into_the_list_and_not_the_shelf_after_it() {
+        let sizes = |crumb: &Crumb| -> Vec<usize> {
+            crumb
+                .screen
+                .sections
+                .iter()
+                .map(|s| s.items.len())
+                .collect()
+        };
+        let mut crumb = songs_crumb(30);
+
+        put_page(&mut crumb.screen, vec![song("later")], false);
+        assert_eq!(sizes(&crumb), vec![3, 31, 1]);
+        assert_eq!(crumb.screen.sections[1].items[30], song("later"));
+
+        // A jump replaces the window, and leaves the options above it and the
+        // shelf after it as they were.
+        put_page(&mut crumb.screen, vec![song("jumped")], true);
+        assert_eq!(sizes(&crumb), vec![3, 1, 1]);
+        assert_eq!(crumb.screen.sections[1].items, vec![song("jumped")]);
+        assert_eq!(crumb.screen.sections[2].items, vec![song("shelf 0")]);
     }
 
     #[test]

@@ -118,6 +118,26 @@ pub fn queue() -> &'static str {
 </playlist>"#
 }
 
+/// A queue `length` songs long, carrying only the positions in `window` — the
+/// shape `/Playlist?start=&end=` answers with. Each song is named for its
+/// position, so a test can see which ones came back.
+pub fn queue_of(length: u32, window: &[u32]) -> String {
+    let songs: String = window
+        .iter()
+        .map(|i| {
+            format!(
+                "\n  <song id=\"{i}\" service=\"LocalMusic\">\
+                 <art>A Band</art><title>Song {i}</title><time>200</time></song>"
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <playlist repeat=\"0\" length=\"{length}\" id=\"8\" modified=\"0\" shuffle=\"0\">\
+         {songs}\n</playlist>"
+    )
+}
+
 pub fn no_alarms() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <alarms supportsEndTime="true"></alarms>"#

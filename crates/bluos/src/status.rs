@@ -14,6 +14,24 @@ use serde::Deserialize;
 
 use crate::device::DeviceId;
 
+/// A number the player may leave blank.
+///
+/// quick-xml hands an empty element to an `Option` as present and empty, and a
+/// `u32` refuses `""` — so a single `<secs></secs>` failed the whole of
+/// `/Status`, and took every other field down with it. The player does send
+/// one now and then while it changes input. Every number here is optional
+/// already, so one left blank, or written as something that is not a number,
+/// reads as one the player did not say. `default` has to sit beside this on
+/// each field: a `deserialize_with` no longer lets a missing element be `None`.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| raw.trim().parse().ok()))
+}
+
 /// `/SyncStatus` — the player itself, and its grouping.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncStatus {
@@ -23,7 +41,7 @@ pub struct SyncStatus {
     #[serde(rename = "@id")]
     pub id: String,
     /// Only present when `id` is a bare host rather than `host:port`.
-    #[serde(rename = "@port")]
+    #[serde(rename = "@port", default, deserialize_with = "lenient")]
     pub port: Option<u16>,
     #[serde(rename = "@name")]
     pub name: String,
@@ -47,11 +65,11 @@ pub struct SyncStatus {
     /// BluOS firmware version.
     #[serde(rename = "@version")]
     pub version: Option<String>,
-    #[serde(rename = "@volume")]
+    #[serde(rename = "@volume", default, deserialize_with = "lenient")]
     pub volume: Option<i32>,
-    #[serde(rename = "@db")]
+    #[serde(rename = "@db", default, deserialize_with = "lenient")]
     pub db: Option<f32>,
-    #[serde(rename = "@schemaVersion")]
+    #[serde(rename = "@schemaVersion", default, deserialize_with = "lenient")]
     pub schema_version: Option<u32>,
     #[serde(rename = "@initialized")]
     pub initialized: Option<bool>,
@@ -109,13 +127,18 @@ impl SyncStatus {
     /// — which is true from where they are standing and useless from here. In
     /// that case the address it was actually reached on wins.
     pub fn device_id(&self, reached_at: DeviceId) -> DeviceId {
-        let parsed = self.id.parse::<DeviceId>().ok().or_else(|| {
-            let host: std::net::IpAddr = self.id.parse().ok()?;
-            Some(DeviceId::new(
-                host,
-                self.port.unwrap_or(crate::DEFAULT_PORT),
-            ))
-        });
+        // `host:port` first, then a bare host with `port` beside it. Not
+        // `DeviceId::from_str`, which takes a bare host too and gives it the
+        // default port — so the attribute was never read, and a player on
+        // 11010 was recorded at 11000.
+        let parsed = match self.id.parse::<std::net::SocketAddr>() {
+            Ok(addr) => Some(DeviceId::new(addr.ip(), addr.port())),
+            Err(_) => self
+                .id
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|host| DeviceId::new(host, self.port.unwrap_or(crate::DEFAULT_PORT))),
+        };
 
         match parsed {
             Some(id) if !id.host.is_loopback() => id,
@@ -128,7 +151,7 @@ impl SyncStatus {
 /// is the element's text, not an attribute.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Master {
-    #[serde(rename = "@port")]
+    #[serde(rename = "@port", default, deserialize_with = "lenient")]
     pub port: Option<u16>,
     /// True while the slave has lost its master and is trying to get it back.
     /// Worth showing rather than pretending the group is healthy.
@@ -158,7 +181,7 @@ impl Master {
 pub struct Slave {
     #[serde(rename = "@id")]
     pub id: Option<String>,
-    #[serde(rename = "@port")]
+    #[serde(rename = "@port", default, deserialize_with = "lenient")]
     pub port: Option<u16>,
 }
 
@@ -206,18 +229,25 @@ pub struct Status {
 
     /// `play`, `pause`, `stop`, `stream`, `connecting`.
     pub state: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
     pub volume: Option<i32>,
+    #[serde(default, deserialize_with = "lenient")]
     pub db: Option<f32>,
+    #[serde(default, deserialize_with = "lenient")]
     pub mute: Option<u8>,
     /// 0 off, 1 on.
+    #[serde(default, deserialize_with = "lenient")]
     pub shuffle: Option<u8>,
     /// 0 all, 1 one, 2 off — note that 2, not 0, is the off value.
+    #[serde(default, deserialize_with = "lenient")]
     pub repeat: Option<u8>,
     /// Elapsed seconds.
+    #[serde(default, deserialize_with = "lenient")]
     pub secs: Option<u32>,
     /// Track length in seconds. Fractional on some services.
+    #[serde(default, deserialize_with = "lenient")]
     pub totlen: Option<f64>,
-    #[serde(rename = "canSeek")]
+    #[serde(rename = "canSeek", default, deserialize_with = "lenient")]
     pub can_seek: Option<u8>,
 
     /// The three display lines, in the player's own priority order. What lands
@@ -252,7 +282,7 @@ pub struct Status {
     pub service_icon: Option<String>,
     /// Whether what is playing is already a favourite. Only present on the
     /// services that have favourites.
-    #[serde(rename = "isFavourite")]
+    #[serde(rename = "isFavourite", default, deserialize_with = "lenient")]
     pub is_favourite: Option<u8>,
     #[serde(rename = "streamUrl")]
     pub stream_url: Option<String>,
@@ -264,18 +294,24 @@ pub struct Status {
     pub input_id: Option<String>,
 
     /// Index of the playing track in the queue.
+    #[serde(default, deserialize_with = "lenient")]
     pub song: Option<u32>,
     /// Total queue length, as the player counts it.
+    #[serde(default, deserialize_with = "lenient")]
     pub cursor: Option<u32>,
     /// Queue identity. Changes when the queue is replaced.
+    #[serde(default, deserialize_with = "lenient")]
     pub pid: Option<u32>,
     /// Preset list identity.
+    #[serde(default, deserialize_with = "lenient")]
     pub prid: Option<u32>,
     /// Service identity.
+    #[serde(default, deserialize_with = "lenient")]
     pub sid: Option<u32>,
     /// How many songs the player has indexed so far, and zero when it is not
     /// indexing. A library runs to five figures, so this is not a small number
     /// and not a percentage — there is no total to measure it against.
+    #[serde(default, deserialize_with = "lenient")]
     pub indexing: Option<u32>,
     /// Minutes left on the sleep timer; empty when it is off.
     pub sleep: Option<String>,
@@ -311,10 +347,10 @@ pub struct Action {
     pub url: Option<String>,
     /// For the toggles — `love` and `ban` — whether they are currently set.
     /// Not an enabled flag.
-    #[serde(rename = "@state")]
+    #[serde(rename = "@state", default, deserialize_with = "lenient")]
     pub state: Option<i32>,
     /// Seconds, on the seek-by-a-bit variants of skip and back.
-    #[serde(rename = "@interval")]
+    #[serde(rename = "@interval", default, deserialize_with = "lenient")]
     pub interval: Option<i32>,
     #[serde(rename = "@type")]
     pub kind: Option<String>,
@@ -590,7 +626,7 @@ mod tests {
 
     /// A slave, and one that has lost its master.
     const SLAVE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<SyncStatus etag="12" syncStat="12" id="192.0.2.9" port="11000" volume="20" name="Kitchen" model="N125" schemaVersion="34"><master port="11000" reconnecting="true">192.0.2.155</master></SyncStatus>"#;
+<SyncStatus etag="12" syncStat="12" id="192.0.2.9" port="11010" volume="20" name="Kitchen" model="N125" schemaVersion="34"><master port="11000" reconnecting="true">192.0.2.155</master></SyncStatus>"#;
 
     #[test]
     fn reads_a_group_from_the_master_side() {
@@ -624,9 +660,43 @@ mod tests {
         // ...and it is not currently reachable.
         assert!(s.master.as_ref().unwrap().is_reconnecting());
 
-        // Here `id` is a bare host with the port beside it.
+        // Here `id` is a bare host with the port beside it, and on a port that
+        // is not the default, so the attribute has to be what supplies it.
         let reached_at = "192.0.2.9:11000".parse().unwrap();
-        assert_eq!(s.device_id(reached_at).to_string(), "192.0.2.9:11000");
+        assert_eq!(s.device_id(reached_at).to_string(), "192.0.2.9:11010");
+
+        // A port in `id` itself is the port, whatever sits beside it.
+        let both: SyncStatus = quick_xml::de::from_str(
+            r#"<SyncStatus etag="1" id="192.0.2.9:11020" port="11000" name="A" model="X"></SyncStatus>"#,
+        )
+        .unwrap();
+        assert_eq!(both.device_id(reached_at).to_string(), "192.0.2.9:11020");
+    }
+
+    /// One blank number used to fail the whole document, and every field in it
+    /// with the one that was empty.
+    #[test]
+    fn a_blank_number_is_one_the_player_did_not_say() {
+        let s: Status = quick_xml::de::from_str(
+            r#"<status etag="1"><secs></secs><totlen/><volume>31</volume><song>soon</song><state>play</state><actions><action name="skip" url="/Action?skip" state=""></action></actions></status>"#,
+        )
+        .expect("the rest of the document still reads");
+        assert_eq!(s.secs, None);
+        assert_eq!(s.totlen, None);
+        assert_eq!(s.song, None, "not a number is not said either");
+        assert_eq!(s.volume, Some(31));
+        assert_eq!(s.state.as_deref(), Some("play"));
+        assert_eq!(s.action("skip").unwrap().state, None);
+
+        // Attributes are read the same way.
+        let sync: SyncStatus = quick_xml::de::from_str(
+            r#"<SyncStatus etag="1" id="192.0.2.9" port="" volume="" name="A" model="X"></SyncStatus>"#,
+        )
+        .expect("reads");
+        assert_eq!(sync.port, None);
+        assert_eq!(sync.volume, None);
+        let reached_at = "10.0.0.1:11000".parse().unwrap();
+        assert_eq!(sync.device_id(reached_at).to_string(), "192.0.2.9:11000");
     }
 
     #[test]

@@ -244,6 +244,12 @@ impl Setting {
     }
 
     /// What to write to turn a boolean the other way.
+    ///
+    /// In the vocabulary the value was read in. [`Self::is_on`] accepts four
+    /// spellings of on, and a boolean holding `1` is one the player writes as
+    /// a number: answering it with `OFF` hands back a word it never used.
+    /// `ON`/`OFF` only where nothing says otherwise, since that is what most
+    /// of them hold.
     pub fn toggled(&self) -> Option<String> {
         if self.kind != Kind::Boolean {
             return None;
@@ -255,10 +261,14 @@ impl Setting {
             } else {
                 on.clone()
             }
-        } else if self.is_on() {
-            "OFF".to_owned()
         } else {
-            "ON".to_owned()
+            let (on, off) = match self.value.as_deref() {
+                Some("1" | "0") => ("1", "0"),
+                Some("true" | "false") => ("true", "false"),
+                Some("on" | "off") => ("on", "off"),
+                _ => ("ON", "OFF"),
+            };
+            if self.is_on() { off } else { on }.to_owned()
         })
     }
 
@@ -461,7 +471,16 @@ fn close(
 ) {
     match name {
         "setting" => {
-            if let Some(done) = setting.take() {
+            if let Some(mut done) = setting.take() {
+                // A group's `url` is where the settings inside it write unless
+                // one names its own, and the player does leave it off: the
+                // volume limits on the Audio page carry none and sit in a group
+                // that says `/audiomodes`. Filled in here, from the innermost
+                // group that has one, because a write sees only the setting and
+                // not the tree it came out of.
+                if done.url.is_none() {
+                    done.url = groups.iter().rev().find_map(|g| g.url.clone());
+                }
                 push(settings, groups, Entry::Setting(Box::new(done)));
             }
         }
@@ -728,5 +747,77 @@ mod tests {
             "</menuGroup>".repeat(2)
         );
         assert!(parse(&ordinary, "http://player").is_ok());
+    }
+
+    #[test]
+    fn a_toggle_answers_in_the_words_it_was_read_in() {
+        let from = |value: &str| {
+            Setting {
+                kind: Kind::Boolean,
+                value: Some(value.to_owned()),
+                ..Default::default()
+            }
+            .toggled()
+        };
+
+        // A boolean held as a number goes back as a number, and so on: the
+        // player never wrote OFF for these, and should not be handed it.
+        assert_eq!(from("1").as_deref(), Some("0"));
+        assert_eq!(from("0").as_deref(), Some("1"));
+        assert_eq!(from("true").as_deref(), Some("false"));
+        assert_eq!(from("false").as_deref(), Some("true"));
+        assert_eq!(from("on").as_deref(), Some("off"));
+        assert_eq!(from("off").as_deref(), Some("on"));
+        assert_eq!(from("ON").as_deref(), Some("OFF"));
+        assert_eq!(from("OFF").as_deref(), Some("ON"));
+
+        // With nothing to go on, the spelling most of them use.
+        let unset = Setting {
+            kind: Kind::Boolean,
+            ..Default::default()
+        };
+        assert_eq!(unset.toggled().as_deref(), Some("ON"));
+    }
+
+    #[test]
+    fn a_setting_without_a_url_writes_where_its_group_does() {
+        let page = audio();
+        let url_of = |id: &str| {
+            page.settings()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .url
+                .clone()
+        };
+
+        // Names no url of its own, in a group that says /audiomodes. Without
+        // this the write refuses it for having nowhere to go.
+        assert_eq!(url_of("volumeLimits").as_deref(), Some("/audiomodes"));
+        // One that names its own keeps it.
+        assert_eq!(url_of("eq-switch").as_deref(), Some("/alsa_setting"));
+
+        // The innermost group that has one wins; a group without one passes
+        // its parent's through; a setting outside every group gets nothing.
+        let nested = parse(
+            r#"<settings>
+                <menuGroup id="outer" url="/outer">
+                    <menuGroup id="plain"><setting id="a" name="a" class="boolean"/></menuGroup>
+                    <menuGroup id="own" url="/own"><setting id="b" name="b" class="boolean"/></menuGroup>
+                </menuGroup>
+                <setting id="c" name="c" class="boolean"/>
+            </settings>"#,
+            "http://x",
+        )
+        .unwrap();
+        let urls: Vec<_> = nested
+            .settings()
+            .into_iter()
+            .map(|s| (s.id.as_str(), s.url.as_deref()))
+            .collect();
+        assert_eq!(
+            urls,
+            vec![("a", Some("/outer")), ("b", Some("/own")), ("c", None)]
+        );
     }
 }

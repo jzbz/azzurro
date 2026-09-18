@@ -137,7 +137,16 @@ pub fn shares(html: &str) -> (Option<String>, Vec<Share>) {
 
     let mut out = Vec::new();
     for field in html.split("<input name=\"").skip(1) {
-        let Some(name) = field.split('"').next().filter(|n| !n.is_empty()) else {
+        // Decoded, as the label beside it is. The player escapes the path it
+        // writes into the attribute, so a share with `&` in its name arrives
+        // as `&amp;`; posted back like that, the name matched no share and
+        // nothing was removed.
+        let Some(name) = field
+            .split('"')
+            .next()
+            .filter(|n| !n.is_empty())
+            .map(crate::html::unescape)
+        else {
             continue;
         };
         // Only the checkboxes are shares; the submits carry a value instead.
@@ -153,12 +162,12 @@ pub fn shares(html: &str) -> (Option<String>, Vec<Share>) {
             .map(|label| strip_tags(label.split_once('>').map(|(_, t)| t).unwrap_or(label)))
             .unwrap_or_default();
         out.push(Share {
-            field: name.to_owned(),
             label: if label.is_empty() {
-                name.to_owned()
+                name.clone()
             } else {
                 label
             },
+            field: name,
         });
     }
     (action, out)
@@ -237,7 +246,7 @@ fn between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
 
 /// Text with any tags removed and whitespace collapsed. Enough for two pages
 /// of plain values; not an HTML parser and not pretending to be one.
-fn strip_tags(raw: &str) -> String {
+pub(crate) fn strip_tags(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut inside = false;
     for c in raw.chars() {
@@ -318,6 +327,21 @@ mod tests {
 <tr><td valign="top">Format:</td><td valign="bottom"><small>FLAC 24/96</small></td></tr>
 <tr><td valign="top">Sample&nbsp;rate:</td><td valign="bottom"><small>96000</small></td></tr>
 <tr><td valign="top">Channels:</td><td valign="bottom"><small>2</small></td></tr></table>"#;
+
+    /// The attribute is escaped by the player, and has to be read back the way
+    /// the label is: the name is what the removal posts, and `%26amp%3B` in it
+    /// named no share at all.
+    #[test]
+    fn a_share_name_is_decoded_like_its_label() {
+        let page = r#"<form id="configshareform" method="POST" action="/findremoveshares?noheader=1">
+            <input name="\\nas\R&amp;B &#34;live&#34;" id="checkbox1" type="checkbox" />
+            <label for="checkbox1">R&amp;B on nas</label>
+        </form>"#;
+        let (_, found) = shares(page);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].field, r#"\\nas\R&B "live""#);
+        assert_eq!(found[0].label, "R&B on nas");
+    }
 
     #[test]
     fn reads_a_track_technical_info() {

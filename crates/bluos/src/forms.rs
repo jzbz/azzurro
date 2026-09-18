@@ -45,7 +45,18 @@ pub struct Field {
     pub kind: Kind,
     /// The page's own words for it, from the `<label>` beside it.
     pub label: String,
+    /// What the page filled in. For a switch, what it sends when it is on:
+    /// the checkbox's own `value`, or `on` when it names none, which is what
+    /// a browser sends. Whether it *is* on is [`Field::checked`].
     pub value: String,
+    /// Whether a switch arrived ticked.
+    ///
+    /// Kept apart from `value` because a checkbox has both: `value="1"` is
+    /// what goes back when it is ticked, and nothing at all goes back when it
+    /// is not. Folding the two into one string posted a ticked box as `on`
+    /// rather than `1`, and an unticked one as `name=` — which the player
+    /// reads as set, since presence is the whole of a checkbox's message.
+    pub checked: bool,
     pub placeholder: String,
     /// For a choice: what there is to choose from.
     pub choices: Vec<Choice>,
@@ -102,6 +113,12 @@ pub fn parse(html: &str) -> Vec<Form> {
     for piece in pieces(html) {
         match piece {
             Piece::Text(text) => {
+                // Words inside a hidden region are as hidden as its tags. A
+                // hidden `<option>` gives no `</option>` to end the one before
+                // it, so its label ran on into that visible choice's.
+                if hiding.is_some() {
+                    continue;
+                }
                 // Decoded here as well as in `attributes`. Without it a label
                 // and a value read from the same page disagreed: the value of
                 // an `<option>` came back decoded and the words between its
@@ -121,6 +138,30 @@ pub fn parse(html: &str) -> Vec<Form> {
                 self_closing,
                 attrs,
             } => {
+                // A hidden `<option>` or `<optgroup>` is a region with no
+                // closing tag to wait for: both closing tags are optional, and
+                // the next opening tag of the same name or the `</select>`
+                // ends one as surely. Waiting for the closing tag hid the rest
+                // of the list, the fields after it and the form's own
+                // `</form>`, so the page lost the whole form. An `<optgroup>`
+                // or `</optgroup>` ends an option too, as it does in a
+                // browser; skipped as a tag inside the option's region, a
+                // hidden group straight after it opened no region of its own
+                // and its options were offered. `</datalist>`, a new
+                // `<select>` and `</form>` end one as well, again as in a
+                // browser: a hidden datalist option swallowed every field
+                // after its list, and one left open in a select swallowed the
+                // next select whole. The tag that ends the region is then read
+                // as itself.
+                if let Some((tag, _)) = hiding.as_ref()
+                    && matches!(tag.as_str(), "option" | "optgroup")
+                    && ((name == *tag && !closing)
+                        || (tag == "option" && name == "optgroup")
+                        || name == "select"
+                        || (closing && matches!(name.as_str(), "datalist" | "form")))
+                {
+                    hiding = None;
+                }
                 // Track the hidden region first: everything inside one is
                 // skipped, including the tags that would open another.
                 if let Some((tag, depth)) = hiding.as_mut() {
@@ -131,7 +172,12 @@ pub fn parse(html: &str) -> Vec<Form> {
                             } else {
                                 *depth -= 1;
                             }
-                        } else {
+                        } else if !self_closing {
+                            // A `<span/>` inside a hidden `<span>` opens
+                            // nothing, so no `</span>` is coming for it.
+                            // Counted, it left the region one level deep when
+                            // the real closing tag arrived, and everything to
+                            // the end of the page stayed hidden.
                             *depth += 1;
                         }
                     }
@@ -180,6 +226,9 @@ pub fn parse(html: &str) -> Vec<Form> {
                     }
 
                     ("select", false) => {
+                        // An option still open here is not one of this
+                        // select's, whichever list it was left open in.
+                        option = None;
                         choosing = Some(Field {
                             name: attrs.get("name").cloned().unwrap_or_default(),
                             id: attrs.get("id").cloned().unwrap_or_default(),
@@ -188,29 +237,43 @@ pub fn parse(html: &str) -> Vec<Form> {
                         });
                     }
                     ("select", true) => {
-                        if let (Some(field), Some(form)) = (choosing.take(), open.as_mut())
+                        finish_option(option.take(), choosing.as_mut());
+                        if let (Some(mut field), Some(form)) = (choosing.take(), open.as_mut())
                             && !field.name.is_empty()
                         {
+                            // Nothing marked selected means the first one is,
+                            // which is what a browser shows and what it sends.
+                            // Left unmarked, the list was drawn on its first
+                            // network while the form posted `essid=` — a
+                            // choice nobody saw. Radios are different: none
+                            // checked sends nothing, so they are left alone.
+                            if !field.choices.iter().any(|c| c.selected)
+                                && let Some(first) = field.choices.first_mut()
+                            {
+                                first.selected = true;
+                            }
                             form.fields.push(field);
                         }
                     }
 
                     ("option", false) => {
-                        option = Some(Choice {
+                        // `</option>` is optional in HTML: the next `<option>`
+                        // ends the one before it, as `</select>` ends the last.
+                        // Waiting for the closing tag lost every option a page
+                        // wrote without one.
+                        finish_option(option.take(), choosing.as_mut());
+                        // Only inside a select. A `<datalist>`'s options have
+                        // no field to go into, and one left open there was
+                        // filed as the first choice of the next select, and
+                        // took the words of any label on the way to it.
+                        option = choosing.is_some().then(|| Choice {
                             value: attrs.get("value").cloned().unwrap_or_default(),
                             selected: attrs.contains_key("selected"),
                             ..Choice::default()
                         });
                     }
                     ("option", true) => {
-                        if let (Some(mut choice), Some(field)) = (option.take(), choosing.as_mut())
-                        {
-                            choice.label = tidy(&choice.label);
-                            if choice.label.is_empty() {
-                                choice.label.clone_from(&choice.value);
-                            }
-                            field.choices.push(choice);
-                        }
+                        finish_option(option.take(), choosing.as_mut());
                     }
 
                     ("input", _) => {
@@ -281,11 +344,14 @@ pub fn parse(html: &str) -> Vec<Form> {
                                 id: attrs.get("id").cloned().unwrap_or_default(),
                                 name: field,
                                 kind: Kind::Switch,
-                                value: if attrs.contains_key("checked") {
-                                    "on".to_owned()
-                                } else {
-                                    String::new()
-                                },
+                                checked: attrs.contains_key("checked"),
+                                // Only a missing `value` defaults. `value=""`
+                                // is a box that sends an empty string when
+                                // ticked, and that is what it has to send.
+                                value: attrs
+                                    .get("value")
+                                    .cloned()
+                                    .unwrap_or_else(|| "on".to_owned()),
                                 ..Field::default()
                             }),
                             other => form.fields.push(Field {
@@ -315,6 +381,17 @@ pub fn parse(html: &str) -> Vec<Form> {
     }
 
     forms
+}
+
+/// Put a finished `<option>` into the `<select>` it belongs to.
+fn finish_option(option: Option<Choice>, field: Option<&mut Field>) {
+    if let (Some(mut choice), Some(field)) = (option, field) {
+        choice.label = tidy(&choice.label);
+        if choice.label.is_empty() {
+            choice.label.clone_from(&choice.value);
+        }
+        field.choices.push(choice);
+    }
 }
 
 /// Give every field the label the page wrote for it.
@@ -404,6 +481,14 @@ enum Piece<'a> {
 fn pieces(html: &str) -> impl Iterator<Item = Piece<'_>> {
     let mut rest = html;
     std::iter::from_fn(move || {
+        // A comment is not markup, and neither is a script's body — but both
+        // can hold something that looks like it. `<!-- <input name="old"> -->`
+        // offered a field the page had commented out, and a script comparing
+        // `a<b` opened a tag that ran to the next `>` and swallowed whatever
+        // sat between. Stepped over whole, so nothing inside is read.
+        while let Some(body) = rest.strip_prefix("<!--") {
+            rest = body.find("-->").map_or("", |end| &body[end + 3..]);
+        }
         if rest.is_empty() {
             return None;
         }
@@ -429,6 +514,17 @@ fn pieces(html: &str) -> impl Iterator<Item = Piece<'_>> {
                 let raw = raw.trim_start_matches('/').trim_end_matches('/');
                 let mut words = raw.splitn(2, |c: char| c.is_whitespace());
                 let name = words.next().unwrap_or_default().to_ascii_lowercase();
+                if name == "script" && !closing && !self_closing {
+                    // Up to its own closing tag, which is then read as a tag
+                    // like any other. A script that never closes runs to the
+                    // end of the page, as it would in a browser.
+                    let end = rest
+                        .as_bytes()
+                        .windows(b"</script".len())
+                        .position(|w| w.eq_ignore_ascii_case(b"</script"))
+                        .unwrap_or(rest.len());
+                    rest = &rest[end..];
+                }
                 Some(Piece::Tag {
                     attrs: attributes(words.next().unwrap_or_default()),
                     name,
@@ -680,6 +776,297 @@ mod tests {
         assert_eq!(key.label, "Enter password or key (if protected)");
     }
 
+    /// A checkbox sends its own value when ticked and nothing when not, so
+    /// both have to survive the parse: what it would send, and whether it is
+    /// ticked.
+    #[test]
+    fn a_checkbox_keeps_its_value_apart_from_whether_it_is_ticked() {
+        let forms = parse(
+            r#"<form action="/x">
+                 <input type="checkbox" name="plain" checked/>
+                 <input type="checkbox" name="one" value="1"/>
+                 <input type="checkbox" name="empty" value="" checked/>
+               </form>"#,
+        );
+        let fields = &forms[0].fields;
+
+        assert_eq!(fields[0].kind, Kind::Switch);
+        assert!(fields[0].checked);
+        assert_eq!(fields[0].value, "on", "no value attribute sends `on`");
+
+        assert!(!fields[1].checked);
+        assert_eq!(fields[1].value, "1", "the page's own value is kept");
+
+        assert!(fields[2].checked);
+        assert_eq!(fields[2].value, "", "an empty value is a value");
+    }
+
+    /// Browsers show and send the first option when none is marked, and the
+    /// list is drawn on that one too.
+    #[test]
+    fn a_select_with_nothing_selected_selects_its_first_choice() {
+        let forms = parse(
+            r#"<form action="/wificfg">
+                 <select name="essid">
+                   <option value="one">one</option>
+                   <option value="two">two</option>
+                 </select>
+                 <input type="radio" name="band" value="2g"/>
+                 <input type="radio" name="band" value="5g"/>
+               </form>"#,
+        );
+        let fields = &forms[0].fields;
+        let picked: Vec<bool> = fields[0].choices.iter().map(|c| c.selected).collect();
+        assert_eq!(picked, vec![true, false]);
+
+        // A set of radios with none checked sends nothing, so nothing is
+        // invented for it.
+        assert!(fields[1].choices.iter().all(|c| !c.selected));
+
+        // And an explicit choice is not overridden.
+        let forms = parse(WIFI);
+        let picked: Vec<bool> = forms[0].fields[0]
+            .choices
+            .iter()
+            .map(|c| c.selected)
+            .collect();
+        assert_eq!(picked, vec![false, true, false]);
+    }
+
+    /// The same name self-closed inside a hidden region opens nothing, so it
+    /// must not be waited for.
+    #[test]
+    fn a_self_closing_tag_inside_a_hidden_region_does_not_deepen_it() {
+        let forms = parse(
+            r#"<form action="/x">
+                 <span hidden><span/><input name="inside" type="text"/></span>
+                 <input name="after" type="text"/>
+               </form>"#,
+        );
+        let names: Vec<&str> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["after"]);
+    }
+
+    /// `</option>` is optional in HTML.
+    #[test]
+    fn an_option_without_its_closing_tag_is_still_an_option() {
+        let forms = parse(
+            r#"<form action="/x">
+                 <select name="quality">
+                   <option value="6">CD
+                   <option value="27" selected>Hi-Res
+                 </select>
+               </form>"#,
+        );
+        let choices = &forms[0].fields[0].choices;
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].value, "6");
+        assert_eq!(choices[0].label, "CD");
+        assert_eq!(choices[1].label, "Hi-Res");
+        assert!(choices[1].selected);
+        assert!(!choices[0].selected, "the one marked is the one chosen");
+    }
+
+    /// An option left open where there is no select to fill belongs to
+    /// neither the next select nor the label on the way to it.
+    #[test]
+    fn an_option_left_open_elsewhere_is_no_choice_of_the_next_select() {
+        let essid = |page: &str| {
+            parse(page)[0]
+                .fields
+                .iter()
+                .find(|f| f.name == "essid")
+                .cloned()
+                .expect("the select is read")
+        };
+        let choices = |field: &Field| -> Vec<(String, String, bool)> {
+            field
+                .choices
+                .iter()
+                .map(|c| (c.value.clone(), c.label.clone(), c.selected))
+                .collect()
+        };
+        let offered = vec![("b".to_owned(), "B".to_owned(), true)];
+
+        // A datalist's option, which is valid without its `</option>`.
+        let field = essid(
+            r#"<form action="/x">
+                 <datalist id="hints"><option value="a"></datalist>
+                 <label for="essid">Network</label>
+                 <select id="essid" name="essid"><option value="b">B</option></select>
+               </form>"#,
+        );
+        assert_eq!(choices(&field), offered);
+        assert_eq!(field.label, "Network");
+
+        // And one left open in a select that never closed.
+        let field = essid(
+            r#"<form action="/x">
+                 <select name="old"><option value="a">A
+                 <select id="essid" name="essid"><option value="b">B</option></select>
+               </form>"#,
+        );
+        assert_eq!(choices(&field), offered);
+    }
+
+    /// Neither a comment nor a script body is markup, however much of either
+    /// looks like it.
+    #[test]
+    fn comments_and_scripts_are_not_read_as_markup() {
+        let forms = parse(
+            r#"<form action="/x">
+                 <!-- retired: <b>old</b> <input name="commented" type="text"/> -->
+                 <script type="text/javascript">
+                   if (a<b && c>d) { document.write('<input name="scripted">'); }
+                 </SCRIPT>
+                 <!----><input name="real" type="text"/>
+               </form>"#,
+        );
+        let names: Vec<&str> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+
+        // Unterminated, each runs to the end of the page rather than panicking,
+        // and takes everything after it along. The form that closed before it
+        // is still read, and nothing inside it is: parse only keeps a form
+        // that closes, so the second form is closed inside the bad region to
+        // show up if the skipping ever stopped. The comment's `>` is there for
+        // the same reason. Read as a tag, `<!--` runs to the first `>`, and
+        // without one it ate `<form action="/y"` and the second form never
+        // opened, skipping or not.
+        for page in [
+            r#"<form action="/x"><input name="kept"/></form><!-- > <form action="/y"><input name="a"/></form>"#,
+            r#"<form action="/x"><input name="kept"/></form><script> <form action="/y"><input name="a"/></form>"#,
+        ] {
+            let forms = parse(page);
+            assert_eq!(forms.len(), 1, "{page:?}");
+            let names: Vec<&str> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["kept"], "{page:?}");
+        }
+        // And at the tokenizer, where the region itself is: nothing after the
+        // opening `<!--` or `<script>` comes back as a tag but the script's own.
+        for page in [
+            r#"<!-- <input name="a" type="text"> </form>"#,
+            r#"<script> <input name="a" type="text"> </form>"#,
+        ] {
+            let tags: Vec<String> = pieces(page)
+                .filter_map(|p| match p {
+                    Piece::Tag { name, .. } => Some(name),
+                    Piece::Text(_) => None,
+                })
+                .collect();
+            assert!(tags.iter().all(|t| t == "script"), "{page:?} gave {tags:?}");
+        }
+    }
+
+    /// `</option>` is optional, and a hidden option written without it used to
+    /// hide everything to the end of the page, the form's `</form>` included.
+    #[test]
+    fn a_hidden_option_without_its_closing_tag_hides_only_itself() {
+        let forms = parse(
+            r#"<form action="/x"><select name="q">
+                 <option value="a" hidden>A
+                 <option value="b">B
+                 <option value="c" hidden>C
+               </select><input name="after" type="text"/></form>"#,
+        );
+        assert_eq!(forms.len(), 1);
+        let names: Vec<&str> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["q", "after"]);
+        let choices: Vec<(&str, &str)> = forms[0].fields[0]
+            .choices
+            .iter()
+            .map(|c| (c.value.as_str(), c.label.as_str()))
+            .collect();
+        // The hidden option's label does not run on into the visible one.
+        assert_eq!(choices, vec![("b", "B")]);
+
+        // Outside a select, or before another one, the region ends where a
+        // browser ends the option: at `</datalist>`, at the next `<select>`,
+        // and at `</form>`. Each of these used to hide the rest of the page.
+        let essid = |page: &str| {
+            parse(page)
+                .first()
+                .and_then(|form| form.fields.iter().find(|f| f.name == "essid").cloned())
+                .unwrap_or_else(|| panic!("the select is read: {page:?}"))
+        };
+        let field = essid(
+            r#"<form action="/x">
+                 <datalist id="h"><option value="a" hidden></datalist>
+                 <label for="essid">Network</label>
+                 <select id="essid" name="essid"><option value="b">B</option></select>
+               </form>"#,
+        );
+        assert_eq!(field.label, "Network");
+        assert_eq!(field.choices.len(), 1);
+        let field = essid(
+            r#"<form action="/x">
+                 <select name="old"><option value="a" hidden>A
+                 <select id="essid" name="essid"><option value="b">B</option></select>
+               </form>"#,
+        );
+        let values: Vec<&str> = field.choices.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["b"]);
+
+        let forms = parse(
+            r#"<form action="/x"><datalist id="h"><option value="a" hidden></form>
+               <form action="/y"><input name="after" type="text"/></form>"#,
+        );
+        let actions: Vec<&str> = forms.iter().map(|f| f.action.as_str()).collect();
+        assert_eq!(actions, vec!["/x", "/y"]);
+        assert_eq!(forms[1].fields[0].name, "after");
+    }
+
+    /// `</optgroup>` is just as optional, and a hidden group written without
+    /// it counted the next `<optgroup>` as nested inside it, so `</select>`
+    /// and `</form>` were skipped and the page read as having no form.
+    #[test]
+    fn a_hidden_optgroup_without_its_closing_tag_hides_only_itself() {
+        for page in [
+            r#"<form action="/x"><select name="q">
+                 <optgroup label="A" hidden><option value="a">A
+                 <optgroup label="B"><option value="b">B
+               </select><input name="after" type="text"/></form>"#,
+            r#"<form action="/x"><select name="q">
+                 <option value="b">B
+                 <optgroup label="A" hidden><option value="a">A
+               </select><input name="after" type="text"/></form>"#,
+            // A hidden option left open ends at the group after it, so that
+            // group's own `hidden` is read rather than skipped.
+            r#"<form action="/x"><select name="q">
+                 <option value="b">B<option value="a" hidden>A<optgroup label="G" hidden><option value="x">X</optgroup>
+               </select><input name="after" type="text"/></form>"#,
+            r#"<form action="/x"><select name="q">
+                 <optgroup label="F"><option value="b">B<option value="a" hidden>A</optgroup>
+                 <optgroup label="G" hidden><option value="x">X</optgroup>
+               </select><input name="after" type="text"/></form>"#,
+        ] {
+            let forms = parse(page);
+            assert_eq!(forms.len(), 1, "{page:?}");
+            let names: Vec<&str> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["q", "after"], "{page:?}");
+            let choices: Vec<&str> = forms[0].fields[0]
+                .choices
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect();
+            assert_eq!(choices, vec!["b"], "{page:?}");
+        }
+    }
+
+    /// Go's `html/template` writes a double quote as `&#34;`, and the value
+    /// goes back to the player exactly as it was read.
+    #[test]
+    fn a_numeric_reference_in_a_value_is_decoded() {
+        let forms = parse(
+            r#"<form action="/wificfg"><select name="essid">
+                 <option value="My &#34;Den&#34; &#x2B;5G">My &#34;Den&#34; &#43;5G</option>
+               </select></form>"#,
+        );
+        let choice = &forms[0].fields[0].choices[0];
+        assert_eq!(choice.value, r#"My "Den" +5G"#);
+        assert_eq!(choice.label, r#"My "Den" +5G"#);
+    }
+
     #[test]
     fn a_page_with_no_form_reads_as_no_forms() {
         assert!(parse("<html><body><p>Nothing here</p></body></html>").is_empty());
@@ -726,6 +1113,20 @@ mod tests {
         assert_eq!(unescape("Sample&nbsp;rate"), "Sample\u{a0}rate");
         // Still left alone: an entity these pages do not emit.
         assert_eq!(unescape("&copy;"), "&copy;");
+
+        // Numeric references, in both bases, whatever the number.
+        assert_eq!(unescape("&#34;&#43;&#x22;&#X2b;"), "\"+\"+");
+        assert_eq!(unescape("caf&#233;"), "café");
+        assert_eq!(unescape("&#38;amp;"), "&amp;", "decoded once, not twice");
+        // Ones that name no character are kept as written: a surrogate, a
+        // number past Unicode, digits that are not digits, no semicolon.
+        assert_eq!(unescape("&#xD800;"), "&#xD800;");
+        assert_eq!(unescape("&#1114112;"), "&#1114112;");
+        assert_eq!(unescape("&#99999999999;"), "&#99999999999;");
+        assert_eq!(unescape("&#zz;"), "&#zz;");
+        assert_eq!(unescape("&#;"), "&#;");
+        assert_eq!(unescape("&#34"), "&#34");
+        assert_eq!(unescape("&#"), "&#");
         assert_eq!(unescape("trailing &"), "trailing &");
 
         // Multi-byte input must survive being stepped over a byte at a time.

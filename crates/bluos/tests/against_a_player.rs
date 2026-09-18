@@ -35,6 +35,29 @@ async fn the_queue_comes_back_as_songs() {
     assert_eq!(queue.songs[0].title.as_deref(), Some("A Song"));
 }
 
+/// A window onto the queue names its last song, not the one after it. Asked
+/// for 5 to 7 a player answers three songs; a client that took `end` as
+/// exclusive would skip a song at every seam as the list scrolls.
+#[tokio::test]
+async fn a_window_onto_the_queue_includes_both_ends() {
+    let player = Player::start().await;
+    player.hold_queue(10);
+    let client = client_for(&player).await;
+
+    let window = client.queue_range(5, 7).await.expect("reads");
+    let ids: Vec<u32> = window.songs.iter().map(|s| s.id).collect();
+    assert_eq!(ids, [5, 6, 7], "both ends included: {:?}", player.asked());
+    assert_eq!(window.length, 10, "length is the whole queue");
+
+    // The last window runs past the end and comes back short.
+    let tail = client.queue_range(8, 11).await.expect("reads");
+    let ids: Vec<u32> = tail.songs.iter().map(|s| s.id).collect();
+    assert_eq!(ids, [8, 9]);
+
+    let whole = client.queue().await.expect("reads");
+    assert_eq!(whole.songs.len(), 10, "no window is the whole queue");
+}
+
 /// The alarm routes are all one path with different parameters, so what a
 /// caller sends is most of what there is to get wrong.
 #[tokio::test]
@@ -99,14 +122,28 @@ async fn a_schedule_sends_an_end_time_and_no_duration() {
 #[tokio::test]
 async fn deleting_and_arming_name_the_alarm() {
     let player = Player::start().await;
+    // Answer the way a player does, by what was asked: a delete comes back
+    // without the alarm, anything else with it.
+    player.handle("/Alarms", |request| {
+        assert_eq!(request.method, "GET", "every alarm route is a GET");
+        Some(match request.param("delete") {
+            Some("1") => fixtures::no_alarms().to_owned(),
+            _ => fixtures::one_alarm().to_owned(),
+        })
+    });
     let client = client_for(&player).await;
 
-    client.delete_alarm(4).await.expect("deletes");
+    let after = client.delete_alarm(4).await.expect("deletes");
     assert!(player.asked_for("delete=1"));
     assert!(player.asked_for("id=4"));
+    assert!(
+        after.alarms.is_empty(),
+        "the reply is the list after the delete"
+    );
 
-    client.arm_alarm(4, false).await.expect("disarms");
+    let after = client.arm_alarm(4, false).await.expect("disarms");
     assert!(player.asked_for("enable=0"));
+    assert_eq!(after.alarms.len(), 1, "arming is not a delete");
 }
 
 /// The reply is the whole list, so a caller never re-reads after a write.
@@ -187,6 +224,30 @@ async fn a_route_the_player_does_not_have_is_an_error() {
     assert!(client.alarms().await.is_err());
 }
 
+/// A settings page id is encoded on the way out, whatever is in it. Ids come
+/// out of attributes, so nothing upstream has encoded them already.
+#[tokio::test]
+async fn a_settings_page_id_is_sent_encoded() {
+    let player = Player::with_routes(vec![(
+        "/Settings",
+        r#"<settings pageId="a b"></settings>"#.to_owned(),
+    )])
+    .await;
+    let client = client_for(&player).await;
+
+    let page = client.settings(Some("a b&c=d")).await.expect("reads");
+    assert_eq!(page.page_id.as_deref(), Some("a b"));
+    assert!(
+        player.asked_for("/Settings?id=a+b%26c%3Dd"),
+        "asked {:?}",
+        player.asked()
+    );
+
+    // And the top of the menu carries no id at all.
+    client.settings(None).await.expect("reads");
+    assert!(player.asked().iter().any(|seen| seen == "/Settings"));
+}
+
 /// Starting a firmware upgrade is the one call in this crate that cannot be
 /// undone, so what it refuses matters more than what it does.
 #[tokio::test]
@@ -214,6 +275,11 @@ async fn an_upgrade_is_refused_unless_the_player_says_it_is_ready() {
     let refused = client.start_upgrade().await;
     assert!(refused.is_err(), "a second upgrade must not start");
     assert!(!player.asked_for("upgrade=this"));
+    // Said as what it is: this crate declining, not a document it misread.
+    assert!(
+        matches!(&refused, Err(bluos::Error::Refused(why)) if why.contains("already running")),
+        "{refused:?}"
+    );
 
     // Ready: available, and nothing running.
     player.serve(
@@ -328,10 +394,33 @@ async fn reordering_presets_sends_every_move() {
             .contains("content-type: application/json"),
         "the player refuses anything else outright"
     );
-    assert!(
-        head.contains(r#"{"prid":4,"ordering":[{"from":4,"to":1},{"from":1,"to":2},{"from":2,"to":3},{"from":3,"to":4}]}"#),
-        "every slot that moves must be named, or the ones left out are deleted: {head}"
+    let body = player.bodies().last().cloned().unwrap_or_default();
+    assert_eq!(
+        body,
+        r#"{"prid":4,"ordering":[{"from":4,"to":1},{"from":1,"to":2},{"from":2,"to":3},{"from":3,"to":4}]}"#,
+        "every slot that moves must be named, or the ones left out are deleted"
     );
+}
+
+/// A setting is written as one JSON pair, by POST, to the path it names.
+#[tokio::test]
+async fn writing_a_setting_posts_its_name_and_value() {
+    let player = Player::start().await;
+    let client = client_for(&player).await;
+    player.serve("/alsa_setting", "<ok/>");
+
+    let setting = bluos::settings::Setting {
+        id: "eq-bass".to_owned(),
+        name: Some("eq-bass".to_owned()),
+        url: Some("/alsa_setting".to_owned()),
+        ..Default::default()
+    };
+    client.write_setting(&setting, "3").await.expect("writes");
+
+    let head = player.heads().last().cloned().unwrap_or_default();
+    assert!(head.starts_with("POST /alsa_setting "), "{head}");
+    let body = player.bodies().last().cloned().unwrap_or_default();
+    assert_eq!(body, r#"{"eq-bass":"3"}"#);
 }
 
 /// Nothing to reorder sends nothing at all.
