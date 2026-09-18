@@ -23,17 +23,16 @@ use quick_xml::events::BytesStart;
 /// away. The split stays anyway — it costs nothing on a name with no colon in
 /// it, and a parser matching `"item"` would silently stop recognizing the same
 /// element the day a firmware did start writing `<ns:item>`.
-pub(crate) fn local_name(raw: &[u8]) -> &str {
+pub(crate) fn local_name(full: &str) -> &str {
     // Borrowed from the reader's buffer rather than copied: every caller wants
     // a `&str` to match on and then drops it, so the owned `String` this used
     // to build was allocated and freed once per element for nothing.
     //
-    // A name that is not UTF-8 reads as empty. The lossy conversion this
-    // replaced could not be borrowed, and the two behave the same where it
-    // matters: no branch in either parser matches a mangled name, so both an
-    // empty string and a string full of replacement characters fall through to
-    // "an element this does not know about", which is already the common case.
-    let full = std::str::from_utf8(raw).unwrap_or_default();
+    // A `&str` and not bytes since quick-xml 0.42, which checks the input is
+    // UTF-8 as it builds each event and hands names over already as text. The
+    // case this used to guard, a name that was not UTF-8, cannot reach here:
+    // every parser reads from a `&str`, which is what the response body
+    // already was.
     match full.split_once(':') {
         Some((_, local)) => local,
         None => full,
@@ -49,7 +48,7 @@ pub(crate) fn attributes(e: &BytesStart<'_>) -> BTreeMap<String, String> {
     e.attributes()
         .flatten()
         .filter_map(|attr| {
-            let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+            let key = attr.key.as_ref().to_owned();
             // Drop the schema noise the player puts on every <screen>.
             if key.starts_with("xmlns") || key.starts_with("xsi:") {
                 return None;
@@ -117,11 +116,12 @@ mod tests {
 
     #[test]
     fn a_prefix_is_dropped_and_a_plain_name_is_kept() {
-        assert_eq!(local_name(b"item"), "item");
-        assert_eq!(local_name(b"ns:item"), "item");
-        assert_eq!(local_name(b""), "");
-        // Not UTF-8, so not a name any branch can match.
-        assert_eq!(local_name(&[b'i', 0xff, b'm']), "");
+        assert_eq!(local_name("item"), "item");
+        assert_eq!(local_name("ns:item"), "item");
+        assert_eq!(local_name(""), "");
+        // Split on the colon, not at a byte count that could land inside a
+        // character.
+        assert_eq!(local_name("ns:çà"), "çà");
     }
 
     #[test]

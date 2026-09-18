@@ -170,12 +170,12 @@ impl Discovery {
             };
 
             // Fire any query whose slot has arrived before going back to sleep.
-            if let Some(at) = pending.front().copied() {
-                if at <= elapsed {
-                    pending.pop_front();
-                    self.query().await?;
-                    continue;
-                }
+            if let Some(at) = pending.front().copied()
+                && at <= elapsed
+            {
+                pending.pop_front();
+                self.query().await?;
+                continue;
             }
 
             let wake = pending

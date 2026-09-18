@@ -157,7 +157,7 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                 let Some(what) = collecting.as_deref() else {
                     continue;
                 };
-                let text = e.decode().unwrap_or_default().into_owned();
+                let text: &str = &e;
                 match what {
                     // Appended, not assigned: a name with an entity in it
                     // arrives as several events and has to be joined up.
@@ -165,11 +165,11 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                         if let Some(playlist) =
                             out.groups.last_mut().and_then(|g| g.playlists.last_mut())
                         {
-                            playlist.name.push_str(&text);
+                            playlist.name.push_str(text);
                         }
                     }
-                    "urlPath" => out.url_path.push_str(&text),
-                    "requestParameter" => parameter.push_str(&text),
+                    "urlPath" => out.url_path.push_str(text),
+                    "requestParameter" => parameter.push_str(text),
                     _ => {}
                 }
             }
@@ -183,8 +183,7 @@ pub fn parse(xml: &str) -> Result<AddToPlaylist> {
                 let Some(what) = collecting.as_deref() else {
                     continue;
                 };
-                let Ok(name) = e.decode() else { continue };
-                let resolved = entity(name.as_ref());
+                let resolved = entity(&e);
                 match what {
                     "playlistName" => {
                         if let Some(playlist) =

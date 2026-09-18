@@ -459,7 +459,8 @@ impl Artwork {
                 .written
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let sweep = (due % PRUNE_EVERY == 0)
+            let sweep = due
+                .is_multiple_of(PRUNE_EVERY)
                 .then(|| self.disk.clone())
                 .flatten();
 

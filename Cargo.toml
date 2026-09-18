@@ -5,7 +5,7 @@ members = ["crates/bluos", "crates/bluos-cli", "crates/azzurro-gui", "crates/fak
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "MIT"
 repository = "https://github.com/jzbz/azzurro"
 
@@ -52,7 +52,7 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 lru = "0.18"
-dirs = "6"
+dirs = "7"
 # Hands a URL to the desktop's own opener. Music-service sign-in and the
 # player's settings pages are web pages served by Lenbrook or by the player, and
 # a controller can only point at them.
@@ -62,7 +62,7 @@ open = "5"
 # /SyncStatus. The server-driven `<screen>` documents are tree-shaped with
 # heterogeneous children and will want the pull parser instead; see
 # docs/protocol.md.
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 
 # SO_REUSEADDR and SO_REUSEPORT on the LSDP socket, which tokio's UdpSocket

@@ -544,10 +544,8 @@ pub fn parse(xml: &str) -> Result<Screen> {
             // page of a long list is written between its tags rather than as
             // an attribute.
             Ok(Event::Text(text)) if stack.last() == Some(&Ctx::NextLink) => {
-                if let Some(next) = screen.next.as_mut()
-                    && let Ok(raw) = text.decode()
-                {
-                    next.push_str(&raw);
+                if let Some(next) = screen.next.as_mut() {
+                    next.push_str(&text);
                 }
             }
 
@@ -555,10 +553,8 @@ pub fn parse(xml: &str) -> Result<Screen> {
             // `&amp;` would otherwise fall out from between its parameters and
             // leave a request the player cannot read.
             Ok(Event::GeneralRef(entity)) if stack.last() == Some(&Ctx::NextLink) => {
-                if let Some(next) = screen.next.as_mut()
-                    && let Ok(name) = entity.decode()
-                {
-                    next.push_str(&resolve_entity(name.as_ref()));
+                if let Some(next) = screen.next.as_mut() {
+                    next.push_str(&resolve_entity(&entity));
                 }
             }
             Ok(_) => {}
