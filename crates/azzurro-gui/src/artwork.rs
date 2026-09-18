@@ -368,6 +368,13 @@ impl Artwork {
     /// pool. The D-Bus methods run on zbus's own executor thread, where there
     /// is no runtime and asking for one panics — so they use
     /// [`Self::offered`] instead.
+    ///
+    /// Compiled on Linux and under test only. MPRIS is the one thing that hands
+    /// a URL to a desktop and it is Linux-only, so elsewhere this is a method
+    /// nobody calls — which CI, running clippy with `-D warnings`, refuses. The
+    /// policy it applies is worth checking on every platform, so the tests keep
+    /// it.
+    #[cfg(any(target_os = "linux", test))]
     pub async fn for_desktop(&self, url: &str) -> Option<String> {
         if let Some(dir) = &self.disk {
             let path = dir.join(file_name(url));
@@ -394,6 +401,10 @@ impl Artwork {
 
     /// The URL itself, if this app would fetch it — the half of
     /// [`Self::for_desktop`] that needs no disk and no runtime.
+    ///
+    /// Linux and test only, for the reason above: its only caller is the MPRIS
+    /// bridge.
+    #[cfg(any(target_os = "linux", test))]
     pub fn offered(&self, url: &str) -> Option<String> {
         self.may_fetch(url).then(|| url.to_owned())
     }
