@@ -148,25 +148,55 @@ export struct BrowseRow {
     plays: bool,
 }
 
-// One section of a screen, with the rows it holds.
+// One drawn thing on a screen: a row, the heading over a section, a shelf, a
+// strip of service chips, or a section that is a way in and holds nothing.
 //
-// The player says how each section wants to be drawn and the official
-// controller obeys: a shelf of covers for "Recently Played", a strip of
-// service chips at the top of Favorites, a plain list for an album. A flat
-// list of everything is legible but it is not what the player asked for.
-export struct BrowseBlock {
-    // 0 = a plain list, 1 = a shelf of tiles, 2 = a strip of service chips,
-    // 3 = a heading that is a way in and holds nothing itself.
+// The player still says how each section wants to be drawn and the official
+// controller still obeys: a shelf of covers for "Recently Played", a strip of
+// service chips at the top of Favorites, a plain list for an album. The kinds
+// below are exactly those answers. What is gone is the nesting — a section
+// used to arrive holding its rows, and the pane drew it as one element.
+//
+// A `ListView` virtualises the items of its own `for` and nothing deeper, so
+// a section cost whatever everything inside it cost: a two-thousand-row list
+// was a single list item, and all two thousand rows of it were instantiated,
+// laid out and visited on every frame. Measured on the software renderer, a
+// 200-row library page redrawing beside a playing track took 16% of a core
+// against 7% for the same window with no list on it, and 1900 rows took 66%,
+// with the scroll down to 30fps and a 100ms stall each time a page landed.
+// One item per row is what lets the list leave the rows nobody can see
+// unbuilt; the sections survive as the order of the items and the `kind` on
+// each one.
+//
+// That is the standing cost — the frames — and not the stall, which was the
+// other half of the same figure: the model was rebuilt whole on every
+// publish, which is every page, every status and every 400ms while the covers
+// walk in, and building one of these costs five strings and a glyph lookup.
+// The publisher compares the items it is about to send against the ones the
+// window is holding and writes only the ones that moved; see
+// `Backend::sent_items`. Neither half has been measured again on the machine
+// the figures above came from, so what is recorded here is what was changed
+// and why, not a new number.
+export struct BrowseItem {
+    // 0 = a row of a plain list, 1 = a shelf of tiles, 2 = a strip of service
+    // chips, 3 = a section that is a way in and holds nothing itself,
+    // 4 = the heading over a section.
     kind: int,
+    // The row itself, for kind 0.
+    row: BrowseRow,
+    // What a heading or a way in says. Kinds 3 and 4.
     title: string,
     // The button the player puts on this section's heading — "View All" beside
     // a shelf that is showing ten of a hundred, "Clear" beside the recents.
-    // Empty when the section has none.
+    // Empty when the section has none. Kind 4.
     action: string,
-    // Which section of the screen it belongs to, which is not the block's own
-    // position: empty sections and the service picker never become blocks.
+    // Which section of the screen it belongs to, which is not its own
+    // position: empty sections and the service picker never become items.
     section: int,
-    rows: [BrowseRow],
+    // A shelf's tiles or a picker's chips. Kinds 1 and 2, which run across the
+    // pane rather than down it and are therefore one item each however many
+    // they hold — a shelf is ten or twenty covers, not two thousand rows.
+    tiles: [BrowseRow],
 }
 
 // One row of the navigation sidebar: a heading, a screen, or an entry from
@@ -2024,24 +2054,42 @@ component Indeterminate inherits Rectangle {
     }
 }
 
-// One section, drawn the way it asked to be.
-component BrowseBlockView inherits VerticalLayout {
-    in property <BrowseBlock> block;
+// One item of a screen, drawn the way its section asked to be.
+component BrowseItemView inherits VerticalLayout {
+    in property <BrowseItem> item;
+    // Where this sits among everything the pane is showing, for anything
+    // reading it aloud. The pane is the set now: a section arrives as an order
+    // of items rather than as a container, so there is no longer anything for
+    // its rows to be counted inside of. The list itself carries the count, the
+    // way the queue's does.
+    in property <int> at;
     callback activate(int);
     callback open-menu(int, length, length);
     callback section-action(int);
 
-    if root.block.kind == 2: HorizontalLayout {
+    // A row of a plain list, and one item of the `ListView` above — which is
+    // the whole of the flattening: a row nobody can see is never built.
+    if root.item.kind == 0: BrowseRowView {
+        entry: root.item.row;
+        accessible-item-index: root.at;
+        activate => { root.activate(root.item.row.index); }
+        open-menu(y, right) => { root.open-menu(root.item.row.index, y, right); }
+    }
+
+    if root.item.kind == 2: HorizontalLayout {
         padding-left: Theme.pad;
         padding-right: Theme.pad;
         padding-bottom: Theme.pad;
         spacing: Theme.gap;
         alignment: start;
 
+        // A strip runs across the pane and is a handful of chips wide, so it
+        // stays one item holding all of them — and a list of its own, which
+        // is what a reader stepping through the chips is actually inside.
         accessible-role: list;
-        accessible-item-count: root.block.rows.length;
+        accessible-item-count: root.item.tiles.length;
 
-        for entry[i] in root.block.rows: ServiceChip {
+        for entry[i] in root.item.tiles: ServiceChip {
             entry: entry;
             accessible-item-index: i;
             activate => { root.activate(entry.index); }
@@ -2050,14 +2098,15 @@ component BrowseBlockView inherits VerticalLayout {
 
     // A section that leads somewhere and holds nothing. Drawn as a row rather
     // than as an empty shelf with a caption over it.
-    if root.block.kind == 3: Rectangle {
+    if root.item.kind == 3: Rectangle {
         // One press, one destination, so the row is the button. Named after
         // the section it opens — the chevron beside the title is the only
         // thing that said it led anywhere, and a chevron says nothing to
         // anything that cannot see it.
         accessible-role: button;
-        accessible-label: root.block.title;
-        accessible-action-default => { root.section-action(root.block.section); }
+        accessible-label: root.item.title;
+        accessible-item-index: root.at;
+        accessible-action-default => { root.section-action(root.item.section); }
 
         height: 52px;
         border-radius: Theme.radius-small;
@@ -2072,7 +2121,7 @@ component BrowseBlockView inherits VerticalLayout {
                 // The row above carries this already; left as a text node it
                 // is read out a second time as the row's contents.
                 accessible-role: none;
-                text: root.block.title;
+                text: root.item.title;
                 font-size: Theme.body-size;
                 color: Theme.text;
                 vertical-alignment: center;
@@ -2093,11 +2142,13 @@ component BrowseBlockView inherits VerticalLayout {
         }
 
         into := TouchArea {
-            clicked => { root.section-action(root.block.section); }
+            clicked => { root.section-action(root.item.section); }
         }
     }
 
-    if root.block.kind != 2 && root.block.kind != 3 && root.block.title != "": HorizontalLayout {
+    // The heading over a section. Its own item, sitting above the rows it
+    // names rather than wrapping them.
+    if root.item.kind == 4: HorizontalLayout {
         padding-left: Theme.pad;
         padding-right: Theme.pad;
         padding-top: Theme.tight;
@@ -2107,10 +2158,10 @@ component BrowseBlockView inherits VerticalLayout {
             alignment: center;
             horizontal-stretch: 1;
 
-            SectionLabel { prose: true; text: root.block.title; }
+            SectionLabel { prose: true; text: root.item.title; }
         }
 
-        if root.block.action != "": VerticalLayout {
+        if root.item.action != "": VerticalLayout {
             alignment: center;
 
             Rectangle {
@@ -2126,7 +2177,7 @@ component BrowseBlockView inherits VerticalLayout {
 
                 more := Text {
                     accessible-role: none;
-                    text: root.block.action;
+                    text: root.item.action;
                     font-size: Theme.micro-size;
                     font-weight: 600;
                     letter-spacing: 0.6px;
@@ -2137,11 +2188,11 @@ component BrowseBlockView inherits VerticalLayout {
 
                 shelf := TouchArea {
                     accessible-role: button;
-                    accessible-label: root.block.action;
+                    accessible-label: root.item.action;
                     accessible-action-default => {
-                        root.section-action(root.block.section);
+                        root.section-action(root.item.section);
                     }
-                    clicked => { root.section-action(root.block.section); }
+                    clicked => { root.section-action(root.item.section); }
                 }
             }
         }
@@ -2149,20 +2200,21 @@ component BrowseBlockView inherits VerticalLayout {
 
     // A shelf runs off the side of the pane, as it does in the official
     // controller: the alternative is a wall of covers that pushes everything
-    // below it off the screen.
-    if root.block.kind == 1: Flickable {
+    // below it off the screen. One item, tiles and all, for the same reason
+    // the chip strip is: it is as wide as the pane and no taller than a tile.
+    if root.item.kind == 1: Flickable {
         // As tall as the tiles need, not a fixed figure. A shelf of inputs has
         // no subtitles and so wants less than one of records; asking the tiles
         // is how the two stay right without the number being written twice.
         height: tiles.preferred-height;
-        viewport-width: root.block.rows.length * 128px + 2 * Theme.pad;
+        viewport-width: root.item.tiles.length * 128px + 2 * Theme.pad;
         viewport-height: self.height;
 
         tiles := HorizontalLayout {
             accessible-role: list;
-            accessible-item-count: root.block.rows.length;
+            accessible-item-count: root.item.tiles.length;
             x: Theme.pad;
-            width: root.block.rows.length * 128px;
+            width: root.item.tiles.length * 128px;
             height: self.preferred-height;
             alignment: start;
 
@@ -2172,7 +2224,7 @@ component BrowseBlockView inherits VerticalLayout {
             // and those are now different heights, so without this the shorter
             // one could sit centered and its cover would ride below its
             // neighbors'.
-            for entry[i] in root.block.rows: VerticalLayout {
+            for entry[i] in root.item.tiles: VerticalLayout {
                 alignment: start;
 
                 BrowseTile {
@@ -2182,21 +2234,6 @@ component BrowseBlockView inherits VerticalLayout {
                     open-menu(y, right) => { root.open-menu(entry.index, y, right); }
                 }
             }
-        }
-    }
-
-    if root.block.kind == 0: VerticalLayout {
-        // A block is one shelf or list on a browse screen, so the set is this
-        // block's rows rather than everything on the screen — which is what a
-        // reader stepping through it is actually inside.
-        accessible-role: list;
-        accessible-item-count: root.block.rows.length;
-
-        for entry[i] in root.block.rows: BrowseRowView {
-            entry: entry;
-            accessible-item-index: i;
-            activate => { root.activate(entry.index); }
-            open-menu(y, right) => { root.open-menu(entry.index, y, right); }
         }
     }
 }
@@ -2254,7 +2291,8 @@ export component AppWindow inherits Window {
     callback track-action(string);
     // Whether the middle pane is showing the record rather than a screen.
     in property <bool> now-playing: false;
-    in property <[BrowseBlock]> browse-blocks;
+    // Everything the middle pane draws, flat and in order. See `BrowseItem`.
+    in property <[BrowseItem]> browse-items;
     // What a screen about one thing says about it, straight from the player:
     // an album's cover, who made it, when, and what to do with the whole of it.
     in property <image> browse-header-cover;
@@ -2364,6 +2402,44 @@ export component AppWindow inherits Window {
     // was off the network — or rewriting its own firmware, which is the same
     // thing with a worse ending.
     property <bool> controllable: root.has-selection && root.current.reachable;
+    // Whether the window manager says this is the window being used.
+    //
+    // Only motion nobody would miss depends on it. The transport's position
+    // glides, so that a figure stepping once a second reads as continuous
+    // travel, and a glide is a frame every 16ms for as long as music plays:
+    // measured at 62 redraws a second against 12 with the glide off, which is
+    // what keeps a laptop out of its deep idle states for the whole of an
+    // album. That is worth paying while someone is watching the bar move and
+    // not while the app is behind something else, so the glide is narrowed to
+    // here rather than taken away.
+    //
+    // Tracked from `keys` rather than asked of the window, because Slint has
+    // no window-active property and only a FocusScope is offered the event at
+    // all: activation reaches whichever element holds the caret, and `keys`
+    // holds it whenever no field wants it. A LineEdit that has it instead
+    // cannot pass the news on — neither it nor the TextInput under it has a
+    // `focus-changed-event` to put a handler on — so while a field holds the
+    // caret this cannot be known.
+    //
+    // Unknown therefore reads as true, and false is only ever the one thing
+    // `keys` saw for itself. Any focus event for any other reason puts it back
+    // to true, which is what stops a false outliving what it described: the
+    // caret leaving `keys` for a search box that a background republish has
+    // just built is exactly such an event, and without that the window would
+    // be left believing it is not the active one for the rest of the session —
+    // the activation that follows goes to the box, and `keys` never hears
+    // another one. Stale true is the way round this can afford to be wrong,
+    // since it only means the glide runs while the window is behind another,
+    // as it did before any of this.
+    //
+    // So the saving is narrowed to what it covers: a window whose caret is
+    // where the app keeps it. `/ui/Search` carries a box that takes the caret
+    // on sight, so a session left on that screen is a session that goes on
+    // gliding. Every other screen is a screen the reader is only looking at.
+    //
+    // `out` rather than private only so a test can read what the window
+    // believes; nothing outside writes it.
+    out property <bool> window-active: true;
     // Something asking a question that has to be answered before the window
     // can be used again. All of these cover it with a scrim, so nothing behind
     // one is reachable by pointer either.
@@ -2425,10 +2501,14 @@ export component AppWindow inherits Window {
     // model does not move a Flickable and the new rows would otherwise appear
     // under whatever scroll position the old ones had.
     in-out property <int> browse-jumped: 0;
-    // Where that jump landed, in pixels down the list. Zero for a jump that
-    // fetched its rows, since those replaced what was there; a real offset for
-    // a list held whole, where the letter is already on screen somewhere.
-    in property <float> browse-jump-y: 0;
+    // Where that jump landed, as an item of `browse-items`. Zero for a jump
+    // that fetched its rows, since those replaced what was there; a real item
+    // for a list held whole, where the letter is already on screen somewhere.
+    //
+    // An item rather than the offset a Flickable takes, because the offset
+    // that reaches a given item is the list's own arithmetic and not ours —
+    // see `jump-y` on the list.
+    in property <int> browse-jump-at: 0;
     callback clear-recent();
     // The cover reduced to a wash. Slint has no blur, so the softening is
     // done in the pixels before they arrive — see artwork::frosted.
@@ -2680,6 +2760,19 @@ export component AppWindow inherits Window {
         // row, which is how a zero-width sibling once collapsed the window.
         keys := FocusScope {
             height: 0px;
+
+            // The window manager changing which window is in use is delivered
+            // as a focus event to whatever holds the caret, and this holds it
+            // whenever no field does. Every other reason is the caret moving
+            // about inside a window that is being used either way — and is
+            // also the moment to forget a deactivation this scope watched but
+            // will not see the end of, because the caret has gone to a field
+            // that cannot report one. See `window-active`.
+            focus-changed-event(reason) => {
+                root.window-active = reason == FocusReason.window-activation
+                    ? self.has-focus
+                    : true;
+            }
 
             // What the letters belong to, so walking to another screen — or
             // out to Settings and back — takes the focus again. A change
@@ -3432,7 +3525,7 @@ export component AppWindow inherits Window {
                     // above it, so a question does not reflow the screen
                     // behind its own scrim.
                     if root.search-drawn
-                        && root.browse-blocks.length == 0
+                        && root.browse-items.length == 0
                         && root.browse-recent.length > 0: VerticalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
@@ -3639,6 +3732,15 @@ export component AppWindow inherits Window {
                         browse-list := ListView {
                             horizontal-stretch: 1;
 
+                            // The size of the set belongs on the container,
+                            // the same as the queue's: AccessKit reads it from
+                            // the list and hands it down. It used to sit on
+                            // each section's own wrapper, one count per
+                            // section, and the sections are no longer
+                            // containers — a screen arrives flat, so the pane
+                            // is the set. The role is not restated: a ListView
+                            // is already a list.
+                            accessible-item-count: root.browse-items.length;
                             vertical-stretch: 1;
                             // A ListView is a Flickable, and a Flickable sizes its
                             // viewport to what the content would like to be — so
@@ -3682,6 +3784,36 @@ export component AppWindow inherits Window {
                             // when the artwork makes the rows taller.
                             property <bool> settling-end: false;
 
+                            // Where `browse-jump-at` sits, in the offset this
+                            // list takes.
+                            //
+                            // A ListView places a seek of more than a screen
+                            // and a half by dividing the offset by what it
+                            // believes one item is worth, and it believes
+                            // every item is worth the same — the average of
+                            // the ones it has built. So the offset that
+                            // reaches a given item is that average times the
+                            // item, and the average is `viewport-height` over
+                            // the number of items, which is how the list
+                            // arrived at the height in the first place. Adding
+                            // the heights up here instead landed a jump a few
+                            // rows above its letter on any list carrying
+                            // headings, which are shorter than rows, and
+                            // further out the further down the list the letter
+                            // was.
+                            //
+                            // Half a pixel past the item's own top, because
+                            // the list rounds the division down and an exact
+                            // multiple can come out a hair under it. Nothing
+                            // else has an opinion about half a pixel: the list
+                            // snaps the offset to the item it settles on.
+                            function jump-y() -> length {
+                                root.browse-items.length > 0 && root.browse-jump-at > 0
+                                    ? -(self.viewport-height * root.browse-jump-at
+                                        / root.browse-items.length) - 0.5px
+                                    : 0px
+                            }
+
                             changed viewport-y => {
                                 if (self.viewport-height + self.viewport-y - self.height < 900px) {
                                     root.browse-more();
@@ -3702,7 +3834,7 @@ export component AppWindow inherits Window {
                             // being the thing that gets bored and stops.
                             changed viewport-height => {
                                 if (self.settling) {
-                                    self.viewport-y = -root.browse-jump-y * 1px;
+                                    self.viewport-y = self.jump-y();
                                 }
                                 if (self.settling-end) {
                                     self.viewport-y = min(0px, self.height - self.viewport-height);
@@ -3712,8 +3844,9 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            for block in root.browse-blocks: BrowseBlockView {
-                                block: block;
+                            for item[i] in root.browse-items: BrowseItemView {
+                                item: item;
+                                at: i;
                                 activate(i) => { root.browse-activate(i); }
                                 open-menu(i, y, right) => {
                                     root.queue-menu-y = y;
@@ -3783,7 +3916,7 @@ export component AppWindow inherits Window {
                             property <int> at: root.browse-jumped;
                             changed at => {
                                 browse-list.settling-end = false;
-                                browse-list.viewport-y = -root.browse-jump-y * 1px;
+                                browse-list.viewport-y = browse-list.jump-y();
                                 // Held there until the rows stop changing size
                                 // under it. See `settling` on the list.
                                 browse-list.settling = true;
@@ -5342,7 +5475,13 @@ export component AppWindow inherits Window {
                     label: "Position in the track";
                     enabled: root.current.reachable && root.seekable && root.duration > 0;
                     value: root.position / Math.max(root.duration, 1);
-                    glide: 1s;
+                    // A second, which is exactly the interval the position
+                    // arrives on — and only while anyone is here to see it.
+                    // See `window-active`: the bar still moves in a window
+                    // that is behind something else, it just steps there
+                    // instead of sliding, and the window goes back to drawing
+                    // in bursts rather than continuously.
+                    glide: root.window-active ? 1s : 0ms;
                     height: 12px;
                     seek(fraction) => {
                         root.seek(root.current.id, Math.round(fraction * root.duration));

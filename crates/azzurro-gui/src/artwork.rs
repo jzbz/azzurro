@@ -34,18 +34,18 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// covers of everything recently selected, with room to spare.
 ///
 /// Counted in entries rather than bytes, so what it costs depends on which
-/// sizes are in it. Three tiers are asked for and no more: `THUMB_SIZE` 72,
+/// sizes are in it. Three tiers are asked for and no more: `THUMB_SIZE` 80,
 /// `TILE_SIZE` 232 and `COVER_SIZE` 720, and one LRU holds all of them. A
-/// fourth crept in for a while — the sidebar card fetched its own 80×80, so
-/// the selected player's cover was decoded twice and held twice for a picture
-/// eleven percent larger than the thumbnail of it in the queue. The card asks
-/// for the thumbnail tier now; keeping this table true is what makes a fourth
-/// tier visible if one is ever added deliberately. At four bytes a pixel the
-/// worst case for a full cache of each is
+/// fourth crept in for a while — the sidebar card fetched its own 80×80 beside
+/// the queue's 72, so the selected player's cover was decoded twice and held
+/// twice for a difference nothing can see. The two are one tier at 80 now,
+/// which is what both of them want at 2x: keeping this table true is what
+/// makes a fourth tier visible if one is ever added deliberately. At four
+/// bytes a pixel the worst case for a full cache of each is
 ///
 /// | tier | one entry | 256 entries |
 /// |------|-----------|-------------|
-/// | 72   | 20 KiB    | 5 MiB       |
+/// | 80   | 25 KiB    | 6 MiB       |
 /// | 232  | 210 KiB   | 53 MiB      |
 /// | 720  | 2 MiB     | 506 MiB     |
 ///
@@ -377,6 +377,28 @@ pub struct Artwork {
     /// Covers written since the process started. Every [`PRUNE_EVERY`] of them
     /// buys a look at the directory; see [`DISK_CACHE_FILES`].
     written: std::sync::atomic::AtomicUsize,
+    /// Decoded images that have landed in `memory` since the process started.
+    ///
+    /// A number that only goes up, so anything drawing from the cache can ask
+    /// "has anything at all decoded since I last looked?" for the price of one
+    /// atomic load. The queue's memo needs that as a gate: what it used to hash
+    /// was [`Self::cached`] per row, which is the memory lock taken once a
+    /// track and answers a narrower question at five hundred times the cost.
+    ///
+    /// It is only a gate, because it counts every decode in the process — a
+    /// browse thumbnail, another player's sidebar card — and a queue watching
+    /// it alone is a queue rebuilt several times a second for covers that are
+    /// not its own. What arrived is asked separately, of the URLs the asker
+    /// actually named, in [`Self::any_decoded`].
+    arrivals: std::sync::atomic::AtomicU64,
+    /// And how many rows have asked [`Self::cached`] what is decoded.
+    ///
+    /// The other side of the same story: every one of those is a turn of the
+    /// memory lock, taken while whoever is drawing holds a lock of its own.
+    /// The queue's memo is written so that this grows by the length of the
+    /// window when the window has changed and by nothing when it has not, and
+    /// a test watches the number to say so.
+    peeks: std::sync::atomic::AtomicU64,
     limit: Semaphore,
     /// And the same for decoding; see [`CONCURRENT_DECODES`].
     ///
@@ -422,6 +444,8 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
+            arrivals: std::sync::atomic::AtomicU64::new(0),
+            peeks: std::sync::atomic::AtomicU64::new(0),
             players,
             memory: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
@@ -449,6 +473,8 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
+            arrivals: std::sync::atomic::AtomicU64::new(0),
+            peeks: std::sync::atomic::AtomicU64::new(0),
             players,
             memory: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
@@ -481,11 +507,83 @@ impl Artwork {
     /// eviction order stops meaning anything. Wanting a cover is `get`, in
     /// [`Self::get`]; drawing one is this.
     pub fn cached(&self, url: &str, size: u32) -> Option<Pixels> {
+        self.peeks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = Key {
             url: url.to_owned(),
             size,
         };
         self.memory.lock().unwrap().peek(&key).cloned()
+    }
+
+    /// Whether any of `urls` is decoded at `size`, in one turn of the lock.
+    ///
+    /// The question [`Self::arrivals`] cannot answer: that counter says
+    /// something decoded, this says whether it was one of the covers the
+    /// caller is waiting on. Asked only once a rebuild is otherwise in
+    /// prospect, so the walk is over the URLs a list still lacks rather than
+    /// over the whole of it.
+    ///
+    /// Deliberately not counted in [`Self::peeks`], which measures what the
+    /// rows cost: this is one turn of the lock for the whole list and clones
+    /// nothing. `peek` rather than `get`, for the reason given on
+    /// [`Self::cached`] — asking is not using.
+    pub fn any_decoded(&self, urls: &[String], size: u32) -> bool {
+        // One key, refilled, rather than one allocated per URL: a queue that
+        // is still waiting asks this every time anything anywhere decodes.
+        let mut key = Key {
+            url: String::new(),
+            size,
+        };
+        let memory = self.memory.lock().unwrap();
+        urls.iter().any(|url| {
+            key.url.clear();
+            key.url.push_str(url);
+            memory.contains(&key)
+        })
+    }
+
+    /// Put a decoded image in as though one had been fetched and decoded.
+    ///
+    /// For a test of a memo that watches the cache. Nothing in this build can
+    /// stage a real arrival: the fake player answers `/Artwork` with a 404,
+    /// and a picture it could answer with is bytes rather than the text its
+    /// routes are written in. The pixels are a single blank one, because what
+    /// is under test is which URLs moved and not what they look like.
+    #[cfg(test)]
+    pub fn note_arrival(&self, url: &str, size: u32) {
+        self.memory.lock().unwrap().put(
+            Key {
+                url: url.to_owned(),
+                size,
+            },
+            Pixels::new(1, 1),
+        );
+        // After the entry is in, exactly as in `get`: a memo that sees the new
+        // number goes looking for the picture it is announcing.
+        self.arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many times that has been asked. See [`Self::peeks`].
+    ///
+    /// Only a test reads it, the same as [`Self::in_memory`]: the count is
+    /// kept either way, because an atomic add beside a mutex is not worth a
+    /// `cfg` of its own.
+    #[cfg(test)]
+    pub fn peeks(&self) -> u64 {
+        self.peeks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many decoded images have landed since the process started.
+    ///
+    /// For a memo that draws from the cache: the number standing still is a
+    /// one-load proof that a list of rows built out of [`Self::cached`] would
+    /// come out byte for byte the same, so it is the gate in front of the
+    /// narrower question. The number moving proves nothing on its own — see
+    /// [`Self::arrivals`] and [`Self::any_decoded`].
+    pub fn arrivals(&self) -> u64 {
+        self.arrivals.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Note that this player's own address serves art that is allowed.
@@ -699,6 +797,10 @@ impl Artwork {
             },
             decoded.clone(),
         );
+        // After the entry is in, so a memo that sees the new number and
+        // rebuilds finds the picture the number is announcing.
+        self.arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Some(decoded)
     }
 

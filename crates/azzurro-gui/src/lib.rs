@@ -84,13 +84,22 @@ const COVER_SETTLE: Duration = Duration::from_millis(180);
 /// The cost is real and is worth stating: 720² × 4 = 2 MiB per entry against
 /// 506 KiB before, and the table on [`artwork::MEMORY_CACHE`] carries the
 /// arithmetic. Only the hero asks for this tier — the 232px shelf tiles and
-/// 72px thumbnails are unchanged — so a cache full of them needs 256 different
-/// albums opened at full size.
+/// the small tier below are unchanged — so a cache full of them needs 256
+/// different albums opened at full size.
 const COVER_SIZE: u32 = 720;
 
-/// Queue thumbnails are drawn at 34px, likewise doubled. Browse rows use the
-/// same size, so the two panes share cache entries for the same art.
-const THUMB_SIZE: u32 = 72;
+/// The small tier: queue thumbnails and browse rows at 34px, and the sidebar
+/// card at 40px. Three places, one size, so they share cache entries for the
+/// same art — the selected player's cover is a card and a queue row at once,
+/// and it is decoded and held once.
+///
+/// 80 rather than 68 because the card is the largest of the three and it is
+/// the doubling that decides the number: a square cover fills its 40px box
+/// exactly on a 2x screen. It was 72 for a while, from when the queue's 34px
+/// row was the only thing in the tier, and the card was quietly upscaled by
+/// the eleven percent between them. The rows are over-sampled by the same
+/// eleven percent instead, which costs 5 KiB an entry and nothing to look at.
+const THUMB_SIZE: u32 = 80;
 
 /// A cover on a shelf is drawn at 116px, and at 72 it would be a smear. The
 /// cache is keyed by size, so a screen with both shapes on it fetches both.
@@ -402,7 +411,7 @@ struct Browsing {
     /// slower request landing second put the wrong letter on screen.
     jumps: u64,
     /// Letters worked out from the rows on screen, for a list the player sent
-    /// no index for: `(key, every pixel offset that letter starts at)`.
+    /// no index for: `(key, every item the letter starts at)`.
     ///
     /// The player indexes its four long alphabetical lists — Artists, Albums,
     /// Songs, Composers — and nothing else. Genres is 175 entries, sorted, and
@@ -413,7 +422,7 @@ struct Browsing {
     ///
     /// Rebuilt whenever the rows are, and from the same rows the window is
     /// given, so the offsets cannot drift from what is drawn.
-    derived: Vec<(String, Vec<f32>)>,
+    derived: Vec<(String, Vec<i32>)>,
     /// The bar letter last pressed, which era it was pressed in, and how far
     /// through that letter's runs the list has been taken.
     ///
@@ -1213,6 +1222,20 @@ struct Entry {
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
 
+/// What the queue pane's last build was still waiting on from the artwork
+/// cache. See [`Backend::queue_art`].
+#[derive(Default)]
+struct QueueArt {
+    /// The cover URLs rows asked the cache for and did not get, de-duplicated:
+    /// a queue of one album names the same cover five hundred times, and what
+    /// is wanted is the set of answers that could change, not the rows.
+    wanted: Vec<String>,
+    /// What [`artwork::Artwork::arrivals`] stood at when those rows were
+    /// built, so one decode is looked into once rather than at every status
+    /// until the next one.
+    seen: u64,
+}
+
 /// Everything the background tasks share. Cheap to clone; all of it is behind
 /// an `Arc` already.
 ///
@@ -1313,6 +1336,23 @@ struct Backend {
     /// second of repainting for nothing — measured at eleven frames a second
     /// with the app sitting idle.
     sent_queue: Arc<AtomicU64>,
+    /// Which covers that memo is still waiting for, because it cannot see them
+    /// itself.
+    ///
+    /// A cover is not in the queue document — it is in the artwork cache — so
+    /// two builds of the same unmoved queue differ whenever one lands. The
+    /// arrival counter alone stands in for that, and it stands in far too
+    /// widely: it counts every decode in the process, so a browse page walking
+    /// its thumbnails, or another player's sidebar card changing track, rebuilt
+    /// this queue several times a second for covers that were never its own.
+    /// Remembering what is outstanding narrows it back to the question worth
+    /// asking — the counter is the gate, these are what is then looked for.
+    /// Empty means the pane has every cover its rows name, or names none, and
+    /// unrelated decodes are ignored outright.
+    ///
+    /// Taken only in [`Backend::publish_queue`] and outermost there, so it has
+    /// no order to get wrong with the locks above.
+    queue_art: Arc<Mutex<QueueArt>>,
     sent_players: Arc<AtomicU64>,
     /// And the settings rows, for the same reason as the three above: the
     /// status ticks every second and rebuilding a settings model replaces
@@ -1355,6 +1395,22 @@ struct Backend {
     /// model with the most rows in it. A screen is republished whenever a
     /// thumbnail lands, on every page of a paged screen, and on every refresh.
     sent_browse: Arc<AtomicU64>,
+    /// And the same screen item by item: one fingerprint per drawn thing, in
+    /// the order the pane draws them.
+    ///
+    /// The memo above answers "is this screen the one on show", which is no
+    /// whenever anything at all has moved — a page of thirty rows landing on
+    /// two thousand, a cover arriving, the playing row moving on. It then
+    /// rebuilt the whole model for the window: two thousand items, five
+    /// `SharedString`s and a glyph lookup apiece, on the event loop, and again
+    /// every 400ms for as long as the covers were walking in. This says *which*
+    /// of them moved, so a page costs the page.
+    ///
+    /// The record of what the window is holding, so it is written where the
+    /// publish that updates the window is posted, under this lock, and the
+    /// posts therefore reach the event loop in the order the diffs were taken
+    /// in. See [`Backend::send_browse`].
+    sent_items: Arc<Mutex<Vec<u64>>>,
     /// The letters of the jump bar, so the model is not replaced on every
     /// republish of the same screen.
     sent_index: Arc<AtomicU64>,
@@ -1404,14 +1460,14 @@ struct Backend {
     /// The redraw clock lives here too, for the reason in [`Walks`].
     queue_walk: Arc<Mutex<Walks>>,
     browse_walk: Arc<Mutex<Walks>>,
-    /// How many sweeps are running, so the window can say one is.
+    /// How many sweeps are running, and what the window has been told.
     ///
     /// A count rather than a flag because there can be two: Rescan starts a
     /// sweep of its own, and the rebind loop starts one every time it binds a
     /// fresh socket. With a flag the first of them to finish said so for both,
     /// and the empty state went back to "No players found" with twelve seconds
     /// of broadcasts still to run. See [`Looking`].
-    sweeping: Arc<AtomicU64>,
+    sweeping: Arc<Mutex<Sweeps>>,
 }
 
 /// The player's own words, in American spelling.
@@ -2501,6 +2557,135 @@ struct BlockData {
     rows: Vec<BrowseData>,
 }
 
+/// One drawn thing on a browse screen, on its way to the window.
+///
+/// The window's `BrowseItem` in the same plain shape [`BrowseData`] is a
+/// `BrowseRow` in, and for the same reason: the pixels are `Send` and an
+/// `Image` is not. A screen arrives as sections and is drawn as a flat list —
+/// a heading is an item, and each row under it is an item of its own — so this
+/// is what the pane is a list *of*, and the unit a publish is compared in.
+struct ItemData {
+    /// The kinds `BrowseItem` documents: 0 a row, 1 a shelf, 2 a chip strip,
+    /// 3 a way in, 4 the heading over a section.
+    kind: i32,
+    title: String,
+    action: String,
+    section: i32,
+    /// The one row a plain-list item draws, or the tiles a shelf or a chip
+    /// strip holds across the pane. Empty for a heading and for a way in,
+    /// which draw their own title and nothing under it.
+    rows: Vec<BrowseData>,
+}
+
+/// Lay a screen's sections out in the order the pane draws them.
+///
+/// Here rather than in the event loop, where it used to sit, because this is
+/// the form a screen can be compared against the one on show in: what it costs
+/// to build is a `Vec` of what the publisher already owns, where the window's
+/// own items cost five `SharedString`s and a glyph lookup apiece — which is
+/// the work worth not doing for rows that have not changed. See [`Backend::
+/// sent_items`].
+fn flatten_browse(blocks: Vec<BlockData>) -> Vec<ItemData> {
+    let mut items: Vec<ItemData> = Vec::new();
+    for block in blocks {
+        // A way in carries its own title and has nothing under it, so it is
+        // one item and never gets a heading above it.
+        if block.kind == 3 {
+            items.push(ItemData {
+                kind: 3,
+                title: block.title,
+                action: String::new(),
+                section: block.section,
+                rows: Vec::new(),
+            });
+            continue;
+        }
+        // The same test the section heading used to be drawn under, from when
+        // a section was one element holding its rows. A chip strip names
+        // nothing: the chips say what they are.
+        if block.kind != 2 && !block.title.is_empty() {
+            items.push(ItemData {
+                kind: 4,
+                title: block.title,
+                action: block.action,
+                section: block.section,
+                rows: Vec::new(),
+            });
+        }
+        match block.kind {
+            0 => items.extend(block.rows.into_iter().map(|row| ItemData {
+                kind: 0,
+                title: String::new(),
+                action: String::new(),
+                section: block.section,
+                rows: vec![row],
+            })),
+            kind => items.push(ItemData {
+                kind,
+                title: String::new(),
+                action: String::new(),
+                section: block.section,
+                rows: block.rows,
+            }),
+        }
+    }
+    items
+}
+
+/// Everything about one of those items that the window draws.
+///
+/// One number per item rather than one for the screen, because the screen's
+/// own memo can only answer "anything at all" — and the answer to that is yes
+/// on every page, every status and every cover, while the answer for all but a
+/// few of the items is no. See [`Backend::sent_items`].
+fn item_fingerprint(item: &ItemData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    item.kind.hash(&mut hash);
+    item.title.hash(&mut hash);
+    item.action.hash(&mut hash);
+    item.section.hash(&mut hash);
+    for row in &item.rows {
+        browse_row_fingerprint(row, &mut hash);
+    }
+    hash.finish()
+}
+
+/// Which of a screen's items are not the ones the window is already holding.
+///
+/// `held` is that record — one fingerprint per item, in drawn order — and is
+/// brought up to date here, so the caller's only job is to see that the window
+/// is given what comes back. The second answer says whether it is a patch at
+/// all: `true` means the window is to throw its rows away and take these as a
+/// new list, and the patch is then every item.
+///
+/// Two cases ask for that. A screen that has *lost* items, because a
+/// `VecModel` has no way to drop a tail except a row and a notification at a
+/// time — and a screen that lost rows has almost always changed the ones it
+/// kept as well. And a screen where everything changed, which is what walking
+/// into another screen looks like: the same number of writes, and a new model
+/// besides.
+///
+/// Everything else is a patch, and the case worth having it for is a page: a
+/// library's Songs list is two thousand items, a page adds thirty, and the
+/// other one thousand nine hundred and seventy are the ones already on screen.
+/// A cover landing is one item, and a walk republishes every 400ms for as long
+/// as covers are arriving.
+fn browse_patch(held: &mut Vec<u64>, items: Vec<ItemData>) -> (Vec<(usize, ItemData)>, bool) {
+    let total = items.len();
+    let marks: Vec<u64> = items.iter().map(item_fingerprint).collect();
+    let shrunk = total < held.len();
+    let mut patch: Vec<(usize, ItemData)> = Vec::new();
+    for (at, item) in items.into_iter().enumerate() {
+        if shrunk || held.get(at) != Some(&marks[at]) {
+            patch.push((at, item));
+        }
+    }
+    *held = marks;
+    let whole = shrunk || patch.len() == total;
+    (patch, whole)
+}
+
 /// Everything about a browse row that the window draws.
 ///
 /// Split out because the browse memo hashes rows from two places — the
@@ -2697,6 +2882,22 @@ struct QueueButtonData {
     highlight: bool,
     mode: i32,
     question: String,
+}
+
+/// Everything about those buttons that the window draws.
+///
+/// Its own function for the same reason [`browse_row_fingerprint`] is: the
+/// queue's memo hashes them from either side of a branch — a queue and a
+/// player that has not sent one — and a field added to one and not the other
+/// is a button that stops redrawing when it changes.
+fn queue_buttons_fingerprint(buttons: &[QueueButtonData], hash: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    for button in buttons {
+        button.index.hash(hash);
+        button.label.hash(hash);
+        button.highlight.hash(hash);
+        button.mode.hash(hash);
+    }
 }
 
 /// Distinguishes the several MPRIS bus names one process claims.
@@ -3235,7 +3436,7 @@ async fn run(
         known: Arc::new(Mutex::new(Vec::new())),
         queue_walk: Arc::default(),
         browse_walk: Arc::default(),
-        sweeping: Arc::new(AtomicU64::new(0)),
+        sweeping: Arc::default(),
         vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
         searches: Arc::new(AtomicU64::new(0)),
         forms: Arc::new(AtomicU64::new(0)),
@@ -3243,6 +3444,7 @@ async fn run(
         sent_transport: Arc::new(AtomicU64::new(0)),
         sent_track_actions: Arc::new(AtomicU64::new(0)),
         sent_queue: Arc::new(AtomicU64::new(0)),
+        queue_art: Arc::default(),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
         settings_redraws: Arc::new(AtomicU64::new(0)),
@@ -3250,6 +3452,7 @@ async fn run(
         told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
         update_offer: Arc::new(Mutex::new(None)),
         sent_browse: Arc::new(AtomicU64::new(0)),
+        sent_items: Arc::default(),
         sent_index: Arc::new(AtomicU64::new(0)),
         sent_era: Arc::new(AtomicU64::new(0)),
         thumbnails: Arc::new(AtomicU64::new(0)),
@@ -4159,10 +4362,35 @@ impl Backend {
     /// Rescan, the one a user presses and the one whose only feedback this is,
     /// was the one that never bracketed anything.
     fn looking(&self) -> Looking {
-        if self.sweeping.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.set_looking(true);
-        }
+        self.sweeps(1);
         Looking(self.clone())
+    }
+
+    /// Add or take away one sweep and tell the window what that makes it.
+    ///
+    /// Both under the one lock, because the count and the thing it describes
+    /// are one transition. As an atomic plus a separate push they were not:
+    /// two sweeps starting and ending around each other could have the thread
+    /// that took the count to zero post "no" while the thread that took it
+    /// back to one had already posted "yes", and the window applies them in
+    /// the order they were posted rather than the order the counts changed.
+    /// Whichever way round it landed was permanent — the spinner left turning
+    /// with no sweep behind it, or the first-run window reading "No players
+    /// found" through twelve seconds of broadcasts, which is the very thing
+    /// counting the sweeps was for — because nothing tells the window again
+    /// until a sweep both starts and ends.
+    fn sweeps(&self, by: i64) {
+        let mut sweeping = self.sweeping.lock().unwrap();
+        sweeping.running = sweeping.running.saturating_add_signed(by);
+        let looking = sweeping.running > 0;
+        if sweeping.told == looking {
+            return;
+        }
+        sweeping.told = looking;
+        // Posted under the guard as well: the order the window is told in has
+        // to be the order the counts changed in, and that is only guaranteed
+        // while nothing else can interleave a post of its own.
+        self.set_looking(looking);
     }
 
     /// Whether discovery is still sweeping, so the window can say so.
@@ -4621,6 +4849,28 @@ impl Backend {
         });
     }
 
+    /// Whether a cover the queue pane is short of has decoded since its rows
+    /// were built — the one thing that can redraw a queue nothing has moved.
+    ///
+    /// Three steps, cheapest first, because this runs for every status of the
+    /// selected player. A pane with all its art in hand asks nothing at all; a
+    /// process where nothing has decoded since costs one atomic load; only
+    /// then is the outstanding set looked through, in a single turn of the
+    /// artwork lock. The counter is banked whichever way that comes out, so
+    /// one decode elsewhere is looked into once and not at every status after
+    /// it.
+    fn wanted_art_landed(&self, art: &mut QueueArt) -> bool {
+        if art.wanted.is_empty() {
+            return false;
+        }
+        let arrivals = self.artwork.arrivals();
+        if arrivals == art.seen {
+            return false;
+        }
+        art.seen = arrivals;
+        self.artwork.any_decoded(&art.wanted, THUMB_SIZE)
+    }
+
     fn publish_queue(&self) {
         // Read the selection out before taking the registry lock, so the two
         // are never held at once and there is no order to get wrong.
@@ -4696,40 +4946,118 @@ impl Backend {
                 .unwrap_or_default()
         };
 
+        // A status arrives for the selected player about once a second, and
+        // nearly every one of them describes a queue that has not moved. So
+        // what would be drawn is identified first, from what the registry
+        // already holds, and the rows are built only once that identity has
+        // changed. Building them first and rejecting them afterwards is how
+        // this was written, and on a full window it meant five hundred
+        // `TrackData` with five `String` clones apiece and five hundred turns
+        // of the artwork cache's lock, once a second, thrown away every time —
+        // all of it under the registry lock, which is the lock the status poll
+        // for every other player and every transport press are waiting on.
+        //
+        // The identity is hashed off the queue itself rather than off the rows
+        // it would make: the same fields, but borrowed, and `seconds` and
+        // `quality` in place of the text they are turned into.
+        //
+        // The covers are the one thing a row carries that the queue says
+        // nothing about, so they are asked about separately rather than
+        // hashed. The count of decoded images was hashed in at first, and it
+        // is a count for the whole process: a browse page walking its
+        // thumbnails moves it several times a second, so every status through
+        // a library page rebuilt all five hundred rows — and posted them,
+        // which is worse than what this replaced — for covers belonging to
+        // something else entirely. So the count is the gate and not the
+        // answer, and what is behind it is the set of covers these rows are
+        // actually waiting on. See [`Backend::queue_art`].
+        let mut art = self.queue_art.lock().unwrap();
         let (rows, line, cursor_row) = {
             let guard = self.registry.lock().unwrap();
-            match selected.and_then(|id| guard.get(&id)).and_then(|entry| {
-                entry
-                    .queue
-                    .as_ref()
-                    .map(|queue| (queue, entry.status.clone()))
-            }) {
-                Some((queue, status)) => {
-                    let status = status.unwrap_or_default();
-                    let cursor = queue.cursor(&status);
+            // Borrowed rather than cloned, and a shared default for the player
+            // that has not answered yet.
+            let idle = bluos::Status::default();
+            match selected
+                .and_then(|id| guard.get(&id))
+                .and_then(|entry| entry.queue.as_ref().map(|queue| (queue, entry)))
+            {
+                Some((queue, entry)) => {
+                    let status = entry.status.as_ref().unwrap_or(&idle);
+                    let cursor = queue.cursor(status);
                     // The cursor is where playback would resume; it is only a
                     // now-playing marker if the queue is what is playing.
-                    let live = queue.is_live(&status);
+                    let live = queue.is_live(status);
 
-                    let client = selected
-                        .and_then(|id| guard.get(&id))
-                        .map(|e| e.client.clone());
+                    // Which row the player is on, which is not the same number
+                    // as the queue position once a window starts anywhere but
+                    // the beginning.
+                    let cursor_row = cursor
+                        .and_then(|at| queue.songs.iter().position(|song| song.id == at))
+                        .map(|row| row as i32)
+                        .unwrap_or(-1);
 
+                    let shown = queue.songs.len() as u32;
+                    let plural = if queue.length == 1 { "track" } else { "tracks" };
+                    let line = if shown == queue.length {
+                        format!("Queue · {shown} {plural}")
+                    } else {
+                        format!("Queue · {shown} of {} {plural}", queue.length)
+                    };
+
+                    let unchanged = already_sent(&self.sent_queue, {
+                        use std::hash::{Hash, Hasher};
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        line.hash(&mut hash);
+                        cursor_row.hash(&mut hash);
+                        live.hash(&mut hash);
+                        for song in &queue.songs {
+                            song.id.hash(&mut hash);
+                            song.title.hash(&mut hash);
+                            song.artist.hash(&mut hash);
+                            song.seconds.hash(&mut hash);
+                            song.quality.hash(&mut hash);
+                            song.image.hash(&mut hash);
+                        }
+                        queue_buttons_fingerprint(&buttons, &mut hash);
+                        hash.finish()
+                    });
+                    // A queue that has not moved can still draw differently,
+                    // but only if one of the covers it is short of has landed.
+                    if unchanged && !self.wanted_art_landed(&mut art) {
+                        return;
+                    }
+
+                    // Read before the rows are, so a cover that decodes while
+                    // they are being built is looked into at the next status
+                    // rather than counted as already seen.
+                    let arrivals = self.artwork.arrivals();
+                    let client = &entry.client;
+                    let mut wanted: Vec<String> = Vec::new();
                     let rows: Vec<TrackData> = queue
                         .songs
                         .iter()
                         .map(|song| {
                             let at_cursor = Some(song.id) == cursor;
                             // Only what is already decoded. Anything missing
-                            // is being fetched, and lands on a later republish.
-                            let cover = song
+                            // is being fetched, and lands on a later republish
+                            // — which is what the URL is written down for: it
+                            // is the whole reason this pane has to be rebuilt
+                            // for something the queue document cannot show.
+                            let cover = match song
                                 .image
                                 .as_deref()
                                 .filter(|src| !src.is_empty())
-                                .zip(client.as_ref())
-                                .and_then(|(src, client)| {
-                                    self.artwork.cached(&client.image_url(src), THUMB_SIZE)
-                                });
+                                .map(|src| client.image_url(src))
+                            {
+                                Some(url) => {
+                                    let cover = self.artwork.cached(&url, THUMB_SIZE);
+                                    if cover.is_none() {
+                                        wanted.push(url);
+                                    }
+                                    cover
+                                }
+                                None => None,
+                            };
 
                             TrackData {
                                 id: song.id as i32,
@@ -4744,52 +5072,33 @@ impl Backend {
                         })
                         .collect();
 
-                    // Which row the player is on, which is not the same number
-                    // as the queue position once a window starts anywhere but
-                    // the beginning.
-                    let cursor_row = cursor
-                        .and_then(|at| queue.songs.iter().position(|song| song.id == at))
-                        .map(|row| row as i32)
-                        .unwrap_or(-1);
-
-                    let shown = rows.len() as u32;
-                    let plural = if queue.length == 1 { "track" } else { "tracks" };
-                    let line = if shown == queue.length {
-                        format!("Queue · {shown} {plural}")
-                    } else {
-                        format!("Queue · {shown} of {} {plural}", queue.length)
+                    wanted.sort_unstable();
+                    wanted.dedup();
+                    *art = QueueArt {
+                        wanted,
+                        seen: arrivals,
                     };
+
                     (rows, line, cursor_row)
                 }
-                None => (Vec::new(), "Queue".to_owned(), -1),
+                None => {
+                    // Nothing drawn is nothing waited on.
+                    *art = QueueArt::default();
+                    let line = "Queue".to_owned();
+                    if already_sent(&self.sent_queue, {
+                        use std::hash::{Hash, Hasher};
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        line.hash(&mut hash);
+                        queue_buttons_fingerprint(&buttons, &mut hash);
+                        hash.finish()
+                    }) {
+                        return;
+                    }
+                    (Vec::new(), line, -1)
+                }
             }
         };
-
-        if already_sent(&self.sent_queue, {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            line.hash(&mut hash);
-            cursor_row.hash(&mut hash);
-            for row in &rows {
-                row.id.hash(&mut hash);
-                row.title.hash(&mut hash);
-                row.artist.hash(&mut hash);
-                row.duration.hash(&mut hash);
-                row.quality.hash(&mut hash);
-                row.cursor.hash(&mut hash);
-                row.live.hash(&mut hash);
-                row.cover.is_some().hash(&mut hash);
-            }
-            for button in &buttons {
-                button.index.hash(&mut hash);
-                button.label.hash(&mut hash);
-                button.highlight.hash(&mut hash);
-                button.mode.hash(&mut hash);
-            }
-            hash.finish()
-        }) {
-            return;
-        }
+        drop(art);
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -6164,7 +6473,7 @@ impl Backend {
         // scrolled must not do it either, and neither changes the era.
         let era = self.browsing.lock().unwrap().era;
         if !already_sent(&self.sent_era, era) {
-            self.scroll_browse_to(0.0);
+            self.scroll_browse_to(0);
         }
     }
 
@@ -6223,11 +6532,15 @@ impl Backend {
     /// The same event as a fetched jump — the window is told the list has moved
     /// and where to — so the two kinds of jump land through one path. Zero is
     /// what a fetched jump sends, its rows having been replaced.
-    fn scroll_browse_to(&self, y: f32) {
+    ///
+    /// `at` is an item of the browse list rather than a pixel down it; see
+    /// [`derived_index`] for why the window is left to turn one into the
+    /// other.
+    fn scroll_browse_to(&self, at: i32) {
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui.upgrade() {
-                ui.set_browse_jump_y(y);
+                ui.set_browse_jump_at(at);
                 ui.set_browse_jumped(ui.get_browse_jumped().wrapping_add(1));
             }
         });
@@ -6313,50 +6626,79 @@ impl Backend {
             return;
         }
 
+        // Which of the drawn things moved. The memo above only answers whether
+        // anything did, and on a library page the answer is yes for a screen
+        // of two thousand items every time a page of thirty lands and every
+        // 400ms while the covers walk in — for thirty items' worth of change.
+        // Comparing them here costs a hash apiece off rows this thread already
+        // owns; rebuilding them for the window costs five `SharedString`s and
+        // a glyph lookup apiece on the event loop. See [`Backend::sent_items`].
+        //
+        // The record is held across the post, so the window is given the
+        // changes in the order they were worked out. Two publishers racing
+        // here would otherwise each diff against the other's record and post
+        // in the other order, which is a screen half of one and half of the
+        // other.
+        let mut sent = self.sent_items.lock().unwrap();
+        let (patch, whole) = browse_patch(&mut sent, flatten_browse(blocks));
+
         let ui = self.ui.clone();
+        let sent_browse = self.sent_browse.clone();
+        let sent_items = self.sent_items.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
             let icons = Icons::get(&ui);
 
-            let blocks: Vec<BrowseBlock> = blocks
-                .into_iter()
-                .map(|block| BrowseBlock {
-                    kind: block.kind,
-                    title: block.title.into(),
-                    action: block.action.into(),
-                    section: block.section,
-                    rows: ModelRc::new(VecModel::from(
-                        block
-                            .rows
-                            .into_iter()
-                            .map(|row| BrowseRow {
-                                index: row.index,
-                                title: row.title.into(),
-                                subtitle: row.subtitle.into(),
-                                track: row.track.into(),
-                                quality: row.quality.into(),
-                                // The glyphs live in the .slint file, so they
-                                // can only be reached from inside the event
-                                // loop — which is also the only place a
-                                // slint::Image may be built.
-                                cover: match row.glyph {
-                                    Some(glyph) => glyph_image(&icons, glyph),
-                                    None => {
-                                        row.cover.map(slint::Image::from_rgba8).unwrap_or_default()
-                                    }
-                                },
-                                is_glyph: row.glyph.is_some(),
-                                heading: row.heading,
-                                actionable: row.actionable,
-                                playing: row.playing,
-                                selected: row.selected,
-                                has_menu: row.has_menu,
-                                plays: row.plays,
-                            })
-                            .collect::<Vec<_>>(),
+            // The glyphs live in the .slint file, so they can only be
+            // reached from inside the event loop — which is also the only
+            // place a slint::Image may be built. Named here rather than
+            // written out twice: a shelf's tiles and a list's rows are the
+            // same conversion, and they are now built from two places.
+            let to_row = |row: BrowseData| BrowseRow {
+                index: row.index,
+                title: row.title.into(),
+                subtitle: row.subtitle.into(),
+                track: row.track.into(),
+                quality: row.quality.into(),
+                cover: match row.glyph {
+                    Some(glyph) => glyph_image(&icons, glyph),
+                    None => row.cover.map(slint::Image::from_rgba8).unwrap_or_default(),
+                },
+                is_glyph: row.glyph.is_some(),
+                heading: row.heading,
+                actionable: row.actionable,
+                playing: row.playing,
+                selected: row.selected,
+                has_menu: row.has_menu,
+                plays: row.plays,
+            };
+
+            // One item of the window's own, out of one of ours. Everything
+            // expensive about a publish is in here — five `SharedString`s and
+            // a glyph lookup for every row of it — which is why it is called
+            // for the items that changed and not for the screen.
+            let built = |item: ItemData| match item.kind {
+                0 => BrowseItem {
+                    kind: 0,
+                    row: item.rows.into_iter().next().map(to_row).unwrap_or_default(),
+                    ..Default::default()
+                },
+                3 | 4 => BrowseItem {
+                    kind: item.kind,
+                    title: item.title.into(),
+                    action: item.action.into(),
+                    section: item.section,
+                    ..Default::default()
+                },
+                kind => BrowseItem {
+                    kind,
+                    section: item.section,
+                    tiles: ModelRc::new(VecModel::from(
+                        item.rows.into_iter().map(to_row).collect::<Vec<_>>(),
                     )),
-                })
-                .collect();
+                    ..Default::default()
+                },
+            };
 
             // Which service the picker is showing, said once here rather
             // than searched for in the .slint file every time it draws.
@@ -6449,7 +6791,46 @@ impl Backend {
                     })
                     .collect::<Vec<_>>(),
             )));
-            ui.set_browse_blocks(ModelRc::new(VecModel::from(blocks)));
+            // The rows, either as a new model or as the few of them that
+            // moved. `whole` says which, and the publisher decides it: it is
+            // what happens on the first screen, on a screen that replaced
+            // another, and on one that grew shorter — a `VecModel` drops a
+            // tail a row and a notification at a time, and a screen that
+            // shrank has usually changed everything anyway.
+            if whole {
+                ui.set_browse_items(ModelRc::new(VecModel::from(
+                    patch
+                        .into_iter()
+                        .map(|(_, item)| built(item))
+                        .collect::<Vec<_>>(),
+                )));
+            } else if let Some(list) = ui
+                .get_browse_items()
+                .as_any()
+                .downcast_ref::<VecModel<BrowseItem>>()
+            {
+                for (at, item) in patch {
+                    let item = built(item);
+                    if at < list.row_count() {
+                        list.set_row_data(at, item);
+                    } else {
+                        // Everything past what the window holds is new by
+                        // definition, and `patch` is in order, so these arrive
+                        // in the order they are drawn in.
+                        list.push(item);
+                    }
+                }
+            } else {
+                // The window is holding a model this publisher did not put
+                // there, so there is nothing to patch and no way to tell from
+                // here what it holds. Both memos are dropped instead, which
+                // makes the next publish — a status tick away — send the whole
+                // screen again. Nothing but `send_browse` writes these rows,
+                // so this is the impossible branch rather than a path.
+                tracing::debug!("the browse list is not the one that was published");
+                sent_browse.store(0, Ordering::Relaxed);
+                sent_items.lock().unwrap().clear();
+            }
             ui.set_browse_empty(
                 empty
                     .as_ref()
@@ -8567,11 +8948,21 @@ impl Drop for Looking {
     fn drop(&mut self) {
         // The last one out says so. Two sweeps can overlap — see
         // [`Backend::sweeping`] — and the first to finish speaks only for
-        // itself.
-        if self.0.sweeping.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.set_looking(false);
-        }
+        // itself. Counting and saying so are one step; see
+        // [`Backend::sweeps`].
+        self.0.sweeps(-1);
     }
+}
+
+/// The sweeps running, and the last thing the window was told about them.
+///
+/// Together under one lock rather than apart, so that what the window is told
+/// cannot be reordered against the transitions it describes. See
+/// [`Backend::sweeps`].
+#[derive(Default)]
+struct Sweeps {
+    running: u64,
+    told: bool,
 }
 
 /// Holds the single refresh slot, and gives it back however the refresh ends.
@@ -8955,8 +9346,9 @@ fn start_walk(
 /// Hold one list to [`WALKS_AT_ONCE`] walks, oldest stopped first, carrying
 /// what each of them still owed.
 ///
-/// Called by a walk once it has listed its rows, with `mine` its own, and
-/// never called with a `mine` it could stop. Both halves of that matter:
+/// Called by a walk once it has listed its rows, with `mine` its own. What it
+/// may stop is bounded three ways, and each of them was a way of getting this
+/// wrong:
 ///
 /// A walk that has not been polled has no requests out, no permits and no list
 /// of what it was going to fetch, so stopping it costs nothing and abandons
@@ -8966,19 +9358,44 @@ fn start_walk(
 /// them settles to the ceiling as each one wakes up rather than being trimmed
 /// blind.
 ///
-/// And whoever stops a walk has to be around to finish what it owed. The walk
-/// doing the trimming is the newest, so it is not a candidate for its own
-/// ceiling; it is therefore still running when it reaches the end of its own
-/// rows and takes on [`Walks::carried`]. A trimmer stopped later by a newer
-/// one hands its own remaining rows to the same place, so the debt always has
-/// a walk behind it.
+/// Nothing older stops anything newer. The trimmer is not always the
+/// newest walk: `listed` is set on a walk's first poll and the runtime polls
+/// the pages of a burst in whatever order it likes, so a page grafted on early
+/// can reach here after the page below it has already listed. Picking the
+/// oldest listed walk on the list would then have the walk covering rows
+/// halfway up the screen stop the walk covering the rows somebody has just
+/// scrolled to, and harvest its rows into [`Walks::carried`] — where they wait
+/// behind the trimmer's own page, which is precisely the fill order the
+/// ceiling exists to prevent. Only the walks above `mine` are candidates, and
+/// [`Walks::running`] is in the order [`start_walk`] pushed them under this
+/// same lock, so a walk's position in it is its age and no number of its own
+/// is needed. A list over the ceiling with nothing older to stop simply stays
+/// there until one of the newer walks trims it.
+///
+/// And whoever stops one has to be around to finish what it owed. Stopping
+/// only what is older than `mine` says that directly: `mine` is still running
+/// when it reaches the end of its own rows and takes on [`Walks::carried`]. A
+/// trimmer stopped later by a newer one hands its own remaining rows to the
+/// same place, so the debt always has a walk behind it.
 fn trim_walks(walks: &mut Walks, mine: &Rows) {
     walks.running.retain(|walk| !walk.stop.is_finished());
     while walks.running.len() > WALKS_AT_ONCE {
-        let oldest = walks
+        let Some(age) = walks
             .running
             .iter()
-            .position(|walk| !Arc::ptr_eq(&walk.left, mine) && walk.left.lock().unwrap().listed);
+            .position(|walk| Arc::ptr_eq(&walk.left, mine))
+        else {
+            // A walk the list no longer holds: the whole list was replaced
+            // while this one was between awaits, so every walk on it is newer
+            // and the rows this one was carrying belong to a screen that has
+            // gone. It has nothing to say about the ceiling.
+            break;
+        };
+        // Searched over the walks above it alone, so the index the slice
+        // answers is the index in `running`.
+        let oldest = walks.running[..age]
+            .iter()
+            .position(|walk| walk.left.lock().unwrap().listed);
         let Some(oldest) = oldest else {
             // Only walks that have yet to be polled are left to stop, and
             // stopping those is the one thing this must not do.
@@ -9132,14 +9549,14 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left
 async fn load_card_cover(backend: Backend, id: DeviceId) {
     let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
 
-    // The thumbnail tier, not one of its own. The row draws this at 40px and
-    // had been asking for 80 — eleven percent larger than the 72 the queue
-    // asks for of the same cover, so the selected player's art was fetched
-    // once, decoded twice and held in two of the memory cache's entries for a
-    // difference nothing can see. Sharing the tier makes the second ask a
-    // cache hit, and 72 into 40 is still 1.8x, which is ample on a HiDPI
-    // screen. See `artwork::MEMORY_CACHE`, whose table is the record of which
-    // sizes exist.
+    // The small tier, not one of its own. The row draws this at 40px and asked
+    // for its own 80 beside the queue's 72, so the selected player's art was
+    // fetched once, decoded twice and held in two of the memory cache's
+    // entries for a difference nothing can see. The tier is 80 now, which is
+    // the size this row wanted all along: sharing it makes the second ask a
+    // cache hit and leaves a square cover at exactly 2x its box on a HiDPI
+    // screen, rather than trading the card's sharpness for the entry. See
+    // `artwork::MEMORY_CACHE`, whose table is the record of which sizes exist.
     let pixels = match &wanted {
         Some(url) => backend.artwork.get(url, THUMB_SIZE).await,
         None => None,
@@ -9351,14 +9768,6 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
 /// list, taller than the pane, in front of the first.
 const OTHER_KEY: &str = "*";
 
-/// The two row heights are `BrowseRowView`'s and have to stay in step with it.
-/// Measured rather than assumed: a twenty-row list reported a viewport of
-/// 1040px, so the pitch is exactly 52 with no spacing or padding between rows.
-/// If that component's height changes, the letters drift further from their
-/// rows the further down the list you go.
-const ROW_PX: f32 = 52.0;
-const HEADING_PX: f32 = 30.0;
-
 /// How many rows are worth a bar. Below this the list fits on a screen or two
 /// and the letters would be furniture: the folder root is seven entries.
 const WORTH_INDEXING: usize = 40;
@@ -9392,7 +9801,7 @@ fn bar_keys(keys: Vec<String>) -> Vec<String> {
 /// Exact match first, because a click sends a key straight off the bar. Then
 /// case-insensitively, so typing `e` reaches `E`. `*` gathers every letter
 /// behind it, since the bar drew them as one.
-fn stops_derived(index: &[(String, Vec<f32>)], key: &str) -> Vec<f32> {
+fn stops_derived(index: &[(String, Vec<i32>)], key: &str) -> Vec<i32> {
     if key == OTHER_KEY {
         return index
             .iter()
@@ -9503,13 +9912,23 @@ fn collate(blocks: &mut [BlockData]) {
 
 /// Letters for a list the player did not index, with where each one starts.
 ///
-/// Only for a list that is entirely in hand — the caller checks that. The
-/// offsets are pixels down the viewport, because scrolling is what a jump does
-/// here: there is nothing to fetch.
-fn derived_index(blocks: &[BlockData]) -> Vec<(String, Vec<f32>)> {
+/// Only for a list that is entirely in hand — the caller checks that. Nothing
+/// is fetched for one of these: a jump scrolls, so what a letter carries is
+/// the item to put at the top of the pane.
+///
+/// Items and not pixels, although a pixel offset is what a Flickable takes.
+/// The rows are the list's own items now, and a `ListView` places a far seek
+/// by dividing the offset it is given by the average height of the items it
+/// has instantiated — so on a list carrying headings, which are shorter than
+/// rows, an offset added up out of exact heights here lands a few rows above
+/// the row it was worked out for, and further out the further down the list
+/// the letter is. The window turns the item back into an offset with the
+/// list's own measure of what an item is worth, which is the only figure that
+/// agrees with what the list will do with it. See `jump-y` in the .slint.
+fn derived_index(blocks: &[BlockData]) -> Vec<(String, Vec<i32>)> {
     // Only a plain list. A screen of shelves and tiles has no single column to
     // scroll a letter to, and mixing kinds would put the offsets out anyway
-    // because a tile is not `ROW_PX` tall.
+    // because the items would not be of one size.
     if blocks.len() != 1 || blocks[0].kind != 0 {
         return Vec::new();
     }
@@ -9518,7 +9937,15 @@ fn derived_index(blocks: &[BlockData]) -> Vec<(String, Vec<f32>)> {
         return Vec::new();
     }
 
-    let index = letters(rows).unwrap_or_default();
+    // The pane draws a section's heading as an item above its rows, so a
+    // titled block moves every row of it down by one. See `publish_browse`,
+    // which builds the items in that order.
+    let above = if blocks[0].title.is_empty() { 0 } else { 1 };
+    let index: Vec<(String, Vec<i32>)> = letters(rows)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, stops)| (key, stops.into_iter().map(|at| at + above).collect()))
+        .collect();
 
     // Three letters is a bar; one is a decoration.
     if index.len() < 3 { Vec::new() } else { index }
@@ -9534,30 +9961,30 @@ fn derived_index(blocks: &[BlockData]) -> Vec<(String, Vec<f32>)> {
 /// are more than a quarter of the runs. Both mean the list is not alphabetical,
 /// and a bar on an unsorted list is worse than none: every letter would be a
 /// cycle through arbitrary rows.
-fn letters(rows: &[BrowseData]) -> Option<Vec<(String, Vec<f32>)>> {
-    let mut index: Vec<(String, Vec<f32>)> = Vec::new();
+fn letters(rows: &[BrowseData]) -> Option<Vec<(String, Vec<i32>)>> {
+    let mut index: Vec<(String, Vec<i32>)> = Vec::new();
     let mut last: Option<String> = None;
     let mut runs = 0usize;
     let mut repeats = 0usize;
-    let mut y = 0.0;
 
-    for row in rows {
-        // A heading is not an entry, but it does take space.
-        if !row.heading {
-            let key = leading_key(&row.title);
-            if last.as_deref() != Some(key.as_str()) {
-                runs += 1;
-                match index.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, stops)) => {
-                        stops.push(y);
-                        repeats += 1;
-                    }
-                    None => index.push((key.clone(), vec![y])),
-                }
-                last = Some(key);
-            }
+    for (at, row) in rows.iter().enumerate() {
+        // A heading is not an entry of its own, but it is an item like any
+        // other and the rows below it are counted past it.
+        if row.heading {
+            continue;
         }
-        y += if row.heading { HEADING_PX } else { ROW_PX };
+        let key = leading_key(&row.title);
+        if last.as_deref() != Some(key.as_str()) {
+            runs += 1;
+            match index.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, stops)) => {
+                    stops.push(at as i32);
+                    repeats += 1;
+                }
+                None => index.push((key.clone(), vec![at as i32])),
+            }
+            last = Some(key);
+        }
     }
 
     if !index.windows(2).all(|pair| pair[0].0 < pair[1].0) {
@@ -9731,7 +10158,7 @@ async fn jump_to_letter(
     if to_end {
         backend.scroll_browse_to_end();
     } else {
-        backend.scroll_browse_to(0.0);
+        backend.scroll_browse_to(0);
     }
     // The rows are all new, so the artwork walk starts at the top of them.
     // Which player, read and the lock let go: starting a walk takes a lock of
@@ -13186,8 +13613,8 @@ async fn run_commands(
                     let stops = stops_derived(&browsing.derived, &key);
                     browsing.next_stop(&key, stops.len()).map(|at| stops[at])
                 };
-                if let Some(y) = scrolled {
-                    backend.scroll_browse_to(y);
+                if let Some(at) = scrolled {
+                    backend.scroll_browse_to(at);
                     continue;
                 }
 
@@ -14102,7 +14529,7 @@ mod index_tests {
     /// A plain list of rows, written out rather than derived from `Default`:
     /// only the title and `heading` matter here, and spelling the rest out
     /// keeps the derive off a type the window depends on.
-    fn row_of(title: &str) -> BrowseData {
+    pub(super) fn row_of(title: &str) -> BrowseData {
         BrowseData {
             index: 0,
             plays: false,
@@ -14121,7 +14548,7 @@ mod index_tests {
         }
     }
 
-    fn one_block(titles: &[String]) -> Vec<BlockData> {
+    pub(super) fn one_block(titles: &[String]) -> Vec<BlockData> {
         vec![BlockData {
             kind: 0,
             title: String::new(),
@@ -14263,16 +14690,18 @@ mod index_tests {
         let names = genres();
         let index = derived_index(&one_block(&names));
 
-        // Row 0 is "80s", row 1 "A Cappella", row 2 the first B.
-        assert_eq!(index[0].1, vec![0.0]);
-        assert_eq!(index[1].1, vec![ROW_PX]);
-        assert_eq!(index[2].1, vec![2.0 * ROW_PX]);
+        // Row 0 is "80s", row 1 "A Cappella", row 2 the first B — and a row
+        // of a titleless block is an item of the pane's list at its own
+        // number.
+        assert_eq!(index[0].1, vec![0]);
+        assert_eq!(index[1].1, vec![1]);
+        assert_eq!(index[2].1, vec![2]);
 
         // And the last letter is where its row is, not where the list ends:
         // Z has two rows, so it starts two from the bottom.
         let (key, stops) = index.last().expect("a last letter");
         assert_eq!(key, "Z");
-        assert_eq!(*stops, vec![(names.len() - 2) as f32 * ROW_PX]);
+        assert_eq!(*stops, vec![names.len() as i32 - 2]);
     }
 
     #[test]
@@ -14286,9 +14715,31 @@ mod index_tests {
 
         // The heading is not a letter of its own...
         assert_eq!(index[0].0, "#");
-        // ...but everything below it is pushed down by its lesser height.
-        assert_eq!(index[0].1, vec![HEADING_PX]);
-        assert_eq!(index[1].1, vec![HEADING_PX + ROW_PX]);
+        // ...but it is an item of the list, so everything below it is one
+        // further down. Its lesser height is the window's business: this is
+        // counted in items, which is exactly what the mixture of heights the
+        // pixels used to be added up out of made unreliable.
+        assert_eq!(index[0].1, vec![1]);
+        assert_eq!(index[1].1, vec![2]);
+    }
+
+    /// A titled section puts its heading above the rows, and the letters count
+    /// past it.
+    ///
+    /// The pane draws a block's title as an item of its own — see
+    /// `flatten_browse` — so the first row of a titled block is item one, not
+    /// item zero. A letter that did not know this landed a row high on every
+    /// screen the player gave a heading to.
+    #[test]
+    fn a_section_title_moves_every_letter_down_one() {
+        let names = genres();
+        let mut blocks = one_block(&names);
+        blocks[0].title = "Genres".to_owned();
+
+        let index = derived_index(&blocks);
+        assert_eq!(index[0].0, "#");
+        assert_eq!(index[0].1, vec![1], "the first row sits under the heading");
+        assert_eq!(index[1].1, vec![2]);
     }
 
     #[test]
@@ -14304,8 +14755,8 @@ mod index_tests {
 
     #[test]
     fn tiles_and_mixed_screens_get_no_bar() {
-        // A tile is not `ROW_PX` tall, and a screen of several blocks has no
-        // single column for a letter to scroll to.
+        // A shelf is one item holding its tiles, and a screen of several
+        // blocks has no single column for a letter to scroll to.
         let names = genres();
         let mut shelf = one_block(&names);
         shelf[0].kind = 1;
@@ -14374,24 +14825,21 @@ mod index_tests {
         // "classical" is, three rows from the bottom.
         let c = &index.iter().find(|(k, _)| k == "C").expect("a C").1;
         assert_eq!(c.len(), 2);
-        assert!(c[0] < 10.0 * ROW_PX);
-        assert_eq!(c[1], (names.len() - 3) as f32 * ROW_PX);
+        assert!(c[0] < 10);
+        assert_eq!(c[1], names.len() as i32 - 3);
 
         // And E knows about the accented entry, which is the very last row.
         let e = &index.iter().find(|(k, _)| k == "E").expect("an E").1;
         assert_eq!(e.len(), 2);
-        assert_eq!(e[1], (names.len() - 1) as f32 * ROW_PX);
+        assert_eq!(e[1], names.len() as i32 - 1);
     }
 
     #[test]
     fn pressing_a_letter_again_moves_to_its_next_place() {
-        let index = vec![
-            ("A".to_owned(), vec![0.0]),
-            ("E".to_owned(), vec![100.0, 900.0]),
-        ];
-        assert_eq!(stops_derived(&index, "E"), vec![100.0, 900.0]);
+        let index = vec![("A".to_owned(), vec![0]), ("E".to_owned(), vec![4, 17])];
+        assert_eq!(stops_derived(&index, "E"), vec![4, 17]);
         // Typed lowercase, which is how a keyboard sends it.
-        assert_eq!(stops_derived(&index, "e"), vec![100.0, 900.0]);
+        assert_eq!(stops_derived(&index, "e"), vec![4, 17]);
 
         let mut browsing = Browsing::default();
         assert_eq!(browsing.next_stop("E", 2), Some(0));
@@ -14418,12 +14866,12 @@ mod index_tests {
     #[test]
     fn a_keystroke_reaches_a_letter_the_bar_only_has_in_capitals() {
         let index = vec![
-            ("#".to_owned(), vec![0.0]),
-            ("A".to_owned(), vec![52.0]),
-            ("C".to_owned(), vec![104.0]),
+            ("#".to_owned(), vec![0]),
+            ("A".to_owned(), vec![1]),
+            ("C".to_owned(), vec![2]),
         ];
-        assert_eq!(stops_derived(&index, "c"), vec![104.0]);
-        assert_eq!(stops_derived(&index, "C"), vec![104.0]);
+        assert_eq!(stops_derived(&index, "c"), vec![2]);
+        assert_eq!(stops_derived(&index, "C"), vec![2]);
         // And a letter on no list is nowhere to go.
         assert!(stops_derived(&index, "q").is_empty());
     }
@@ -14461,6 +14909,139 @@ mod index_tests {
             offset: 0,
         }];
         assert!(stops_sent(&latin, "*").is_empty());
+    }
+}
+
+/// What a publish of the browse pane costs the window.
+#[cfg(test)]
+mod browse_model_tests {
+    use super::index_tests::{one_block, row_of};
+    use super::*;
+
+    /// A library page, in the shape `publish_browse` hands over.
+    fn library(rows: usize) -> Vec<BlockData> {
+        let titles: Vec<String> = (0..rows).map(|at| format!("Track {at:04}")).collect();
+        one_block(&titles)
+    }
+
+    /// A page landing costs the page, not the screen.
+    ///
+    /// The flattening made the rows the list's own items, so the ones off
+    /// screen are no longer built — but the model handed to the list was still
+    /// rebuilt whole on every publish, and a screen is republished on every
+    /// page, on every status and every 400ms while the covers walk in. On a
+    /// library's Songs list that is two thousand items — five `SharedString`s
+    /// and a glyph lookup apiece — on the event loop, for thirty rows' worth of
+    /// news.
+    #[test]
+    fn a_page_of_rows_costs_the_page() {
+        let mut held: Vec<u64> = Vec::new();
+
+        // The screen as it arrives: nothing is on show, so all of it is new
+        // and the window is given a model rather than a patch.
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(library(2000)));
+        assert!(whole, "the first screen has no rows to keep");
+        assert_eq!(patch.len(), 2000);
+
+        // Then a page of thirty grafted onto the bottom of it.
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(library(2030)));
+        assert!(!whole, "the rows already on screen are still the rows");
+        assert_eq!(
+            patch.len(),
+            30,
+            "a page of thirty rebuilt {} items: the cost of a page has to be \
+             the page and not the library",
+            patch.len()
+        );
+        assert_eq!(patch[0].0, 2000, "and it is the bottom of the list");
+
+        // And the republish that follows it, with nothing new in it at all.
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(library(2030)));
+        assert!(!whole);
+        assert!(patch.is_empty());
+    }
+
+    /// One cover landing is one item.
+    #[test]
+    fn a_cover_arriving_redraws_its_own_row() {
+        let mut held: Vec<u64> = Vec::new();
+        let _ = browse_patch(&mut held, flatten_browse(library(500)));
+
+        let mut arrived = library(500);
+        arrived[0].rows[7].cover = Some(Pixels::new(1, 1));
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(arrived));
+        assert!(!whole);
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0].0, 7);
+    }
+
+    /// A screen that replaces another is a model, not a patch.
+    ///
+    /// Both ways round: every item different, and a screen with fewer items
+    /// than the one before it — a `VecModel` drops a tail one row and one
+    /// notification at a time, and a shorter screen has almost always changed
+    /// what it kept as well.
+    #[test]
+    fn walking_into_another_screen_replaces_the_rows() {
+        let mut held: Vec<u64> = Vec::new();
+        let _ = browse_patch(&mut held, flatten_browse(library(40)));
+
+        let other: Vec<String> = (0..40).map(|at| format!("Album {at}")).collect();
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(one_block(&other)));
+        assert!(whole);
+        assert_eq!(patch.len(), 40);
+
+        let (patch, whole) = browse_patch(&mut held, flatten_browse(library(9)));
+        assert!(whole, "a screen that lost rows is rebuilt");
+        assert_eq!(patch.len(), 9, "and the whole of it is handed over");
+    }
+
+    /// The heading over a section is an item, and the rows of it come after.
+    ///
+    /// The contract [`derived_index`] counts its letters by. Both are built
+    /// from the same blocks and neither sees the other, so it is worth one
+    /// test that they agree.
+    #[test]
+    fn a_section_heading_is_an_item_of_its_own() {
+        let mut blocks = library(3);
+        blocks[0].title = "Songs".to_owned();
+        let items = flatten_browse(blocks);
+
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].kind, 4);
+        assert_eq!(items[0].title, "Songs");
+        assert_eq!(items[1].kind, 0);
+        assert_eq!(items[1].rows[0].title, "Track 0000");
+
+        // And with no title there is no heading, so a row is its own number.
+        let plain = flatten_browse(library(3));
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain[0].rows[0].title, "Track 0000");
+    }
+
+    /// A shelf stays one item however many tiles it holds.
+    ///
+    /// It runs across the pane rather than down it, so it is a tile tall and
+    /// ten or twenty wide — which is the one shape the flattening is not for.
+    #[test]
+    fn a_shelf_is_one_item() {
+        let mut blocks = library(20);
+        blocks[0].kind = 1;
+        let items = flatten_browse(blocks);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, 1);
+        assert_eq!(items[0].rows.len(), 20);
+
+        // And a row of it changing is that one item.
+        let mut held: Vec<u64> = Vec::new();
+        let mut blocks = library(20);
+        blocks[0].kind = 1;
+        let _ = browse_patch(&mut held, flatten_browse(blocks));
+        let mut moved = library(20);
+        moved[0].kind = 1;
+        moved[0].rows[4] = row_of("Something else");
+        let (patch, _) = browse_patch(&mut held, flatten_browse(moved));
+        assert_eq!(patch.len(), 1);
     }
 }
 
@@ -15763,6 +16344,201 @@ mod tests {
              its `init` would have: what it arrived holding is a query to be \
              typed over"
         );
+
+        // A long list must not also be a long list of elements.
+        //
+        // The rows are the list's own items now, so the ones off screen are
+        // never built. As one block holding all of them they were: a
+        // two-thousand-row library page carried every row — twenty to forty
+        // thousand elements — and each frame laid out and walked the lot,
+        // which is why the same window cost 7% of a core on Home and 66% with
+        // that page open. Counted rather than timed, because the count is what
+        // made the frames expensive and it is the same on any renderer.
+        ui.set_browse_has_search(false);
+        ui.set_now_playing(false);
+        ui.set_browse_empty("".into());
+        settle(200);
+        // Counted through the model rather than by looking for the rows,
+        // because an element query skips what is clipped out of sight and so
+        // reports the same handful either way — while taking forty seconds to
+        // walk past the ones it is skipping, which is the cost this is about.
+        // A repeater reads a row out of its model exactly when it builds it,
+        // so the reads are the instances.
+        struct Counted {
+            rows: Vec<BrowseItem>,
+            reads: std::cell::Cell<usize>,
+            /// And which they were, for the jump below: a repeater builds the
+            /// rows from the one it has placed at the top, so the lowest of
+            /// these is where the list came to rest.
+            seen: std::cell::RefCell<Vec<usize>>,
+            tracker: slint::ModelNotify,
+        }
+        impl slint::Model for Counted {
+            type Data = BrowseItem;
+
+            fn row_count(&self) -> usize {
+                self.rows.len()
+            }
+
+            fn row_data(&self, row: usize) -> Option<BrowseItem> {
+                self.reads.set(self.reads.get() + 1);
+                self.seen.borrow_mut().push(row);
+                self.rows.get(row).cloned()
+            }
+
+            fn model_tracker(&self) -> &dyn slint::ModelTracker {
+                &self.tracker
+            }
+        }
+        // A row, and every tenth one a heading: the shape of a library list
+        // the player has put its own headings in, and the one the jump used to
+        // land above its letter on.
+        let item_of = |at: i32| BrowseItem {
+            kind: 0,
+            row: BrowseRow {
+                index: at,
+                title: format!("Track {at}").into(),
+                actionable: at % 10 != 0,
+                heading: at % 10 == 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let list_of = |count: i32| {
+            let model = std::rc::Rc::new(Counted {
+                rows: (0..count).map(item_of).collect(),
+                reads: std::cell::Cell::new(0),
+                seen: Default::default(),
+                tracker: Default::default(),
+            });
+            ui.set_browse_items(ModelRc::from(model.clone()));
+            settle(0);
+            model
+        };
+        let short = list_of(200).reads.get();
+        let listed = list_of(4000);
+        let long = listed.reads.get();
+        assert!(
+            short > 0,
+            "the browse list built none of its rows, so nothing below this \
+             proves anything"
+        );
+        assert!(
+            long < 4000,
+            "a screen of 4000 rows built all {long} of them: the cost is \
+             tracking the whole list rather than the part of it on screen, \
+             which is what a `for` nested inside a list item costs"
+        );
+        assert!(
+            long <= short * 2,
+            "a screen of 4000 rows built {long} where 200 rows built {short}: \
+             what the list costs must follow the pane's height and not the \
+             library's size"
+        );
+
+        // And a letter lands on the row it names, on a list whose rows are
+        // not all one height.
+        //
+        // The list places a seek of more than a screen and a half by dividing
+        // the offset by the average height of the items it has built, so an
+        // offset added up out of exact heights — 52 for a row, 30 for a
+        // heading — lands above the row it was worked out for, further out the
+        // more headings are above it. The window is handed the item and turns
+        // it into an offset with the list's own measure instead; see `jump-y`
+        // on the list. Read off the model, because what a repeater builds
+        // first is where it placed the top of the view.
+        listed.seen.borrow_mut().clear();
+        ui.set_browse_jump_at(2000);
+        ui.set_browse_jumped(ui.get_browse_jumped() + 1);
+        settle(200);
+        let seen = listed.seen.borrow();
+        let landed = seen.iter().copied().min().expect("the list built rows");
+        assert!(
+            (2000..2004).contains(&landed),
+            "a jump to item 2000 built from item {landed}: the offset the \
+             window worked out is not the one that reaches the item it was \
+             worked out for"
+        );
+        drop(seen);
+
+        // The glide, and the one thing that narrows it.
+        //
+        // The transport's position slides over a second so that a figure
+        // stepping once a second reads as travel, and that is a redraw every
+        // frame for as long as music plays — 62 a second against 12 with it
+        // off. Worth it while someone is looking at the window and not while
+        // the window is behind something else.
+        // Activation reaches whatever holds the caret, so it has to be back
+        // where the window keeps it when no field wants it: the search box has
+        // been holding it, and it went with the box. Walking to another screen
+        // is what hands it back.
+        ui.set_browse_title("Tracks".into());
+        settle(200);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(false));
+        settle(0);
+        assert!(
+            !ui.get_window_active(),
+            "the window was told it is no longer the active one and did not \
+             believe it, so the position would go on gliding behind whatever \
+             is in front of it"
+        );
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        settle(0);
+        assert!(
+            ui.get_window_active(),
+            "coming back to the window must bring the glide back with it"
+        );
+
+        // And the limit of it, written down as a test rather than as a hope:
+        // activation is delivered to whatever holds the caret, so while a
+        // field does, the window cannot tell. It keeps gliding, which is what
+        // it did before any of this.
+        ui.set_browse_has_search(true);
+        settle(200);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(false));
+        settle(0);
+        assert!(
+            ui.get_window_active(),
+            "with the caret in a field the window hears nothing, and must \
+             leave the glide exactly as it was rather than guess"
+        );
+
+        // The other half of that, and the one that does not forgive itself: a
+        // window that believes it is not the active one while the caret is
+        // somewhere that will never tell it otherwise.
+        //
+        // Leave the window with the keys holding the caret, so the scope sees
+        // the deactivation. Then let a status-driven refresh publish a screen
+        // carrying a search box, exactly as it would while the app sits
+        // behind another: the box takes the caret, and every activation from
+        // then on is delivered to the box. Nothing would ever put the belief
+        // right, and the position would step once a second in a window in
+        // front of the reader for the rest of the session.
+        // Walking to a screen with no box is what hands the caret back, the
+        // same as above: it is the screen changing that the scope watches for,
+        // not the box going.
+        ui.set_browse_has_search(false);
+        ui.set_browse_title("Albums".into());
+        settle(200);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        settle(0);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(false));
+        settle(0);
+        assert!(!ui.get_window_active(), "the keys were there to hear it");
+
+        ui.set_browse_has_search(true);
+        settle(200);
+        assert!(
+            ui.get_window_active(),
+            "the caret has gone somewhere that cannot report an activation, \
+             so what this window believes about being active is out of date \
+             and has to go back to the way round that costs only a redraw"
+        );
     }
 
     /// Which presses take the speaker away from what it was doing.
@@ -15937,20 +16713,81 @@ mod tests {
     fn overlapping_sweeps_are_counted_rather_than_flagged() {
         let http = reqwest::Client::new();
         let (backend, _commands) = selection_tests::backend(&http);
+        let running = || backend.sweeping.lock().unwrap().running;
 
         let rebinding = backend.looking();
-        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 1);
+        assert_eq!(running(), 1);
         let rescan = backend.looking();
-        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 2);
+        assert_eq!(running(), 2);
 
         drop(rebinding);
-        assert_eq!(
-            backend.sweeping.load(Ordering::SeqCst),
-            1,
-            "the sweep still running is still a sweep"
-        );
+        assert_eq!(running(), 1, "the sweep still running is still a sweep");
         drop(rescan);
-        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 0);
+        assert_eq!(running(), 0);
+    }
+
+    /// And what the window is told cannot be reordered against the count.
+    ///
+    /// The count was an atomic and the push to the window a separate step
+    /// after it, so two sweeps starting and ending around each other could
+    /// have the thread that took the count to zero post "no sweep" *after* the
+    /// thread that took it back to one posted "a sweep" — or the reverse. The
+    /// window applies them in the order they were posted, so whichever way
+    /// round it landed stuck: a spinner turning with nothing behind it, or a
+    /// first run reading "No players found" through twelve seconds of
+    /// broadcasts.
+    ///
+    /// Hammered rather than reasoned about, because the window it needs is a
+    /// preemption between two instructions. What is checked is the invariant
+    /// the fix rests on — that the count and what the window was told are one
+    /// value, so nobody can ever observe them disagreeing — and that a storm
+    /// of overlapping sweeps ends with the spinner off.
+    #[test]
+    fn what_the_window_is_told_moves_with_the_count() {
+        // This one may be the first test in the process to build a client.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _commands) = selection_tests::backend(&http);
+
+        let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let watcher = {
+            let backend = backend.clone();
+            let watching = watching.clone();
+            std::thread::spawn(move || {
+                while watching.load(Ordering::Relaxed) {
+                    let seen = backend.sweeping.lock().unwrap();
+                    assert_eq!(
+                        seen.told,
+                        seen.running > 0,
+                        "the window was told something the count does not say"
+                    );
+                }
+            })
+        };
+
+        let sweepers: Vec<_> = (0..4)
+            .map(|_| {
+                let backend = backend.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let sweep = backend.looking();
+                        drop(sweep);
+                    }
+                })
+            })
+            .collect();
+        for sweeper in sweepers {
+            sweeper.join().expect("a sweeper");
+        }
+        watching.store(false, Ordering::Relaxed);
+        watcher.join().expect("the watcher");
+
+        let settled = backend.sweeping.lock().unwrap();
+        assert_eq!(settled.running, 0);
+        assert!(
+            !settled.told,
+            "every sweep has ended and the window still believes one is running"
+        );
     }
 
     /// The one string on the alarms list that is not the player's wording.
@@ -17094,7 +17931,7 @@ mod selection_tests {
             known: Arc::new(Mutex::new(Vec::new())),
             queue_walk: Arc::default(),
             browse_walk: Arc::default(),
-            sweeping: Arc::new(AtomicU64::new(0)),
+            sweeping: Arc::default(),
             vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
             searches: Arc::new(AtomicU64::new(0)),
             forms: Arc::new(AtomicU64::new(0)),
@@ -17102,6 +17939,7 @@ mod selection_tests {
             sent_transport: Arc::new(AtomicU64::new(0)),
             sent_track_actions: Arc::new(AtomicU64::new(0)),
             sent_queue: Arc::new(AtomicU64::new(0)),
+            queue_art: Arc::default(),
             sent_players: Arc::new(AtomicU64::new(0)),
             sent_settings: Arc::new(AtomicU64::new(0)),
             settings_redraws: Arc::new(AtomicU64::new(0)),
@@ -17109,6 +17947,7 @@ mod selection_tests {
             told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
             update_offer: Arc::new(Mutex::new(None)),
             sent_browse: Arc::new(AtomicU64::new(0)),
+            sent_items: Arc::default(),
             sent_index: Arc::new(AtomicU64::new(0)),
             sent_era: Arc::new(AtomicU64::new(0)),
             thumbnails: Arc::new(AtomicU64::new(0)),
@@ -20847,6 +21686,16 @@ mod thumbnail_tests {
         }
     }
 
+    /// Where one of that queue's covers comes from, spelled the way the rows
+    /// ask the cache for it: resolved against the player serving the queue.
+    fn cover_url(backend: &Backend, player: &Player, id: u32) -> String {
+        backend
+            .with_entry(player.id(), |entry| {
+                entry.client.image_url(&format!("/Artwork?album={id}"))
+            })
+            .expect("the player is in the registry")
+    }
+
     /// How many covers the player has been asked for so far. The replies are
     /// 404s, which is all this needs: what is counted is what was asked for.
     fn covers_asked(player: &Player) -> usize {
@@ -20855,6 +21704,192 @@ mod thumbnail_tests {
             .iter()
             .filter(|seen| seen.starts_with("/Artwork"))
             .count()
+    }
+
+    /// A status that moves nothing does not rebuild the queue.
+    ///
+    /// `publish_queue` runs for every status of the selected player, about
+    /// once a second, and it used to build a `TrackData` for every track in
+    /// the window — five `String` clones and a turn of the artwork cache's
+    /// lock apiece — before hashing the lot and, almost always, throwing it
+    /// away. All of it under the registry lock, which is the lock the status
+    /// poll for every other player and every transport press are waiting on.
+    /// What would be drawn is identified first now, off the queue itself.
+    ///
+    /// Counted in cache lookups because that is the part with a lock on it and
+    /// the part a test can see; the clones go with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_status_that_moves_nothing_does_not_rebuild_the_queue() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+
+        // The first one has rows to build: nothing has been drawn yet.
+        backend.publish_queue();
+        let built = backend.artwork.peeks();
+        assert!(
+            built >= COVERS as u64,
+            "the first publish asked about {built} covers for {COVERS} \
+             tracks, so it never built the rows at all"
+        );
+
+        // Then ten more statuses describing the same queue.
+        for _ in 0..10 {
+            backend.publish_queue();
+        }
+        assert_eq!(
+            backend.artwork.peeks(),
+            built,
+            "a queue that has not moved was rebuilt anyway: {COVERS} rows \
+             cloned and {COVERS} turns of the artwork lock per status, under \
+             the registry lock, and thrown away every time"
+        );
+
+        // A cover that is not this queue's own is not this queue's business.
+        // Browsing a library walks a page of thumbnails through the decoder
+        // for tens of seconds, and every other player's sidebar card decodes a
+        // new record on every track change: watching a count of decodes for
+        // the whole process put all of that on the queue's bill, at around one
+        // rebuild a second for as long as the browsing lasted.
+        backend
+            .artwork
+            .note_arrival("http://10.0.0.1/Artwork?album=somewhere-else", THUMB_SIZE);
+        backend.publish_queue();
+        assert_eq!(
+            backend.artwork.peeks(),
+            built,
+            "a cover belonging to something else decoded and this queue was \
+             rebuilt for it"
+        );
+
+        // Its own cover landing changes the rows without changing the queue,
+        // and that still has to get through — otherwise the tracks keep the
+        // placeholder until something else moves.
+        backend
+            .artwork
+            .note_arrival(&cover_url(&backend, &player, 0), THUMB_SIZE);
+        backend.publish_queue();
+        let redrawn = backend.artwork.peeks();
+        assert!(
+            redrawn > built,
+            "a cover arrived and the queue was not redrawn"
+        );
+
+        // So does a page of tracks.
+        {
+            let mut registry = backend.registry.lock().unwrap();
+            let queue = registry
+                .get_mut(&player.id())
+                .expect("the player is still there")
+                .queue
+                .as_mut()
+                .expect("the queue is still there");
+            queue.songs.push(bluos::QueueSong {
+                id: COVERS,
+                image: Some(format!("/Artwork?album={COVERS}")),
+                ..Default::default()
+            });
+            queue.length += 1;
+        }
+        backend.publish_queue();
+        assert!(
+            backend.artwork.peeks() > redrawn,
+            "a track was added to the queue and the pane was not redrawn"
+        );
+    }
+
+    /// A walk trimmed for room is always one that started before the trimmer.
+    ///
+    /// `listed` is set on a walk's first poll and the runtime polls a burst of
+    /// pages in whatever order it likes, so the walk that reaches the ceiling
+    /// first is not necessarily the newest one. Taking the oldest walk that
+    /// had listed then had a page halfway up the screen stop the page somebody
+    /// had just scrolled to and carry its rows off to be fetched behind its
+    /// own — the exact fill order `Walk::From`'s skip and the ceiling were
+    /// added to remove.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_walk_never_stops_one_that_started_after_it() {
+        // Walks that do nothing and never end, so that what is aborted is
+        // unmistakable.
+        let waiting = || tokio::spawn(std::future::pending::<()>());
+        let mut running: Vec<tokio::task::JoinHandle<()>> = (0..5).map(|_| waiting()).collect();
+        let rows = |listed: bool| -> Rows {
+            Arc::new(Mutex::new(Owed {
+                listed,
+                stopped: false,
+                rows: vec![Some(("/Artwork?album=1".to_owned(), THUMB_SIZE))],
+            }))
+        };
+
+        // Five pages in flight, oldest first, and the oldest of them has not
+        // been polled yet — which is how this happens: the page under it was
+        // polled first and is the one asking.
+        let owed: Vec<Rows> = (0..5).map(|at| rows(at != 0)).collect();
+        let mut walks = Walks {
+            running: running
+                .iter()
+                .zip(&owed)
+                .map(|(task, left)| Walking {
+                    stop: task.abort_handle(),
+                    left: left.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        trim_walks(&mut walks, &owed[1]);
+
+        assert!(
+            !running[4].is_finished(),
+            "the newest walk was stopped by an older one, so the rows just \
+             scrolled to now wait behind the page above them"
+        );
+        assert!(
+            walks.carried.is_empty(),
+            "and its rows were carried off to be fetched last"
+        );
+        // Nothing older than the trimmer had listed, so the ceiling waits for
+        // a walk that can be held to it rather than stopping what it must not.
+        assert_eq!(walks.running.len(), 5);
+
+        // Now the newest asks, with four listed walks above it to choose from,
+        // and holds the list to its ceiling by standing the oldest of them
+        // down until it is met.
+        trim_walks(&mut walks, &owed[4]);
+        assert_eq!(walks.running.len(), WALKS_AT_ONCE);
+        assert_eq!(
+            walks.carried.len(),
+            2,
+            "carrying what the walks that stood down had not fetched"
+        );
+        // Awaited rather than read: an abort lands at the walk's next await,
+        // which is on another thread.
+        for down in [1usize, 2] {
+            let ended = tokio::time::timeout(Duration::from_secs(5), &mut running[down])
+                .await
+                .unwrap_or_else(|_| panic!("walk {down} never stood down"));
+            assert!(ended.expect_err("it was stopped").is_cancelled());
+        }
+        for still in [0usize, 3, 4] {
+            assert!(
+                !running[still].is_finished(),
+                "walk {still} was stopped and should not have been: the \
+                 unpolled one cannot be, and the two newest are the pages \
+                 somebody is looking at"
+            );
+        }
     }
 
     /// A queue that is re-read or that grows starts another loader, and the
