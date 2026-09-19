@@ -19,6 +19,7 @@ mod lane;
 mod mpris;
 mod order;
 mod searches;
+mod store;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -210,6 +211,17 @@ enum Command {
     SettingAction(usize),
     /// Change the value of the setting at row `n`.
     SettingEdit(usize, Edit),
+    /// A letter typed into the text row at `n`, which is not a change to
+    /// anything: nothing is written and nothing is published. It is only the
+    /// characters getting out of the field before something destroys it. See
+    /// [`Drafts`].
+    SettingDraft(usize, String),
+    /// Escape was pressed with the caret in the field on row `n`. Escape in a
+    /// field means "never mind", and there are two things that can be: the
+    /// playlist name line, which is there to ask a question and goes away
+    /// again, and a text row holding a [`Drafts`] entry, which has to be
+    /// thrown away or the player's own value never comes back.
+    SettingEscaped(usize),
     /// Follow a sidebar entry: `(kind, index)`, where kind 0 is a screen and
     /// kind 1 is an item on the Sources screen.
     Sidebar(i32, i32),
@@ -242,7 +254,17 @@ enum Command {
     /// A name and an address, as typed. Both are checked here.
     StationAdd(String, String),
     StationPlay(usize),
+    /// A name as it is being typed. The list takes it; the file does not, not
+    /// until `StationRenamed` says the typing is over.
     StationRename(usize, String),
+    /// The rename is over: Enter was pressed, or the field lost the caret.
+    ///
+    /// Carries no name and no row on purpose. It arrives from a field that may
+    /// already be gone — pressing the bin destroys the row that had the caret
+    /// — and a row number from before that would name a different station than
+    /// the one that was typed into. The list is already right; this only says
+    /// it is worth writing down.
+    StationRenamed,
     StationRemove(usize),
     StationMove(usize, usize),
     /// Forget every search made this session.
@@ -469,6 +491,18 @@ struct Browsing {
     /// Whether a page of a long list is already on its way, so that scrolling
     /// past the trigger a second time does not ask for it twice.
     fetching_more: bool,
+    /// Whether a page was asked for while one was already on its way.
+    ///
+    /// Refusing that ask is right while the page in flight is the one wanted,
+    /// and wrong once it turns out not to be. The window asks again the moment
+    /// a jump lands — see `browse-jumped` — precisely because a fetched window
+    /// that moves neither the scroll nor the height would otherwise never ask;
+    /// that ask arrives while the old window's page is still out, is refused,
+    /// and then the page is dropped for belonging to a window that has gone.
+    /// Nothing asked after that, so a window too short to scroll sat with the
+    /// rest of the list stranded until the pane was resized. Remembered here
+    /// so the drop can honour it.
+    more_wanted: bool,
     /// The same, for the queue.
     ///
     /// Its own flag rather than sharing `fetching_more`: the browse list and
@@ -492,6 +526,13 @@ struct Browsing {
     /// was not on screen: with the services list left set, every row of the
     /// settings page opened a music service's sign-in page instead.
     pane: Pane,
+    /// Text typed into a settings row and not sent to the player yet.
+    ///
+    /// See [`Drafts`]. Kept beside the pane rather than in it because the pane
+    /// holds the player's own document — `bluos::settings::Settings`, which is
+    /// what the player said and has no room for what the user is half-way
+    /// through saying back.
+    drafts: Drafts,
     /// Which sidebar entry is lit, as `(kind, index)`, and whose sidebar it
     /// was lit on. Recorded on activation rather than inferred, because a
     /// screen can be reached several ways.
@@ -563,6 +604,59 @@ impl Pane {
             Pane::Form(page) => Some(page),
             _ => None,
         }
+    }
+}
+
+/// Text typed into a settings page's rows and not sent to the player yet.
+///
+/// A settings text row commits on Enter, because every report from one is a
+/// write to the player and one per letter is not a thing to send. So between
+/// the first letter and Enter those characters live in the field on screen and
+/// nowhere else — and the field is destroyed whenever the rows are published
+/// again, which something else on the page is quite enough to cause. Type a
+/// new name into Player name, flip the switch beside it: a write that succeeds
+/// re-reads the page, a write that fails puts the controls back, and either
+/// way the model is replaced and the name comes back as whatever the player
+/// still calls itself. Nothing says it happened, and the backend never had the
+/// letters, so nothing can put them back.
+///
+/// It has them now. They leave the field as they are typed and wait here — the
+/// way a form's [`FormPage::values`] already hold its fields — and
+/// [`walk_settings`] seats them back into the row it builds. Nothing here is
+/// ever sent anywhere: Enter is still the only thing that writes.
+///
+/// They wait only as long as the field does, which is the other half of it. A
+/// draft that outlives its row is not a rescue but a lie: the page comes back
+/// up reading a name the player never took, indistinguishable from one it did,
+/// and hiding a name set from the official app in the meantime. So there are
+/// three ends to one. Enter writes it and the write's reply drops it, as this
+/// player's and this page's. Escape gives up on it — see
+/// `Command::SettingEscaped`, which is what "never mind" has to mean once a
+/// field can hold something that is not the player's. And
+/// [`Backend::publish_pane`] drops the lot whenever the pane stops being the
+/// page they were typed on, since every change of pane goes through there.
+#[derive(Default)]
+struct Drafts {
+    /// Which page these belong to, as `SettingsPage::page_id` names it, and
+    /// whose page that was. The same row of the page one level down is a
+    /// different row, and a draft left over from Audio has no business
+    /// seating itself into Network — nor has one typed on a player's own page
+    /// any business appearing on the next player's, which carries the same
+    /// page ids and is where everything else in this file is careful too.
+    page: Option<String>,
+    device: Option<DeviceId>,
+    /// By `bluos::settings::Setting::id` rather than by row index: a page
+    /// re-read after a write can gain or lose rows — turning tone controls on
+    /// brings treble and bass to life — and every index past the change would
+    /// then name a different setting.
+    text: BTreeMap<String, String>,
+}
+
+impl Drafts {
+    /// What is held for the rows of `owner`'s `page`, which is nothing at all
+    /// unless these are that page's.
+    fn on(&self, owner: DeviceId, page: &SettingsPage) -> Option<&BTreeMap<String, String>> {
+        (self.device == Some(owner) && self.page == page.page_id).then_some(&self.text)
     }
 }
 
@@ -646,6 +740,22 @@ struct StationsPage {
     /// putting the bin behind Edit is the difference between deleting a
     /// station and meaning to.
     editing: bool,
+}
+
+impl Drop for StationsPage {
+    /// A name being retyped is staged rather than written — see
+    /// [`custom::stage`] — and the page going away is the last moment anything
+    /// knows it was. Pressing Back, opening a player's settings, being sent to
+    /// Now Playing by a status: every way out of this pane replaces it, so
+    /// every way out ends here, which is why this rather than a save on each
+    /// of them.
+    ///
+    /// `sync` and not a write: this runs under the browsing lock, on the
+    /// command loop, and the disk is the store's to reach from a blocking
+    /// thread.
+    fn drop(&mut self) {
+        custom::sync();
+    }
 }
 
 /// Somewhere to put a track, being chosen.
@@ -1087,6 +1197,35 @@ struct Backend {
     /// every row instance, which throws away whatever was being typed into
     /// one and jumps the scroll on a page of mixed heights.
     sent_settings: Arc<AtomicU64>,
+    /// How many times a settings control has had to be put back where the
+    /// player has it, hashed into the fingerprint above so the rows are
+    /// replaced although nothing in them changed.
+    ///
+    /// A `Switch`, a `Slider` and a `ComboBox` all write their own property
+    /// when they are used, which is the end of the `item.on`, `item.number`
+    /// and `item.option-index` binding that put them there: from then on the
+    /// control shows what the hand did, not what the player says. That is
+    /// right while the write is in flight and wrong from the moment it is
+    /// answered, whichever way it is answered: nothing about the page need
+    /// have changed, so the fingerprint matches, so nothing is published, and
+    /// the switch is left sitting in a position the player never took. A
+    /// refused write changes nothing anywhere, and an accepted one is re-read
+    /// from a player that owes nobody the answer it was sent — it rounds the
+    /// number the slider was dropped on to the step it keeps, or it takes the
+    /// write and leaves the setting alone. Bumping this makes the next publish
+    /// replace the model and re-establish the binding.
+    settings_redraws: Arc<AtomicU64>,
+    /// The `settings_redraws` value the rows on screen were last rebuilt for.
+    ///
+    /// The bump above only gets the publish past the memo; what puts the
+    /// control back is the model replacement at the end of it, and
+    /// [`seat_settings`] seats rows in place wherever the shape has not
+    /// moved — which is every row of a page whose write was refused, since
+    /// the failed write changed nothing anywhere. So the demand has to survive
+    /// the trip to the event loop rather than be read back off the rows: while
+    /// this lags `settings_redraws` the next publish replaces instead of
+    /// seating, and it is caught up only once one actually has.
+    seated_redraws: Arc<AtomicU64>,
     /// And the browse model, which is the largest of them.
     ///
     /// It was the only one published with no memo at all, so every republish
@@ -1329,6 +1468,133 @@ fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
     // Zero is the "nothing sent yet" value, so a fingerprint that happens to
     // be zero simply sends once more than it needs to.
     fingerprint != 0 && seen.swap(fingerprint, Ordering::Relaxed) == fingerprint
+}
+
+/// Say that a model the caret could have been in has just been replaced.
+///
+/// Every row drawn from a model is destroyed when the model under it is
+/// swapped, and a row that is destroyed while it holds the caret takes the
+/// caret with it: Slint is left with no focused item at all, so Escape, the
+/// space bar and the letters do nothing until something is clicked. Renaming
+/// a station and then pressing the bin beside it is the plainest way in; a
+/// settings field whose write reloads the page is another.
+///
+/// Called with the window in hand, on the event-loop thread, immediately after
+/// the model is set. The window decides what to do about it — see
+/// `models-replaced` in the .slint — because only it knows what else might be
+/// holding the caret.
+fn models_replaced(ui: &AppWindow) {
+    ui.set_models_replaced(ui.get_models_replaced().wrapping_add(1));
+}
+
+/// Put a page of settings-shaped rows into the window, and say whether the
+/// model had to be replaced to do it.
+///
+/// Replacing a model destroys every row drawn from it, and a row destroyed
+/// while its field holds the caret takes the caret with it. On this pane that
+/// is not a rare corner. A settings page open on a playing player is published
+/// again on every status tick — the sleep row reads its state out of `/Status`
+/// — and the letters staged in [`Drafts`] are part of `row.value`, which is
+/// part of the fingerprint `Backend::send_settings` takes. So from the first
+/// letter typed into Player name the fingerprint no longer matched, every tick
+/// replaced the model, and the rest of the word went wherever the keyboard
+/// landed next: the space in "Living Room" reaches the window's own handler
+/// and pauses the music, Backspace leaves the page. The letters survived; the
+/// caret did not, which is only half of what F1 and F3 ask for.
+///
+/// So the rows are seated into the model that is already there wherever the
+/// shape of it has not moved. The shape is what decides which elements exist —
+/// each row's place in the list, the control it carries, and whether it is a
+/// heading rather than a row at all. Everything else is a binding inside one of
+/// those, and re-seating it leaves every element standing, caret included.
+///
+/// Anything else is a real replacement and says so: a write that brought treble
+/// and bass to life has rows that were not there before, and the handback in
+/// the window is then exactly what is wanted.
+///
+/// A control's own value counts as shape for the same reason. A `Switch`, a
+/// `Slider` and a `ComboBox` each write their own property the moment they are
+/// used, which ends the binding to `item.on`, `item.number` and
+/// `item.option-index` that put them there — so seating a *different* number
+/// into a row whose slider has been dragged writes it everywhere but the knob.
+/// A write that succeeds is re-read, and a player that quantises what it was
+/// sent answers with its own number: the text beside the slider moved and the
+/// knob stayed where it was dropped. The same for two switches the player
+/// treats as exclusive, where turning one on turns the other off. Whenever the
+/// player restates one of those three, the element has to be built again to
+/// hear it. A text row carries none of them, so the caret this function exists
+/// to protect is not touched by the comparison.
+///
+/// `rebuild` is the caller saying that the elements themselves are what is
+/// wrong, whatever the shape says. Seating is re-reading: it writes `item` and
+/// leaves every binding that reads it exactly as the hand left it, which is
+/// the point while a page is being typed into and useless when the publish
+/// exists to overrule a control that has assigned itself. A refused write and
+/// an abandoned draft both leave the shape precisely as it was — that is what
+/// makes them the two cases seating cannot serve, and why the demand for a
+/// replacement has to arrive as a word rather than be inferred from the rows.
+/// See `settings_redraws` and [`Backend::redraw_settings`].
+fn seat_settings(ui: &AppWindow, items: Vec<SettingItem>, rebuild: bool) -> bool {
+    let model = ui.get_settings();
+    let in_place = !rebuild
+        && model.row_count() == items.len()
+        && items.iter().enumerate().all(|(at, item)| {
+            model.row_data(at).is_some_and(|was| {
+                was.index == item.index
+                    && was.control == item.control
+                    && was.heading == item.heading
+                    // The three a control assigns to itself, compared by bits
+                    // for the float so that a row nobody has touched matches
+                    // itself.
+                    && was.on == item.on
+                    && was.option_index == item.option_index
+                    && was.number.to_bits() == item.number.to_bits()
+            })
+        });
+    if in_place {
+        for (at, item) in items.into_iter().enumerate() {
+            model.set_row_data(at, item);
+        }
+        return false;
+    }
+    ui.set_settings(ModelRc::new(VecModel::from(items)));
+    // Every field on the page is about to be destroyed, the one holding the
+    // caret among them, and a field destroyed that way cannot report losing
+    // it: `settings-typing` is set when the caret arrives and never cleared by
+    // the row that set it. Left standing it would say a settings field has the
+    // caret at exactly the moment none can, and the handback in the window
+    // reads it — so the window would refuse to take the keyboard back on the one
+    // replacement that always needs it, and Escape, the space bar and the
+    // letters would all be dead until something was clicked.
+    //
+    // Cleared here rather than only in `publish_pane` because this is where
+    // the rows die, and a page whose rows are replaced under it has not
+    // changed pane. What the flag then says is true of a live field only,
+    // which is what the window is asking about.
+    ui.set_settings_typing(false);
+    models_replaced(ui);
+    true
+}
+
+/// How many of these cards draw the badge row, and so are the taller of the
+/// picker's two card heights.
+///
+/// The picker's list is a `ListView`, which takes a fixed height and nothing
+/// else, and nothing in Slint can sum a condition over a model — so the count
+/// is made here and published beside the rows. The condition is `DeviceCard`'s
+/// own, repeated: keeping the two in step is by hand, which is why both say so.
+///
+/// Counted rather than assumed. The list used to take the taller number for
+/// every row but one, on the reasoning that grouping is offered against every
+/// player except the selected one. That holds for `groupable` and for neither
+/// of the others: the selected player leads the group it is in, and it rewrites
+/// its own firmware, and it wears the badge for both. Two grouped players were
+/// then given 226px of the 260px they draw, and what fell off the bottom was
+/// the Ungroup button — the one control that undoes the grouping.
+fn badged_cards(rows: &[Device]) -> i32 {
+    rows.iter()
+        .filter(|row| row.upgrading || !row.role.is_empty() || row.groupable)
+        .count() as i32
 }
 
 /// Whether a row is the app's own furniture rather than something on the system.
@@ -1617,12 +1883,96 @@ fn put_up_menu(backend: &Backend, id: DeviceId, selection: u64, menu: Screen) {
 /// player hands out from one, so another player's list on this page would
 /// have its toggles arm and its rows open alarms that happen to share an id.
 fn replace_alarms(backend: &Backend, id: DeviceId, list: bluos::alarms::Alarms) -> bool {
-    match &mut backend.browsing.lock().unwrap().pane {
-        Pane::Alarms(page) if page.device == id => {
-            page.list = list;
-            true
+    let mut browsing = backend.browsing.lock().unwrap();
+    let note = match &mut browsing.pane {
+        Pane::Alarms(page) if page.device == id => seat_alarms(page, list),
+        _ => return false,
+    };
+    drop(browsing);
+    if let Some(note) = note {
+        say(&backend.ui, note);
+    }
+    true
+}
+
+/// Put a list the player has just sent on the page, and bring an editor open
+/// over it back into line with it.
+///
+/// The list on the page is what an editor is copied from, and it is only ever
+/// as fresh as the last write's answer. On a slow player that leaves a window
+/// open: Back out of an alarm while its save is still in the writes lane, open
+/// the same alarm again, and the copy on screen holds the values from before
+/// the save. Its own Save then writes those back and undoes the save the toast
+/// announced. A late delete is worse — the editor is left on an alarm that is
+/// gone, and Save makes it again, so deleting an alarm can end with it still
+/// there.
+///
+/// So an editor whose alarm has gone is closed, and one still showing exactly
+/// what it was opened on is re-seated on what the player now says: nothing
+/// typed is thrown away, because nothing was typed. An editor the user has
+/// changed keeps their work — no merge of two people's edits is going to be
+/// right, and losing typing is the one thing worse than this — and they are
+/// told, so that pressing Save is not silently a replacement.
+///
+/// Returns what to tell the user, if anything; the caller says it once the
+/// lock is let go.
+fn seat_alarms(page: &mut AlarmsPage, list: bluos::alarms::Alarms) -> Option<&'static str> {
+    /// What the arriving list means for the editor open over it.
+    enum Seat {
+        /// Its alarm is not in the list any more.
+        Gone,
+        /// It has not been touched, so it can simply show this instead.
+        Fresh(bluos::alarms::Alarm),
+        /// It has been touched and the player's copy has moved as well.
+        Diverged,
+    }
+
+    let seat = page
+        .editing
+        .as_ref()
+        // A new alarm has no id until it is saved and is in nobody's list, so
+        // there is nothing to reconcile it against.
+        .filter(|held| held.id != 0)
+        .and_then(|held| match list.alarms.iter().find(|a| a.id == held.id) {
+            None => Some(Seat::Gone),
+            Some(now) if now == held => None,
+            // Still showing the row it was copied out of, which is the whole
+            // of "untouched": the page's list is where the copy came from, and
+            // only a reply replaces either of them.
+            Some(now) if page.list.alarms.contains(held) => Some(Seat::Fresh(now.clone())),
+            // Touched, so the editor is no help in saying whether the player
+            // moved: `now != held` is true from the first keystroke either
+            // way. The row the editor was opened over is what answers it, and
+            // that is the list about to be replaced. Told only when those two
+            // differ — otherwise the alarm is exactly where it was and the
+            // editor simply holds work nobody has saved yet. Saving an alarm
+            // on a slow player, opening another and changing an hour, and then
+            // being told *that* one had changed on the player was this arm
+            // firing on the reply to the first save.
+            Some(now) => page
+                .list
+                .alarms
+                .iter()
+                .find(|was| was.id == held.id)
+                .filter(|was| *was != now)
+                .map(|_| Seat::Diverged),
+        });
+
+    page.list = list;
+    match seat {
+        Some(Seat::Gone) => {
+            page.editing = None;
+            // With the picker, which would otherwise be left drawn over no
+            // editor — the same reason a save closes it.
+            page.picking.clear();
+            Some("That alarm is no longer there")
         }
-        _ => false,
+        Some(Seat::Fresh(alarm)) => {
+            page.editing = Some(alarm);
+            None
+        }
+        Some(Seat::Diverged) => Some("This alarm changed on the player — Save will replace it"),
+        None => None,
     }
 }
 
@@ -1667,6 +2017,21 @@ const DURATIONS: &[u32] = &[15, 30, 45, 60, 90, 120];
 /// The letters under the day chips, Sunday first, matching the order the
 /// player writes `days` in.
 const DAY_LETTERS: [&str; bluos::alarms::DAYS] = ["S", "M", "T", "W", "T", "F", "S"];
+
+/// And what those chips are called where the letter cannot say it.
+///
+/// Two of the seven letters are S and two are T, so read out on their own
+/// they name four chips ambiguously — which is no use at all to somebody
+/// setting which days an alarm repeats on without seeing them. Same order.
+const DAY_NAMES: [&str; bluos::alarms::DAYS] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
 
 /// A time as the list and the header show it.
 fn clock(hour: u8, minute: u8) -> String {
@@ -1960,8 +2325,23 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     runtime.spawn(run(ui.as_weak(), command_rx, commands.clone()));
 
     wire(&ui, commands);
-    ui.run()?;
+    let ran = ui.run();
+    // After the window and before the runtime, which is dropped with this
+    // frame: the small files are written off the loop, so a change made in the
+    // last moments of a run can still be waiting its turn — and a station name
+    // typed but never committed is waiting on purpose. This is the last place
+    // any of it can reach the disk.
+    settle_files();
+    ran?;
     Ok(())
+}
+
+/// Write down anything the small files are still only holding in memory.
+fn settle_files() {
+    custom::flush();
+    known::flush();
+    searches::flush();
+    order::flush();
 }
 
 /// Point every callback at the command channel.
@@ -2071,8 +2451,21 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_setting_drafted(move |index, text| {
+        let _ = tx.send(Command::SettingDraft(
+            index.max(0) as usize,
+            text.to_string(),
+        ));
+    });
+
+    let tx = commands.clone();
     ui.on_setting_open(move |index| {
         let _ = tx.send(Command::SettingAction(index.max(0) as usize));
+    });
+
+    let tx = commands.clone();
+    ui.on_setting_escaped(move |index| {
+        let _ = tx.send(Command::SettingEscaped(index.max(0) as usize));
     });
 
     let tx = commands.clone();
@@ -2103,6 +2496,11 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     let tx = commands.clone();
     ui.on_station_rename(move |at, name| {
         let _ = tx.send(Command::StationRename(at.max(0) as usize, name.to_string()));
+    });
+
+    let tx = commands.clone();
+    ui.on_station_renamed(move || {
+        let _ = tx.send(Command::StationRenamed);
     });
 
     let tx = commands.clone();
@@ -2418,6 +2816,8 @@ async fn run(
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
+        settings_redraws: Arc::new(AtomicU64::new(0)),
+        seated_redraws: Arc::new(AtomicU64::new(0)),
         told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
         update_offer: Arc::new(Mutex::new(None)),
         sent_browse: Arc::new(AtomicU64::new(0)),
@@ -2783,6 +3183,10 @@ impl Backend {
             n => format!("{n} players"),
         };
 
+        // How tall the picker's list has to be, in the only form a `ListView`
+        // can be told it. See [`badged_cards`].
+        let badged = badged_cards(&rows);
+
         if already_sent(&self.sent_players, {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -2801,6 +3205,13 @@ impl Backend {
                 row.role.hash(&mut hash);
                 row.in_group.hash(&mut hash);
                 row.groupable.hash(&mut hash);
+                // Not for the badge's words — those follow the percentage and
+                // would republish the whole model on every progress tick —
+                // but for whether there is a badge row at all, which decides
+                // how tall the picker's list has to be. `reachable` flips with
+                // it today, so this only makes the height's own input explicit
+                // rather than leaning on that.
+                row.upgrading.hash(&mut hash);
             }
             // Whether each row has its art yet. Art arrives after the row it
             // belongs to, so without this the covers land in a model the memo
@@ -2836,6 +3247,7 @@ impl Backend {
                     .collect::<Vec<_>>(),
             )));
             ui.set_devices(ModelRc::new(VecModel::from(rows)));
+            ui.set_badged_players(badged);
             ui.set_selected(restored as i32);
             // Not the toast. This is a standing fact about the system rather
             // than something that just happened, and it was being republished
@@ -3241,6 +3653,12 @@ impl Backend {
                             .map(|d| slint::SharedString::from(*d))
                             .collect::<Vec<_>>(),
                     )));
+                    ui.set_alarm_day_names(ModelRc::new(VecModel::from(
+                        DAY_NAMES
+                            .iter()
+                            .map(|d| slint::SharedString::from(*d))
+                            .collect::<Vec<_>>(),
+                    )));
                 }
                 None => ui.set_alarm_editing(false),
             }
@@ -3281,8 +3699,19 @@ impl Backend {
                     destructive: choice.color.is_some(),
                 })
                 .collect();
+            // Which one the keyboard opens on: the first the player has not
+            // colored, since the colored one is the one that discards
+            // something and Enter on a question that has only just appeared
+            // must not be the thing that does it. A question whose every
+            // answer is colored falls back to the first, which is still the
+            // player's own order.
+            let safe = buttons
+                .iter()
+                .position(|button| !button.destructive)
+                .unwrap_or(0);
             ui.set_dialog_title(asked.title.unwrap_or_default().into());
             ui.set_dialog_body(asked.body.unwrap_or_default().into());
+            ui.set_dialog_safe(safe as i32);
             ui.set_dialog_buttons(ModelRc::new(VecModel::from(buttons)));
             ui.set_dialog_open(true);
         });
@@ -3760,6 +4189,7 @@ impl Backend {
                 })
                 .collect();
             ui.set_stations(ModelRc::new(VecModel::from(rows)));
+            models_replaced(&ui);
             ui.set_stations_editing(editing);
             ui.set_in_stations(true);
             ui.set_browse_title("My Stations".into());
@@ -4011,70 +4441,7 @@ impl Backend {
             return;
         };
         let (title, form, values, note) = page;
-
-        let mut rows: Vec<SettingData> = Vec::new();
-        if !note.is_empty() {
-            rows.push(SettingData {
-                index: -1,
-                glyph: Some(Glyph::Info),
-                label: note,
-                control: "none",
-                available: true,
-                ..SettingData::blank()
-            });
-        }
-
-        for field in &form.fields {
-            let held = values.get(&field.name).cloned().unwrap_or_default();
-            rows.push(SettingData {
-                index: -1,
-                glyph: Some(match field.kind {
-                    bluos::forms::Kind::Password => Glyph::Secret,
-                    bluos::forms::Kind::Choice => Glyph::Tweak,
-                    _ => Glyph::Details,
-                }),
-                label: if field.label.is_empty() {
-                    field.name.clone()
-                } else {
-                    field.label.clone()
-                },
-                control: match field.kind {
-                    bluos::forms::Kind::Text => "text",
-                    bluos::forms::Kind::Password => "password",
-                    bluos::forms::Kind::Choice => "list",
-                    bluos::forms::Kind::Switch => "boolean",
-                },
-                on: !held.is_empty(),
-                // A password is never drawn back, not even as its own length.
-                value: match field.kind {
-                    bluos::forms::Kind::Password => String::new(),
-                    _ => held.clone(),
-                },
-                options: field.choices.iter().map(|c| c.label.clone()).collect(),
-                option_index: drawn_choice(field, values.get(&field.name).map(String::as_str)),
-                available: true,
-                ..SettingData::blank()
-            });
-        }
-
-        for submit in &form.submits {
-            rows.push(SettingData {
-                index: -1,
-                glyph: None,
-                // The button says what it does; a row saying the same thing
-                // beside it is the word twice.
-                label: String::new(),
-                value: submit.label.clone(),
-                control: "button",
-                available: true,
-                ..SettingData::blank()
-            });
-        }
-
-        for (at, row) in rows.iter_mut().enumerate() {
-            row.index = at as i32;
-        }
-        self.send_settings(rows, title);
+        self.send_settings(form_rows(&form, &values, note), title);
     }
 
     /// Put one of the player's web configuration pages in the middle pane.
@@ -4163,7 +4530,29 @@ impl Backend {
             Customise,
             Alarms,
         }
-        let showing = match self.browsing.lock().unwrap().pane {
+        let mut browsing = self.browsing.lock().unwrap();
+        // A draft lives exactly as long as the field it was typed into, and
+        // that field is one row of one settings page. The moment the pane is
+        // anything else — a page one level down, the screen Back lands on,
+        // another player's settings — there is no longer a row for the letters
+        // to go back into, and they must not be seated over the player's own
+        // value when the page is next opened.
+        //
+        // Cleared here for the same reason the pane flags below are: this is
+        // the one place every change of pane passes through, and the sites that
+        // assign `pane` are too many to ask each of them to remember. Left to
+        // themselves they did not: a name typed and thought better of came back
+        // over the player's real one on every later visit to the page, for the
+        // life of the window, with nothing on screen saying it was never sent.
+        // See [`Drafts`].
+        let staged = browsing
+            .pane
+            .settings_owned()
+            .is_some_and(|(owner, page)| browsing.drafts.on(owner, page).is_some());
+        if !staged {
+            browsing.drafts = Drafts::default();
+        }
+        let showing = match browsing.pane {
             Pane::Browse => Showing::Browse,
             Pane::Settings(..) => Showing::Settings,
             Pane::Help | Pane::HelpDetail(..) => Showing::Help,
@@ -4178,6 +4567,9 @@ impl Backend {
             Pane::Stations(_) => Showing::Settings,
             Pane::EditPreset(_) => Showing::Settings,
         };
+        // Everything below publishes, and the publishers take this lock
+        // themselves.
+        drop(browsing);
 
         let large = matches!(showing, Showing::NowPlaying);
         let customising = matches!(showing, Showing::Customise);
@@ -4203,6 +4595,21 @@ impl Backend {
                 // `publish_stations` runs later in the same queue when the
                 // pane really is up, and puts it back.
                 ui.set_in_stations(false);
+                // With it, the note that one of its two boxes has the caret.
+                // That is set by the boxes themselves and cleared by them when
+                // the caret leaves — but a box that is destroyed while it
+                // still holds the caret never says so, and left true it would
+                // suppress the keyboard handback on every other pane for the
+                // life of the window. `browse-typing` is the older version of
+                // exactly that mistake; see the note on `claim`.
+                ui.set_station_typing(false);
+                // And the same note for a settings row's field, which is set
+                // by the field and deliberately never cleared by it: the row
+                // it sits in is destroyed whenever the model is replaced, and
+                // a field destroyed while it holds the caret has no way to say
+                // so. Every change of pane comes through here, and by then
+                // whatever was being typed into a settings row is behind us.
+                ui.set_settings_typing(false);
                 // And the settings rows, which look answered but are not.
                 // `publish_settings` clears this whenever the pane is no
                 // longer a settings page — but the Stations, Playlists and
@@ -4267,14 +4674,17 @@ impl Backend {
 
     /// Turn a settings page into rows for the middle pane.
     fn publish_settings(&self) {
-        let owned = self
-            .browsing
-            .lock()
-            .unwrap()
-            .pane
-            .settings_owned()
-            .map(|(owner, page)| (owner, page.clone()));
-        let Some((owner, page)) = owned else {
+        let owned = {
+            let browsing = self.browsing.lock().unwrap();
+            browsing.pane.settings_owned().map(|(owner, page)| {
+                (
+                    owner,
+                    page.clone(),
+                    browsing.drafts.on(owner, page).cloned().unwrap_or_default(),
+                )
+            })
+        };
+        let Some((owner, page, drafts)) = owned else {
             let ui = self.ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui.upgrade() {
@@ -4295,7 +4705,7 @@ impl Backend {
 
         let mut rows: Vec<SettingData> = Vec::new();
         let mut index = 0i32;
-        walk_settings(&page.entries, &page, sleep, &mut rows, &mut index);
+        walk_settings(&page.entries, &page, sleep, &drafts, &mut rows, &mut index);
 
         // A page fetched by id has one group on it and that group names
         // itself — "Customize sources", "Music library". Its own name beats
@@ -4312,6 +4722,101 @@ impl Backend {
         };
 
         self.send_settings(rows, title);
+    }
+
+    /// Put the settings controls back where the player has them.
+    ///
+    /// For after a write that failed, for the alarm list a write is answered
+    /// with, and for Escape giving up on a draft. The rows may well be
+    /// unchanged — a failed write changed nothing anywhere, an abandoned word
+    /// leaves the same row in the same place, and a player can answer an
+    /// arming with the list exactly as it stood — so the publish
+    /// below would match the fingerprint and skip the model replacement that
+    /// re-establishes the bindings. Bumping the count first is what makes it go
+    /// out, and what makes [`seat_settings`] rebuild rather than seat when it
+    /// gets there; see `settings_redraws` for why a control needs putting back
+    /// at all, and `seated_redraws` for why the bump alone is not enough.
+    ///
+    /// And for a form document arriving, where the rows do change but not in a
+    /// way seating can carry: the page is being restated by the player and the
+    /// controls that assigned themselves have to be built again to hear it.
+    /// See [`show_form`].
+    ///
+    /// Through `publish_pane` rather than `publish_settings` so it draws
+    /// whatever pane is on screen now: the failure arrives a round trip after
+    /// the press, by which time the page may have been left for another.
+    fn redraw_settings(&self) {
+        self.owe_settings_redraw();
+        self.publish_pane();
+    }
+
+    /// Ask for that rebuild without drawing one here.
+    ///
+    /// For the write that succeeded, where the page is being re-read and so
+    /// the publish the rows need is already on its way: drawing one now would
+    /// put the values the write has just replaced back on screen for the
+    /// length of a round trip. What is owed there is not another publish but
+    /// that the publish answering the write be a replacement.
+    ///
+    /// It has to be said here, where a control is known to have spoken for the
+    /// player, because the rows themselves may not say it. A player is free to
+    /// take the write and restate the page exactly as it was last published —
+    /// it quantises the number the slider was dropped on, or it answers 200
+    /// and does not apply the setting — and then the memo matches, nothing is
+    /// published at all, and the knob is left sitting where the hand put it
+    /// with the player's own number printed beside it. See `settings_redraws`.
+    fn owe_settings_redraw(&self) {
+        self.settings_redraws.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Draw the settings pane again for a status that has arrived, unless a
+    /// control is still waiting on the player.
+    ///
+    /// A settings page open on a playing player is republished about once a
+    /// second, because some of its rows are read out of `/Status` rather than
+    /// out of the settings document — the sleep timer is one. The rows those
+    /// publishes are built from are the page as it was last read, which
+    /// between a write and the re-read answering it is the page the write has
+    /// already replaced.
+    ///
+    /// That is the one moment those rows must not go out. The demand left by
+    /// [`Self::owe_settings_redraw`] is a demand on the publish that answers
+    /// the write, and a tick landing first answers it with the values from
+    /// before: the model is replaced, so the switch flips visibly back to OFF
+    /// and forward again a round trip later — on a slow player the wrong
+    /// position stands for seconds and reads as a refused write. And the
+    /// demand is spent doing it, so the publish that really does carry the
+    /// player's answer seats into rows that may not have moved, leaving a
+    /// quantised number unheard by the knob it belongs to.
+    ///
+    /// So the tick stands still until the page it would draw is the page the
+    /// player has. Nothing is lost by waiting a round trip for it; the sleep
+    /// row is a second old either way. An answer that never comes is dealt
+    /// with where it fails to arrive — see the re-read's error arm, which
+    /// gives the demand up rather than leave the tick holding.
+    fn restate_settings(&self) {
+        if self.settings_redraws.load(Ordering::Relaxed)
+            != self.seated_redraws.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        self.publish_settings();
+    }
+
+    /// Give up on putting a control back, because the page that would have
+    /// done it never came.
+    ///
+    /// The write was accepted and the re-read that follows it failed, so the
+    /// only rows in hand are the ones the write replaced: publishing those
+    /// would snap the switch back to a value the player no longer has. The
+    /// control is left where the hand put it, which is the nearest thing to
+    /// the truth anybody here knows, and the demand is dropped so that
+    /// [`Self::restate_settings`] starts following the player again.
+    fn forget_settings_redraw(&self) {
+        self.seated_redraws.store(
+            self.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Hand a list of setting-shaped rows to the middle pane.
@@ -4342,6 +4847,12 @@ impl Backend {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             title.hash(&mut hash);
+            // Not a property of the rows: the count of times a control has
+            // been left somewhere the player never put it. See
+            // `settings_redraws`.
+            self.settings_redraws
+                .load(Ordering::Relaxed)
+                .hash(&mut hash);
             for row in &rows {
                 row.index.hash(&mut hash);
                 row.label.hash(&mut hash);
@@ -4353,11 +4864,22 @@ impl Backend {
                 row.available.hash(&mut hash);
                 row.options.hash(&mut hash);
                 row.option_index.hash(&mut hash);
+                row.as_typed.hash(&mut hash);
                 // The numbers a slider carries, which change as it is dragged.
                 row.number.to_bits().hash(&mut hash);
             }
             hash.finish()
         });
+
+        // Whether this publish is one of the ones that exists to overrule a
+        // control rather than to report the player, which is the difference
+        // between rebuilding the rows and seating into them. Read here and
+        // caught up on the other side, once a replacement has actually
+        // happened: the closure below may find no window, and the publish that
+        // answers a bump is not always the one the bump was made for.
+        let wanted = self.settings_redraws.load(Ordering::Relaxed);
+        let rebuild = self.seated_redraws.load(Ordering::Relaxed) != wanted;
+        let seated = self.seated_redraws.clone();
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -4401,10 +4923,21 @@ impl Backend {
                     option_index: row.option_index,
                     available: row.available,
                     opens: row.opens,
+                    as_typed: row.as_typed,
                 })
                 .collect();
 
-            ui.set_settings(ModelRc::new(VecModel::from(items)));
+            // Seated rather than handed over where it can be, so that a field
+            // being typed into is not destroyed under the caret — and handed
+            // over anyway when the rows are what is wrong. See
+            // [`seat_settings`].
+            if seat_settings(&ui, items, rebuild) {
+                // Whatever asked for a rebuild has had one. Storing the value
+                // that was read rather than the count as it stands now: a bump
+                // made while this publish was in the air is a demand this
+                // replacement cannot be said to have answered.
+                seated.store(wanted, Ordering::Relaxed);
+            }
             ui.set_in_settings(true);
             ui.set_browse_title(title.into());
             ui.set_browse_can_go_back(true);
@@ -5357,6 +5890,11 @@ struct SettingData {
     options: Vec<String>,
     option_index: i32,
     available: bool,
+    /// Whether a text field on this row is reported as it is typed rather than
+    /// only on Enter. Set by [`Backend::publish_form`] and nothing else: a
+    /// form holds what it is handed until its submit, where a settings row
+    /// writes every report straight to the player.
+    as_typed: bool,
 }
 
 /// Flatten a settings page into rows, in the same order [`pick`] counts them.
@@ -5367,6 +5905,10 @@ fn walk_settings(
     // the player reports it in `/Status` — so the one row that needs it is
     // handed it from outside.
     sleep: Option<u32>,
+    // What has been typed into this page's text rows and not written yet. See
+    // [`Drafts`]: the page itself is the player's document and has no room for
+    // it.
+    drafts: &BTreeMap<String, String>,
     rows: &mut Vec<SettingData>,
     index: &mut i32,
 ) {
@@ -5400,7 +5942,7 @@ fn walk_settings(
                         ..SettingData::blank()
                     });
                 }
-                walk_settings(&group.entries, page, sleep, rows, index);
+                walk_settings(&group.entries, page, sleep, drafts, rows, index);
             }
             SettingEntry::Setting(setting) => {
                 let available = page.is_available(setting);
@@ -5473,6 +6015,16 @@ fn walk_settings(
                             Some(minutes) => format!("{minutes} min"),
                             None => "Off".to_owned(),
                         },
+                        // What was typed here beats what the player says, for
+                        // as long as it has not been sent: this row is being
+                        // rebuilt under somebody's hands, and the player's
+                        // answer is the thing they are part-way through
+                        // replacing. See [`Drafts`].
+                        Kind::Text => drafts
+                            .get(&setting.id)
+                            .cloned()
+                            .or_else(|| setting.value.clone())
+                            .unwrap_or_default(),
                         _ => setting.value.clone().unwrap_or_default(),
                     },
                     number: setting.number().unwrap_or(0.0),
@@ -5487,6 +6039,10 @@ fn walk_settings(
                         .collect(),
                     option_index,
                     available,
+                    // Never here: a row on this page is a setting on the
+                    // player, and reporting it as it is typed would be one
+                    // write per letter.
+                    as_typed: false,
                 });
                 *index += 1;
             }
@@ -5514,6 +6070,7 @@ impl SettingData {
             option_index: 0,
             available: true,
             opens: false,
+            as_typed: false,
         }
     }
 }
@@ -5758,6 +6315,9 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             if screen.next.is_none() {
                 screen.next = bluos::screen::continuation(&uri, &screen);
             }
+            // Whether the pane was left where it was found, decided under the
+            // lock below and acted on once it is let go.
+            let kept_pane;
             {
                 let mut browsing = backend.browsing.lock().unwrap();
 
@@ -5792,7 +6352,20 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 // Showing a screen means leaving Settings and Help, which
                 // otherwise keep the pane and the sidebar navigates
                 // underneath them with nothing appearing to happen.
-                browsing.pane = Pane::Browse;
+                //
+                // A refresh is the one arrival nobody asked for: it is the
+                // player saying the drawing is stale, and a preset changes
+                // `prid` on every edit, so any other app on the network saving
+                // one brings it on. Taking the pane there closed Settings and
+                // Alarms and threw away a Customise drag while the user was in
+                // the middle of it. The crumb underneath is replaced either
+                // way, and `publish_browse` draws nothing while another pane
+                // has the screen, so the new screen is simply there when they
+                // come back to it.
+                if !matches!(&arrive, Arrive::Refresh { .. }) {
+                    browsing.pane = Pane::Browse;
+                }
+                kept_pane = !matches!(browsing.pane, Pane::Browse);
                 // Browsing follows the selection: a screen only means anything
                 // against the player that served it.
                 if browsing.device != Some(id) {
@@ -5851,9 +6424,16 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             // keeps drawing the settings rows until it is told otherwise —
             // which showed as a screen with the right title and the wrong list
             // under it.
-            backend.publish_pane();
-            if arrive == Arrive::Home {
-                backend.publish_sidebar();
+            //
+            // Unless the pane was left alone: publishing it would rebuild the
+            // rows of whichever pane is up, and a rebuilt row is a lost caret
+            // and a lost drag. Nothing needs publishing there — the browse
+            // rows nobody can see are drawn when the pane goes back to them.
+            if !kept_pane {
+                backend.publish_pane();
+                if arrive == Arrive::Home {
+                    backend.publish_sidebar();
+                }
             }
             tokio::spawn(load_browse_thumbnails(backend, id, 0));
         }
@@ -6262,8 +6842,116 @@ fn show_form(
     // half seconds, which is long enough to press My Stations in the sidebar
     // and have the form land on top of a pane that is still drawing itself.
     // Only `publish_pane` answers the other panes' flags.
-    backend.publish_pane();
+    //
+    // And through `redraw_settings`, which is `publish_pane` with the rows
+    // rebuilt rather than seated. A document arriving is the page being
+    // restated from the player, and the controls on screen are not all reading
+    // the page any more: a masked box and a list both assign their own
+    // property when they are used, which ends the `item.value` and
+    // `item.option-index` bindings that seeded them. Seated into, those two go
+    // on showing what the hand did while the page holds what the document
+    // said — and the reply to a submit is nearly always the same form, so the
+    // shape matches and seating is what would happen. Pressing Update on the
+    // wireless page returned it with no password held (`form_values` seeds
+    // none) and the essid the player itself had selected; the box went on
+    // drawing eight dots and the list went on reading the network that was
+    // picked, and the next press sent neither. A box full of dots that submits
+    // no key is the worse half of F1, not a fix for it.
+    backend.redraw_settings();
     Some(opened)
+}
+
+/// The rows a form page is drawn as.
+///
+/// A free function rather than part of [`Backend::publish_form`] so that what
+/// goes on screen can be read without a window: every publish from here goes
+/// through `invoke_from_event_loop`, which does nothing at all in the tests,
+/// and the rows were the one part of the page no test could reach.
+fn form_rows(
+    form: &bluos::forms::Form,
+    values: &BTreeMap<String, String>,
+    note: String,
+) -> Vec<SettingData> {
+    let mut rows: Vec<SettingData> = Vec::new();
+    if !note.is_empty() {
+        rows.push(SettingData {
+            index: -1,
+            glyph: Some(Glyph::Info),
+            label: note,
+            control: "none",
+            available: true,
+            ..SettingData::blank()
+        });
+    }
+
+    for field in &form.fields {
+        let held = values.get(&field.name).cloned().unwrap_or_default();
+        rows.push(SettingData {
+            index: -1,
+            glyph: Some(match field.kind {
+                bluos::forms::Kind::Password => Glyph::Secret,
+                bluos::forms::Kind::Choice => Glyph::Tweak,
+                _ => Glyph::Details,
+            }),
+            label: if field.label.is_empty() {
+                field.name.clone()
+            } else {
+                field.label.clone()
+            },
+            control: match field.kind {
+                bluos::forms::Kind::Text => "text",
+                bluos::forms::Kind::Password => "password",
+                bluos::forms::Kind::Choice => "list",
+                bluos::forms::Kind::Switch => "boolean",
+            },
+            on: !held.is_empty(),
+            // Every field goes back as the page holds it, the masked one
+            // included. What is in that one was typed on this page and
+            // could not have come from anywhere else — `form_values` seeds
+            // no password, so nothing the player sent is ever in it — so
+            // this is the user's own characters going back, masked, rather
+            // than a secret of the player's being put on the screen.
+            //
+            // Published empty, the box came back blank the first time
+            // anything else on the page redrew the form, while the page
+            // went on holding the key. The next letter typed into a box
+            // that looked empty replaced the whole key with that one
+            // letter, and a one-character wireless key was submitted with
+            // nothing on screen saying so.
+            value: held.clone(),
+            options: field.choices.iter().map(|c| c.label.clone()).collect(),
+            option_index: drawn_choice(field, values.get(&field.name).map(String::as_str)),
+            available: true,
+            // Every letter, because nothing leaves the app until the
+            // submit is pressed and there is nowhere else for a
+            // half-typed value to live. Committing on Enter alone meant
+            // that typing a name and then reaching for the list beside it
+            // drew the form again from values that had never heard of
+            // what was typed, and the field came back empty.
+            as_typed: true,
+            ..SettingData::blank()
+        });
+    }
+
+    for submit in &form.submits {
+        rows.push(SettingData {
+            index: -1,
+            glyph: None,
+            // The button says what it does; a row saying the same thing
+            // beside it is the word twice.
+            label: String::new(),
+            value: submit.label.clone(),
+            control: "button",
+            available: true,
+            ..SettingData::blank()
+        });
+    }
+
+    for (at, row) in rows.iter_mut().enumerate() {
+        row.index = at as i32;
+    }
+
+    rows
 }
 
 /// What a form's fields hold before anybody touches them, by name.
@@ -6369,16 +7057,21 @@ fn remember_search(backend: &Backend, query: String) {
         return;
     }
 
-    let keeping = {
+    {
         let mut browsing = backend.browsing.lock().unwrap();
         browsing.recent.retain(|seen| seen != &query);
         browsing.recent.insert(0, query);
         browsing.recent.truncate(RECENT_SEARCHES);
-        browsing.recent.clone()
-    };
-    // Off the event loop and out from under the lock: this is a file write on
-    // the path that runs when a search is committed.
-    tokio::task::spawn_blocking(move || searches::save(&keeping));
+        // Handed over here, under the lock that made it, because that lock is
+        // the only thing putting these in order. Spawning the *whole* save was
+        // the first way an older snapshot landed after a newer one; cloning
+        // the list here and handing it over after the lock was let go was the
+        // second. This runs in a spawned task and `Command::ClearRecent` runs
+        // on the command loop, so a list read a moment before a Clear could
+        // reach the store a moment after it and undo it — the same Clear, by a
+        // different route. See the store's note on order.
+        searches::save(&browsing.recent);
+    }
     backend.publish_browse();
 }
 
@@ -6915,12 +7608,18 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
 
     // Remembered only now, not when it was adopted: answering /SyncStatus is
     // what makes an address a player, so a mistyped one is never written down.
-    let newly_known = {
+    {
         let mut known = backend.known.lock().unwrap();
-        known::remember(&mut known, id).then(|| known.clone())
-    };
-    if let Some(known) = newly_known {
-        tokio::task::spawn_blocking(move || known::save(&known));
+        if known::remember(&mut known, id) {
+            // Handed over under the lock that changed it, which is where the
+            // order comes from — not from this thread, which is one poller
+            // task of several. Two players answering at the same moment both
+            // read the list and both hand one over, and outside the lock the
+            // shorter of the two can land last: the player it does not mention
+            // is then unknown for the rest of the session, and the list
+            // written on the way out is the one without it.
+            known::save(&known);
+        }
     }
 
     let name = sync.name.clone();
@@ -8033,11 +8732,15 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // timer is one — so it is redrawn along with everything else.
                 // Keyed on the player the pane belongs to, which is whose
                 // status that row shows.
+                //
+                // Through `restate_settings` rather than the publisher: these
+                // rows are the page as it was last read, and a write waiting
+                // on its re-read has already left them behind. See there.
                 if matches!(
                     backend.browsing.lock().unwrap().pane,
                     Pane::Settings(owner, _) if owner == id
                 ) {
-                    backend.publish_settings();
+                    backend.restate_settings();
                 }
 
                 if backend.is_selected(id) {
@@ -8840,12 +9543,30 @@ async fn run_commands(
                         // The reply is the whole list, so the screen is redrawn
                         // from what the player now holds rather than from what
                         // was asked for.
+                        //
+                        // As a replacement, because the switch on the row
+                        // assigned its own `checked` when it was pressed: a
+                        // player that takes the write and answers with the
+                        // list unchanged leaves nothing in the rows for the
+                        // memo or for `seat_settings` to go on, and the row
+                        // would go on saying an alarm is armed that is not.
+                        // The same shape as the settings write above, and it
+                        // costs nothing where the list did move — those rows
+                        // are replaced for their own sake anyway.
                         Ok(list) => {
                             if replace_alarms(&backend, id, list) {
-                                backend.publish_pane();
+                                backend.redraw_settings();
                             }
                         }
-                        Err(e) => say(&backend.ui, format!("could not change the alarm: {e}")),
+                        // The switch on the row moved itself when it was
+                        // pressed and the list it is drawn from did not move
+                        // at all, so without this it is left reading armed on
+                        // an alarm that is not. Same shape as a settings
+                        // control's failed write.
+                        Err(e) => {
+                            say(&backend.ui, format!("could not change the alarm: {e}"));
+                            backend.redraw_settings();
+                        }
                     }
                 });
                 continue;
@@ -9064,32 +9785,45 @@ async fn run_commands(
                         Ok(list) => {
                             // Saved either way; the page is only put back if
                             // it is still this player's.
-                            {
+                            let note = {
                                 let mut browsing = backend.browsing.lock().unwrap();
-                                if let Pane::Alarms(page) = &mut browsing.pane
-                                    && page.device == id
-                                {
-                                    // A refreshed list is the player's
-                                    // whichever editor is up over it.
-                                    page.list = list;
-                                    // Back to the list: the alarm is the
-                                    // player's now, not the copy's. Only the
-                                    // editor that was saved, though — the save
-                                    // waits its turn in the writes lane and
-                                    // then makes a round trip, and an editor
-                                    // opened since is half a typed alarm the
-                                    // user is still in, not this reply's to
-                                    // throw away. The picker goes with it, or
-                                    // a level would be left drawn over no
-                                    // editor, and the source chosen on it
-                                    // dropped.
-                                    if page.opened == opened {
-                                        page.editing = None;
-                                        page.picking.clear();
+                                match &mut browsing.pane {
+                                    Pane::Alarms(page) if page.device == id => {
+                                        // Back to the list: the alarm is the
+                                        // player's now, not the copy's. Only
+                                        // the editor that was saved, though —
+                                        // the save waits its turn in the
+                                        // writes lane and then makes a round
+                                        // trip, and an editor opened since is
+                                        // half a typed alarm the user is still
+                                        // in, not this reply's to throw away.
+                                        // The picker goes with it, or a level
+                                        // would be left drawn over no editor,
+                                        // and the source chosen on it dropped.
+                                        //
+                                        // Closed before the list is seated, so
+                                        // that an editor this reply answers is
+                                        // not also reconciled against it.
+                                        if page.opened == opened {
+                                            page.editing = None;
+                                            page.picking.clear();
+                                        }
+                                        // A refreshed list is the player's
+                                        // whichever editor is up over it —
+                                        // and an editor opened from the list
+                                        // this one replaces is holding values
+                                        // the save has just overtaken.
+                                        seat_alarms(page, list)
                                     }
+                                    _ => None,
                                 }
-                            }
+                            };
                             say(&backend.ui, "Alarm saved");
+                            // After it: what became of the editor still open
+                            // is the more urgent of the two.
+                            if let Some(note) = note {
+                                say(&backend.ui, note);
+                            }
                             backend.publish_pane();
                         }
                         Err(e) => say(&backend.ui, format!("could not save the alarm: {e}")),
@@ -9129,21 +9863,31 @@ async fn run_commands(
                     ticket.wait().await;
                     match client.delete_alarm(alarm).await {
                         Ok(list) => {
-                            {
+                            let note = {
                                 let mut browsing = backend.browsing.lock().unwrap();
-                                if let Pane::Alarms(page) = &mut browsing.pane
-                                    && page.device == id
-                                {
-                                    page.list = list;
-                                    // Only the editor the delete was pressed
-                                    // on, for the reason Save's reply gives.
-                                    if page.opened == opened {
-                                        page.editing = None;
-                                        page.picking.clear();
+                                match &mut browsing.pane {
+                                    Pane::Alarms(page) if page.device == id => {
+                                        // Only the editor the delete was
+                                        // pressed on, for the reason Save's
+                                        // reply gives, and before the list is
+                                        // seated for the same reason.
+                                        if page.opened == opened {
+                                            page.editing = None;
+                                            page.picking.clear();
+                                        }
+                                        // Which leaves an editor opened since
+                                        // on an alarm that is gone. Saving
+                                        // that would make it again; seating
+                                        // the list closes it instead.
+                                        seat_alarms(page, list)
                                     }
+                                    _ => None,
                                 }
-                            }
+                            };
                             say(&backend.ui, "Alarm deleted");
+                            if let Some(note) = note {
+                                say(&backend.ui, note);
+                            }
                             backend.publish_pane();
                         }
                         Err(e) => say(&backend.ui, format!("could not delete the alarm: {e}")),
@@ -9290,6 +10034,15 @@ async fn run_commands(
                         Err(e) => {
                             tracing::warn!(%id, "could not read settings: {e}");
                             say(&backend.ui, format!("could not read settings: {e}"));
+                            // A re-read is what a control that spoke for the
+                            // player is waiting on, and it is not coming. Say
+                            // so, or the status tick goes on standing still
+                            // for a page that will never arrive and the pane
+                            // stops following the player altogether. See
+                            // [`Backend::forget_settings_redraw`].
+                            if matches!(step, Step::Reload(_)) {
+                                backend.forget_settings_redraw();
+                            }
                         }
                     }
                 });
@@ -9304,7 +10057,7 @@ async fn run_commands(
                     let mut browsing = backend.browsing.lock().unwrap();
                     browsing.pane = Pane::Stations(Box::new(StationsPage {
                         stations: custom::load(),
-                        ..StationsPage::default()
+                        editing: false,
                     }));
                 }
                 // Through publish_pane, never the specific publisher: it is
@@ -9312,6 +10065,19 @@ async fn run_commands(
                 // opened past it comes up underneath whatever is already on
                 // top of it.
                 backend.publish_pane();
+                // Said as the pane comes up, before anything is typed into it.
+                // A file that cannot be read loads as an empty list, which is
+                // exactly what a first run looks like, so the pane invites a
+                // station to be typed in and then keeps every one of them in
+                // memory and nowhere else. This is the one list nothing else
+                // holds a copy of; it is worth interrupting for, the way the
+                // alarms pane says when a player's alarms would not come.
+                if custom::sealed() {
+                    say(
+                        &backend.ui,
+                        "Your stations file could not be read, so changes will not be saved",
+                    );
+                }
                 continue;
             }
 
@@ -9357,6 +10123,9 @@ async fn run_commands(
                         page.editing = !page.editing;
                     }
                 }
+                // Done is one of the ways a rename ends, and the field it ends
+                // is about to be replaced by a plain row.
+                custom::sync();
                 backend.publish_stations();
                 continue;
             }
@@ -9399,11 +10168,24 @@ async fn run_commands(
                     // window draws this model, so an untidied name would be
                     // on screen until something reloaded the list.
                     station.name = custom::tidy(&name);
-                    custom::save(&page.stations);
+                    // Staged rather than written. This arrives on every
+                    // keystroke, and a write per letter meant the whole file
+                    // rewritten — on this loop, under this lock — for a name
+                    // nobody had finished typing. What is staged is the whole
+                    // file, so the next write of any kind carries it, and the
+                    // page cannot go away without one: see `StationsPage`'s
+                    // `Drop`.
+                    custom::stage(&page.stations);
                 }
                 // Deliberately no republish: the row that reported this is the
                 // field being typed into, and replacing the model under it
                 // would take the cursor with it.
+                continue;
+            }
+
+            Command::StationRenamed => {
+                // Off the loop, and only if a name is actually waiting.
+                custom::sync();
                 continue;
             }
 
@@ -9993,6 +10775,21 @@ async fn run_commands(
                     continue;
                 };
 
+                // A letter typed into a field, which is the one edit the rows
+                // must not be redrawn for. The field on screen already shows
+                // what was typed — it is where it came from — and replacing
+                // the model would destroy it mid-word, cursor and all. The
+                // masked field made that plain: its first letter flipped the
+                // row's `on` flag, which changed the fingerprint, which
+                // rebuilt every row, so a wireless key could be one character
+                // long by the time the submit went out and nothing on screen
+                // said so.
+                //
+                // The others have to be drawn again. A switch and a list carry
+                // their state in the model, and after a toggle the model is
+                // the only thing that knows what the new state is.
+                let keystroke = matches!(edit, Edit::Text(_));
+
                 let value = match edit {
                     Edit::Text(text) => Some(text),
                     Edit::Choose(n) => field.choices.get(n).map(|c| c.value.clone()),
@@ -10009,7 +10806,9 @@ async fn run_commands(
                     page.values.insert(field.name.clone(), value);
                 }
                 drop(browsing);
-                backend.publish_form();
+                if !keystroke {
+                    backend.publish_form();
+                }
                 continue;
             }
 
@@ -10089,6 +10888,87 @@ async fn run_commands(
                 continue;
             }
 
+            Command::SettingEscaped(index) => {
+                // Escape in a field means "never mind", and there are two
+                // fields with something to take back.
+                //
+                // The line that asks for a name is there because the line
+                // above it was pressed, and giving up on it turns the line
+                // back into what it was.
+                //
+                // A settings text row used to hold nothing but the player's
+                // own value, where Escape was only handing the keyboard back —
+                // which the window has done by the time this arrives. It holds
+                // a [`Drafts`] entry now, and that entry is what the row is
+                // drawn from for as long as it is there, so leaving it would
+                // make Escape the one gesture that cannot undo what it means
+                // to undo: the abandoned word would come back on every later
+                // publish of the page.
+                //
+                // Only this row's draft. Typing in one field and then in
+                // another is the case `Drafts` exists for, and giving up on
+                // the second is not giving up on the first.
+                let redraw = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    // Read before the pane is touched. The playlist line has
+                    // no setting behind it — the name is the whole request —
+                    // so this finds nothing there.
+                    let staged = browsing
+                        .pane
+                        .settings_owned()
+                        .and_then(|(_, page)| setting_at(page, index))
+                        .map(|setting| setting.id);
+                    let naming = match &mut browsing.pane {
+                        Pane::Playlists(page) if page.naming => {
+                            page.naming = false;
+                            true
+                        }
+                        _ => false,
+                    };
+                    naming || staged.is_some_and(|id| browsing.drafts.text.remove(&id).is_some())
+                };
+                if redraw {
+                    // And through `redraw_settings` rather than `publish_pane`,
+                    // because dropping the draft is only half of it. A field
+                    // that has been typed into has assigned its own `text`,
+                    // which is the end of the `item.value` binding that seeded
+                    // it, so rows that come back with the same shape are seated
+                    // into the field still showing the abandoned word: Escape
+                    // read as having done nothing, and Enter in that field
+                    // afterwards wrote the very word it had given up on. The
+                    // row has to be built again for the player's value to reach
+                    // the screen. Safe here, where a replacement is not
+                    // elsewhere: the window hands the keyboard back to itself
+                    // before this is sent, so there is no caret in the field
+                    // being destroyed.
+                    backend.redraw_settings();
+                }
+                continue;
+            }
+
+            Command::SettingDraft(index, text) => {
+                let mut browsing = backend.browsing.lock().unwrap();
+                let Some((owner, page_id, setting)) =
+                    browsing.pane.settings_owned().and_then(|(owner, page)| {
+                        setting_at(page, index)
+                            .map(|setting| (owner, page.page_id.clone(), setting.id))
+                    })
+                else {
+                    continue;
+                };
+                // A page of its own, so the rows it is about are its own.
+                if browsing.drafts.page != page_id || browsing.drafts.device != Some(owner) {
+                    browsing.drafts.page = page_id;
+                    browsing.drafts.device = Some(owner);
+                    browsing.drafts.text.clear();
+                }
+                browsing.drafts.text.insert(setting, text);
+                // And nothing else. Publishing here would replace the model
+                // and destroy the field these letters have just left, which is
+                // the very thing they left it to survive.
+                continue;
+            }
+
             Command::SettingEdit(index, edit) => {
                 // The naming line on the "add to playlist" list is a settings
                 // text row like any other, but there is no setting behind it
@@ -10126,6 +11006,16 @@ async fn run_commands(
                     continue;
                 }
 
+                // Whether the control that sent this is one that moved
+                // itself. A switch, a slider and a list all write their own
+                // property when they are used, and what they show afterwards
+                // is a claim about the player — false the moment the write
+                // fails, with nothing on the page to correct it. A text field
+                // is left exactly as it was typed instead: there the words are
+                // the user's to fix and send again, and taking them away is
+                // the loss F1 and F3 are about. See `settings_redraws`.
+                let claims = !matches!(edit, Edit::Text(_));
+
                 let value = match edit {
                     Edit::Toggle => setting.toggled(),
                     Edit::Choose(n) => setting.options.get(n).map(|o| o.name.clone()),
@@ -10149,6 +11039,46 @@ async fn run_commands(
                     ticket.wait().await;
                     match client.write_setting(&setting, &value).await {
                         Ok(()) => {
+                            // Whatever was held for this row is spent: the
+                            // player has the words now, and the page about to
+                            // be re-read is the place to read them back from.
+                            // Left staged, a name accepted a minute ago would
+                            // go on being drawn over whatever the player says
+                            // next. See [`Drafts`].
+                            //
+                            // Only if what is staged is still this page's, and
+                            // this player's, which is the same care the insert
+                            // takes: a setting id says nothing about whose
+                            // page it came from. Enter in one player's name
+                            // row and then, while the POST is out, a letter
+                            // into the next player's, and this reply arriving
+                            // afterwards would take the new letters away under
+                            // the same id — the loss `Drafts` is here to stop,
+                            // caused by the thing that clears it.
+                            {
+                                let mut browsing = backend.browsing.lock().unwrap();
+                                if browsing.drafts.device == Some(id)
+                                    && browsing.drafts.page == page.page_id
+                                {
+                                    browsing.drafts.text.remove(&setting.id);
+                                }
+                            }
+                            // And the page that comes back is owed to a
+                            // control that assigned its own value, so it goes
+                            // out as a replacement rather than be seated into
+                            // rows that may not have moved. The player is
+                            // under no obligation to answer with what it was
+                            // sent: it rounds the number the slider was
+                            // dropped on to the step it keeps, or it takes the
+                            // write and leaves the setting where it was. Then
+                            // the rows restate the last publish word for word,
+                            // and nothing short of this says the elements are
+                            // what is wrong. Only for the controls that speak
+                            // for the player; a field is left as it was typed,
+                            // for the reason on `claims`.
+                            if claims {
+                                backend.owe_settings_redraw();
+                            }
                             // Re-read rather than assume: a write can move more
                             // than the one value — turning tone controls on
                             // brings treble and bass to life — and only the
@@ -10158,7 +11088,12 @@ async fn run_commands(
                                 Step::Reload(id),
                             ));
                         }
-                        Err(e) => say(&backend.ui, format!("{}: {e}", setting.label())),
+                        Err(e) => {
+                            say(&backend.ui, format!("{}: {e}", setting.label()));
+                            if claims {
+                                backend.redraw_settings();
+                            }
+                        }
                     }
                 });
                 continue;
@@ -10683,10 +11618,17 @@ async fn run_commands(
             }
 
             Command::ClearRecent => {
-                backend.browsing.lock().unwrap().recent.clear();
-                // Emptied on disk too. A list that came back at the next
-                // startup would make "Clear" mean "until you restart".
-                tokio::task::spawn_blocking(|| searches::save(&[]));
+                {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.recent.clear();
+                    // Emptied on disk too, and under the same lock that
+                    // emptied it here. A list that came back at the next
+                    // startup would make "Clear" mean "until you restart", and
+                    // so would a search staged out of a list read before this
+                    // ran — see `remember_search` and the store's note on
+                    // order.
+                    searches::save(&browsing.recent);
+                }
                 backend.publish_browse();
                 continue;
             }
@@ -10890,8 +11832,13 @@ async fn run_commands(
                 let asking = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     if browsing.fetching_more {
+                        // Kept rather than queued: the page out may be the one
+                        // this ask wants, and then nothing more is needed. See
+                        // `more_wanted` for when it is not.
+                        browsing.more_wanted = true;
                         continue;
                     }
+                    browsing.more_wanted = false;
                     let era = browsing.era;
                     let jump = browsing.jumps;
                     let next = browsing
@@ -10938,8 +11885,22 @@ async fn run_commands(
                                 // asked for, and a jump has since replaced that
                                 // window with a different part of the same list.
                                 if browsing.era != era || browsing.jumps != jump {
+                                    // The window on screen now has nothing in
+                                    // flight, so an ask refused while this was
+                                    // out has no other chance of being served.
+                                    // See `more_wanted`.
+                                    let again = std::mem::take(&mut browsing.more_wanted);
+                                    drop(browsing);
+                                    if again {
+                                        let _ = backend.commands.send(Command::BrowseMore);
+                                    }
                                     return;
                                 }
+                                // Whatever was asked for while this was out is
+                                // answered by the rows about to go on: they
+                                // change the list's height, which is what asks
+                                // again when there is still more to come.
+                                browsing.more_wanted = false;
                                 let Some(crumb) = browsing.trail.last_mut() else {
                                     return;
                                 };
@@ -11009,13 +11970,39 @@ async fn run_commands(
                             // retrying blind is a loop nobody can see.
                             let mut browsing = backend.browsing.lock().unwrap();
                             browsing.fetching_more = false;
-                            if browsing.era == era
-                                && browsing.jumps == jump
-                                && let Some(crumb) = browsing.trail.last_mut()
-                            {
-                                crumb.screen.next = None;
+                            if browsing.era == era && browsing.jumps == jump {
+                                // The window that asked is still the window on
+                                // screen, and its cursor is going with this
+                                // failure, so there is nothing left to ask for.
+                                // Nothing is asked again here however long the
+                                // list was waiting: a re-ask against the list
+                                // that just refused is how the 94 requests
+                                // above happened. The rest of it waits for a
+                                // scroll.
+                                browsing.more_wanted = false;
+                                if let Some(crumb) = browsing.trail.last_mut() {
+                                    crumb.screen.next = None;
+                                }
+                                drop(browsing);
+                            } else {
+                                // A different window is on screen — a jump, or
+                                // a screen pushed while this was out — and it
+                                // has nothing in flight of its own, because
+                                // this was it. An ask refused while this was
+                                // out has no other chance of being served, and
+                                // it is not the loop the comment above guards
+                                // against: the next request is for another
+                                // window at another URL, and `more_wanted` is
+                                // already false if that one fails too, so it is
+                                // one more request rather than a spiral. The
+                                // same branch the page that arrived takes; see
+                                // `more_wanted`.
+                                let again = std::mem::take(&mut browsing.more_wanted);
+                                drop(browsing);
+                                if again {
+                                    let _ = backend.commands.send(Command::BrowseMore);
+                                }
                             }
-                            drop(browsing);
                             tracing::debug!(%id, "could not read {next}, so no more of it: {e}");
                         }
                     }
@@ -11239,12 +12226,12 @@ async fn run_commands(
                     });
                     continue;
                 }
-                // What the file can hold of this, worked out before the map
-                // takes it so there is something to say about it. The whole
+                // What became of this, worked out before the map takes the
+                // arrangement so there is something to say about it. The whole
                 // arrangement goes into the map either way: it is what was
                 // just asked for, and it holds for as long as the window is
                 // open whether or not it can be written down.
-                let kept = order::savable(&arranged.0, &arranged.1);
+                let outcome = order::outcome(&arranged.0, &arranged.1, order::sealed());
                 let saved = {
                     let mut orders = backend.orders.lock().unwrap();
                     orders.insert(arranged.0, arranged.1.clone());
@@ -11262,14 +12249,14 @@ async fn run_commands(
                 // saved when it was not is worse than it not lasting: the
                 // screen comes back the player's way at the next start with
                 // nothing to explain it.
-                say(
-                    &backend.ui,
-                    match kept {
-                        Some(rows) if rows == arranged.1 => "Home rearranged",
-                        Some(_) => "Home rearranged, but not all of it can be saved",
-                        None => "Home rearranged, but it cannot be saved",
-                    },
-                );
+                //
+                // The file itself can refuse for a reason that has nothing to
+                // do with the ids: a `screen-order` that will not read is kept
+                // for repair rather than overwritten, and a sealed store
+                // writes nothing for the rest of the run. That is the same
+                // broken promise by another route, so it is answered with the
+                // same words rather than left to the log.
+                say(&backend.ui, outcome);
                 continue;
             }
 
@@ -11508,9 +12495,26 @@ fn say(ui: &slint::Weak<AppWindow>, message: impl Into<String>) {
     let ui = ui.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui.upgrade() {
-            ui.set_status_line(message.into());
+            show_message(&ui, message);
         }
     });
+}
+
+/// Put a message in the toast, and say that it is a new one.
+///
+/// The count is the second half of it. The toast clears itself four seconds
+/// after the message went up, and its timer keeps running while one message
+/// replaces another — so without something that changes on every message the
+/// second one inherited whatever was left of the first one's four seconds,
+/// and a message that landed at 3.9s was read by nobody. The line cannot be
+/// that something: the same words twice in a row are two messages and one
+/// unchanged string.
+///
+/// Called with the window in hand, on the event-loop thread, the way
+/// `models_replaced` is.
+fn show_message(ui: &AppWindow, message: impl Into<String>) {
+    ui.set_status_line(message.into().into());
+    ui.set_messages_said(ui.get_messages_said().wrapping_add(1));
 }
 
 #[cfg(test)]
@@ -12136,10 +13140,14 @@ mod tests {
 
         match row {
             Some(row) => {
+                // A settings row presses through `setting-open`, whatever pane
+                // is drawn with settings rows — the alarms list is one — so
+                // the command is the row's own action and not a browse
+                // activation. What is under test is the number it carries.
                 row.invoke_accessible_default_action();
                 let sent = rx.try_recv();
                 assert!(
-                    matches!(sent, Ok(Command::BrowseActivate(at)) if at == NEW_ALARM),
+                    matches!(sent, Ok(Command::SettingAction(at)) if at == NEW_ALARM),
                     "a press on the last row must carry its own index, got {sent:?}"
                 );
             }
@@ -12169,6 +13177,1068 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Command::DialogPress(at)) if at == usize::MAX),
             "a dismissal must not read as pressing the first button"
+        );
+
+        // Clicking away from a question, which is the other way it is
+        // dismissed and the one a callback cannot stand in for: what broke it
+        // was the order the press is offered to the children of the scrim.
+        //
+        // The focus trap is declared last inside `Modal`, so it is in front of
+        // the dismissing area and covers the same whole veil — and a focus
+        // scope that takes the caret on click accepts the press that gave it
+        // to it, which ends the walk. The press never reached the area behind
+        // it, so the question stayed up; and the caret had moved off the safe
+        // button onto the trap, which answers every key but Escape and Tab, so
+        // Enter no longer answered the question either. One click did nothing
+        // and looked like the app ignoring it.
+        ui.window().set_size(slint::LogicalSize::new(1200.0, 800.0));
+        ui.set_dialog_title("Playing replaces Play Queue".into());
+        ui.set_dialog_body("Playing this will clear your existing queue.".into());
+        ui.set_dialog_buttons(ModelRc::new(VecModel::from(vec![
+            DialogButton {
+                index: 0,
+                label: "Replace".into(),
+                destructive: true,
+            },
+            DialogButton {
+                index: 1,
+                label: "Cancel".into(),
+                destructive: false,
+            },
+        ])));
+        ui.set_dialog_safe(1);
+        ui.set_dialog_open(true);
+
+        // The top-left corner: over the veil, and nowhere near the card, which
+        // the question draws in the middle.
+        let corner = slint::LogicalPosition::new(6.0, 6.0);
+        let button = slint::platform::PointerEventButton::Left;
+        for event in [
+            slint::platform::WindowEvent::PointerMoved { position: corner },
+            slint::platform::WindowEvent::PointerPressed {
+                position: corner,
+                button,
+            },
+            slint::platform::WindowEvent::PointerReleased {
+                position: corner,
+                button,
+            },
+        ] {
+            ui.window().dispatch_event(event);
+        }
+        let sent = rx.try_recv();
+        assert!(
+            matches!(sent, Ok(Command::DialogPress(at)) if at == usize::MAX),
+            "one click outside the card must answer the question, got {sent:?}"
+        );
+        ui.set_dialog_open(false);
+
+        // Typing into the two kinds of text row, which report differently on
+        // purpose.
+        //
+        // A field on one of the player's web forms has nowhere to keep a
+        // half-typed value but the page it is on, so it reports every letter:
+        // committing on Enter alone meant that typing a name and then reaching
+        // for the list beside it drew the form again from values that had
+        // never heard of what was typed, and the field came back empty. A
+        // settings row must not write one per letter, because every write
+        // there is a POST to the player — but the letters still have to leave
+        // the field, as a draft, because the field itself is destroyed
+        // whenever the page's rows are published again. See `Drafts`.
+        let rows = vec![
+            SettingItem {
+                index: 7,
+                label: "Network".into(),
+                control: "text".into(),
+                available: true,
+                as_typed: true,
+                ..Default::default()
+            },
+            SettingItem {
+                index: 8,
+                label: "Player name".into(),
+                control: "text".into(),
+                value: "Kitchen".into(),
+                available: true,
+                ..Default::default()
+            },
+        ];
+        ui.set_settings(ModelRc::new(VecModel::from(rows)));
+
+        let boxes = i_slint_backend_testing::ElementQuery::from_root(&ui)
+            .match_descendants()
+            .match_accessible_role(i_slint_backend_testing::AccessibleRole::TextInput)
+            .find_all();
+        // Told apart by what is in them: a settings row is drawn holding the
+        // player's own value, a form field is drawn empty.
+        let on_form = boxes
+            .iter()
+            .find(|field| field.accessible_value().is_none_or(|v| v.is_empty()));
+        let on_settings = boxes
+            .iter()
+            .find(|field| field.accessible_value().is_some_and(|v| v == "Kitchen"));
+
+        match (on_form, on_settings) {
+            (Some(on_form), Some(on_settings)) => {
+                on_form.set_accessible_value("wireless key");
+                let sent = rx.try_recv();
+                assert!(
+                    matches!(&sent, Ok(Command::SettingEdit(at, Edit::Text(text)))
+                        if *at == 7 && text == "wireless key"),
+                    "a form field must report what was typed without waiting for Enter, got {sent:?}"
+                );
+
+                on_settings.set_accessible_value("Kitchen speaker");
+                let sent = rx.try_recv();
+                assert!(
+                    matches!(&sent, Ok(Command::SettingDraft(at, text))
+                        if *at == 8 && text == "Kitchen speaker"),
+                    "a settings row must report what was typed without writing it, got {sent:?}"
+                );
+                assert!(
+                    !matches!(sent, Ok(Command::SettingEdit(..))),
+                    "and it must not be a write: one POST per letter is not a thing to send"
+                );
+            }
+            // Debug info is what the element query needs to find anything at
+            // all (see build.rs). Without it there is nothing to press, and a
+            // test that quietly passes on nothing is worse than one that says
+            // so.
+            _ => panic!(
+                "the two text rows were not found among {} boxes",
+                boxes.len()
+            ),
+        }
+
+        // The keys, which reach the window only through whatever holds the
+        // caret. Pressed as the window sees them: Slint sends a named key as
+        // its character, so Enter is "\n", Tab is "\t" and Escape is
+        // "\u{1b}".
+        let press = |text: &str| {
+            let text = slint::SharedString::from(text);
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        };
+        // What an event loop does between one press and the next: fire the
+        // timers that came due, run the `changed` handlers, and build
+        // whatever conditional block a property has just switched on. None of
+        // it happens on its own here, and the window's keys are held together
+        // by all three.
+        let settle = |ms: u64| {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+        };
+
+        // A browse screen with a jump bar, and a player to send the transport
+        // keys to. The address is TEST-NET-1 and nothing is sent to it: the
+        // commands are read off the channel above.
+        let player = "192.0.2.7:11000";
+        ui.set_in_settings(false);
+        ui.set_settings(ModelRc::new(VecModel::from(Vec::<SettingItem>::new())));
+        ui.set_browse_index(ModelRc::new(VecModel::from(vec![
+            slint::SharedString::from("A"),
+        ])));
+        let devices = |reachable| {
+            ModelRc::new(VecModel::from(vec![Device {
+                id: player.into(),
+                name: "Test player".into(),
+                reachable,
+                ..Default::default()
+            }]))
+        };
+        ui.set_devices(devices(true));
+        ui.set_selected(0);
+        settle(0);
+
+        // Everything the window has said so far, so that what a key sends can
+        // be told from what laying the list out sends on its own: the browse
+        // pane asks for another page whenever its viewport is measured, which
+        // happens the moment the tree is built.
+        let mut drained = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            drained.push(command);
+        }
+        drop(drained);
+
+        // Now Playing covers the browse list without taking the pane, so the
+        // letters and the page keys used to go on paging a list nobody could
+        // see.
+        ui.set_now_playing(true);
+        settle(0);
+        let paged = (ui.get_browse_page(), ui.get_browse_to_top());
+        press("a");
+        press("\u{F72D}");
+        press("\u{F729}");
+        assert_eq!(
+            (ui.get_browse_page(), ui.get_browse_to_top()),
+            paged,
+            "the page keys must not move a list that is behind Now Playing"
+        );
+        let mut jumped = false;
+        while let Ok(command) = rx.try_recv() {
+            jumped |= matches!(command, Command::BrowseJump(_));
+        }
+        assert!(
+            !jumped,
+            "a letter typed under Now Playing must not jump the list behind it"
+        );
+
+        ui.set_now_playing(false);
+        settle(0);
+        press("a");
+        press("\u{F729}");
+        assert_eq!(
+            ui.get_browse_to_top(),
+            paged.1 + 1,
+            "Home on a browse screen still goes to the top of the list"
+        );
+        let mut jumped = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::BrowseJump(key) = command {
+                jumped = Some(key);
+            }
+        }
+        assert_eq!(
+            jumped.as_deref(),
+            Some("a"),
+            "a letter on a browse screen still jumps the list"
+        );
+
+        // The space bar asks what the button beside the artwork asks. A
+        // player that is off the network — or rewriting its own firmware —
+        // is not one to send to.
+        ui.set_devices(devices(false));
+        settle(0);
+        press(" ");
+        let mut toggled = false;
+        while let Ok(command) = rx.try_recv() {
+            toggled |= matches!(command, Command::Player(_, Action::Toggle));
+        }
+        assert!(
+            !toggled,
+            "the space bar must not reach a player that cannot be reached"
+        );
+
+        ui.set_devices(devices(true));
+        settle(0);
+        press(" ");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::Player(id, Action::Toggle)) if id.to_string() == player),
+            "the space bar pauses a player that can hear it, got {sent:?}"
+        );
+
+        // A question, answered without a mouse. Nothing on one of these could
+        // take the caret at all before: the buttons had no focus scope, so
+        // the window's key handler passed everything but Escape on to a
+        // focused button that never existed.
+        ui.set_dialog_title("Playing replaces Play Queue".into());
+        ui.set_dialog_buttons(ModelRc::new(VecModel::from(vec![
+            DialogButton {
+                index: 0,
+                label: "Cancel".into(),
+                destructive: false,
+            },
+            DialogButton {
+                index: 1,
+                label: "Play now".into(),
+                destructive: true,
+            },
+        ])));
+        ui.set_dialog_safe(0);
+        ui.set_dialog_open(true);
+        settle(0);
+
+        press("a");
+        press(" ");
+        let mut through = false;
+        while let Ok(command) = rx.try_recv() {
+            through |= matches!(
+                command,
+                Command::BrowseJump(_) | Command::Player(_, Action::Toggle)
+            );
+        }
+        assert!(
+            !through,
+            "neither the jump bar nor the transport is reachable past a question"
+        );
+
+        press("\n");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::DialogPress(0))),
+            "a question opens on the answer that discards nothing, got {sent:?}"
+        );
+
+        press("\t");
+        settle(0);
+        press("\n");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::DialogPress(1))),
+            "Tab moves to the next answer and Enter presses it, got {sent:?}"
+        );
+
+        // And round, rather than out into the controls under the scrim.
+        press("\t");
+        settle(0);
+        press("\n");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::DialogPress(0))),
+            "Tab off the last answer comes back to the first, got {sent:?}"
+        );
+
+        press("\u{1b}");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::DialogPress(at)) if *at == usize::MAX),
+            "Escape dismisses the player's question, got {sent:?}"
+        );
+        ui.set_dialog_open(false);
+        settle(0);
+
+        // The firmware question, which refuses Escape on purpose and so has
+        // to be answerable some other way. Before the buttons could be
+        // focused there was none.
+        ui.set_confirm_upgrade("Kitchen".into());
+        settle(0);
+        press("\u{1b}");
+        let mut answered = false;
+        while let Ok(command) = rx.try_recv() {
+            answered |= matches!(command, Command::UpgradeAnswer(_));
+        }
+        assert!(!answered, "Escape must not answer the firmware question");
+        assert_eq!(
+            ui.get_confirm_upgrade(),
+            "Kitchen",
+            "and must not take it down either"
+        );
+
+        press("\n");
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::UpgradeAnswer(false))),
+            "it opens on the answer that installs nothing, got {sent:?}"
+        );
+        assert_eq!(ui.get_confirm_upgrade(), "");
+        settle(0);
+
+        // Two messages in a row. The second used to inherit what was left of
+        // the first one's four seconds.
+        show_message(&ui, "Added to Favourites");
+        settle(0);
+        settle(3500);
+        assert_eq!(ui.get_status_line(), "Added to Favourites");
+
+        show_message(&ui, "Saved to Playlists");
+        settle(0);
+        settle(600);
+        assert_eq!(
+            ui.get_status_line(),
+            "Saved to Playlists",
+            "a second message gets its own four seconds, not the tail of the first"
+        );
+        settle(3600);
+        assert_eq!(ui.get_status_line(), "", "and is then cleared");
+
+        // Two players upgrading, the second starting at the stage the first
+        // was already on: the name changes and the stage does not.
+        ui.set_upgrading_player("Kitchen".into());
+        ui.set_upgrading_stage("Downloading".into());
+        settle(0);
+        ui.set_upgrading_player("Study".into());
+        // Past the strip's own growing animation: an element with no height
+        // yet is not on screen, and the query does not look at what is not.
+        settle(600);
+        let strip = i_slint_backend_testing::ElementQuery::from_root(&ui)
+            .match_descendants()
+            .match_predicate(|e| {
+                e.accessible_label()
+                    .is_some_and(|l| l == "Study — Downloading")
+            })
+            .find_first();
+        assert!(
+            strip.is_some(),
+            "the upgrade strip must name the player that is upgrading now"
+        );
+
+        // The day chips on the alarm editor, which were seven anonymous hit
+        // targets: no role, no name, no state, and a letter drawn in them that
+        // names four of the seven ambiguously even if it were read out.
+        let words = |list: &[&str]| {
+            ModelRc::new(VecModel::from(
+                list.iter()
+                    .map(|w| slint::SharedString::from(*w))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        ui.set_alarm_editing(true);
+        ui.set_alarm_letters(words(&DAY_LETTERS));
+        ui.set_alarm_day_names(words(&DAY_NAMES));
+        ui.set_alarm_days(ModelRc::new(VecModel::from(vec![
+            false, false, false, true, false, false, false,
+        ])));
+        settle(0);
+
+        let chip = |name: &str| {
+            let name = name.to_owned();
+            i_slint_backend_testing::ElementQuery::from_root(&ui)
+                .match_descendants()
+                .match_predicate(move |e| e.accessible_label().is_some_and(|l| l == name))
+                .find_first()
+        };
+        match (chip("Wednesday"), chip("Sunday")) {
+            (Some(wednesday), Some(sunday)) => {
+                assert_eq!(
+                    wednesday.accessible_role(),
+                    Some(i_slint_backend_testing::AccessibleRole::Checkbox),
+                    "a day is on or off, which is what a checkbox is"
+                );
+                assert_eq!(
+                    wednesday.accessible_checked(),
+                    Some(true),
+                    "the fill is the only thing that said a day was set"
+                );
+                assert_eq!(sunday.accessible_checked(), Some(false));
+
+                wednesday.invoke_accessible_default_action();
+                let sent = rx.try_recv();
+                assert!(
+                    matches!(&sent, Ok(Command::AlarmEdit(AlarmField::Day(3)))),
+                    "pressing a chip toggles that day, got {sent:?}"
+                );
+            }
+            _ => panic!("the day chips are not named after the days"),
+        }
+
+        // And the chevrons beside the time, which are only "up" and "down" to
+        // somebody who can see them.
+        assert!(
+            chip("An hour later").is_some() && chip("An hour earlier").is_some(),
+            "the time field's chevrons say what they do to the field"
+        );
+        ui.set_alarm_editing(false);
+        settle(0);
+
+        // Now Playing in a short window. The sleeve used to be sized as though
+        // nothing were drawn under the title and the artist, so the badge, the
+        // stream-format line and the row of track actions were pushed off the
+        // bottom of a pane that clips.
+        ui.window().set_size(slint::LogicalSize::new(1100.0, 560.0));
+        ui.set_quality("MQA".into());
+        ui.set_stream_format("FLAC 96kHz/24bit".into());
+        ui.set_track_actions(ModelRc::new(VecModel::from(vec![TrackAction {
+            name: "love".into(),
+            label: "Love".into(),
+            on: false,
+        }])));
+        ui.set_now_playing(true);
+        settle(600);
+
+        let loved = i_slint_backend_testing::ElementQuery::from_root(&ui)
+            .match_descendants()
+            .match_predicate(|e| e.accessible_label().is_some_and(|l| l == "Love"))
+            .find_first()
+            .expect("the track action on the Now Playing sleeve");
+        // The pane is the window less the transport strip along its bottom.
+        let pane = ui.window().size().height as f32 - 88.0;
+        let bottom = loved.absolute_position().y + loved.size().height;
+        assert!(
+            bottom <= pane,
+            "the track actions are drawn inside the Now Playing pane, not past its \
+             bottom edge: {bottom} in a pane {pane} tall"
+        );
+
+        ui.set_now_playing(false);
+        settle(600);
+
+        // A long player name used to push the queue toggle out of the fixed
+        // width of the transport bar, so the one control that brings the queue
+        // back could not be pressed.
+        let toggle = || {
+            i_slint_backend_testing::ElementQuery::from_root(&ui)
+                .match_descendants()
+                .match_predicate(|e| {
+                    e.accessible_label().is_some_and(|l| {
+                        l.starts_with("Show the play queue") || l.starts_with("Hide the play queue")
+                    })
+                })
+                .find_first()
+                .map(|e| e.absolute_position().x + e.size().width)
+        };
+        let short = toggle().expect("the queue toggle");
+        ui.set_devices(ModelRc::new(VecModel::from(vec![Device {
+            id: player.into(),
+            name: "Living room (Powernode) upstairs by the window".into(),
+            reachable: true,
+            ..Default::default()
+        }])));
+        settle(0);
+        // Gone from the query means gone from the window: an element outside
+        // everything that clips it is not visible, and the bar clips.
+        let long = toggle().expect("a long player name pushed the queue toggle off the bar");
+        assert_eq!(
+            long, short,
+            "a long player name elides rather than moving the queue toggle"
+        );
+
+        // The line that asks for a playlist name, which is the one field in
+        // the window that is neither in the pane nor above it. The queue is a
+        // column drawn *beside* the pane, so a screen finishing its fetch and
+        // a page restating its rows both happen behind a name being typed —
+        // and the whole column can be taken away by one press while the caret
+        // is still in the line.
+        //
+        // Cleared first because the two flags that guard the other fields are
+        // set by the typing above and are answered by `publish_pane`, which
+        // has no backend to run it here: left true they would stand in for the
+        // guard under test and it would pass on nothing.
+        ui.set_station_typing(false);
+        ui.set_settings_typing(false);
+        let by_label = |label: &'static str| {
+            i_slint_backend_testing::ElementQuery::from_root(&ui)
+                .match_descendants()
+                .match_predicate(move |e| e.accessible_label().is_some_and(|l| l == label))
+                .find_first()
+        };
+        // Mode 3 is the button that asks for a name rather than sending
+        // anything; the label is the player's own and any word does here.
+        ui.set_queue_buttons(ModelRc::new(VecModel::from(vec![QueueButton {
+            label: "Save to a playlist".into(),
+            mode: 3,
+            ..Default::default()
+        }])));
+        settle(0);
+        by_label("Save to a playlist")
+            .expect("the queue's Save button")
+            .invoke_accessible_default_action();
+        settle(0);
+        assert!(
+            ui.get_queue_naming(),
+            "the line reports the caret as it appears: a change tracker never \
+             fires on creation, so the field has to say so itself"
+        );
+
+        // Two publishes behind the column, which is what the guard is for.
+        // A screen arriving moves `arrived`, whose handler claims the keyboard
+        // unconditionally; a page restating its rows moves `models-replaced`,
+        // which is watched separately because the title and the pane are the
+        // same on either side of it.
+        ui.set_browse_title("Artists".into());
+        settle(0);
+        ui.set_models_replaced(ui.get_models_replaced() + 1);
+        settle(0);
+        assert!(
+            ui.get_queue_naming(),
+            "neither a screen arriving nor a model replaced behind the column \
+             may take the caret out of a half-typed name"
+        );
+        while rx.try_recv().is_ok() {}
+        press(" ");
+        let mut reached = false;
+        while let Ok(command) = rx.try_recv() {
+            reached |= matches!(command, Command::Player(_, Action::Toggle));
+        }
+        assert!(
+            !reached,
+            "the space in \"Road Trip\" is part of the name, not the transport"
+        );
+
+        // Half of a name, so the line can be picked out of the window by what
+        // is in it and so there is a word for the letters after the question
+        // to join. The space above went into it too.
+        for letter in ["R", "o", "a", "d"] {
+            press(letter);
+        }
+        settle(0);
+        let named = || {
+            i_slint_backend_testing::ElementQuery::from_root(&ui)
+                .match_descendants()
+                .match_accessible_role(i_slint_backend_testing::AccessibleRole::TextInput)
+                .find_all()
+                .into_iter()
+                .filter_map(|field| field.accessible_value())
+                .find(|value| value.contains("Road"))
+        };
+        assert!(
+            named().is_some(),
+            "the letters have to reach the line before there is anything to \
+             take away from it"
+        );
+
+        // A question drawn over the window while that name is half typed. The
+        // queue's own rows stay visible while naming — only the button rows go
+        // — so a row's menu button is the commonest way in, and a dialog or an
+        // update notice arriving mid-word is the same thing. The card takes the
+        // keyboard from above itself, so the line loses the caret without
+        // anything having finished with it.
+        ui.set_queue_menu_open(true);
+        // Given the length of the fade the card sits behind: its contents are
+        // kept under an `if` on the opacity, so nothing takes the keyboard
+        // until the animation has started moving.
+        settle(200);
+        assert!(
+            ui.get_queue_naming(),
+            "a question borrowing the keyboard is not the line being done with: \
+             the line is still on screen and still what the next letter is for"
+        );
+
+        // And the question going again. Nothing else will put the caret back:
+        // the guard that keeps the window from claiming the keys is the flag
+        // above, and the line was never destroyed for anything else to notice.
+        ui.set_queue_menu_open(false);
+        settle(200);
+        assert!(
+            ui.get_queue_naming(),
+            "the line is still being typed into once the question has gone"
+        );
+        while rx.try_recv().is_ok() {}
+        press(" ");
+        press("T");
+        settle(0);
+        let mut after = false;
+        while let Ok(command) = rx.try_recv() {
+            after |= matches!(command, Command::Player(_, Action::Toggle));
+        }
+        assert!(
+            !after,
+            "the space in \"Road Trip\" is still part of the name after a \
+             question has come and gone"
+        );
+        assert!(
+            named().is_some_and(|value| value.ends_with("Road T")),
+            "and the letters after it are too: the caret goes back to the line \
+             the question borrowed it from, not to nothing at all"
+        );
+
+        // And the way out that takes the column with it. The toggle beside the
+        // volume is an IconButton — no focus scope, so the press does not move
+        // the caret first — and nothing the window watches has moved by the
+        // time the line is destroyed, so the keyboard has to be handed back
+        // here or Slint is left with nothing focused at all.
+        by_label("Hide the play queue")
+            .expect("the queue toggle")
+            .invoke_accessible_default_action();
+        settle(0);
+        assert!(
+            !ui.get_queue_shown() && !ui.get_queue_naming(),
+            "the column goes, and the flag that suppresses the handback must \
+             not outlive the line it was about"
+        );
+        while rx.try_recv().is_ok() {}
+        press(" ");
+        let mut toggled = false;
+        while let Ok(command) = rx.try_recv() {
+            toggled |= matches!(command, Command::Player(_, Action::Toggle));
+        }
+        assert!(
+            toggled,
+            "the keys are the window's again once the line is gone: without \
+             the handback the space bar, the letters and Escape are all dead \
+             until something is clicked"
+        );
+
+        // And the other half of keeping a field alive: rows that have not
+        // changed shape are seated into the model on screen rather than
+        // replacing it, so the caret is never destroyed to begin with.
+        rows_are_seated_rather_than_replaced(&ui);
+        // And the rows that really are replaced, where the keyboard has to be
+        // handed back because the field holding it has gone.
+        a_replaced_settings_page_gives_the_keyboard_back(&ui, &mut rx);
+        // And the box that a question must not take a half-typed query from.
+        a_question_does_not_select_a_half_typed_query(&ui);
+    }
+
+    /// Rows whose shape has not moved are seated into the model on screen.
+    ///
+    /// The window hands the keyboard back to itself whenever a model the caret
+    /// could have been in is replaced, because a replaced model destroys every
+    /// row drawn from it and a destroyed row takes the caret with it. That is
+    /// right when rows really have gone, and ruinous when they have not: a
+    /// settings page on a playing player is published again on every status
+    /// tick, and the letters staged for a text row are part of what the
+    /// fingerprint is taken over, so the first letter typed into Player name
+    /// used to make every tick a replacement — and the rest of the word went
+    /// to the window's own shortcuts, where space pauses the music.
+    ///
+    /// Called from the window test above rather than being one of its own: the
+    /// testing backend is installed once per thread, and `cargo test --
+    /// --test-threads=1` runs every test on the same one.
+    fn rows_are_seated_rather_than_replaced(ui: &AppWindow) {
+        let page = |name: &str, extra: &[SettingItem]| {
+            let mut rows = vec![
+                SettingItem {
+                    index: 0,
+                    label: "Player name".into(),
+                    control: "text".into(),
+                    value: name.into(),
+                    available: true,
+                    ..Default::default()
+                },
+                SettingItem {
+                    index: 1,
+                    label: "Tone Controls".into(),
+                    control: "boolean".into(),
+                    available: true,
+                    ..Default::default()
+                },
+            ];
+            rows.extend_from_slice(extra);
+            rows
+        };
+
+        // The first page has nothing to seat into, so it is a replacement.
+        assert!(seat_settings(ui, page("Kitchen", &[]), false));
+        let replaced = ui.get_models_replaced();
+
+        // A letter typed into the name, which is what the status tick then
+        // publishes back. The same rows carrying a different word: no element
+        // has gone, so nothing is destroyed and nothing is handed back.
+        assert!(!seat_settings(ui, page("Larder", &[]), false));
+        assert_eq!(
+            ui.get_models_replaced(),
+            replaced,
+            "a word changing must not replace the field it is being typed into"
+        );
+        assert_eq!(
+            ui.get_settings().row_data(0).map(|row| row.value),
+            Some("Larder".into()),
+            "and the word is on screen"
+        );
+
+        // A write that brought another row to life. That row was not there to
+        // be seated into, so this is a replacement and says so — which is
+        // exactly when the window has to take the keyboard back.
+        let brought = SettingItem {
+            index: 2,
+            label: "Treble".into(),
+            control: "range".into(),
+            available: true,
+            ..Default::default()
+        };
+        assert!(seat_settings(ui, page("Larder", &[brought]), false));
+        assert_eq!(ui.get_models_replaced(), replaced.wrapping_add(1));
+
+        // And a row that keeps its place but changes what it carries: the
+        // control decides which elements exist, so this is a replacement too.
+        let mut swapped = page("Larder", &[]);
+        swapped[0].control = "list".into();
+        assert!(seat_settings(ui, swapped, false));
+        assert_eq!(ui.get_models_replaced(), replaced.wrapping_add(2));
+
+        // And the value a control writes for itself, which is shape for the
+        // same reason the control is: a Slider that has been dragged no longer
+        // reads `item.number`, so seating a different number into its row
+        // moves the text beside the knob and leaves the knob behind. Only
+        // building the element again re-establishes the binding.
+        let knob = |at: f32| SettingItem {
+            index: 2,
+            label: "Treble".into(),
+            control: "range".into(),
+            number: at,
+            maximum: 10.0,
+            available: true,
+            ..Default::default()
+        };
+        assert!(seat_settings(ui, page("Larder", &[knob(6.0)]), false));
+        let moved = ui.get_models_replaced();
+        assert!(!seat_settings(ui, page("Larder", &[knob(6.0)]), false));
+        assert_eq!(
+            ui.get_models_replaced(),
+            moved,
+            "a page republished unchanged must still not replace anything"
+        );
+
+        // The write succeeded, the page was re-read, and the player answered
+        // with a number of its own — it quantises what it is sent. That
+        // publish goes through the `Ok` arm, which bumps nothing, so the rows
+        // are all there is to decide on.
+        assert!(seat_settings(ui, page("Larder", &[knob(5.0)]), false));
+        assert_eq!(
+            ui.get_models_replaced(),
+            moved.wrapping_add(1),
+            "a number the player restates has to reach the knob, not only the \
+             text beside it"
+        );
+
+        // The same for a Switch, where the player is the one that moved it:
+        // two settings it treats as exclusive, so turning one on turns the
+        // other off and the re-read says so. The knob row goes first, which is
+        // a replacement on its own count.
+        assert!(seat_settings(ui, page("Larder", &[]), false));
+        let flipped = ui.get_models_replaced();
+        let mut exclusive = page("Larder", &[]);
+        exclusive[1].on = true;
+        assert!(seat_settings(ui, exclusive, false));
+        assert_eq!(
+            ui.get_models_replaced(),
+            flipped.wrapping_add(1),
+            "a switch the player moved must not go on reading where it was left"
+        );
+
+        // Back to a page with the name field on it, so that what follows is
+        // decided by the caller rather than by the shape.
+        assert!(seat_settings(ui, page("Kitchen", &[]), false));
+        let replaced = ui.get_models_replaced();
+
+        // And the publish that exists to overrule a control rather than to
+        // report the player, on the row where it is hardest to see.
+        //
+        // A LineEdit assigns its own `text` from the first letter typed into
+        // it, which is the end of the `text: root.item.value` binding that
+        // seeded it — the same mechanism as the Switch, and why Escape needs a
+        // replacement and not merely a publish. A refused write and an
+        // abandoned draft both leave every row exactly where it was, so
+        // nothing about the rows can tell this apart from the tick above.
+        //
+        // Drawn rather than only in the model, because the binding this is
+        // about lives in the element: the pane was put away by the keyboard
+        // section of the test above, so it goes back up first.
+        ui.set_in_settings(true);
+        let settle = || {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(0));
+        };
+        settle();
+        let field = || {
+            i_slint_backend_testing::ElementQuery::from_root(ui)
+                .match_descendants()
+                .match_accessible_role(i_slint_backend_testing::AccessibleRole::TextInput)
+                .find_all()
+                .into_iter()
+                .find(|field| {
+                    field
+                        .accessible_value()
+                        .is_some_and(|value| value == "Kitchen" || value == "Larder")
+                })
+        };
+        let Some(typed_into) = field() else {
+            panic!("the name row's field was not found")
+        };
+        typed_into.set_accessible_value("Larder");
+        assert_eq!(
+            typed_into.accessible_value().as_deref(),
+            Some("Larder"),
+            "the field holds what was typed into it"
+        );
+
+        // Escape's publish: the same rows, carrying the player's own name
+        // again. Seated, it cannot reach the field at all.
+        assert!(!seat_settings(ui, page("Kitchen", &[]), false));
+        settle();
+        assert_eq!(
+            typed_into.accessible_value().as_deref(),
+            Some("Larder"),
+            "seating cannot reach a field whose binding the typing removed"
+        );
+        assert!(seat_settings(ui, page("Kitchen", &[]), true));
+        settle();
+        assert_eq!(
+            ui.get_models_replaced(),
+            replaced.wrapping_add(1),
+            "a rebuild replaces the model although no row has moved"
+        );
+        assert_eq!(
+            field()
+                .and_then(|field| field.accessible_value())
+                .as_deref(),
+            Some("Kitchen"),
+            "and the rebuilt row is drawn from the player's value once more"
+        );
+    }
+
+    /// The keyboard comes back to the window when the field holding it is
+    /// destroyed.
+    ///
+    /// `settings-typing` says a settings row's field has the caret, and the
+    /// window asks it before claiming the keys, on the same argument that
+    /// keeps them out of the boxes above My Stations: a field that is still
+    /// there is where the next letter is meant to go. But a settings field is
+    /// not still there — the only thing that replaces the settings model is
+    /// the publish that destroys every row drawn from it — so the flag stood
+    /// true at exactly the moment it could protect nothing, and suppressed the
+    /// handback on the one replacement that always needs it. Slint was then
+    /// left with no focused item at all: the space bar, the letters and Escape
+    /// were dead until something was clicked.
+    ///
+    /// Called from the window test above, for the reason given on the function
+    /// before it.
+    fn a_replaced_settings_page_gives_the_keyboard_back(
+        ui: &AppWindow,
+        rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) {
+        let settle = || {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(0));
+        };
+        let press = |text: &str| {
+            let text = slint::SharedString::from(text);
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        };
+
+        // A page with a field on it, and whatever else the write brings to
+        // life.
+        let page = |extra: &[SettingItem]| {
+            let mut rows = vec![SettingItem {
+                index: 0,
+                label: "Player name".into(),
+                control: "text".into(),
+                value: "Kitchen".into(),
+                available: true,
+                ..Default::default()
+            }];
+            rows.extend_from_slice(extra);
+            rows
+        };
+        ui.set_in_settings(true);
+        ui.set_settings_typing(false);
+        seat_settings(ui, page(&[]), true);
+        settle();
+
+        // The caret put in the field by clicking it, which is how the row
+        // comes to report one: the field says so when it takes the focus, and
+        // nothing else ever sets the flag.
+        let field = i_slint_backend_testing::ElementQuery::from_root(ui)
+            .match_descendants()
+            .match_accessible_role(i_slint_backend_testing::AccessibleRole::TextInput)
+            .find_all()
+            .into_iter()
+            .find(|field| {
+                field
+                    .accessible_value()
+                    .is_some_and(|value| value == "Kitchen")
+            })
+            .expect("the name row's field");
+        let at = slint::LogicalPosition::new(
+            field.absolute_position().x + field.size().width / 2.0,
+            field.absolute_position().y + field.size().height / 2.0,
+        );
+        let button = slint::platform::PointerEventButton::Left;
+        for event in [
+            slint::platform::WindowEvent::PointerMoved { position: at },
+            slint::platform::WindowEvent::PointerPressed {
+                position: at,
+                button,
+            },
+            slint::platform::WindowEvent::PointerReleased {
+                position: at,
+                button,
+            },
+        ] {
+            ui.window().dispatch_event(event);
+        }
+        settle();
+        assert!(
+            ui.get_settings_typing(),
+            "the field reports the caret as it arrives: a row that is being \
+             typed into is not one to take the keyboard from"
+        );
+
+        // And the write that succeeded, answered by a page with a row on it
+        // that was not there before. Every field goes with the model, the one
+        // holding the caret among them.
+        let brought = SettingItem {
+            index: 1,
+            label: "Treble".into(),
+            control: "range".into(),
+            maximum: 10.0,
+            available: true,
+            ..Default::default()
+        };
+        assert!(seat_settings(ui, page(&[brought]), false));
+        settle();
+        assert!(
+            !ui.get_settings_typing(),
+            "a field that has been destroyed cannot be where the next letter \
+             is meant to go"
+        );
+
+        while rx.try_recv().is_ok() {}
+        press(" ");
+        let mut toggled = false;
+        while let Ok(command) = rx.try_recv() {
+            toggled |= matches!(command, Command::Player(_, Action::Toggle));
+        }
+        assert!(
+            toggled,
+            "the keys are the window's again once the rows are gone: without \
+             the handback the space bar, the letters and Escape are all dead \
+             until something is clicked"
+        );
+    }
+
+    /// A question borrows the keyboard from the search box; it does not empty
+    /// it.
+    ///
+    /// The box was drawn on the same terms the keys are gated by, and a
+    /// question is one of them — so any question destroyed the whole block.
+    /// When it went the block was built again, and its `init` selects what it
+    /// finds: a query half typed came back selected whole, and the next letter
+    /// replaced all of it and searched for that one letter. Which is the loss
+    /// `resume-focus` was written for, on the box its own comment names.
+    ///
+    /// Called from the window test above, for the reason given two functions
+    /// up.
+    fn a_question_does_not_select_a_half_typed_query(ui: &AppWindow) {
+        let settle = |ms: u64| {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+        };
+        let press = |text: &str| {
+            let text = slint::SharedString::from(text);
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        };
+
+        // The search screen: the player puts a box on that one and nowhere
+        // else.
+        ui.set_in_settings(false);
+        ui.set_in_stations(false);
+        ui.set_now_playing(false);
+        ui.set_browse_query("".into());
+        ui.set_browse_has_search(true);
+        settle(0);
+
+        // Arriving on it means wanting to search, so the box takes the caret
+        // as it is built and the letters go into it.
+        for letter in ["b", "e", "a", "t"] {
+            press(letter);
+        }
+        settle(0);
+        assert_eq!(
+            ui.get_browse_query().as_str(),
+            "beat",
+            "the letters have to reach the box before there is anything to \
+             take away from it"
+        );
+
+        // A question over the screen. The queue row's menu is the commonest
+        // way in; a dialog or an update notice arriving on its own is the
+        // same thing. The card takes the keyboard from above itself, so the
+        // box loses the caret without anything having finished with it.
+        ui.set_queue_menu_open(true);
+        // Given the length of the fade the card sits behind, as the playlist
+        // name line's own section above is.
+        settle(200);
+        assert!(
+            ui.get_browse_typing(),
+            "a question borrowing the keyboard is not the box being done with: \
+             it is still on screen and still what the next letter is for"
+        );
+
+        ui.set_queue_menu_open(false);
+        settle(200);
+        press("l");
+        settle(0);
+        assert_eq!(
+            ui.get_browse_query().as_str(),
+            "beatl",
+            "the caret goes back where the question borrowed it from, and what \
+             was being typed is a word rather than a query to be replaced"
         );
     }
 
@@ -12217,6 +14287,50 @@ mod tests {
             "/Play?url=Capture%3Abluez%3Abluetooth",
             bluos::screen::ActionKind::Browse
         )));
+    }
+
+    /// The picker's list is as tall as the cards in it, not as tall as their
+    /// positions suggest.
+    ///
+    /// The card is 96px without its badge row and 130px with it, and the list
+    /// has a fixed height because a `ListView` has no other kind. Sizing it as
+    /// "the selected card plus the rest badged" reads the selected row as the
+    /// only one that can be short, which is false of two of the three things
+    /// that put a badge on a card.
+    #[test]
+    fn the_selected_player_wears_a_badge_as_readily_as_any_other() {
+        let card = |role: &str, upgrading: bool, groupable: bool| Device {
+            role: role.into(),
+            upgrading,
+            groupable,
+            ..Default::default()
+        };
+
+        // The ordinary shape, and the one the positional sum was written for:
+        // the selected player is first, plain, and grouping is offered against
+        // the other.
+        assert_eq!(badged_cards(&[card("", false, false)]), 0);
+        assert_eq!(
+            badged_cards(&[card("", false, false), card("", false, true)]),
+            1
+        );
+
+        // Grouped. The selected player leads, so `publish` gives it a role and
+        // the card draws the badge and the Ungroup button under it. Both cards
+        // are 130px; the old sum asked for 96 + 130 and cut 34px off the
+        // bottom of the list, which is where the button was.
+        assert_eq!(
+            badged_cards(&[
+                card("Leading 1 player", false, false),
+                card("", false, true)
+            ]),
+            2
+        );
+
+        // And one player, alone, rewriting its own firmware: the only card
+        // there is, and it is the tall one.
+        assert_eq!(badged_cards(&[card("", true, false)]), 1);
+        assert_eq!(badged_cards(&[card("Following Kitchen", false, false)]), 1);
     }
 
     /// The one string on the alarms list that is not the player's wording.
@@ -12940,6 +15054,8 @@ mod selection_tests {
             sent_queue: Arc::new(AtomicU64::new(0)),
             sent_players: Arc::new(AtomicU64::new(0)),
             sent_settings: Arc::new(AtomicU64::new(0)),
+            settings_redraws: Arc::new(AtomicU64::new(0)),
+            seated_redraws: Arc::new(AtomicU64::new(0)),
             told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
             update_offer: Arc::new(Mutex::new(None)),
             sent_browse: Arc::new(AtomicU64::new(0)),
@@ -13246,6 +15362,283 @@ mod selection_tests {
   </setting>
 </settings>"#;
 
+    /// A name to type into and a switch beside it, which is the shape of the
+    /// page where typing was lost: the player-name page.
+    const NAME_AND_SWITCH: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="name" name="name" displayName="Player name" url="/name_setting" class="text" value="Kitchen"/>
+  <setting id="eq-switch" name="eq-switch" displayName="Tone Controls" url="/alsa_setting" class="boolean" value="OFF"/>
+</settings>"#;
+
+    /// The rows the settings pane would be drawn from, built the way
+    /// [`Backend::publish_settings`] builds them.
+    ///
+    /// There is no window in these tests, so this is where a published value
+    /// can be read: `send_settings` hands its rows to the event loop and keeps
+    /// only a fingerprint of them.
+    fn settings_rows(backend: &Backend) -> Vec<SettingData> {
+        let browsing = backend.browsing.lock().unwrap();
+        let Some((owner, page)) = browsing.pane.settings_owned() else {
+            return Vec::new();
+        };
+        let drafts = browsing.drafts.on(owner, page).cloned().unwrap_or_default();
+        let mut rows = Vec::new();
+        let mut index = 0;
+        walk_settings(&page.entries, page, None, &drafts, &mut rows, &mut index);
+        rows
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_typed_into_a_settings_row_survives_the_row_beside_it() {
+        let (backend, player, _second) = two_players().await;
+        player.serve("/Settings", NAME_AND_SWITCH);
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+
+        // Typed, not committed. A settings row writes on Enter — one POST per
+        // letter is not a thing to send — so these characters are the app's to
+        // keep until then.
+        let _ = backend
+            .commands
+            .send(Command::SettingDraft(0, "Larder".to_owned()));
+        until("the name to be held", || {
+            settings_rows(&backend)
+                .first()
+                .is_some_and(|row| row.value == "Larder")
+        })
+        .await;
+        assert_eq!(
+            asked(&player, "/name_setting"),
+            0,
+            "and nothing of it has gone to the player"
+        );
+
+        // The switch beside it, on a route the player does not have. The
+        // refusal puts the controls back where the player has them, which
+        // rebuilds every row on the page — and used to rebuild the field with
+        // the player's own name in it, so the typing was gone with no warning.
+        let _ = backend.commands.send(Command::SettingEdit(1, Edit::Toggle));
+        until("the failed write", || asked(&player, "/alsa_setting") == 1).await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            settings_rows(&backend)
+                .first()
+                .map(|row| row.value.as_str()),
+            Some("Larder"),
+            "the half-typed name comes back with the rows, not the player's"
+        );
+
+        // Enter sends it, and once it is sent the row follows the player
+        // again: what is held is only ever what has not been said yet.
+        player.serve("/name_setting", "");
+        let _ = backend
+            .commands
+            .send(Command::SettingEdit(0, Edit::Text("Larder".to_owned())));
+        until("the write", || asked(&player, "/name_setting") == 1).await;
+        until("the page to be read again", || {
+            settings_rows(&backend)
+                .first()
+                .is_some_and(|row| row.value == "Kitchen")
+        })
+        .await;
+    }
+
+    /// Two text rows on one page, so that giving up on one is told apart from
+    /// giving up on the page.
+    const TWO_NAMES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="name" name="name" displayName="Player name" url="/name_setting" class="text" value="Kitchen"/>
+  <setting id="group" name="group" displayName="Group name" url="/group_setting" class="text" value="Downstairs"/>
+</settings>"#;
+
+    /// Leaving the page throws away what was typed on it and never sent.
+    ///
+    /// A draft is the letters on their way out of a field that is about to be
+    /// destroyed, and it is worth exactly as long as that field. Kept past it,
+    /// it comes back the next time the page is opened and is seated over the
+    /// player's own value — so the row reads a name the player never took,
+    /// with nothing on screen saying it is unsent, and Enter in that field
+    /// later writes the name that was given up on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_draft_does_not_outlive_the_page_it_was_typed_on() {
+        let (backend, player, _second) = two_players().await;
+        player.serve("/Settings", NAME_AND_SWITCH);
+        choose(&backend, &player).await;
+        let open = || async {
+            let _ = backend
+                .commands
+                .send(Command::OpenSettings(None, Step::Root));
+            until("the settings", || {
+                settings_owner(&backend) == Some(player.id())
+            })
+            .await;
+        };
+        open().await;
+
+        let _ = backend
+            .commands
+            .send(Command::SettingDraft(0, "Larder".to_owned()));
+        until("the name to be held", || {
+            settings_rows(&backend)
+                .first()
+                .is_some_and(|row| row.value == "Larder")
+        })
+        .await;
+
+        // Out of the pane, which is the gesture that means "not this after
+        // all" as plainly as Escape does.
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the pane to be left", || settings_owner(&backend).is_none()).await;
+        assert!(
+            backend.browsing.lock().unwrap().drafts.text.is_empty(),
+            "nothing is held for a page that is not up"
+        );
+
+        // And the page read again is the player's, not the abandoned word's.
+        open().await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            settings_rows(&backend)
+                .first()
+                .map(|row| row.value.as_str()),
+            Some("Kitchen"),
+            "the row comes back with the player's name"
+        );
+    }
+
+    /// Escape gives up on the row it was pressed in, and on nothing else.
+    ///
+    /// Before drafts a settings text row held only the player's own value, and
+    /// Escape there was nothing but handing the keyboard back. It can hold
+    /// something that is not the player's now, so the one gesture that means
+    /// "never mind" has to be able to get rid of it — and a page where two
+    /// fields have been typed into must not lose the other one with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_gives_up_on_the_settings_row_it_was_pressed_in() {
+        let (backend, player, _second) = two_players().await;
+        player.serve("/Settings", TWO_NAMES);
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+
+        let shown = || {
+            settings_rows(&backend)
+                .iter()
+                .map(|row| row.value.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let _ = backend
+            .commands
+            .send(Command::SettingDraft(0, "Larder".to_owned()));
+        let _ = backend
+            .commands
+            .send(Command::SettingDraft(1, "Upstairs".to_owned()));
+        until("both to be held", || {
+            shown() == ["Larder".to_owned(), "Upstairs".to_owned()]
+        })
+        .await;
+
+        let _ = backend.commands.send(Command::SettingEscaped(1));
+        until("the second to be given up on", || {
+            shown() == ["Larder".to_owned(), "Downstairs".to_owned()]
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            shown(),
+            ["Larder".to_owned(), "Downstairs".to_owned()],
+            "the row escaped from is the player's again and the one beside it is not"
+        );
+        // And the rows go out as a rebuild, not as a seat. The field the word
+        // was typed into stopped reading `item.value` the moment it was typed
+        // into, so a publish that only re-seats the model leaves the abandoned
+        // word on screen over a row the backend has already put back — and
+        // Enter there afterwards would write it. See `redraw_settings`.
+        assert_eq!(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            1,
+            "giving up on a draft has to build the row again"
+        );
+    }
+
+    /// The reply to one player's write does not take the next player's typing.
+    ///
+    /// A successful write spends the draft it wrote, but a setting id says
+    /// nothing about whose page it came from: `name` is `name` on every
+    /// player. Press Enter in one player's name row, and while the POST is out
+    /// start typing into the next player's — the reply landing afterwards used
+    /// to remove the new letters under the same id, which is the loss drafts
+    /// exist to prevent, caused by the thing that clears them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_reply_does_not_take_the_next_players_draft() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Settings", NAME_AND_SWITCH);
+        second.serve("/Settings", NAME_AND_SWITCH);
+        // Slow enough that the second player's page is up, and typed into,
+        // before the first player's reply comes back.
+        first.serve("/name_setting", "");
+        first.delay("/name_setting", SLOW);
+
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        let _ = backend
+            .commands
+            .send(Command::SettingEdit(0, Edit::Text("Larder".to_owned())));
+        until("the write to be out", || {
+            asked(&first, "/name_setting") == 1
+        })
+        .await;
+
+        // The other player's page, and a name half typed into it.
+        choose(&backend, &second).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the second player's settings", || {
+            settings_owner(&backend) == Some(second.id())
+        })
+        .await;
+        let _ = backend
+            .commands
+            .send(Command::SettingDraft(0, "Den".to_owned()));
+        until("the name to be held", || {
+            settings_rows(&backend)
+                .first()
+                .is_some_and(|row| row.value == "Den")
+        })
+        .await;
+
+        // Long enough for the first player's reply, which is about a page that
+        // is not on screen any more.
+        tokio::time::sleep(SLOW + SETTLED).await;
+        assert_eq!(
+            settings_rows(&backend)
+                .first()
+                .map(|row| row.value.as_str()),
+            Some("Den"),
+            "the reply spends its own page's draft, not this one's"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_setting_the_player_has_dimmed_is_not_written() {
         let (backend, player, _) = two_players().await;
@@ -13284,6 +15677,264 @@ mod selection_tests {
             asked(&player, "/loudness_setting"),
             0,
             "the switch is not written"
+        );
+    }
+
+    /// A switch and a text field, both writing to a path this player answers
+    /// nothing on, so every write from the page comes back a 404.
+    const REFUSED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="eq-switch" name="eq-switch" displayName="Tone Controls" url="/alsa_setting" class="boolean" value="OFF"/>
+  <setting id="name" name="name" displayName="Player name" url="/name_setting" class="text" value="Kitchen"/>
+</settings>"#;
+
+    /// A control whose write failed stops speaking for the player until the
+    /// rows are drawn again.
+    ///
+    /// The switch writes its own `checked` when it is pressed, which ends the
+    /// binding to `item.on`. Nothing about the page changes when the write is
+    /// refused, so the fingerprint matches and the model is not replaced — and
+    /// the switch is left saying the tone controls are on when the player
+    /// never turned them on. The redraw count is what forces that publish
+    /// through; a text field is deliberately left as typed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_whose_write_failed_is_drawn_from_the_player_again() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Settings", REFUSED);
+
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+
+        let _ = backend.commands.send(Command::SettingEdit(0, Edit::Toggle));
+        until("the refused switch to be put back", || {
+            backend.settings_redraws.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_ne!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "the rows go out again, so the switch is bound to the player's value once more"
+        );
+        let redrawn = backend.sent_settings.load(Ordering::Relaxed);
+
+        // The field beside it holds words somebody typed, and a refused write
+        // is exactly when they are wanted: on screen, to be corrected and sent
+        // again. Taking them away here would be the loss F1 and F3 are about.
+        let _ = backend
+            .commands
+            .send(Command::SettingEdit(1, Edit::Text("Larder".to_owned())));
+        until("the refused write", || asked(&player, "/name_setting") == 1).await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            1,
+            "a field is left as it was typed"
+        );
+        assert_eq!(backend.sent_settings.load(Ordering::Relaxed), redrawn);
+    }
+
+    /// One switch on a player that takes the write and does not act on it: the
+    /// url it names answers, and the page it is read back from goes on saying
+    /// the tone controls are off.
+    const UNAPPLIED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<settings schemaVersion="35">
+  <setting id="eq-switch" name="eq-switch" displayName="Tone Controls" url="/alsa_setting" class="boolean" value="OFF"/>
+</settings>"#;
+
+    /// And a control whose write was taken and not acted on.
+    ///
+    /// The refused write is only half of it. A write that succeeds is answered
+    /// by a re-read of the page, and a player owes nobody the value it was
+    /// sent: it rounds the number a slider was dropped on to the step it
+    /// keeps, or — as here — it answers the write and leaves the setting where
+    /// it was. The rows that come back are then the ones that went out before,
+    /// word for word, so the memo matches and the publish returns before
+    /// `seat_settings` is reached at all. The switch is left saying the tone
+    /// controls are on over a row that says they are off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_the_player_did_not_act_on_is_drawn_from_it_again() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Settings", UNAPPLIED);
+        // The write lands. Nothing else about the player moves.
+        player.serve("/alsa_setting", "");
+
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+        let read = asked(&player, "/Settings");
+        // The rows on screen taken to be the ones the page holds, as a window
+        // that had just drawn them would have left behind: `seat_settings`
+        // catches this up once it has replaced a model, and there is no window
+        // here to run it.
+        backend.seated_redraws.store(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        let _ = backend.commands.send(Command::SettingEdit(0, Edit::Toggle));
+        until("the page to be read back", || {
+            asked(&player, "/Settings") == read + 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_ne!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "the rows go out although they are the rows that went out before, \
+             which is the only way anything reaches a switch that stopped \
+             reading its row when it was pressed"
+        );
+        assert_ne!(
+            backend.seated_redraws.load(Ordering::Relaxed),
+            backend.settings_redraws.load(Ordering::Relaxed),
+            "and they go out as a replacement rather than be seated into rows \
+             that have not moved"
+        );
+    }
+
+    /// And the status tick that lands between the two.
+    ///
+    /// A settings page open on a playing player is republished about once a
+    /// second, because the sleep row's state is in `/Status` rather than in
+    /// the settings document. Those publishes draw the page as it was last
+    /// read — which, between a write and the re-read answering it, is the page
+    /// the write has already replaced. The bump the write left takes the
+    /// publish past the memo, so the rows go out and the model is replaced
+    /// with the values from before: the switch flips visibly back to OFF, and
+    /// forward again a round trip later, which on a slow player stands for
+    /// seconds and reads as a refused write. Worse, the demand is spent doing
+    /// it, so the page that really does carry the player's answer is seated
+    /// into rows that may not have moved and the switch never hears it.
+    ///
+    /// The tick is called here by hand: nothing in this harness long-polls, and
+    /// what is under test is the publish rather than what provokes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_status_does_not_answer_a_write_with_the_page_it_replaced() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Settings", UNAPPLIED);
+        player.serve("/alsa_setting", "");
+
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        // As the test above: the rows on screen taken to be the ones the page
+        // holds, which is what a window would have left behind.
+        backend.seated_redraws.store(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+        let read = asked(&player, "/Settings");
+
+        // A player that sits on the re-read, which is the whole of the window
+        // this is about.
+        player.delay("/Settings", SLOW);
+        let _ = backend.commands.send(Command::SettingEdit(0, Edit::Toggle));
+        until("the write", || asked(&player, "/alsa_setting") == 1).await;
+        assert_ne!(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            backend.seated_redraws.load(Ordering::Relaxed),
+            "the write leaves the page owing the switch a redraw"
+        );
+
+        backend.restate_settings();
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "a status arriving while the page is out draws nothing: the rows it \
+             has are the ones the write replaced"
+        );
+
+        until("the page to be read back", || {
+            asked(&player, "/Settings") == read + 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_ne!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "and the page that answers the write goes out with the demand still \
+             on it"
+        );
+    }
+
+    /// A re-read that never arrives gives the demand up rather than hold the
+    /// tick for ever.
+    ///
+    /// The write was taken and the page answering it could not be read, so
+    /// there is nothing to put the control back from — the rows in hand are
+    /// the ones the write replaced. The control keeps the position the hand
+    /// gave it, and the pane goes back to following the player.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_read_that_fails_lets_the_settings_pane_follow_the_player_again() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Settings", UNAPPLIED);
+        player.serve("/alsa_setting", "");
+
+        choose(&backend, &player).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the settings", || {
+            settings_owner(&backend) == Some(player.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        backend.seated_redraws.store(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // Taken before the write, so that what follows can be told from a
+        // publish that never happened: the failed re-read publishes nothing at
+        // all, and the demand the write left is hashed into the next
+        // fingerprint.
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+        let read = asked(&player, "/Settings");
+
+        // The page stops answering the moment the write is taken.
+        player.forget("/Settings");
+        let _ = backend.commands.send(Command::SettingEdit(0, Edit::Toggle));
+        until("the re-read to have been asked for and refused", || {
+            asked(&player, "/Settings") == read + 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            backend.seated_redraws.load(Ordering::Relaxed),
+            "the demand is given up where the page fails to arrive, or nothing \
+             will ever answer it"
+        );
+
+        backend.restate_settings();
+        assert_ne!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "so the next status draws the pane again rather than standing still \
+             for a page that is never coming"
         );
     }
 
@@ -13684,6 +16335,59 @@ mod selection_tests {
             .await;
     }
 
+    /// An alarm the player did not arm is drawn from the player again.
+    ///
+    /// Every alarm write is answered with the whole list, so the row is
+    /// normally put back by the list itself — the switch it carries wrote its
+    /// own `checked` when it was pressed, and only a replacement of the model
+    /// can reach it after that. What the list cannot do is say so when it
+    /// comes back as it stood, which is what a player that takes the write and
+    /// does not act on it answers with, and what the fake answers with however
+    /// often it is asked. Rows of the same shape are seated into the switch
+    /// still saying the alarm is armed. See `settings_redraws`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarm_the_player_did_not_arm_is_drawn_from_it_again() {
+        let (backend, player, _) = two_players().await;
+        player.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &player).await;
+
+        let _ = backend.commands.send(Command::OpenAlarms(player.id()));
+        until("the alarms", || alarms_owner(&backend) == Some(player.id())).await;
+        tokio::time::sleep(SETTLED).await;
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+        let read = asked(&player, "/Alarms");
+        // The rows on screen taken to be the ones the page holds, for the
+        // reason on the settings control the player did not act on: there is
+        // no window here for `seat_settings` to catch this up on.
+        backend.seated_redraws.store(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        // The alarm the fixture has armed, turned off. The list comes back
+        // with it armed all the same.
+        let _ = backend
+            .commands
+            .send(Command::AlarmArm(player.id(), 1, false));
+        until("the arming to be written", || {
+            asked(&player, "/Alarms") == read + 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert_ne!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "the list goes out although it is the list that went out before"
+        );
+        assert_ne!(
+            backend.seated_redraws.load(Ordering::Relaxed),
+            backend.settings_redraws.load(Ordering::Relaxed),
+            "and as a replacement, which is the only thing the switch on the \
+             row can still hear"
+        );
+    }
+
     /// Send a write on the first player's alarm, choose the second player and
     /// open its alarms while the answer is still on its way, and check the
     /// first player's list is not put on the second player's page.
@@ -13791,6 +16495,333 @@ mod selection_tests {
             picker_depth(&backend),
             1,
             "and leaves that editor's picker where the user left it"
+        );
+    }
+
+    fn an_alarm(id: u32, hour: u8) -> bluos::alarms::Alarm {
+        bluos::alarms::Alarm {
+            id,
+            hour,
+            minute: 30,
+            duration: 30,
+            volume: 20,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn a_list(alarms: Vec<bluos::alarms::Alarm>) -> bluos::alarms::Alarms {
+        bluos::alarms::Alarms {
+            supports_end_time: true,
+            alarms,
+        }
+    }
+
+    #[test]
+    fn an_alarm_the_player_did_not_move_is_not_reported_as_changed() {
+        // "This alarm changed on the player" is about the player, and the
+        // editor cannot answer it: the moment anything is typed, what the
+        // editor holds differs from the list whether or not the player moved.
+        // Save one alarm on a slow player, press Back, open another and change
+        // its hour, and the first save's reply — which carries the whole list —
+        // said the second alarm had changed on the player. Nothing had touched
+        // it.
+        let mut page = AlarmsPage {
+            device: DeviceId::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 11000),
+            list: a_list(vec![an_alarm(1, 6), an_alarm(2, 7)]),
+            // Touched: the hour here is not the hour the row it was opened
+            // from holds.
+            editing: Some(an_alarm(2, 8)),
+            opened: 1,
+            picking: Vec::new(),
+        };
+
+        let arriving = a_list(vec![an_alarm(1, 9), an_alarm(2, 7)]);
+        assert_eq!(
+            seat_alarms(&mut page, arriving),
+            None,
+            "the alarm open was where it always was, so there is nothing to say"
+        );
+        assert_eq!(
+            page.editing.as_ref().map(|alarm| alarm.hour),
+            Some(8),
+            "and the editor keeps the work nobody has saved yet"
+        );
+
+        // One that really did move is still worth saying, because Save would
+        // replace it with what is on screen.
+        page.editing = Some(an_alarm(2, 8));
+        assert!(
+            seat_alarms(&mut page, a_list(vec![an_alarm(1, 9), an_alarm(2, 10)])).is_some(),
+            "an alarm the player did move is announced"
+        );
+    }
+
+    /// Answer `/Alarms` with one document the first time and another after
+    /// that, which is how a write's reply differs from the list it replaces:
+    /// every alarm route is this one path, so the second request is the write.
+    fn alarms_then(first: &Player, after: &'static str) {
+        let answered = AtomicU64::new(0);
+        first.handle("/Alarms", move |_| {
+            Some(match answered.fetch_add(1, Ordering::Relaxed) {
+                0 => fixtures::one_alarm().to_owned(),
+                _ => after.to_owned(),
+            })
+        });
+    }
+
+    /// The same alarm, saved two hours later.
+    const ALARM_AT_NINE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<alarms supportsEndTime="true">
+  <alarm id="1" hour="9" minute="30" days="0111110" duration="30" volume="20"
+         fadein="1" enable="1" useBackup="true" source="A Station"
+         service="TestRadio" url="TestRadio:/1" image="/art/s.jpg"/>
+</alarms>"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarm_reopened_from_a_stale_list_is_not_written_back() {
+        let (backend, first, _second) = two_players().await;
+        alarms_then(&first, ALARM_AT_NINE);
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+
+        // Long enough to leave the editor and open the alarm again while the
+        // save is still in the writes lane, so the list it is opened from is
+        // the one the save is about to replace.
+        let late = SLOW * 4;
+        first.delay("/Alarms", late);
+        let writing = Instant::now();
+        let _ = backend.commands.send(Command::AlarmSave);
+        until("the save", || asked(&first, "/Alarms") == 2).await;
+
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the editor to close", || editor_opened(&backend).is_none()).await;
+        let _ = backend.commands.send(Command::AlarmOpen(1));
+        until("the alarm to be opened again", || {
+            editor_opened(&backend).is_some()
+        })
+        .await;
+        tokio::time::sleep((writing + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        let browsing = backend.browsing.lock().unwrap();
+        let Pane::Alarms(page) = &browsing.pane else {
+            panic!("the alarms pane went away");
+        };
+        let editing = page.editing.as_ref().expect("the editor opened since");
+        assert_eq!(
+            editing.hour, 9,
+            "the editor shows what the player holds, not the hour its own Save would undo"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarm_reopened_after_it_was_deleted_does_not_stay_open() {
+        let (backend, first, _second) = two_players().await;
+        alarms_then(&first, fixtures::no_alarms());
+        choose(&backend, &first).await;
+        open_alarm(&backend, &first).await;
+
+        let late = SLOW * 4;
+        first.delay("/Alarms", late);
+        let writing = Instant::now();
+        let _ = backend.commands.send(Command::AlarmDelete);
+        until("the delete", || asked(&first, "/Alarms") == 2).await;
+
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the editor to close", || editor_opened(&backend).is_none()).await;
+        let _ = backend.commands.send(Command::AlarmOpen(1));
+        until("the alarm to be opened again", || {
+            editor_opened(&backend).is_some()
+        })
+        .await;
+        tokio::time::sleep((writing + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        assert_eq!(
+            editor_opened(&backend),
+            None,
+            "an editor on an alarm that is gone closes, rather than waiting to make it again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refresh_does_not_close_the_alarms_screen() {
+        let (backend, first, _second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        let _ = backend.commands.send(Command::OpenAlarms(first.id()));
+        until("the alarms", || alarms_owner(&backend) == Some(first.id())).await;
+        let _ = backend.commands.send(Command::AlarmOpen(1));
+        until("the editor", || editor_opened(&backend).is_some()).await;
+
+        // What a preset saved on another app brings on: the screen underneath
+        // is stale, so the status refetches it in place.
+        refresh_current(backend.clone()).await;
+
+        assert_eq!(
+            asked(&first, "/ui/Home"),
+            2,
+            "the screen underneath is read again"
+        );
+        assert!(
+            editor_opened(&backend).is_some(),
+            "and the alarm being edited over it is still open"
+        );
+    }
+
+    /// A window onto a long list that counts rather than points: thirty rows
+    /// from `offset` out of two thousand, a letter index, and no cursor at all
+    /// — the shape a library's Songs comes in, whose next page is asked for by
+    /// number.
+    fn songs_window(offset: u32) -> String {
+        let rows: String = (offset..offset + 30)
+            .map(|i| format!("\n    <item text=\"song {i}\"/>"))
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <screen screenTitle=\"Songs\">\n  \
+             <index><item key=\"S\" offset=\"900\"/></index>\n  \
+             <list offset=\"{offset}\" total=\"2062\">{rows}\n  </list>\n\
+             </screen>"
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_dropped_by_a_jump_is_asked_for_again() {
+        let (backend, first, _second) = two_players().await;
+        first.handle("/ui/songs", |request| {
+            let at = request
+                .param("listContinuation")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Some(songs_window(at))
+        });
+        choose(&backend, &first).await;
+        open_screen(
+            backend.clone(),
+            first.id(),
+            "/ui/songs".to_owned(),
+            Arrive::Deeper,
+        )
+        .await;
+
+        // A scroll asks for the page after the window on screen, on a player
+        // slow enough to still be holding it when a letter is pressed.
+        let late = SLOW * 4;
+        first.delay("/ui/songs", late);
+        let scrolled = Instant::now();
+        let _ = backend.commands.send(Command::BrowseMore);
+        until("the page", || asked(&first, "/ui/songs") == 2).await;
+
+        // The letter answers at once, so the rows on screen are its window and
+        // the page still out belongs to a window that has gone.
+        first.delay("/ui/songs", Duration::ZERO);
+        let _ = backend.commands.send(Command::BrowseJump("S".to_owned()));
+        until("the jump", || {
+            let browsing = backend.browsing.lock().unwrap();
+            browsing.current().and_then(|screen| screen.offset) == Some(900)
+        })
+        .await;
+        // What the window asks the moment a jump lands, because a fetched
+        // window that fills the pane without overflowing it moves neither the
+        // scroll nor the height and would never ask again.
+        let _ = backend.commands.send(Command::BrowseMore);
+        tokio::time::sleep((scrolled + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        assert_eq!(
+            asked(&first, "/ui/songs"),
+            4,
+            "the ask refused while the dropped page was out is made again"
+        );
+        assert!(
+            first
+                .asked()
+                .last()
+                .is_some_and(|last| last.contains("listContinuation=930")),
+            "and it asks for the page after the window the jump brought"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_failed_after_a_jump_is_asked_for_again() {
+        // The same sequence as above, with the page failing rather than
+        // arriving. It is the commoner half: the page that was out is the one
+        // the player was slow with, and slow is what times out. Answered by
+        // clearing everything and asking nothing, the window was left on the
+        // jumped-to rows with nothing in flight, nothing pending and a cursor
+        // still to follow — the whole of the list below it unreachable until
+        // the pane was scrolled or resized.
+        let (backend, first, _second) = two_players().await;
+        first.handle("/ui/songs", |request| {
+            let at: u32 = request
+                .param("listContinuation")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            // The one page that fails is the one asked for before the jump,
+            // so the ask the jump makes is refused while a doomed request is
+            // out. Everything else answers.
+            (at != 30).then(|| songs_window(at))
+        });
+        choose(&backend, &first).await;
+        open_screen(
+            backend.clone(),
+            first.id(),
+            "/ui/songs".to_owned(),
+            Arrive::Deeper,
+        )
+        .await;
+
+        let late = SLOW * 4;
+        first.delay("/ui/songs", late);
+        let scrolled = Instant::now();
+        let _ = backend.commands.send(Command::BrowseMore);
+        until("the page", || asked(&first, "/ui/songs") == 2).await;
+
+        first.delay("/ui/songs", Duration::ZERO);
+        let _ = backend.commands.send(Command::BrowseJump("S".to_owned()));
+        until("the jump", || {
+            let browsing = backend.browsing.lock().unwrap();
+            browsing.current().and_then(|screen| screen.offset) == Some(900)
+        })
+        .await;
+        // The ask the window makes the moment a jump lands, refused because
+        // the page that is about to fail is still out.
+        let _ = backend.commands.send(Command::BrowseMore);
+        tokio::time::sleep((scrolled + late + SETTLED).saturating_duration_since(Instant::now()))
+            .await;
+
+        assert_eq!(
+            asked(&first, "/ui/songs"),
+            4,
+            "the ask refused while the failing page was out is made again"
+        );
+        assert!(
+            first
+                .asked()
+                .last()
+                .is_some_and(|last| last.contains("listContinuation=930")),
+            "and for the window the jump brought, not the one that failed"
+        );
+
+        // And the one thing this must not become: a page that fails on the
+        // window it belongs to is not asked for again, however long that
+        // window has been waiting. That is the loop the error path exists to
+        // stop — 94 requests for one unreadable continuation, measured.
+        let before = asked(&first, "/ui/songs");
+        first.handle("/ui/songs", |_| None);
+        let _ = backend.commands.send(Command::BrowseMore);
+        until("the failing page", || {
+            asked(&first, "/ui/songs") == before + 1
+        })
+        .await;
+        let _ = backend.commands.send(Command::BrowseMore);
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            asked(&first, "/ui/songs"),
+            before + 1,
+            "a failure on the window that asked takes its cursor and asks nothing more"
         );
     }
 
@@ -15111,5 +18142,310 @@ mod selection_tests {
         tokio::time::sleep(SETTLED).await;
 
         assert_eq!(lit(&backend), Some((0, 0)));
+    }
+
+    /// The wireless page's shape: a name, a masked key, a switch and a button.
+    fn wireless_form(device: DeviceId) -> Pane {
+        use bluos::forms::{Field, Form, Kind, Submit};
+
+        Pane::Form(Box::new(FormPage {
+            device,
+            opened: 1,
+            title: "Wireless".to_owned(),
+            form: Form {
+                action: "/join".to_owned(),
+                post: true,
+                fields: vec![
+                    Field {
+                        name: "ssid".to_owned(),
+                        label: "Network".to_owned(),
+                        kind: Kind::Text,
+                        ..Default::default()
+                    },
+                    Field {
+                        name: "key".to_owned(),
+                        label: "Password".to_owned(),
+                        kind: Kind::Password,
+                        ..Default::default()
+                    },
+                    Field {
+                        name: "wps".to_owned(),
+                        label: "Use WPS".to_owned(),
+                        kind: Kind::Switch,
+                        value: "1".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                hidden: BTreeMap::new(),
+                submits: vec![Submit {
+                    name: "join".to_owned(),
+                    label: "Join".to_owned(),
+                }],
+            },
+            values: BTreeMap::new(),
+            note: String::new(),
+            from: None,
+        }))
+    }
+
+    /// What the form is holding for one of its fields.
+    fn held(backend: &Backend, name: &str) -> Option<String> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Form(page) => page.values.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    /// A letter typed into a form must not take the form away under the caret.
+    ///
+    /// Here for the harness above rather than because it is about selection:
+    /// what it needs is a command loop with a player behind it.
+    ///
+    /// The masked field is what made this urgent. Its first letter flipped the
+    /// row's `on` flag, which changed the fingerprint `send_settings` hashes,
+    /// which replaced the model and destroyed the field holding the caret — so
+    /// a wireless key could be one character long by the time Join was
+    /// pressed, with nothing on screen saying so, since a password is never
+    /// drawn back. `sent_settings` is the fingerprint of the rows last
+    /// published, so an unchanged one is the rows not having been published
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_letter_typed_into_a_form_does_not_draw_it_again() {
+        let (backend, player, _other) = two_players().await;
+        choose(&backend, &player).await;
+        tokio::time::sleep(SETTLED).await;
+
+        backend.browsing.lock().unwrap().pane = wireless_form(player.id());
+        backend.publish_pane();
+        let drawn = backend.sent_settings.load(Ordering::Relaxed);
+
+        // The key, a letter at a time, as a keyboard sends it.
+        for typed in ["s", "se", "sec", "secr", "secre", "secret"] {
+            let _ = backend
+                .commands
+                .send(Command::FormEdit(1, Edit::Text(typed.to_owned())));
+            until("the key to be held", || {
+                held(&backend, "key").as_deref() == Some(typed)
+            })
+            .await;
+        }
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "typing a key must not draw the rows again under the caret"
+        );
+        assert_eq!(
+            held(&backend, "key").as_deref(),
+            Some("secret"),
+            "the whole key is held, not the first letter of it"
+        );
+
+        // The plain field beside it commits as it is typed for the same
+        // reason: there is nowhere but the page for a half-typed value to
+        // live, and the submit sends the page.
+        let _ = backend
+            .commands
+            .send(Command::FormEdit(0, Edit::Text("home".to_owned())));
+        until("the name to be held", || {
+            held(&backend, "ssid").as_deref() == Some("home")
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            drawn,
+            "nor must typing a name"
+        );
+
+        // The switch does draw them again — after a toggle the model is the
+        // only thing that knows what the switch is now showing — and what was
+        // typed into the two fields beside it comes back with the rows.
+        let _ = backend.commands.send(Command::FormEdit(2, Edit::Toggle));
+        until("the switch to be drawn", || {
+            backend.sent_settings.load(Ordering::Relaxed) != drawn
+        })
+        .await;
+        assert_eq!(
+            held(&backend, "ssid").as_deref(),
+            Some("home"),
+            "the name typed beside the switch survives its redraw"
+        );
+        assert_eq!(held(&backend, "key").as_deref(), Some("secret"));
+    }
+
+    /// The wireless page as the player answers a submit with: the same form
+    /// again, holding no key — a password is never sent back to a browser —
+    /// and its own idea of which network is selected.
+    const JOINED: &str = r#"<html><body>
+<form id="wificfg" action="/join" method="POST">
+  <label for="ssid">Network</label>
+  <input id="ssid" name="ssid" type="text" value=""/>
+  <label for="key">Password</label>
+  <input id="key" name="key" type="password" value=""/>
+  <label for="wps">Use WPS</label>
+  <input id="wps" name="wps" type="checkbox" value="1"/>
+  <input type="submit" name="join" value="Join"/>
+</form>
+</body></html>"#;
+
+    /// A form answered by another form is drawn again, not seated into.
+    ///
+    /// The reply to a submit is nearly always the same form, so its rows have
+    /// the same shape and [`seat_settings`] would seat them — which writes the
+    /// model and leaves every control that has assigned its own property
+    /// showing what the hand did. The masked box is the one that matters: the
+    /// page holds no key after the reply, because a password is never sent
+    /// back and `form_values` seeds none, while the box goes on drawing a dot
+    /// per character of the key that was typed before. Pressing the button a
+    /// second time then sends no key at all, with eight dots on screen saying
+    /// otherwise.
+    ///
+    /// Three links of one chain, and this reaches the first two. The rows
+    /// themselves are read through [`form_rows`], which is what `publish_form`
+    /// hands over: the masked one carries the key before the reply and nothing
+    /// after it, so an element still bound to the row is right and one that
+    /// has assigned its own text is wrong. `settings_redraws` running ahead of
+    /// `seated_redraws` is the demand that the rows go out as a replacement
+    /// rather than be seated into — which is the only way an element that has
+    /// stopped reading its row can hear any of this. See
+    /// [`Backend::redraw_settings`].
+    ///
+    /// What is left is [`seat_settings`] honouring that demand, and there is
+    /// no window here for it to act on — every publish goes through
+    /// `invoke_from_event_loop`, which does nothing in this harness. That link
+    /// is covered in `a_press_becomes_the_command_it_should`, where a real
+    /// window shows that seating cannot reach a field whose typing removed its
+    /// binding and that a rebuild puts the player's own value back.
+    ///
+    /// The reply is handed to [`show_form`] rather than posted, because the
+    /// form's action is a page of the player's web UI and `web_url` addresses
+    /// that on port 80 — not the port the fake is listening on. What the
+    /// submit does with the body it gets back is what is under test here, and
+    /// this is that body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_form_answered_by_a_form_is_drawn_again() {
+        let (backend, player, _other) = two_players().await;
+        choose(&backend, &player).await;
+        tokio::time::sleep(SETTLED).await;
+
+        backend.browsing.lock().unwrap().pane = wireless_form(player.id());
+        backend.publish_pane();
+        tokio::time::sleep(SETTLED).await;
+
+        // A key typed in, which the page holds and nothing else does.
+        let _ = backend
+            .commands
+            .send(Command::FormEdit(1, Edit::Text("secret".to_owned())));
+        until("the key to be held", || {
+            held(&backend, "key").as_deref() == Some("secret")
+        })
+        .await;
+        assert_eq!(
+            masked(&backend).map(|row| (row.value, row.on)),
+            Some(("secret".to_owned(), true)),
+            "the masked row goes out carrying what was typed into it, which is \
+             what the box on screen is drawing a dot per character of"
+        );
+
+        // The rows on screen taken to be the ones the page holds, which is
+        // what a window that had just drawn them would have left behind.
+        // `seat_settings` catches this up only once it has actually replaced
+        // a model, and there is no window here to run it — so without this the
+        // demand asserted at the end would read as outstanding whatever the
+        // reply did.
+        backend.seated_redraws.store(
+            backend.settings_redraws.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        let answer = bluos::forms::parse(JOINED)
+            .into_iter()
+            .next()
+            .expect("the answering page carries a form");
+        show_form(
+            &backend,
+            player.id(),
+            Replacing::Form(1),
+            "Wireless".to_owned(),
+            answer,
+            String::new(),
+        )
+        .expect("the answer replaces the form it came from");
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            held(&backend, "key"),
+            None,
+            "the page holds no key after the reply: a password is never sent \
+             back, so there is nothing for the reply to seed one from"
+        );
+        assert_eq!(
+            masked(&backend).map(|row| (row.value, row.on)),
+            Some((String::new(), false)),
+            "and the masked row goes out empty, so a box still reading its row \
+             stops drawing the key the page has given up"
+        );
+        assert_ne!(
+            backend.seated_redraws.load(Ordering::Relaxed),
+            backend.settings_redraws.load(Ordering::Relaxed),
+            "the reply owes the pane a rebuild rather than a seating: the box \
+             stopped reading its row the moment a letter was typed into it, so \
+             writing the row again cannot reach it and only replacing the \
+             model puts the binding back"
+        );
+    }
+
+    /// The masked row of the form on screen, as `publish_form` would draw it.
+    ///
+    /// Read through [`form_rows`] rather than off `page.values`, because the
+    /// row is what the window is handed and the value is only where it comes
+    /// from — a publish that stopped seeding the box would leave the values
+    /// untouched and say nothing here.
+    fn masked(backend: &Backend) -> Option<SettingData> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Form(page) => form_rows(&page.form, &page.values, page.note.clone())
+                .into_iter()
+                .find(|row| row.control == "password"),
+            _ => None,
+        }
+    }
+
+    /// Escape in the field that asks for a playlist name gives up on the name.
+    ///
+    /// The field is there because the line above it was pressed; nothing else
+    /// took it back, so the only ways out were to type a name and make a
+    /// playlist or to leave the pane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_takes_back_the_line_that_asks_for_a_playlist_name() {
+        let (backend, player, _other) = two_players().await;
+        choose(&backend, &player).await;
+
+        let naming = || match &backend.browsing.lock().unwrap().pane {
+            Pane::Playlists(page) => Some(page.naming),
+            _ => None,
+        };
+
+        backend.browsing.lock().unwrap().pane = Pane::Playlists(Box::new(PlaylistPage {
+            device: player.id(),
+            opened: 1,
+            title: "Add to playlist".to_owned(),
+            options: bluos::playlists::AddToPlaylist {
+                groups: vec![bluos::playlists::Group {
+                    service: Some("LocalMusic".to_owned()),
+                    service_name: Some("BluOS".to_owned()),
+                    can_create: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            naming: true,
+        }));
+        backend.publish_pane();
+        assert_eq!(naming(), Some(true));
+
+        let _ = backend.commands.send(Command::SettingEscaped(0));
+        until("the line to be taken back", || naming() == Some(false)).await;
     }
 }

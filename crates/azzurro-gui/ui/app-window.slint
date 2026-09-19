@@ -1,6 +1,6 @@
 import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
-import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker, EmptyState } from "widgets.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker, EmptyState, Modal } from "widgets.slint";
 
 // A bare file import is how Slint registers a custom font: the family the
 // file declares becomes usable as a font-family anywhere, and the file is
@@ -207,6 +207,11 @@ export struct SettingItem {
     options: [string],
     option-index: int,
     available: bool,
+    // Whether a text field on this row is reported as it is typed rather than
+    // only on Enter. True of the fields on one of the player's web forms,
+    // which are held on the page until its submit, and false of a settings
+    // row, where every report is a write to the player.
+    as-typed: bool,
     // Whether the row is a door as well as a control. A settings row is
     // normally one or the other; an alarm is both, because arming it is the
     // commonest thing anyone does to one and having to open it first would put
@@ -242,7 +247,20 @@ component SettingRow inherits Rectangle {
     callback chose(int);
     callback numbered(float);
     callback typed(string);
+    // A letter typed into a text row that commits on Enter. The value has not
+    // been asked for and must not be acted on; it is reported so that it
+    // survives the row being built again. See `as-typed`.
+    callback drafted(string);
     callback opened();
+    /// Escape was pressed with the caret in this row's field. The owner
+    /// decides what to hand the caret to next, and whether the field had
+    /// anything to give up; this only says the row is done with it.
+    callback escaped();
+    /// The caret has arrived in this row's field. Only arriving: a field that
+    /// is destroyed while it holds the caret never gets to say it has lost it,
+    /// so a row cannot be trusted to report the other way. Whoever is listening
+    /// clears it at a moment it knows about instead.
+    callback caret();
 
     // One role for nine kinds of row, which is not the compromise it looks.
     //
@@ -443,25 +461,69 @@ component SettingRow inherits Rectangle {
                 text: root.item.value;
                 enabled: root.item.available;
                 font-size: Theme.small-size;
+                changed has-focus => { if (self.has-focus) { root.caret(); } }
+                // As it is typed, but only where the row's owner holds what it
+                // is handed instead of writing it. A settings row is not one
+                // of those — every report there is a POST to the player, and
+                // one per letter is not a thing to send — so it commits on
+                // Enter as it always did. A form field is: it sits on the page
+                // until the submit, and without this a name typed here was
+                // thrown away the moment the switch or the list beside it drew
+                // the form again.
+                edited(t) => {
+                    if (root.item.as-typed) {
+                        root.typed(t);
+                    } else {
+                        // Not a write, and not a redraw either — only the
+                        // letters getting out of the field while they still
+                        // can. Something else on the page is enough to take
+                        // this field away mid-word, and what it was holding
+                        // went with it; whoever owns the row keeps them
+                        // instead and puts them back.
+                        root.drafted(t);
+                    }
+                }
                 accepted(t) => { root.typed(t); }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.escaped();
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
             }
         }
 
         // The player's own settings never ask for one; its web pages do, for a
-        // wireless key and for signing into a music service. Never seeded with
-        // what is held and never drawn back, so what is on screen is only ever
-        // what was typed here.
+        // wireless key and for signing into a music service.
+        //
+        // Drawn back like any other field, and it is not the player's secret
+        // going onto the screen: nothing seeds this row — `form_values` skips
+        // every password the page arrives with — so what is in it is what was
+        // typed into it here. Left empty it was worse than useless. The box
+        // came back blank whenever anything else on the page drew the form
+        // again, while the page went on holding the key, so the next letter
+        // typed into a box that looked empty replaced the whole key with that
+        // one letter and nothing said so.
         if root.item.control == "password": VerticalLayout {
             alignment: center;
             width: 196px;
 
             LineEdit {
                 input-type: password;
-                placeholder-text: root.item.on ? "••••••••" : "";
+                text: root.item.value;
                 enabled: root.item.available;
                 font-size: Theme.small-size;
+                changed has-focus => { if (self.has-focus) { root.caret(); } }
                 edited(t) => { root.typed(t); }
                 accepted(t) => { root.typed(t); }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.escaped();
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
             }
         }
 
@@ -649,6 +711,9 @@ component NavRow inherits Rectangle {
     }
 }
 
+// Two heights, and both of them are written down: the picker's list is sized
+// from `Theme.player-card` and `Theme.player-card-badged`, so a row added here
+// has to be measured and put there as well.
 component DeviceCard inherits Rectangle {
     // What this player is playing, at 40px. Empty until the art arrives, and
     // empty forever for a source that has none — an input, a stream with no
@@ -832,6 +897,9 @@ component StationRow inherits Rectangle {
     in property <length> lift: 0px;
     callback play();
     callback renamed(string);
+    /// The rename is over — Enter, or the caret leaving the field — and is
+    /// worth writing down. No name and no row: see `station-renamed`.
+    callback settled();
     callback remove();
     callback drag-moved(length);
     callback drag-done();
@@ -918,15 +986,29 @@ component StationRow inherits Rectangle {
             alignment: center;
             horizontal-stretch: 1;
 
-            // Retyped in place while editing. Seeded once from the station and
-            // reported on every keystroke — it is this app's own list, so a
-            // rename costs a write to a small file and nothing on the network.
+            // Retyped in place while editing. Seeded once from the station
+            // and reported on every keystroke, which keeps the list in step
+            // with the field; the file is written when the rename ends rather
+            // than per letter, since a rename is the name somebody stopped
+            // typing.
             if root.editing: LineEdit {
                 text: root.station.name;
                 placeholder-text: root.station.url;
                 font-size: Theme.body-size;
                 edited(t) => { root.renamed(t); }
-                accepted(t) => { root.renamed(t); }
+                accepted(t) => {
+                    root.renamed(t);
+                    root.settled();
+                }
+                // The other end of a rename: the caret going somewhere else.
+                // Clicking another row, tabbing away, pressing Done or the bin
+                // — all of them take it, and the name is finished whichever
+                // one it was.
+                changed has-focus => {
+                    if (!self.has-focus) {
+                        root.settled();
+                    }
+                }
             }
 
             if !root.editing: Text {
@@ -1810,6 +1892,17 @@ component SearchField inherits Rectangle {
         input.focus();
         input.select-all();
     }
+    /// Put the caret back where it was, without touching what is in here.
+    ///
+    /// For the box that never stopped being the one the keys were meant for
+    /// and only lost them to something drawn over the window — a context menu,
+    /// a dialog, an update notice. Selecting there would be the opposite of
+    /// what [`take-focus`] selects for: the word is half typed rather than a
+    /// query to be replaced, and the next letter would take the rest of it
+    /// away.
+    public function resume-focus() {
+        input.focus();
+    }
 
     height: 38px;
     border-radius: Theme.radius-small;
@@ -1958,6 +2051,14 @@ component BrowseBlockView inherits VerticalLayout {
     // A section that leads somewhere and holds nothing. Drawn as a row rather
     // than as an empty shelf with a caption over it.
     if root.block.kind == 3: Rectangle {
+        // One press, one destination, so the row is the button. Named after
+        // the section it opens — the chevron beside the title is the only
+        // thing that said it led anywhere, and a chevron says nothing to
+        // anything that cannot see it.
+        accessible-role: button;
+        accessible-label: root.block.title;
+        accessible-action-default => { root.section-action(root.block.section); }
+
         height: 52px;
         border-radius: Theme.radius-small;
         background: into.has-hover ? Theme.hover : transparent;
@@ -1968,6 +2069,9 @@ component BrowseBlockView inherits VerticalLayout {
             padding-right: Theme.pad;
 
             Text {
+                // The row above carries this already; left as a text node it
+                // is read out a second time as the row's contents.
+                accessible-role: none;
                 text: root.block.title;
                 font-size: Theme.body-size;
                 color: Theme.text;
@@ -2108,6 +2212,21 @@ export component AppWindow inherits Window {
     in property <string> queue-line: "";
     // How many players have answered. Shown where the players are.
     in property <string> players-line: "";
+    // How many of `devices` draw `DeviceCard`'s badge row, which is the only
+    // thing that makes a card 130px instead of 96px. Counted in Rust, from the
+    // same three flags the card itself asks about: nothing in Slint can sum a
+    // condition over a model, and the picker's list is a fixed height because
+    // a `ListView` has no other kind.
+    //
+    // The list used to take the taller number for every row but one, on the
+    // reasoning that the selected player is the only one grouping is not
+    // offered against. That is true of `groupable` and of nothing else: the
+    // selected player leads the group it is in, and it upgrades its own
+    // firmware, so it wears a badge as readily as any other. Two grouped
+    // players then asked for 226px of the 260px they draw, and the 34px cut
+    // off the bottom held the Ungroup button — the one control that undoes the
+    // grouping.
+    in property <int> badged-players: 0;
     // Which row of the queue the player is sitting on, or -1. Worked out in
     // Rust because it needs the status, which the row model does not carry.
     in property <int> queue-cursor: -1;
@@ -2118,6 +2237,11 @@ export component AppWindow inherits Window {
     // the toast that shows it. In-out because the clearing happens in the
     // window rather than back in the backend.
     in-out property <string> status-line: "";
+    // How many messages the backend has put in the line above. The number
+    // means nothing; only that it changed, which is what restarts the toast's
+    // four seconds. The line itself cannot say it — the same words twice in
+    // a row are two messages and one unchanged string. See `say`.
+    in property <int> messages-said;
     // "Indexing — 1204 songs processed", or empty when it is not.
     in property <string> indexing: "";
     // What the player says it is decoding: "cd", "hd", "mqa".
@@ -2188,25 +2312,58 @@ export component AppWindow inherits Window {
     // and the stations pane was drawn over a Home screen still showing its
     // shelves because it was not. One property, so the next pane is one line.
     property <bool> browse-pane: !root.in-settings && !root.in-stations;
-    // Whether a search box is actually on screen, which is not what
-    // `browse-has-search` answers: that one is set by `publish_browse` alone
-    // and so describes the last browse screen visited, however long ago you
-    // left it. The two places that drew the box tested the pane as well; the
-    // two that read the key did not, and a `/` on Settings after one visit to
-    // Search went to a box that was not there. Worse, `claim` refused the
-    // caret for the same reason, which left the whole window without a
-    // keyboard on every pane but Browse.
-    // ...and not while something is drawn over the whole of it. Now Playing
-    // and Customize Home cover the pane without taking it: neither touches
-    // `in-settings` or `in-stations`, so `browse-pane` stays true underneath
-    // and the box went on holding the caret behind an opaque sleeve. Space
-    // typed a space into a box nobody could see instead of pausing the player,
-    // and every other key the window binds was swallowed with it.
-    property <bool> searchable: root.browse-pane
-        && root.browse-has-search
+    // Whether a search box is on screen and the keys can reach it, which is
+    // not what `browse-has-search` answers: that one is set by
+    // `publish_browse` alone and so describes the last browse screen visited,
+    // however long ago you left it. The two places that drew the box tested
+    // the pane as well; the two that read the key did not, and a `/` on
+    // Settings after one visit to Search went to a box that was not there.
+    // Worse, `claim` refused the caret for the same reason, which left the
+    // whole window without a keyboard on every pane but Browse. The rest of
+    // the answer — that the box cannot be reached while something is drawn
+    // over the whole of it either — is `search-drawn` below and the scrim
+    // over it.
+    property <bool> searchable: root.search-drawn && !root.modal;
+    // Whether the box is on the screen at all, which is the same question
+    // without the scrim.
+    //
+    // A question is drawn over the pane rather than instead of it, so the box
+    // under it is still the screen's own and still holds the query that was
+    // being typed into it. Built out of `browse-showing` the whole block went
+    // when the question came: the rows below it jumped up to fill the gap, and
+    // when the question went the block was built again — `init` puts the caret
+    // in a new box and selects what it finds, so a query half typed was
+    // selected whole and the next letter took the rest of it away. Now Playing
+    // and Customize Home are the other thing: they replace the screen, and the
+    // box goes with it.
+    property <bool> search-drawn: root.browse-pane
+        && !root.now-playing
+        && !root.customising
+        && root.browse-has-search;
+    // Whether the browse list is on screen, rather than merely the pane it
+    // would be drawn in.
+    //
+    // `browse-pane` answers "is the middle pane the player's", and that stays
+    // true under anything drawn over the whole window: Now Playing and
+    // Customize Home cover the pane without taking it — neither touches
+    // `in-settings` or `in-stations` — and a question covers it with a scrim.
+    // The search box went on holding the caret behind an opaque sleeve, so
+    // Space typed a space into a box nobody could see instead of pausing the
+    // player; the keys that act on the list asked the pane alone, so Home,
+    // End, the page keys and the letters went on paging a list nobody could
+    // see — no feedback, a /Browse on the wire, and the trail sitting
+    // somewhere else when Back was pressed.
+    property <bool> browse-showing: root.browse-pane
         && !root.now-playing
         && !root.customising
         && !root.modal;
+    // Whether there is a player to say something to, which is what the
+    // transport buttons under the artwork ask before they light up. The keys
+    // that do the same things used to ask only whether a player was selected,
+    // so the space bar and the queue chords went on sending to a speaker that
+    // was off the network — or rewriting its own firmware, which is the same
+    // thing with a worse ending.
+    property <bool> controllable: root.has-selection && root.current.reachable;
     // Something asking a question that has to be answered before the window
     // can be used again. All of these cover it with a scrim, so nothing behind
     // one is reachable by pointer either.
@@ -2241,7 +2398,10 @@ export component AppWindow inherits Window {
     // the window only ever sends back which was chosen.
     in property <[string]> browse-index;
     // Whether the search box holds the caret. Only the search box writes it,
-    // and only the jump bar reads it — to keep out of the way.
+    // and it is what tells a question borrowing the caret from the box being
+    // finished with it: a question takes the keyboard from above its own card
+    // while the box stays on screen half typed, and this is not cleared for
+    // one.
     in-out property <bool> browse-typing: false;
     // Counters the keyboard bumps, for the three things it cannot reach
     // directly: the search box and the list both live inside `if` blocks, and
@@ -2317,6 +2477,9 @@ export component AppWindow inherits Window {
     // Sunday first, because that is the end of the week the player writes
     // `days` from. Sent with the data so the two cannot disagree.
     in property <[string]> alarm-letters;
+    // And the same days in full, which is what the chips are called for
+    // anything that cannot see them. See `DayPicker.names`.
+    in property <[string]> alarm-day-names;
     in property <string> alarm-repeat;
     callback alarm-start-changed(int, int);
     callback alarm-end-changed(int, int);
@@ -2347,6 +2510,11 @@ export component AppWindow inherits Window {
     in property <string> dialog-title;
     in property <string> dialog-body;
     in property <[DialogButton]> dialog-buttons;
+    // Which of them opens with the caret: the first the player has not
+    // colored, which is the first that throws nothing away. Worked out on the
+    // Rust side because a list cannot be searched from here, and the answer
+    // is the player's own — see `publish_dialog`.
+    in property <int> dialog-safe;
     callback dialog-press(int);
     callback answer-input(bool);
     callback sidebar-activate(int, int);
@@ -2355,7 +2523,27 @@ export component AppWindow inherits Window {
     callback setting-choose(int, int);
     callback setting-number(int, float);
     callback setting-text(int, string);
+    // What is in a settings text row that has not been sent. Nothing is
+    // written for it; it is kept so that a row rebuilt under the caret comes
+    // back with it. See `Drafts` on the Rust side.
+    callback setting-drafted(int, string);
     callback setting-open(int);
+    // Escape with the caret in the field on this row. Only the backend knows
+    // whether the field was there to hold a value or to ask a question — the
+    // playlist name line is the one that asks — so it decides what giving up
+    // on it means. The row comes with it because a value row has a draft to
+    // throw away, and only its own. See `Drafts` on the Rust side.
+    callback setting-escaped(int);
+    // How many times the backend has replaced a model the caret could have
+    // been in. The number means nothing; only that it changed.
+    //
+    // Replacing a model destroys every row drawn from it, and a destroyed row
+    // takes the caret with it — Slint is then left with nothing focused at
+    // all, and every key the window binds is dead until something is clicked.
+    // Renaming a station and then pressing the bin beside it is the plainest
+    // way in: the pane and the title are both unchanged, so nothing else the
+    // window watches has moved.
+    in property <int> models-replaced;
     callback open-help();
     callback open-stations();
     // The stations typed in by hand. `in-stations` is the pane's own "I am
@@ -2363,10 +2551,56 @@ export component AppWindow inherits Window {
     in property <bool> in-stations: false;
     in property <[MyStation]> stations;
     in property <bool> stations-editing: false;
+    // Whether one of the two boxes above the station list holds the caret,
+    // pushed out from inside the pane because a binding cannot reach into an
+    // `if` block. Read by the keyboard handback below: those two outlive the
+    // model beneath them, and Enter in the address box replaces that model on
+    // purpose, so taking the caret away there would mean clicking back in for
+    // every station added.
+    in-out property <bool> station-typing: false;
+    // Whether a settings row's field holds the caret, reported by the field
+    // itself. The same job as `station-typing` above and read in the same
+    // place, for rows that are in the model rather than above it: when those
+    // are replaced the field is destroyed, and taking the keyboard back to the
+    // window would send the rest of the word to the window's own shortcuts.
+    //
+    // Set when the caret arrives and never cleared by the row, because a field
+    // destroyed while it holds the caret cannot report losing it — that is the
+    // `browse-typing` mistake. It is answered from the other side instead, by
+    // the backend clearing this wherever the rows go: in `publish_pane` on
+    // every change of pane, the way `station-typing` is, and in
+    // `seat_settings` whenever it replaces the model rather than seating into
+    // it. Without the second of those the flag would be true at precisely the
+    // moment the replacement it guards happens — the handback below would be
+    // refused on the one replacement that always needs it, and the window
+    // would be left with nothing focused at all.
+    in-out property <bool> settings-typing: false;
+    // Whether the line that asks for a playlist name holds the caret. The same
+    // job again, for the queue column — which is drawn *beside* the middle
+    // pane rather than instead of it, so both are up at once: a browse screen
+    // clicked just before Save finishing its fetch, or a settings page
+    // replacing its rows, moves what the handback watches while the name is
+    // half typed. Without this the caret goes back to the window with the line
+    // still on screen, and the rest of the name is read as shortcuts — the
+    // letters to the jump bar, the space in "Road Trip" to play/pause.
+    //
+    // Deliberately not cleared in `publish_pane` the way the two above are:
+    // the line is in the column, not in the pane, and outlives the pane
+    // changing — which is exactly the moment this is for. What clears it is
+    // the field losing the caret, every press that removes the line, and the
+    // queue toggle, which removes the whole column and hands the keyboard back
+    // on its way out.
+    in-out property <bool> queue-naming: false;
     callback stations-edit();
     callback station-add(string, string);
     callback station-play(int);
     callback station-rename(int, string);
+    // The name being typed is finished with. The backend has had every
+    // keystroke already, so this carries neither the name nor the row: it says
+    // only that the list is worth writing down now, which is what keeps a
+    // rename off the disk on every letter without any way out of the pane
+    // losing it.
+    callback station-renamed();
     callback station-remove(int);
     callback station-move(int, int);
     callback seek(string, int);
@@ -2493,16 +2727,56 @@ export component AppWindow inherits Window {
                 // the way out and stays true for the life of the window —
                 // which, when it was consulted, left every letter on the
                 // Artists list dead after one visit to Search.
-                if (!root.searchable) {
+                //
+                // Never over a question either. A `Modal` hands the caret to
+                // the button that answers it as the card is built, and this
+                // runs on the same publish — taking it back would leave the
+                // question with no keyboard answer, which is the whole of
+                // what the firmware one has.
+                //
+                // And never out of the line that asks for a playlist name.
+                // That line is in the queue column beside the pane, so it is
+                // still there afterwards and is still what the next letter is
+                // meant for — the same argument as `station-typing` below,
+                // except that this one has to be made here rather than at the
+                // caller, because a screen finishing its fetch moves
+                // `arrived` and `changed arrived` claims unconditionally.
+                if (!root.searchable && !root.modal && !root.queue-naming) {
                     self.focus();
                 }
             }
+
+            // The other way a field disappears: not because the screen
+            // changed, but because the rows it was one of were replaced under
+            // it. `arrived` cannot see that — the title and the pane are the
+            // same on either side of a rename or a form redraw — so the count
+            // is watched separately.
+            property <int> replaced: root.models-replaced;
 
             init => {
                 root.browse-typing = false;
                 self.claim();
             }
             changed arrived => { self.claim(); }
+            changed replaced => {
+                // Never over a question. A dialog's own field has the caret
+                // while it is up, and the rows that were replaced are behind
+                // it where the keys are not meant to reach.
+                //
+                // Never out of the boxes above My Stations either, for the
+                // reason on `station-typing`: they are still there afterwards
+                // and are where the next station is typed.
+                //
+                // `settings-typing` is the same guard for a field further
+                // down, and it answers a model other than its own: the rows a
+                // settings field sits in are cleared of the flag as they are
+                // replaced, so what is left here is a live field — the caret
+                // in a settings row while the stations, or anything else the
+                // count covers, is swapped underneath it.
+                if (!root.modal && !root.station-typing && !root.settings-typing) {
+                    self.claim();
+                }
+            }
 
             key-pressed(event) => {
                 if (event.text == "") {
@@ -2515,15 +2789,20 @@ export component AppWindow inherits Window {
                 // can see, and Escape has something nearer to close than the
                 // screen behind it.
                 //
+                // The question itself handles all of that — see `Modal`, which
+                // holds the keyboard from above its own card and goes round
+                // its answers on Tab. This is the backstop for the case that
+                // is left: the caret somewhere else in the window entirely
+                // when the question opened, where none of it reaches the
+                // question at all. So the chain below repeats what Escape
+                // means to whichever is asking, and everything else is
+                // swallowed rather than passed on.
+                //
                 // Escape answers whichever is asking, exactly as clicking past
                 // it does — except the firmware question, which has no
                 // dismissal by design (see the note on its scrim) and so has to
                 // be answered with a button. It falls through the chain and the
                 // key is swallowed rather than passed to the screen underneath.
-                //
-                // Everything else is passed on rather than taken, so a button
-                // that has the caret still answers to it and Tab still moves
-                // between them.
                 if (root.modal) {
                     if (event.text == Key.Escape) {
                         if (root.queue-menu-open) {
@@ -2539,7 +2818,11 @@ export component AppWindow inherits Window {
                         }
                         return EventResult.accept;
                     }
-                    return EventResult.reject;
+                    // Taken rather than passed on, Tab included. A rejected
+                    // key is offered to the window itself, and the window
+                    // answers Tab by walking the focus on — which, from under
+                    // a scrim, means into the controls the scrim is covering.
+                    return EventResult.accept;
                 }
 
                 // The only chords. Ctrl with an arrow steps the queue, which
@@ -2548,11 +2831,11 @@ export component AppWindow inherits Window {
                 // library where "n" means "next" instead of "N" would be worse
                 // than no shortcut.
                 if (event.modifiers.control || event.modifiers.meta) {
-                    if (root.current.id != "" && event.text == Key.RightArrow) {
+                    if (root.controllable && event.text == Key.RightArrow) {
                         root.skip(root.current.id);
                         return EventResult.accept;
                     }
-                    if (root.current.id != "" && event.text == Key.LeftArrow) {
+                    if (root.controllable && event.text == Key.LeftArrow) {
                         root.back(root.current.id);
                         return EventResult.accept;
                     }
@@ -2576,7 +2859,7 @@ export component AppWindow inherits Window {
 
                 // The ends of the list. The bar stops at Z, and a library's
                 // Songs has two thousand rows after it.
-                if (root.browse-pane
+                if (root.browse-showing
                     && (event.text == Key.Home || event.text == Key.End)) {
                     if (root.browse-paged) {
                         // Thirty rows of two thousand are in hand, so the end
@@ -2591,16 +2874,19 @@ export component AppWindow inherits Window {
                     }
                     return EventResult.accept;
                 }
-                if (root.browse-pane
+                if (root.browse-showing
                     && (event.text == Key.PageUp || event.text == Key.PageDown)) {
                     root.browse-page-down = event.text == Key.PageDown;
                     root.browse-page += 1;
                     return EventResult.accept;
                 }
 
-                // Play and pause. Only with a player to say it to.
+                // Play and pause. Only with a player to say it to, and only
+                // one that can hear it: the button beside the artwork goes
+                // dark on an unreachable speaker and the key has no business
+                // being livelier than the button.
                 if (event.text == " ") {
-                    if (root.current.id == "") {
+                    if (!root.controllable) {
                         return EventResult.reject;
                     }
                     root.toggle(root.current.id);
@@ -2641,13 +2927,12 @@ export component AppWindow inherits Window {
                 }
                 // And nothing to jump to is nothing to take.
                 //
-                // The pane as well as the bar, the way Home/End and the page
-                // keys above already test it. `browse-index` belongs to the
-                // last browse screen and outlives it, so a letter typed on
-                // Settings or My Stations was paging a list nobody could see:
-                // no feedback at all, a /Browse request on the wire, and the
-                // trail sitting somewhere else when you pressed Back.
-                if (!root.browse-pane || root.browse-index.length == 0) {
+                // The list being on screen as well as the bar having letters,
+                // the way Home/End and the page keys above already test it.
+                // `browse-index` belongs to the last browse screen and
+                // outlives it, so a letter typed anywhere else was paging a
+                // list nobody could see.
+                if (!root.browse-showing || root.browse-index.length == 0) {
                     return EventResult.reject;
                 }
                 // Sent exactly as typed. Matching it to a letter is the
@@ -2902,6 +3187,14 @@ export component AppWindow inherits Window {
 
                                         VerticalLayout {
                                             padding: Theme.gap;
+                                            // The count belongs on the list
+                                            // and the index on the row; see
+                                            // the note on the queue's list.
+                                            // Stated on each row instead, it
+                                            // said "one of six" six times and
+                                            // left the popup itself nameless.
+                                            accessible-role: list;
+                                            accessible-item-count: root.browse-selector.length;
 
                                             for entry[i] in root.browse-selector: Rectangle {
                                                 // The twin of ServiceChip on the
@@ -2912,7 +3205,6 @@ export component AppWindow inherits Window {
                                                 accessible-role: list-item;
                                                 accessible-label: entry.title;
                                                 accessible-item-index: i;
-                                                accessible-item-count: root.browse-selector.length;
                                                 accessible-item-selectable: true;
                                                 accessible-item-selected: entry.selected;
                                                 accessible-action-default => {
@@ -2976,7 +3268,7 @@ export component AppWindow inherits Window {
                     // Settings and Help take the pane whole. Leaving the last
                     // screen's search box above them offers to search a screen
                     // that is no longer on show.
-                    if root.searchable: HorizontalLayout {
+                    if root.search-drawn: HorizontalLayout {
                         padding-left: Theme.pad;
                         padding-right: Theme.pad;
                         padding-bottom: Theme.gap;
@@ -2988,13 +3280,52 @@ export component AppWindow inherits Window {
                             // search was one worth keeping.
                             edited(text) => { root.browse-search(text); }
                             accepted(text) => { root.browse-search-done(text); }
-                            // Hoisted to the window because the jump bar has to
-                            // read it and cannot see inside this `if`.
-                            changed typing => { root.browse-typing = self.typing; }
+                            // Hoisted to the window because it has to outlive
+                            // this `if`: the block goes when Now Playing or
+                            // Customize Home takes the screen, and a box that
+                            // is destroyed holding the caret cannot report
+                            // losing it.
+                            //
+                            // Except to a question, which takes the caret from
+                            // above its own card while this box stays on
+                            // screen half typed — the caret leaving that way
+                            // is the question borrowing it, not the box being
+                            // finished with. The same argument as the playlist
+                            // name line's, and what tells the two ways back
+                            // below apart.
+                            changed typing => {
+                                if (!root.modal) {
+                                    root.browse-typing = self.typing;
+                                }
+                            }
                             // And the way back in. A counter rather than a flag
                             // because asking twice has to work twice.
                             property <int> asked: root.focus-search;
                             changed asked => { self.take-focus(); }
+                            // The question going again, which is the other way
+                            // back. Nothing else will put the caret anywhere:
+                            // `claim` refuses it on a screen carrying a box,
+                            // on the reasoning that the box takes it as it
+                            // appears — and this box did not appear, because a
+                            // question no longer destroys it.
+                            //
+                            // `resume-focus` rather than `take-focus` where it
+                            // had the caret: half a query is a word being
+                            // typed rather than one to be replaced, and
+                            // selecting it would let the next letter take the
+                            // rest of it away. Where it did not, the keys go
+                            // back to the window, which is where the question
+                            // borrowed them from.
+                            property <bool> covered: root.modal;
+                            changed covered => {
+                                if (!self.covered) {
+                                    if (root.browse-typing) {
+                                        self.resume-focus();
+                                    } else {
+                                        keys.focus();
+                                    }
+                                }
+                            }
                             // Escape hands the caret back to the key scope, so
                             // the next Escape or Backspace navigates instead of
                             // being swallowed by the box. An inner element can
@@ -3017,13 +3348,24 @@ export component AppWindow inherits Window {
                             init => {
                                 root.want-search = false;
                                 self.take-focus();
+                                // Said out loud, because a change tracker
+                                // never fires on creation: the caret is taken
+                                // here, inside `init`, so `changed typing`
+                                // above has nothing to report and the window
+                                // would go on believing nobody was typing in
+                                // a box that had just claimed the keyboard.
+                                // The same reason the playlist name line says
+                                // so itself.
+                                root.browse-typing = true;
                             }
                         }
                     }
 
                     // What has been searched for before, offered where the
-                    // results will appear.
-                    if root.searchable
+                    // results will appear. Drawn on the same terms as the box
+                    // above it, so a question does not reflow the screen
+                    // behind its own scrim.
+                    if root.search-drawn
                         && root.browse-blocks.length == 0
                         && root.browse-recent.length > 0: VerticalLayout {
                         padding-left: Theme.pad;
@@ -3082,52 +3424,63 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        for entry[i] in root.browse-recent: Rectangle {
-                            // Named after the search it would run again. The
-                            // action writes the box as well as running it, the
-                            // way the press does: the query on screen has to be
-                            // the one whose results are under it.
-                            accessible-role: list-item;
-                            accessible-label: entry;
-                            accessible-item-index: i;
+                        // Wrapped rather than left in the section above,
+                        // which also holds the heading and the Clear button:
+                        // the count belongs on the list and the index on the
+                        // row — see the note on the queue's list — and a
+                        // count stated on each row says "one of four" four
+                        // times over while the list itself stays unnamed.
+                        VerticalLayout {
+                            accessible-role: list;
                             accessible-item-count: root.browse-recent.length;
-                            accessible-action-default => {
-                                root.browse-query = entry;
-                                root.browse-search(entry);
-                            }
-                            height: 38px;
-                            border-radius: Theme.radius-small;
-                            background: again.has-hover ? Theme.hover : transparent;
 
-                            HorizontalLayout {
-                                padding-left: Theme.gap;
-                                spacing: Theme.pad;
+                            for entry[i] in root.browse-recent: Rectangle {
+                                // Named after the search it would run again.
+                                // The action writes the box as well as running
+                                // it, the way the press does: the query on
+                                // screen has to be the one whose results are
+                                // under it.
+                                accessible-role: list-item;
+                                accessible-label: entry;
+                                accessible-item-index: i;
+                                accessible-action-default => {
+                                    root.browse-query = entry;
+                                    root.browse-search(entry);
+                                }
+                                height: 38px;
+                                border-radius: Theme.radius-small;
+                                background: again.has-hover ? Theme.hover : transparent;
 
-                                VerticalLayout {
-                                    alignment: center;
+                                HorizontalLayout {
+                                    padding-left: Theme.gap;
+                                    spacing: Theme.pad;
 
-                                    Icon {
-                                        glyph: Icons.recent;
-                                        tint: Theme.faint;
-                                        width: 15px;
-                                        height: 15px;
+                                    VerticalLayout {
+                                        alignment: center;
+
+                                        Icon {
+                                            glyph: Icons.recent;
+                                            tint: Theme.faint;
+                                            width: 15px;
+                                            height: 15px;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: entry;
+                                        font-size: Theme.body-size;
+                                        color: Theme.dim;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
                                     }
                                 }
 
-                                Text {
-                                    text: entry;
-                                    font-size: Theme.body-size;
-                                    color: Theme.dim;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
-                            }
-
-                            again := TouchArea {
-                                clicked => {
-                                    root.browse-query = entry;
-                                    root.browse-search(entry);
+                                again := TouchArea {
+                                    clicked => {
+                                        root.browse-query = entry;
+                                        root.browse-search(entry);
+                                    }
                                 }
                             }
                         }
@@ -3555,6 +3908,7 @@ export component AppWindow inherits Window {
 
                                 DayPicker {
                                     letters: root.alarm-letters;
+                                    names: root.alarm-day-names;
                                     days: root.alarm-days;
                                     toggled(i) => { root.alarm-day-toggled(i); }
                                 }
@@ -3589,6 +3943,13 @@ export component AppWindow inherits Window {
                                 font-size: Theme.small-size;
                                 width: 200px;
                                 accepted => { new-url.focus(); }
+                                // Both boxes answer for the pair, since either
+                                // holding the caret is a reason to leave it
+                                // where it is. See `station-typing`.
+                                changed has-focus => {
+                                    root.station-typing =
+                                        self.has-focus || new-url.has-focus;
+                                }
                             }
 
                             new-url := LineEdit {
@@ -3605,6 +3966,10 @@ export component AppWindow inherits Window {
                                     root.station-add(new-name.text, url);
                                     new-name.text = "";
                                     self.text = "";
+                                }
+                                changed has-focus => {
+                                    root.station-typing =
+                                        self.has-focus || new-name.has-focus;
                                 }
                             }
 
@@ -3706,6 +4071,7 @@ export component AppWindow inherits Window {
                                         lift: spot.lift;
                                         play => { root.station-play(i); }
                                         renamed(name) => { root.station-rename(i, name); }
+                                        settled => { root.station-renamed(); }
                                         remove => { root.station-remove(i); }
                                         drag-moved(offset) => {
                                             if (station-list.from-row < 0) {
@@ -3748,7 +4114,18 @@ export component AppWindow inherits Window {
                             chose(i) => { root.setting-choose(item.index, i); }
                             numbered(v) => { root.setting-number(item.index, v); }
                             typed(t) => { root.setting-text(item.index, t); }
+                            drafted(t) => { root.setting-drafted(item.index, t); }
+                            caret => { root.settings-typing = true; }
                             opened => { root.setting-open(item.index); }
+                            // Giving up on the field hands the keyboard back
+                            // here first. The row may be about to go away —
+                            // the playlist name line is — and a field that is
+                            // destroyed while it still holds the caret leaves
+                            // the window with nothing focused at all.
+                            escaped => {
+                                keys.focus();
+                                root.setting-escaped(item.index);
+                            }
                         }
                     }
 
@@ -3989,7 +4366,7 @@ export component AppWindow inherits Window {
                         padding: Theme.pad;
                         spacing: Theme.pad;
 
-                        HorizontalLayout {
+                        crown := HorizontalLayout {
                             IconButton {
                                 glyph: Icons.close;
                                 label: "Close Now Playing";
@@ -4041,8 +4418,38 @@ export component AppWindow inherits Window {
                                 // smaller wins, which is what stops a short
                                 // wide window pushing the sleeve off the
                                 // bottom.
+                                //
+                                // Measured rather than counted. The `- 278px`
+                                // that stood here was the two lines of title
+                                // and artist and nothing else, so the three
+                                // things that come and go underneath them —
+                                // the quality badge, the stream-format line
+                                // and the row of track actions — were each
+                                // drawn in space the sleeve had already been
+                                // given. On a tall enough window the padding
+                                // absorbed it; in a short one the buttons went
+                                // off the bottom edge of a pane that clips.
+                                //
+                                // Asking the two siblings how tall they are is
+                                // not the loop the note above warns about:
+                                // neither of them is sized from the sleeve.
+                                // Their heights come from a fixed-size
+                                // button, elided single lines, a badge and a
+                                // row of pills, none of which reads this
+                                // pane's width or this property.
                                 property <length> stage: Math.max(160px, Math.min(
-                                    root.height - 278px,
+                                    root.height
+                                        // The strip along the bottom of the
+                                        // window, which is not this pane's to
+                                        // spend. `root.height` is the whole
+                                        // window; the pane is what is left of
+                                        // it under the transport.
+                                        - transport.height
+                                        - crown.preferred-height
+                                        - below.preferred-height
+                                        // The padding round the three rows and
+                                        // the two gaps between them.
+                                        - 4 * Theme.pad,
                                     root.width - 268px
                                         - (root.queue-shown ? 330px : 0px)
                                         - 96px));
@@ -4094,7 +4501,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        VerticalLayout {
+                        below := VerticalLayout {
                             spacing: Theme.tight;
                             padding-bottom: Theme.room;
 
@@ -4678,8 +5085,83 @@ export component AppWindow inherits Window {
 
                         name-field := SearchField {
                             prompt: "Name for this playlist";
+                            // The caret goes in as the line appears: the line
+                            // is there because Save was pressed, and pressing
+                            // Save is asking to type a name.
+                            //
+                            // Said out loud here as well as tracked below,
+                            // because a change tracker never fires on
+                            // creation and the caret arrives during it.
+                            init => {
+                                self.take-focus();
+                                root.queue-naming = true;
+                            }
+                            // And the caret leaving by a click somewhere else
+                            // in the window, which is the one way out of here
+                            // that none of the presses below can report. See
+                            // `queue-naming`.
+                            //
+                            // Except to a question. A queue row's menu, a
+                            // dialog or an update notice takes the keyboard
+                            // from above its own card while the line stays on
+                            // screen underneath, half typed — so the caret
+                            // leaving that way is the question borrowing it,
+                            // not the line being finished with. Read as the
+                            // latter it cleared the flag, and when the
+                            // question went `claim` handed the keys to the
+                            // window instead: the rest of the name drove the
+                            // jump bar and its space paused the player, which
+                            // is the exact loss this flag exists to stop. The
+                            // four presses that really do finish with the line
+                            // clear it themselves and are unaffected.
+                            changed typing => {
+                                if (!root.modal) {
+                                    root.queue-naming = self.typing;
+                                }
+                            }
+                            // And the question going again, which is the other
+                            // half of the same thing: nothing else will put
+                            // the caret back, because `claim` is guarded on
+                            // the flag held above and the line was never
+                            // destroyed for anything to notice. Not
+                            // `take-focus`, which selects what is there — see
+                            // `resume-focus`.
+                            property <bool> asked: root.modal;
+                            changed asked => {
+                                if (!self.asked && root.queue-naming) {
+                                    self.resume-focus();
+                                }
+                            }
                             accepted(text) => {
+                                // Every way out of here removes the line, and
+                                // the line is what holds the caret — so the
+                                // keyboard goes back to the window first, or
+                                // it is left on nothing at all and the space
+                                // bar, the letters and Escape are all dead
+                                // until something is clicked. The window
+                                // cannot notice this on its own: the pane and
+                                // the title are the same on either side of it.
+                                //
+                                // And said out loud rather than left to
+                                // `changed typing` above, on all four of
+                                // these: the line is gone by the time that
+                                // would be read, and a flag left true would
+                                // suppress the handback everywhere else for
+                                // the life of the window.
+                                keys.focus();
+                                root.queue-naming = false;
                                 root.queue-save(text);
+                                pane.naming = -1;
+                                self.text = "";
+                            }
+                            // Giving up on the name puts the buttons back and
+                            // sends nothing. Without this the box swallows
+                            // Escape — SearchField accepts the key whether or
+                            // not anybody is listening — so there was no way
+                            // out of the line but the mouse.
+                            escaped => {
+                                keys.focus();
+                                root.queue-naming = false;
                                 pane.naming = -1;
                                 self.text = "";
                             }
@@ -4691,6 +5173,10 @@ export component AppWindow inherits Window {
                             PillButton {
                                 label: "Cancel";
                                 clicked => {
+                                    // As above: the caret may well be in the
+                                    // field this press destroys.
+                                    keys.focus();
+                                    root.queue-naming = false;
                                     pane.naming = -1;
                                     name-field.text = "";
                                 }
@@ -4700,6 +5186,8 @@ export component AppWindow inherits Window {
                                 label: "Save";
                                 primary: true;
                                 clicked => {
+                                    keys.focus();
+                                    root.queue-naming = false;
                                     root.queue-save(name-field.text);
                                     pane.naming = -1;
                                     name-field.text = "";
@@ -4760,7 +5248,7 @@ export component AppWindow inherits Window {
         // Transport, across the whole width, the way the official controller
         // has it: what is playing on the left, the controls in the middle, and
         // which player you are driving on the right.
-        Rectangle {
+        transport := Rectangle {
             height: 88px;
             background: Theme.glass-raised;
             clip: true;
@@ -5018,7 +5506,7 @@ export component AppWindow inherits Window {
                     }
 
                     // Which player, and how loud.
-                    HorizontalLayout {
+                    bar := HorizontalLayout {
                         spacing: Theme.gap;
                         width: 420px;
 
@@ -5035,7 +5523,25 @@ export component AppWindow inherits Window {
 
                             Rectangle {
                                 height: 32px;
-                                width: name.preferred-width + 62px;
+                                // As wide as the name wants, up to what is
+                                // left of the bar once the volume slider and
+                                // the queue toggle have taken theirs.
+                                //
+                                // Uncapped it was the name's own width plus
+                                // the chrome, and the row it sits in has a
+                                // fixed width: a player called "Living room
+                                // (Powernode) — upstairs" simply pushed the
+                                // queue toggle off the end of the bar, so the
+                                // one control that brings the queue back could
+                                // not be pressed. Measured off the pieces
+                                // rather than written out as a number, so it
+                                // cannot fall out of step with them.
+                                width: Math.min(
+                                    name.preferred-width + 62px,
+                                    bar.width
+                                        - loudness.width
+                                        - toggle.preferred-width
+                                        - 3 * Theme.gap);
                                 border-radius: self.height / 2;
                                 background: pick.pressed
                                     ? Theme.pressed
@@ -5066,6 +5572,11 @@ export component AppWindow inherits Window {
                                         font-size: Theme.small-size;
                                         color: Theme.text;
                                         vertical-alignment: center;
+                                        // What lets the pill above be capped:
+                                        // an elided text can shrink to an
+                                        // ellipsis, so the row gives way here
+                                        // rather than overflowing.
+                                        overflow: elide;
                                     }
 
                                     VerticalLayout {
@@ -5161,8 +5672,26 @@ export component AppWindow inherits Window {
                                             // 140px of chrome measured above puts
                                             // the whole popup at the same 470px
                                             // it was meant to stop at.
+                                            //
+                                            // Under that, what the cards actually
+                                            // come to. They are two sizes — a
+                                            // badge row is 34px of card — and
+                                            // which row is which is counted in
+                                            // Rust; see `badged-players`. One
+                                            // number for both was 132px, which is
+                                            // more than the taller of them, so a
+                                            // single player sat above a third of a
+                                            // card of empty list and two players
+                                            // above most of one.
                                             ListView {
-                                                height: min(root.devices.length * 132px, 330px);
+                                                height: root.devices.length == 0
+                                                    ? 0px
+                                                    : min(root.badged-players
+                                                            * Theme.player-card-badged
+                                                        + (root.devices.length
+                                                                - root.badged-players)
+                                                            * Theme.player-card,
+                                                        330px);
                                                 accessible-item-count: root.devices.length;
 
                                                 for device[i] in root.devices: DeviceCard {
@@ -5228,7 +5757,7 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        VerticalLayout {
+                        loudness := VerticalLayout {
                             alignment: center;
                             width: 208px;
 
@@ -5244,7 +5773,7 @@ export component AppWindow inherits Window {
                         // Past the volume rather than before it: the queue is
                         // the pane on that side of the window, so the control
                         // that hides it belongs on the same side.
-                        VerticalLayout {
+                        toggle := VerticalLayout {
                             alignment: center;
                             padding-left: Theme.gap;
 
@@ -5255,7 +5784,31 @@ export component AppWindow inherits Window {
                                 glyph-size: 17px;
                                 tint: root.queue-shown ? Theme.text : Theme.dim;
                                 active: root.queue-shown;
-                                clicked => { root.queue-shown = !root.queue-shown; }
+                                clicked => {
+                                    // The fifth way out of the name line, and
+                                    // the only one that takes the column with
+                                    // it: this button is an IconButton, so the
+                                    // press does not move the caret first, and
+                                    // hiding the column destroys the line the
+                                    // caret is in. Nothing the window watches
+                                    // has moved by then — same pane, same
+                                    // title, no model replaced — so the
+                                    // handback has to happen here or Slint is
+                                    // left with nothing focused at all and
+                                    // every key the window binds is dead until
+                                    // something is clicked.
+                                    //
+                                    // Only when the line has the caret: the
+                                    // stations pane's boxes are drawn beside
+                                    // this column too, and taking the keyboard
+                                    // off one of those would be the same fault
+                                    // the other way round.
+                                    if (root.queue-naming) {
+                                        keys.focus();
+                                        root.queue-naming = false;
+                                    }
+                                    root.queue-shown = !root.queue-shown;
+                                }
                             }
                         }
 
@@ -5286,18 +5839,24 @@ export component AppWindow inherits Window {
             easing: ease-out;
         }
 
-        if menu-fade.visible: Rectangle {
-        // Anything outside the panel dismisses it.
+        // Anything outside the panel dismisses it, and for anyone stepping
+        // through the tree that is the only way out: nothing else closes the
+        // menu, so the way out is named rather than being a hit target
+        // covering the window.
         //
-        // Named, because for anyone stepping through the tree this is the only
-        // way out: nothing else closes the menu, and an unnamed hit target
-        // covering the window is a dead end rather than a dismissal.
-        TouchArea {
-            accessible-role: button;
-            accessible-label: "Close this menu";
-            accessible-action-default => { root.queue-menu-open = false; }
-            clicked => { root.queue-menu-open = false; }
-        }
+        // `transparent` rather than a scrim: this one is anchored to the row
+        // it came from, and dimming the window for it would say something
+        // much larger than "here are six things you can do to this track".
+        // Modal all the same — the wheel scrolled the queue behind it and
+        // asked the player for another page of a list the menu was covering.
+        //
+        // No buttons: its rows are its own, so nothing here reaches for the
+        // caret and the scope above them takes it instead, which is what
+        // answers Escape.
+        if menu-fade.visible: Modal {
+        shade: transparent;
+        dismiss-label: "Close this menu";
+        dismissed => { root.queue-menu-open = false; }
 
         Rectangle {
             x: Math.clamp(
@@ -5367,6 +5926,14 @@ export component AppWindow inherits Window {
                 }
 
                 rows := VerticalLayout {
+                    // The count belongs on the list and the index on the row;
+                    // see the note on the queue's list. Without it each row
+                    // announced its position out of nothing — "four" with no
+                    // "of fourteen" to put it in — which is the one number
+                    // that makes a position worth reading.
+                    accessible-role: list;
+                    accessible-item-count: root.queue-menu-rows.length;
+
                     for entry[i] in root.queue-menu-rows: Rectangle {
                         // The rows of the context menu, which are the whole of
                         // what it offers. Unnamed they were fourteen anonymous
@@ -5443,16 +6010,13 @@ export component AppWindow inherits Window {
     // nothing of ours in it: the title, the sentence and every button come off
     // the wire. Dismissing runs no action, which is what its `closeAction` of
     // type `nil` asks for.
-    if root.dialog-open: Rectangle {
-        background: Theme.scrim;
-
-        // As on the queue's menu: the scrim is the way out, so it says so.
-        TouchArea {
-            accessible-role: button;
-            accessible-label: "Dismiss";
-            accessible-action-default => { root.dialog-press(-1); }
-            clicked => { root.dialog-press(-1); }
-        }
+    if root.dialog-open: asking := Modal {
+        // The player's own buttons, in the player's own order, so which of
+        // them is safe is the player's answer too: the first it has not
+        // colored. See `dialog-safe`.
+        buttons: root.dialog-buttons.length;
+        safe: root.dialog-safe;
+        dismissed => { root.dialog-press(-1); }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
@@ -5492,9 +6056,15 @@ export component AppWindow inherits Window {
                     spacing: Theme.gap;
                     padding-top: Theme.tight;
 
-                    for button in root.dialog-buttons: PillButton {
+                    for button[b] in root.dialog-buttons: PillButton {
                         label: button.label;
                         primary: button.destructive;
+                        // Where it sits rather than what it does: `index` is
+                        // the player's number for the answer and the two are
+                        // only the same while the player numbers its choices
+                        // from zero in order.
+                        seat: b;
+                        seated: asking.at;
                         clicked => { root.dialog-press(button.index); }
                     }
                 }
@@ -5502,16 +6072,15 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.update-notice != "": Rectangle {
-        background: Theme.scrim;
-
+    if root.update-notice != "": offer := Modal {
         // Dismissable by clicking away, unlike the install question below:
         // this one is an offer, and ignoring an offer should be easy.
-        TouchArea {
-            clicked => {
-                root.update-notice = "";
-                root.answer-update-notice(false);
-            }
+        buttons: 2;
+        safe: 1;
+        dismiss-label: "Not now";
+        dismissed => {
+            root.update-notice = "";
+            root.answer-update-notice(false);
         }
 
         Rectangle {
@@ -5556,6 +6125,8 @@ export component AppWindow inherits Window {
                     PillButton {
                         label: "Show me";
                         primary: true;
+                        seat: 0;
+                        seated: offer.at;
                         clicked => {
                             root.update-notice = "";
                             root.answer-update-notice(true);
@@ -5564,6 +6135,8 @@ export component AppWindow inherits Window {
 
                     PillButton {
                         label: "Not now";
+                        seat: 1;
+                        seated: offer.at;
                         clicked => {
                             root.update-notice = "";
                             root.answer-update-notice(false);
@@ -5574,12 +6147,16 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.confirm-upgrade != "": Rectangle {
-        background: Theme.scrim;
-
-        // No dismiss-by-scrim here, unlike the input question below. Answering
-        // this one by clicking past it is not a thing to make easy.
-        TouchArea { }
+    if root.confirm-upgrade != "": firmware-asked := Modal {
+        // No dismiss-by-scrim here, unlike the input question below, and no
+        // Escape either. Answering this one by clicking past it is not a
+        // thing to make easy — which is exactly why it has to be answerable
+        // from the keyboard: refusing the one key that leaves and having no
+        // focused button left it with no way out at all for anyone not using
+        // a mouse.
+        dismissable: false;
+        buttons: 2;
+        safe: 1;
 
         Rectangle {
             x: (parent.width - self.width) / 2;
@@ -5625,6 +6202,8 @@ export component AppWindow inherits Window {
                     PillButton {
                         label: "Update";
                         primary: true;
+                        seat: 0;
+                        seated: firmware-asked.at;
                         clicked => {
                             root.confirm-upgrade = "";
                             root.answer-upgrade(true);
@@ -5633,6 +6212,8 @@ export component AppWindow inherits Window {
 
                     PillButton {
                         label: "Not now";
+                        seat: 1;
+                        seated: firmware-asked.at;
                         clicked => {
                             root.confirm-upgrade = "";
                             root.answer-upgrade(false);
@@ -5643,14 +6224,13 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.confirm-input != "": Rectangle {
-        background: Theme.scrim;
-
-        TouchArea {
-            clicked => {
-                root.confirm-input = "";
-                root.answer-input(false);
-            }
+    if root.confirm-input != "": input-asked := Modal {
+        buttons: 2;
+        safe: 1;
+        dismiss-label: "Cancel";
+        dismissed => {
+            root.confirm-input = "";
+            root.answer-input(false);
         }
 
         Rectangle {
@@ -5697,6 +6277,8 @@ export component AppWindow inherits Window {
                     PillButton {
                         label: "Switch";
                         primary: true;
+                        seat: 0;
+                        seated: input-asked.at;
                         clicked => {
                             root.confirm-input = "";
                             root.answer-input(true);
@@ -5705,6 +6287,8 @@ export component AppWindow inherits Window {
 
                     PillButton {
                         label: "Cancel";
+                        seat: 1;
+                        seated: input-asked.at;
                         clicked => {
                             root.confirm-input = "";
                             root.answer-input(false);
@@ -5724,17 +6308,27 @@ export component AppWindow inherits Window {
         }
     }
 
-    // The upgrade strip's words, held for the same reason as `indexed`: the
-    // strip animates its own collapse, and a label bound straight through
-    // would blank on the frame the upgrade ended and leave an empty box
-    // shrinking. Composed here rather than in Rust so the two halves stay
-    // separate properties — the player's name is also what the row badge and
-    // the toasts use.
+    // The upgrade strip's words. Composed here rather than in Rust so the two
+    // halves stay separate properties — the player's name is also what the
+    // row badge and the toasts use.
+    //
+    // Both halves and not the stage alone. The tracker below used to watch
+    // the stage, and a second player beginning at the stage the first was
+    // already on changes the name without changing the stage: nothing fired,
+    // and the strip went on naming the player that had finished while it
+    // counted the one that had not.
+    property <string> upgrade-now: root.upgrading-player == ""
+        ? ""
+        : root.upgrading-player + " — " + root.upgrading-stage;
+
+    // Held for the same reason as `indexed`: the strip animates its own
+    // collapse, and a label bound straight through would blank on the frame
+    // the upgrade ended and leave an empty box shrinking.
     property <string> upgrade-said;
 
-    changed upgrading-stage => {
-        if (root.upgrading-player != "") {
-            root.upgrade-said = root.upgrading-player + " — " + root.upgrading-stage;
+    changed upgrade-now => {
+        if (root.upgrade-now != "") {
+            root.upgrade-said = root.upgrade-now;
         }
     }
 
@@ -5750,6 +6344,25 @@ export component AppWindow inherits Window {
             root.said = root.status-line;
         }
     }
+
+    // Four seconds from the message that is up, not from the first of a run.
+    //
+    // `running` alone cannot do it: it is already true when the next message
+    // lands, so nothing restarts and the second toast inherits whatever is
+    // left of the first one's four seconds — a message that arrives at 3.9s
+    // is read by nobody. The count is what says a message was said, since
+    // the same words twice in a row are still two messages and the line
+    // itself has not changed.
+    //
+    // Out here rather than inside the toast, where it used to sit: a timer
+    // behind an `if` cannot be restarted from outside it.
+    toast-timer := Timer {
+        interval: 4s;
+        running: root.status-line != "";
+        triggered => { root.status-line = ""; }
+    }
+
+    changed messages-said => { toast-timer.restart(); }
 
     toast := Rectangle {
         opacity: root.status-line != "" ? 1.0 : 0.0;
@@ -5801,11 +6414,6 @@ export component AppWindow inherits Window {
             }
         }
 
-        Timer {
-            interval: 4s;
-            running: root.status-line != "";
-            triggered => { root.status-line = ""; }
-        }
         }
     }
 }

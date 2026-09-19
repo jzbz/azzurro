@@ -23,7 +23,16 @@
 //! Putting them in the player's presets would fix that and is the obvious next
 //! step, but presets are their own unfinished story.
 
-use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use crate::store::{Durability, Store};
+
+/// The file, and whatever is waiting to go into it.
+///
+/// `Synced` alone among the four: this list is typed in by hand and kept
+/// nowhere else — not on the player, not in the official app — so a crash that
+/// emptied it would lose something nobody can get back.
+static STORE: LazyLock<Store> = LazyLock::new(|| Store::named("stations", Durability::Synced));
 
 /// How many stations are worth keeping.
 ///
@@ -43,10 +52,6 @@ const MAX_URL: usize = 2000;
 pub struct Station {
     pub name: String,
     pub url: String,
-}
-
-fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("azzurro").join("stations"))
 }
 
 /// Whether a URL is one this app will hand to a player.
@@ -178,32 +183,59 @@ pub fn remember(stations: &mut Vec<Station>, name: &str, url: &str) -> bool {
 }
 
 /// Every station typed in on this machine.
+///
+/// Empty when the file is missing, and empty for this run when it is there but
+/// unreadable — in which case nothing is written back either; see [`store`].
+///
+/// [`store`]: crate::store
 pub fn load() -> Vec<Station> {
-    let Some(path) = path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    read(&text)
+    STORE.read().map(|text| read(&text)).unwrap_or_default()
 }
 
-/// Write the list back, if there is anywhere to write it.
+/// Whether the file is there and could not be read.
+///
+/// [`load`] answers an unreadable file the same way it answers a missing one,
+/// with an empty list, because that is what the pane can draw either way — but
+/// the two mean opposite things to whoever is about to type into it. This list
+/// is kept nowhere else: not on the player, not in the official app, not on
+/// another machine. So the pane asks, once, as it comes up, and says so.
+///
+/// Answers for the last [`load`], which is what opening the pane does.
+pub fn sealed() -> bool {
+    STORE.sealed()
+}
+
+/// Write the list back, off whatever thread asked.
 ///
 /// Failure is logged and swallowed, as with the players and searches beside
 /// it: losing a station is a smaller problem than refusing to run.
 pub fn save(stations: &[Station]) {
-    let Some(path) = path() else { return };
+    STORE.save(body(stations));
+}
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::debug!("cannot keep stations: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::write(&path, body(stations)) {
-        tracing::debug!("cannot write {}: {e}", path.display());
-    }
+/// Say what the file should hold without writing it yet.
+///
+/// For a name being retyped in the list. A rename used to rewrite the whole
+/// file on every keystroke — and to do it on the command loop, under the lock
+/// the rest of browsing waits on — while what the user means by a rename is
+/// the name they stop typing, not each letter on the way to it. So the letters
+/// only stage, and [`sync`] writes at the points that mean the rename is over.
+///
+/// Staging and not simply waiting is what makes sure no exit path can lose it:
+/// whatever the window does next, the newest body is already the file's, and
+/// the next write of any kind carries it — including the one on the way out.
+pub fn stage(stations: &[Station]) {
+    STORE.stage(body(stations));
+}
+
+/// Write whatever [`stage`] left, off this thread.
+pub fn sync() {
+    STORE.sync();
+}
+
+/// Write whatever is left, here and now. For the way out.
+pub fn flush() {
+    STORE.flush();
 }
 
 #[cfg(test)]

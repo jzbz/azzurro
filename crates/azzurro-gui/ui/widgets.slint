@@ -123,6 +123,30 @@ export component PillButton inherits Rectangle {
     in property <bool> primary: false;
     callback clicked();
 
+    // Which answer of a set this is, and which of the set the keyboard is on.
+    //
+    // Only a `Modal` sets them, and it sets the second on every button of its
+    // card at once: the one whose seat is named takes the caret. Two numbers
+    // rather than a flag because a question opens on the same button every
+    // time, and a flag that is already true fires nothing. The defaults
+    // cannot match, so every other button in the window is a plain tab stop
+    // and nothing reaches for the caret on its own.
+    in property <int> seat: -1;
+    in property <int> seated: -2;
+
+    function claim() {
+        if (root.seat == root.seated && root.enabled) {
+            keys.focus();
+        }
+    }
+
+    // On creation as well as on the change: the card is built when its
+    // question opens, so the seat it opens on never changes afterwards and
+    // `changed` alone would leave the first question of the session with no
+    // button focused at all.
+    init => { root.claim(); }
+    changed seated => { root.claim(); }
+
     // The label it already draws is the name it already has.
     accessible-role: button;
     accessible-label: root.label;
@@ -140,10 +164,51 @@ export component PillButton inherits Rectangle {
     background: root.primary
         ? (touch.pressed ? Theme.accent-hover : Theme.accent)
         : (touch.pressed ? Theme.pressed : (touch.has-hover ? Theme.hover : transparent));
-    border-width: root.primary ? 0px : 1px;
-    border-color: Theme.border;
+    // The ring says where the keyboard is. On a plain button the accent reads
+    // against the card it sits on; on a primary one that would be the accent
+    // drawn on the accent, so the ring there is the button's own ink. Slint
+    // draws a border inside the shape, so neither of them moves the label.
+    border-width: keys.has-focus ? 2px : (root.primary ? 0px : 1px);
+    border-color: keys.has-focus
+        ? (root.primary ? Theme.accent-ink : Theme.accent)
+        : Theme.border;
     animate background { duration: Theme.quick; easing: ease-out; }
     opacity: root.enabled ? 1.0 : 0.35;
+
+    // What makes a button answerable without a mouse.
+    //
+    // Without one, nothing on a dialog could take the caret: the window's own
+    // key handler passed everything but Escape on to a focused button and
+    // there was never a focused button to pass it to, so the firmware
+    // question — which ignores Escape on purpose — had no keyboard answer at
+    // all.
+    //
+    // Enter and the space bar, which is what every toolkit's buttons answer
+    // to. The space bar pauses the player everywhere else in the window; a
+    // focused button is the one place it must not, and it does not reach the
+    // window's handler while this holds the caret.
+    //
+    // `focus-on-click` stays off: a press already does what the button is
+    // for, and moving the caret onto a button that is about to close the
+    // question it is on leaves the card's own idea of which seat is taken
+    // pointing at the wrong one.
+    keys := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                // Guarded for the reason the default action is: `enabled` on
+                // the scope keeps the caret away, but a button disabled while
+                // it already held it is still the focused item.
+                if (root.enabled) {
+                    root.clicked();
+                }
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
 
     content := HorizontalLayout {
         alignment: center;
@@ -180,6 +245,129 @@ export component PillButton inherits Rectangle {
     touch := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+// Everything a question laid over the window has to do besides ask it.
+//
+// The card in the middle stays with each question — the firmware warning is
+// wider than the input one, the player's own dialog stretches its buttons
+// across the card instead of centering a pair — but being modal is the same
+// job every time and was written out four times over. They drifted, as four
+// copies do: not one of them stopped the wheel, so the list underneath went
+// on scrolling and asking the player for more pages behind a question nobody
+// could see past, and not one of them held the keyboard, so Tab walked out of
+// the card into the controls under the scrim.
+//
+// Put the card inside one of these and it gets the veil, the pointer, the
+// wheel, Escape where Escape is wanted, and a Tab that goes round the
+// answers rather than out of them.
+export component Modal inherits Rectangle {
+    // The veil itself. The queue's menu passes `transparent`: it is anchored
+    // to the row it came from and dimming the window for it would say
+    // something much larger than "here are six things you can do to this
+    // track".
+    in property <brush> shade: Theme.scrim;
+    // Whether clicking past the card, or pressing Escape, answers it. The
+    // firmware question says no on purpose: answering that one by clicking
+    // away is not a thing to make easy.
+    in property <bool> dismissable: true;
+    // What the way out is called, for anyone reading the window rather than
+    // looking at it.
+    in property <string> dismiss-label: "Dismiss";
+    // How many answers the card carries, so Tab can go round them instead of
+    // walking off into the window behind. Zero is a card with nothing to
+    // press — the queue's menu, whose rows are its own — and Tab then simply
+    // stays put.
+    in property <int> buttons: 0;
+    // Which answer opens with the caret: the one that changes nothing, so
+    // Enter on a question that has only just appeared never installs
+    // firmware or stops the music.
+    in property <int> safe: 0;
+    // Which of them has it now. The card binds every button's `seated` to
+    // this and gives each one its `seat`.
+    out property <int> at: root.safe;
+    callback dismissed();
+
+    background: root.shade;
+
+    // Two of these rather than one with a conditional role: `accessible-role`
+    // has to be a constant, and a scrim that cannot be clicked through must
+    // not announce itself as the way out.
+    //
+    // The wheel is handled either way, and separately from the presses: a
+    // `TouchArea` alone does not stop a wheel, which is how scrolling over a
+    // question went on paging the list beneath it.
+    if root.dismissable: TouchArea {
+        accessible-role: button;
+        accessible-label: root.dismiss-label;
+        accessible-action-default => { root.dismissed(); }
+        clicked => { root.dismissed(); }
+        scroll-event(e) => { return accept; }
+    }
+    if !root.dismissable: TouchArea {
+        scroll-event(e) => { return accept; }
+    }
+
+    trap := FocusScope {
+        // Never by clicking. This scope is declared last, so it is in front of
+        // the dismissing area above and covers the same whole veil — and a
+        // scope that takes the caret on click *accepts* the press that gave it
+        // to it: Slint walks the children front to back and stops at the first
+        // one to accept. So the first click on the dimmed area landed here
+        // rather than on the area behind it, and the question stayed up. Worse,
+        // the caret had moved off the safe button onto this, which answers
+        // every key but Escape and Tab with `accept`, so Enter no longer
+        // answered the question either: clicking away from "Playing replaces
+        // Play Queue" did nothing at all until it was clicked a second time.
+        //
+        // It still takes the caret below, where there is no button to hand it
+        // to. That is the only way it should ever get it.
+        focus-on-click: false;
+
+        // The keyboard, for as long as the question is up. It sits above the
+        // card rather than beside it so that whatever the focused button
+        // rejects arrives here — Slint offers a key to the focused item and
+        // then to each of its parents in turn.
+        //
+        // Only where no button will take the caret. A card with answers on it
+        // hands the keyboard to its safe one as it is built, and this taking
+        // the focus as well would be a race between two `init`s.
+        init => {
+            if (root.buttons <= 0) {
+                self.focus();
+            }
+        }
+
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.dismissable) {
+                    root.dismissed();
+                }
+                // Swallowed either way. The screen behind the question is not
+                // the thing Escape is nearest to, and the one question that
+                // refuses to be dismissed refuses it silently rather than by
+                // walking back through the browse trail.
+                return EventResult.accept;
+            }
+            if (event.text == Key.Tab || event.text == Key.Backtab) {
+                if (root.buttons > 0) {
+                    // Backwards without going negative, since the step is
+                    // taken modulo the count.
+                    let step = event.text == Key.Backtab || event.modifiers.shift
+                        ? root.buttons - 1
+                        : 1;
+                    root.at = Math.mod(root.at + step, root.buttons);
+                }
+                return EventResult.accept;
+            }
+            // And nothing else reaches past the scrim either: the space bar
+            // must not pause the player through a question, and a letter must
+            // not page a list nobody can see.
+            return EventResult.accept;
+        }
+
+        @children
     }
 }
 
@@ -890,8 +1078,15 @@ export component TimeField inherits Rectangle {
                 alignment: center;
                 spacing: 1px;
 
+                // Named for what they do to the field, not for which way
+                // they point: a chevron is only "up" to somebody who can see
+                // it. Which of the two groups they act on is the field's
+                // state, so the names follow it — "Later" alone would be a
+                // pair of buttons that do two different things under one
+                // name, depending on where the caret happens to be.
                 IconButton {
                     glyph: Icons.expand;
+                    label: root.group == 0 ? "An hour later" : "A minute later";
                     size: 22px;
                     glyph-size: 12px;
                     enabled: root.enabled;
@@ -900,6 +1095,7 @@ export component TimeField inherits Rectangle {
 
                 IconButton {
                     glyph: Icons.collapse;
+                    label: root.group == 0 ? "An hour earlier" : "A minute earlier";
                     size: 22px;
                     glyph-size: 12px;
                     enabled: root.enabled;
@@ -919,40 +1115,115 @@ export component TimeField inherits Rectangle {
 //
 // The letters and their order arrive from Rust with the data, so nothing here
 // has to know what a week is or which end of it the player writes first.
-export component DayPicker inherits HorizontalLayout {
+export component DayPicker inherits FocusScope {
     in property <[string]> letters;
+    // The same seven days written out, for anything that cannot see the
+    // chips. The letters cannot do that job as well as their own: a week has
+    // two days beginning with S and two with T, so read aloud they name four
+    // chips ambiguously and two of those wrongly. They arrive from Rust
+    // beside the letters for the reason the letters do — nothing here knows
+    // what a week is — and an empty list simply leaves the chips unnamed.
+    in property <[string]> names;
     in property <[bool]> days;
-    in property <bool> enabled: true;
     callback toggled(int);
 
-    spacing: Theme.gap;
-    alignment: start;
+    // `enabled` is the FocusScope's own and needs no declaring here: off, it
+    // already keeps the caret away, which is half of what the chips want from
+    // it. The other half is below, on each chip.
 
-    for letter[i] in root.letters: Rectangle {
-        width: 32px;
-        height: 32px;
-        border-radius: self.height / 2;
-        background: root.days[i]
-            ? (day.pressed ? Theme.accent-hover : Theme.accent)
-            : (day.pressed ? Theme.pressed : (day.has-hover ? Theme.hover : Theme.raised));
-        border-width: 1px;
-        border-color: root.days[i] ? transparent : Theme.border;
-        opacity: root.enabled ? 1.0 : 0.45;
-        animate background { duration: Theme.quick; easing: ease-out; }
+    // Which chip the keys act on.
+    //
+    // One tab stop with the arrows moving inside it, rather than seven stops
+    // of their own: these are a set of seven equals, and walking past every
+    // day to reach the field below is not what Tab is for. It is the bargain
+    // `TimeField` makes between its two groups, for the same reason.
+    property <int> at: 0;
 
-        Text {
-            text: letter;
-            font-size: Theme.small-size;
-            font-weight: 600;
-            color: root.days[i] ? Theme.accent-ink : Theme.dim;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+    key-pressed(event) => {
+        // Nothing to move between until the days have arrived, and the
+        // arithmetic below divides by this.
+        if (root.letters.length == 0) {
+            return EventResult.reject;
         }
+        if (event.text == Key.LeftArrow) {
+            root.at = Math.mod(root.at - 1 + root.letters.length, root.letters.length);
+            return EventResult.accept;
+        }
+        if (event.text == Key.RightArrow) {
+            root.at = Math.mod(root.at + 1, root.letters.length);
+            return EventResult.accept;
+        }
+        // The space bar pauses the player everywhere else in the window; here
+        // it sets a day, and does not reach the window's handler while this
+        // holds the caret.
+        if (event.text == Key.Return || event.text == " ") {
+            if (root.enabled) {
+                root.toggled(root.at);
+            }
+            return EventResult.accept;
+        }
+        return EventResult.reject;
+    }
 
-        day := TouchArea {
-            enabled: root.enabled;
-            mouse-cursor: pointer;
-            clicked => { root.toggled(i); }
+    HorizontalLayout {
+        spacing: Theme.gap;
+        alignment: start;
+
+        for letter[i] in root.letters: Rectangle {
+            // A day is on or off, which is what a checkbox is; the role has
+            // to be a constant expression, and this one is the same for all
+            // seven. The chip draws its state as a fill, so without
+            // `accessible-checked` there is nothing left of it to read.
+            accessible-role: checkbox;
+            accessible-label: root.names[i];
+            accessible-checkable: true;
+            accessible-checked: root.days[i];
+            accessible-enabled: root.enabled;
+            // Guarded on `enabled` for the reason spelled out on
+            // `IconButton`: a node marked disabled is still sent the click,
+            // and this reaches past the TouchArea that would have refused it.
+            accessible-action-default => {
+                if (root.enabled) {
+                    root.toggled(i);
+                }
+            }
+
+            width: 32px;
+            height: 32px;
+            border-radius: self.height / 2;
+            background: root.days[i]
+                ? (day.pressed ? Theme.accent-hover : Theme.accent)
+                : (day.pressed ? Theme.pressed : (day.has-hover ? Theme.hover : Theme.raised));
+            // The ring says which chip the arrows and the space bar act on.
+            // Drawn in the chip's own ink where it is set, because the accent
+            // on the accent is not a ring at all — the same choice
+            // `PillButton` makes over its primary.
+            border-width: root.has-focus && root.at == i ? 2px : 1px;
+            border-color: root.has-focus && root.at == i
+                ? (root.days[i] ? Theme.accent-ink : Theme.accent)
+                : (root.days[i] ? transparent : Theme.border);
+            opacity: root.enabled ? 1.0 : 0.45;
+            animate background { duration: Theme.quick; easing: ease-out; }
+
+            Text {
+                // Named by the chip above already, and named better: left as
+                // a text node the letter is read out after the day's name.
+                accessible-role: none;
+                text: letter;
+                font-size: Theme.small-size;
+                font-weight: 600;
+                color: root.days[i] ? Theme.accent-ink : Theme.dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            day := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: pointer;
+                // The keyboard follows the mouse, so the arrows carry on from
+                // wherever the last press landed rather than from Sunday.
+                clicked => { root.at = i; root.focus(); root.toggled(i); }
+            }
         }
     }
 }

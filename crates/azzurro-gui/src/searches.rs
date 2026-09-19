@@ -19,7 +19,14 @@
 //! on the way back in. Nothing here is meant to be edited by hand, so nothing
 //! needs a header explaining itself.
 
-use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use crate::store::{Durability, Store};
+
+/// The file, and whatever is waiting to go into it. `Rename` rather than
+/// `Synced`: a lost shortcut costs one retyped query, and the list is written
+/// on every committed search.
+static STORE: LazyLock<Store> = LazyLock::new(|| Store::named("searches", Durability::Rename));
 
 /// How many past searches to keep.
 ///
@@ -53,10 +60,6 @@ pub fn keepable(query: &str) -> bool {
         && !query.contains('\r')
         && !query.trim().is_empty()
         && query.chars().count() <= MAX_LEN
-}
-
-fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("azzurro").join("searches"))
 }
 
 /// Read the file's contents into a list, newest first.
@@ -100,37 +103,33 @@ fn body(searches: &[String]) -> String {
 }
 
 /// Every past query, newest first.
+///
+/// Empty when the file is missing, and empty for this run when it is there but
+/// unreadable — in which case nothing is written back either; see [`store`].
+///
+/// [`store`]: crate::store
 pub fn load() -> Vec<String> {
-    let Some(path) = path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    read(&text)
+    STORE.read().map(|text| read(&text)).unwrap_or_default()
 }
 
-/// Write the list back, if there is anywhere to write it.
+/// Write the list back, off whatever thread asked.
+///
+/// An empty list writes an empty file rather than removing it. Clearing the
+/// list is a thing the user asked for, and leaving yesterday's file on disk to
+/// be read at the next startup would undo it — so would an older snapshot of
+/// the list landing after this one, which is why the order these are handed
+/// over in is the order the file sees and the write itself happens elsewhere.
 ///
 /// Failure is logged and swallowed, for the same reason as the players file:
 /// not being able to remember a search is a smaller problem than refusing to
 /// run.
 pub fn save(searches: &[String]) {
-    let Some(path) = path() else { return };
+    STORE.save(body(searches));
+}
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::debug!("cannot remember searches: {e}");
-        return;
-    }
-
-    // An empty list writes an empty file rather than removing it. Clearing the
-    // list is a thing the user asked for, and leaving yesterday's file on disk
-    // to be read at the next startup would undo it.
-    if let Err(e) = std::fs::write(&path, body(searches)) {
-        tracing::debug!("cannot write {}: {e}", path.display());
-    }
+/// Write whatever is left, here and now. For the way out.
+pub fn flush() {
+    STORE.flush();
 }
 
 #[cfg(test)]

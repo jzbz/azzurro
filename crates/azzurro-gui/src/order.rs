@@ -19,24 +19,41 @@
 //! the bottom rather than vanishing.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::sync::LazyLock;
 
-fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("azzurro").join("screen-order"))
-}
+use crate::store::{Durability, Store};
+
+/// The file, and whatever is waiting to go into it. `Rename` rather than
+/// `Synced`: an arrangement lost to a crash is a drag or two to make again.
+static STORE: LazyLock<Store> = LazyLock::new(|| Store::named("screen-order", Durability::Rename));
 
 /// Screen id to the row ids on it, in the order they should be drawn.
 pub type Orders = BTreeMap<String, Vec<String>>;
 
-/// Read the file, or nothing at all if it is missing or unreadable.
+/// Read the file, or nothing at all if it is missing.
+///
+/// Nothing for this run too when it is there but unreadable — in which case
+/// nothing is written back either, so a file with one bad byte in it does not
+/// cost the arrangement it holds; see [`store`].
+///
+/// [`store`]: crate::store
 pub fn load() -> Orders {
-    let Some(path) = path() else {
-        return Orders::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Orders::new();
-    };
-    parse(&text)
+    STORE.read().map(|text| parse(&text)).unwrap_or_default()
+}
+
+/// Whether the file is there and could not be read, so nothing arranged this
+/// run will be written back over it.
+///
+/// Not to interrupt anyone with, the way the hand-typed stations are: an
+/// arrangement is a drag or two to make again. It is here because Customize
+/// Home says out loud what became of the arrangement it was given, and
+/// "Home rearranged" is a claim about the next start as well as this one. A
+/// sealed store keeps the file for repair and writes nothing for the life of
+/// the run, so the claim has to know.
+///
+/// Answers for the last [`load`], which is the one at startup.
+pub fn sealed() -> bool {
+    STORE.sealed()
 }
 
 fn parse(text: &str) -> Orders {
@@ -85,21 +102,15 @@ fn body(orders: &Orders) -> String {
     text
 }
 
-/// Write the whole map back. Failure is logged and swallowed: a preference
-/// that will not persist is not a reason to stop.
+/// Write the whole map back, off whatever thread asked. Failure is logged and
+/// swallowed: a preference that will not persist is not a reason to stop.
 pub fn save(orders: &Orders) {
-    let Some(path) = path() else { return };
+    STORE.save(body(orders));
+}
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::debug!("cannot save the screen order: {e}");
-        return;
-    }
-
-    if let Err(e) = std::fs::write(&path, body(orders)) {
-        tracing::debug!("cannot save the screen order: {e}");
-    }
+/// Write whatever is left, here and now. For the way out.
+pub fn flush() {
+    STORE.flush();
 }
 
 /// The part of one screen's order the file can hold, or `None` if it can hold
@@ -130,6 +141,25 @@ pub fn savable(screen: &str, rows: &[String]) -> Option<Vec<String>> {
     }
     let rows: Vec<String> = rows.iter().filter(|row| writable(row)).cloned().collect();
     (!rows.is_empty()).then_some(rows)
+}
+
+/// What became of an arrangement, in the words the window says out loud.
+///
+/// Three things can keep a rearrangement from lasting, and the user has no way
+/// to tell them apart afterwards — the screen simply comes back the player's
+/// way at the next start. So each is said as it happens, and "Home rearranged"
+/// on its own is reserved for the case where the whole of it went down.
+///
+/// `sealed` comes from the caller rather than being read here so this can be
+/// asked without a config directory to seal. It outranks the ids: a file that
+/// will not read is not going to be written whatever is in the arrangement.
+pub fn outcome(screen: &str, rows: &[String], sealed: bool) -> &'static str {
+    match savable(screen, rows) {
+        _ if sealed => "Home rearranged, but it cannot be saved",
+        Some(kept) if kept == rows => "Home rearranged",
+        Some(_) => "Home rearranged, but not all of it can be saved",
+        None => "Home rearranged, but it cannot be saved",
+    }
 }
 
 /// Whether an id survives the round trip through the file above.
@@ -258,6 +288,39 @@ mod tests {
         assert_eq!(
             arrange(&ids, &[false; 3], &back["screen-home"]),
             vec![0, 2, 1]
+        );
+    }
+
+    /// The toast is a claim about the next start, not only about this one.
+    ///
+    /// A `screen-order` that will not read is kept for repair and written to
+    /// no more this run, so an arrangement made afterwards is staged and never
+    /// lands. Said to be saved, it comes back the player's way at the next
+    /// start with nothing to explain it — which is the failure the wording
+    /// here exists to prevent, arriving by the one route the ids know nothing
+    /// about.
+    #[test]
+    fn an_arrangement_that_cannot_be_written_does_not_say_it_was() {
+        let rows = vec!["recent".to_owned(), "presets".to_owned()];
+        assert_eq!(outcome("screen-home", &rows, false), "Home rearranged");
+        assert_eq!(
+            outcome("screen-home", &rows, true),
+            "Home rearranged, but it cannot be saved"
+        );
+
+        // And the two the ids decide, which the seal outranks either way.
+        let partly = vec!["recent".to_owned(), "a,b".to_owned()];
+        assert_eq!(
+            outcome("screen-home", &partly, false),
+            "Home rearranged, but not all of it can be saved"
+        );
+        assert_eq!(
+            outcome("screen:home", &rows, false),
+            "Home rearranged, but it cannot be saved"
+        );
+        assert_eq!(
+            outcome("screen-home", &partly, true),
+            "Home rearranged, but it cannot be saved"
         );
     }
 

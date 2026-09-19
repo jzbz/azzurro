@@ -20,9 +20,17 @@
 //! dropped on the way in — the same player listed twice would start two
 //! pollers for it.
 
-use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use bluos::DeviceId;
+
+use crate::store::{Durability, Store};
+
+/// The file, and whatever is waiting to go into it. `Rename` rather than
+/// `Synced`: every address here announced itself once and will again, so the
+/// list rebuilds itself, and a disk flush per status poll would be a real cost
+/// for that.
+static STORE: LazyLock<Store> = LazyLock::new(|| Store::named("players", Durability::Rename));
 
 /// How many addresses are worth carrying between runs.
 ///
@@ -43,19 +51,21 @@ pub const MAX_REMEMBERED: usize = 256;
 /// displace every speaker the user actually owns.
 const MAX_PER_HOST: usize = 4;
 
-fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("azzurro").join("players"))
+/// Every address worth trying, oldest first.
+///
+/// Empty when the file is missing, and empty for this run when it is there but
+/// unreadable — in which case nothing is written back either; see [`store`].
+///
+/// [`store`]: crate::store
+pub fn load() -> Vec<DeviceId> {
+    STORE.read().map(|text| read(&text)).unwrap_or_default()
 }
 
-/// Every address worth trying, oldest first.
-pub fn load() -> Vec<DeviceId> {
-    let Some(path) = path() else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-
+/// Read the file's contents into a list, oldest first.
+///
+/// Separate from [`load`] so the whole of the parsing can be tested without a
+/// config directory to read from.
+fn read(text: &str) -> Vec<DeviceId> {
     let mut players = Vec::new();
     for line in text.lines().map(str::trim) {
         // `#` so the file can carry a note about why an address is pinned.
@@ -65,7 +75,7 @@ pub fn load() -> Vec<DeviceId> {
         match line.parse::<DeviceId>() {
             Ok(id) if players.contains(&id) => {}
             Ok(id) => players.push(id),
-            Err(_) => tracing::warn!("ignoring {line:?} in {}: not an address", path.display()),
+            Err(_) => tracing::warn!("ignoring {line:?} in the players file: not an address"),
         }
     }
 
@@ -74,8 +84,7 @@ pub fn load() -> Vec<DeviceId> {
     if players.len() > MAX_REMEMBERED {
         let dropping = players.len() - MAX_REMEMBERED;
         tracing::warn!(
-            "{} lists {} players; trying the {MAX_REMEMBERED} most recent",
-            path.display(),
+            "the players file lists {} players; trying the {MAX_REMEMBERED} most recent",
             players.len()
         );
         players.drain(..dropping);
@@ -113,29 +122,31 @@ pub fn remember(players: &mut Vec<DeviceId>, id: DeviceId) -> bool {
     true
 }
 
-/// Write the set back, if there is anywhere to write it.
-///
-/// Failure is logged and swallowed: not being able to remember a player is a
-/// smaller problem than refusing to run.
-pub fn save(players: &[DeviceId]) {
-    let Some(path) = path() else { return };
-
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::debug!("cannot remember players: {e}");
-        return;
-    }
-
+/// Render the list as the file's contents.
+fn body(players: &[DeviceId]) -> String {
     let mut body = String::from("# Players Azzurro has seen. One host:port per line.\n");
     for id in players {
         body.push_str(&id.to_string());
         body.push('\n');
     }
+    body
+}
 
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::debug!("cannot write {}: {e}", path.display());
-    }
+/// Write the set back, off whatever thread asked.
+///
+/// Called in the order the list changed and written off the loop, which is the
+/// order that matters: the body handed over last is the one that reaches the
+/// disk, whenever the writers happen to be scheduled.
+///
+/// Failure is logged and swallowed: not being able to remember a player is a
+/// smaller problem than refusing to run.
+pub fn save(players: &[DeviceId]) {
+    STORE.save(body(players));
+}
+
+/// Write whatever is left, here and now. For the way out.
+pub fn flush() {
+    STORE.flush();
 }
 
 #[cfg(test)]
@@ -182,12 +193,7 @@ mod tests {
     fn round_trips_through_the_file_format() {
         // The parsing half, without touching the real config directory.
         let text = "# a comment\n\n10.0.0.155:11000\n  10.0.0.9:11000  \nnonsense\n";
-        let parsed: Vec<DeviceId> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| l.parse().ok())
-            .collect();
+        let parsed = read(text);
 
         assert_eq!(parsed.len(), 2, "the comment, the blank and the rubbish go");
         assert_eq!(parsed[0], id("10.0.0.155:11000"));
@@ -196,6 +202,7 @@ mod tests {
             id("10.0.0.9"),
             "bare host means the default port"
         );
+        assert_eq!(read(&body(&parsed)), parsed, "and back out again unchanged");
     }
 
     #[test]

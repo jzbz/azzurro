@@ -5,6 +5,15 @@ fn main() {
     // and Linux fluent ones inside an otherwise identical window.
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
 
+    // The names the testing backend searches by, which the compiler leaves out
+    // unless it is asked for them. Without it `ElementHandle` refuses every
+    // query — "requires the presence of debug info" — and a test that wanted
+    // to press a row or type into a field could only fall back to invoking the
+    // window's own callbacks, which is the boundary those tests exist to
+    // cross. Debug builds only: this is what the tests are built as, and a
+    // release build should not carry element names it will never be asked for.
+    let config = config.with_debug_info(std::env::var("PROFILE").as_deref() == Ok("debug"));
+
     slint_build::compile_with_config("ui/app-window.slint", config)
         .expect("compiling ui/app-window.slint");
 

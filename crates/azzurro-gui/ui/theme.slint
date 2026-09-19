@@ -84,6 +84,19 @@ export global Theme {
     out property <length> pad: 12px;
     out property <length> room: 18px;
 
+    // How tall a player card is, both ways round: the art row and the level
+    // under it, and the same with the badge row a player that is grouped,
+    // groupable or upgrading grows below them.
+    //
+    // Measured off the built card rather than guessed at, which is the whole
+    // reason they are here. The picker's list is sized from them, and the one
+    // number that used to do for both was 132px — taller than the taller of
+    // these, so a list of one player reserved a third of a card of empty space
+    // under it. Anything added to `DeviceCard` has to be added here too; the
+    // card is what these describe, not the other way round.
+    out property <length> player-card: 96px;
+    out property <length> player-card-badged: 130px;
+
     // Motion, as three durations with a rule each. The app had thirty-odd
     // animations and twenty-one of them were the same hover fade, so what
     // existed was a habit rather than a vocabulary.
