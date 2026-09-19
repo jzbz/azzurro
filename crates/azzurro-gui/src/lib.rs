@@ -1686,11 +1686,22 @@ fn action_label(name: &str) -> String {
     }
 }
 
+/// The badge's word for a tier the player names.
+///
+/// `cd` and `mqa` are already what anyone writes, and `hd` is this player's
+/// word for what everything else calls high resolution. MQA arrives in more
+/// spellings than one: a file carrying MQA authoring that the player is not
+/// unfolding comes back as `mqaAuthored`, which uppercased whole read as
+/// `MQAAUTHORED` — not a word anybody writes, on a badge with no room for one.
+/// All of them are MQA here, since that is what a glance at a badge is for,
+/// and [`authoring`] puts the distinction on the line under the sleeve where
+/// there is room to say it.
 fn quality_label(raw: &str) -> String {
     let raw = raw.trim();
     match raw.to_ascii_lowercase().as_str() {
         "" => String::new(),
         "hd" => "HR".to_owned(),
+        "mqa" | "mqaauthored" | "mqastudio" => "MQA".to_owned(),
         _ => kilobits(raw).unwrap_or_else(|| raw.to_ascii_uppercase()),
     }
 }
@@ -1715,6 +1726,41 @@ fn kilobits(raw: &str) -> Option<String> {
     }
     let bits: u64 = raw.parse().ok()?;
     (bits >= 1000).then(|| format!("{}k", bits / 1000))
+}
+
+/// What the badge had to leave out: which kind of MQA this is.
+///
+/// The badge says MQA for every spelling of it, so the one that matters —
+/// whether the player is unfolding it or merely reporting that the file was
+/// mastered that way — belongs beside the format. A FLAC 16/44.1 that says
+/// `mqaAuthored` is not mislabelled: MQA is carried inside a FLAC, and the
+/// player is saying the authoring is there while it decodes the file as the
+/// FLAC it also is. Without this the badge and the format line read as a
+/// contradiction.
+///
+/// `None` for a tier with nothing to add, which is every other one.
+fn authoring(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "mqaauthored" => Some("MQA authored"),
+        "mqastudio" => Some("MQA Studio"),
+        _ => None,
+    }
+}
+
+/// The line under the sleeve: what the player is decoding, and how it was made.
+///
+/// Both halves come from the same status and neither is worth a line of its
+/// own — "FLAC 16/44.1" says nothing about MQA, and "MQA authored" alone says
+/// nothing about what is actually being played. A player that sends neither
+/// gets no line at all, which is what the window draws on an empty string.
+fn format_line(stream_format: &str, quality: &str) -> String {
+    let format = stream_format.trim();
+    match (format, authoring(quality)) {
+        ("", None) => String::new(),
+        ("", Some(kind)) => kind.to_owned(),
+        (format, None) => format.to_owned(),
+        (format, Some(kind)) => format!("{format} · {kind}"),
+    }
 }
 
 /// Whether this is the same thing the window already has.
@@ -6905,12 +6951,20 @@ impl Backend {
         // badge cannot: the codec, and the depth and rate behind a tier. Too
         // long for the badge, so it goes on the line below it, where Now
         // Playing has the room.
-        let stream_format = snapshot
-            .as_ref()
-            .and_then(|(status, _)| status.stream_format.as_deref())
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
+        // The badge above says MQA for every spelling of it, so the kind is
+        // said here, where the format already is: "FLAC 16/44.1 · MQA
+        // authored" is the whole of what the player told us about this track,
+        // and neither half of it contradicts the other.
+        let stream_format = format_line(
+            snapshot
+                .as_ref()
+                .and_then(|(status, _)| status.stream_format.as_deref())
+                .unwrap_or_default(),
+            snapshot
+                .as_ref()
+                .and_then(|(status, _)| status.quality.as_deref())
+                .unwrap_or_default(),
+        );
 
         let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
             Some(songs) if songs > 0 => {
@@ -17413,6 +17467,50 @@ mod tests {
         assert_eq!(quality_label("mqa"), "MQA");
         assert_eq!(quality_label(""), "");
         assert_eq!(quality_label("  "), "");
+    }
+
+    #[test]
+    fn every_spelling_of_mqa_is_one_badge() {
+        // A file carrying MQA authoring the player is not unfolding. Uppercased
+        // whole this read as MQAAUTHORED on a badge the width of three letters.
+        assert_eq!(quality_label("mqaAuthored"), "MQA");
+        assert_eq!(quality_label("mqaStudio"), "MQA");
+
+        // And the kind the badge dropped is said beside the format instead.
+        assert_eq!(authoring("mqaAuthored"), Some("MQA authored"));
+        assert_eq!(authoring("mqaStudio"), Some("MQA Studio"));
+
+        // Every other tier has nothing to add: the badge already said it all.
+        assert_eq!(authoring("mqa"), None);
+        assert_eq!(authoring("cd"), None);
+        assert_eq!(authoring("hd"), None);
+        assert_eq!(authoring(""), None);
+
+        // A tier nobody here has met still reaches the badge as it arrived,
+        // which is the point of the fallback and worth keeping pinned.
+        assert_eq!(quality_label("dsd"), "DSD");
+        assert_eq!(quality_label("128000"), "128k");
+    }
+
+    #[test]
+    fn the_line_under_the_sleeve_carries_both_halves() {
+        // The track that prompted this: a FLAC the player decodes as a FLAC
+        // and reports as MQA-authored, whose badge said MQAAUTHORED while the
+        // queue row beside it said CD.
+        assert_eq!(
+            format_line("FLAC 16/44.1", "mqaAuthored"),
+            "FLAC 16/44.1 · MQA authored"
+        );
+
+        // Nothing to add, nothing added: the line is the format alone.
+        assert_eq!(format_line("FLAC 16/44.1", "cd"), "FLAC 16/44.1");
+        assert_eq!(format_line("MP3 128 kb/s", "128000"), "MP3 128 kb/s");
+
+        // A player that says one and not the other still gets a line, and one
+        // that says neither gets none — the window draws nothing for empty.
+        assert_eq!(format_line("", "mqaAuthored"), "MQA authored");
+        assert_eq!(format_line("  FLAC 24/96  ", ""), "FLAC 24/96");
+        assert_eq!(format_line("", ""), "");
     }
 
     #[test]
