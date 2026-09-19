@@ -146,6 +146,72 @@ pub fn service_glyph(title: &str) -> Glyph {
 /// is looking at: a row called "Albums" should get the album glyph whichever
 /// PNG happens to sit beside it.
 pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
+    reading(title, source, false)
+}
+
+/// The glyph for a row on one of the player's own settings pages, which always
+/// gets one.
+///
+/// The settings vocabulary is read here and nowhere else — see
+/// [`settings_vocabulary`] — and a row neither it nor the general reading
+/// recognizes falls back to the generic tweak rather than to the player's own
+/// picture, which a settings row does not have.
+pub fn setting_glyph(label: &str) -> Glyph {
+    reading(label, None, true).unwrap_or(Glyph::Tweak)
+}
+
+/// The words a settings row is read by.
+///
+/// Held apart from the rest of the vocabulary and consulted only from
+/// [`setting_glyph`], because every word in it is an ordinary English word
+/// that turns up in ordinary titles: "Greatest Hits Volume 2" came back drawn
+/// with a volume knob, "Audioslave" with a speaker and "Stone Roses" with a
+/// tone control. Matching whole words does not save it — *Volume 2* really is
+/// the word — but the page the row is on does. On a settings page every row is
+/// a control, so the loose matching here is right there and only there.
+///
+/// `title` arrives lowercased, as the caller already has it.
+fn settings_vocabulary(title: &str) -> Option<Glyph> {
+    let has = |needle: &str| title.contains(needle);
+    let word = |needle: &str| title.split_whitespace().any(|w| w == needle);
+
+    if has("alarm") {
+        Some(Glyph::Alarm)
+    } else if has("sleep") {
+        Some(Glyph::Sleep)
+    } else if has("reindex") || has("re-index") {
+        Some(Glyph::Rescan)
+    } else if has("artwork") {
+        Some(Glyph::Artwork)
+    } else if has("wifi") || has("wi-fi") || has("wireless") {
+        Some(Glyph::Wifi)
+    } else if has("network") || has("share") || has("ethernet") {
+        Some(Glyph::Network)
+    } else if has("server") {
+        Some(Glyph::Server)
+    } else if has("standby") || has("power") {
+        Some(Glyph::Power)
+    } else if has("brightness") || has("indicator") || word("dim") {
+        Some(Glyph::Brightness)
+    } else if has("reset") {
+        Some(Glyph::Reset)
+    } else if has("tone") || has("treble") || has("bass") || has("crossover") || has("equali") {
+        Some(Glyph::Tone)
+    } else if has("balance") || has("replay-gain") || has("replay gain") {
+        Some(Glyph::Gauge)
+    } else if has("volume") || has("subwoofer") || has("output mode") {
+        Some(Glyph::Volume)
+    } else if has("audio") || has("amplifier") || title == "player" || has("room name") {
+        Some(Glyph::Speaker)
+    } else {
+        None
+    }
+}
+
+/// The reading both of the above are: `settings` says whether the row is one
+/// of the player's own settings rows, which is what decides whether the
+/// vocabulary above is in play.
+fn reading(title: &str, source: Option<&str>, settings: bool) -> Option<Glyph> {
     // Never override something the player knows better than we do.
     if source.is_some_and(is_content) {
         return None;
@@ -200,35 +266,10 @@ pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
         Some(Glyph::Settings)
     // The settings pages, before the content vocabulary below: "Music library"
     // is a settings row about the library, not a row of albums, and "Optimize
-    // Artwork" is neither an album nor a track.
-    } else if has("alarm") {
-        Some(Glyph::Alarm)
-    } else if has("sleep") {
-        Some(Glyph::Sleep)
-    } else if has("reindex") || has("re-index") {
-        Some(Glyph::Rescan)
-    } else if has("artwork") {
-        Some(Glyph::Artwork)
-    } else if has("wifi") || has("wi-fi") || has("wireless") {
-        Some(Glyph::Wifi)
-    } else if has("network") || has("share") || has("ethernet") {
-        Some(Glyph::Network)
-    } else if has("server") {
-        Some(Glyph::Server)
-    } else if has("standby") || has("power") {
-        Some(Glyph::Power)
-    } else if has("brightness") || has("indicator") || word("dim") {
-        Some(Glyph::Brightness)
-    } else if has("reset") {
-        Some(Glyph::Reset)
-    } else if has("tone") || has("treble") || has("bass") || has("crossover") || has("equali") {
-        Some(Glyph::Tone)
-    } else if has("balance") || has("replay-gain") || has("replay gain") {
-        Some(Glyph::Gauge)
-    } else if has("volume") || has("subwoofer") || has("output mode") {
-        Some(Glyph::Volume)
-    } else if has("audio") || has("amplifier") || title == "player" || has("room name") {
-        Some(Glyph::Speaker)
+    // Artwork" is neither an album nor a track. Only on a settings page,
+    // though — [`settings_vocabulary`] says why.
+    } else if let Some(glyph) = settings.then(|| settings_vocabulary(&title)).flatten() {
+        Some(glyph)
     } else if word("edit") {
         Some(Glyph::Edit)
     // "Clear" is the queue's own button; a track's context menu says "Delete
@@ -436,6 +477,27 @@ mod tests {
         assert_eq!(glyph_for("TV", None), Some(Glyph::Tv));
         // A genuine word still matches.
         assert_eq!(glyph_for("Analog 1", None), Some(Glyph::Cable));
+    }
+
+    #[test]
+    fn a_settings_word_in_an_ordinary_title_is_not_a_settings_row() {
+        // Three album titles, and every one of them used to come back drawn
+        // as a control off a settings page: a volume knob, a speaker and a
+        // tone control.
+        assert_eq!(glyph_for("Greatest Hits Volume 2", None), None);
+        assert_eq!(glyph_for("Audioslave", None), None);
+        assert_eq!(glyph_for("The Stone Roses", None), None);
+        // A settings row still reads as what it is, and one nothing
+        // recognizes still gets the generic tweak rather than a hole.
+        assert_eq!(setting_glyph("Volume limits"), Glyph::Volume);
+        assert_eq!(setting_glyph("Audio"), Glyph::Speaker);
+        assert_eq!(setting_glyph("Amplifier Standby"), Glyph::Power);
+        assert_eq!(setting_glyph("Indicator brightness"), Glyph::Brightness);
+        assert_eq!(setting_glyph("Fnordle"), Glyph::Tweak);
+        // And the words every row is read by, settings page or not, are
+        // still read the same way on one.
+        assert_eq!(setting_glyph("Search"), Glyph::Search);
+        assert_eq!(setting_glyph("Music library"), Glyph::Library);
     }
 
     #[test]

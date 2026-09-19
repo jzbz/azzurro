@@ -15,12 +15,13 @@
 //! thread. `SharedPixelBuffer` is `Send`, so decoded pixels travel and the
 //! `Image` is made on the far side, inside the event loop.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -33,9 +34,13 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// covers of everything recently selected, with room to spare.
 ///
 /// Counted in entries rather than bytes, so what it costs depends on which
-/// sizes are in it. Nothing asks for the 80×80 this comment used to claim; the
-/// three tiers the GUI requests are `THUMB_SIZE` 72, `TILE_SIZE` 232 and
-/// `COVER_SIZE` 720, and one LRU holds all of them. At four bytes a pixel the
+/// sizes are in it. Three tiers are asked for and no more: `THUMB_SIZE` 72,
+/// `TILE_SIZE` 232 and `COVER_SIZE` 720, and one LRU holds all of them. A
+/// fourth crept in for a while — the sidebar card fetched its own 80×80, so
+/// the selected player's cover was decoded twice and held twice for a picture
+/// eleven percent larger than the thumbnail of it in the queue. The card asks
+/// for the thumbnail tier now; keeping this table true is what makes a fourth
+/// tier visible if one is ever added deliberately. At four bytes a pixel the
 /// worst case for a full cache of each is
 ///
 /// | tier | one entry | 256 entries |
@@ -64,6 +69,20 @@ const MEMORY_CACHE: usize = 256;
 /// opening a long queue does not put thirty connections into a speaker that is
 /// also trying to play music.
 const CONCURRENT_FETCHES: usize = 4;
+
+/// Decodes allowed at once.
+///
+/// [`CONCURRENT_FETCHES`] bounds connections and nothing else. A cover already
+/// on disk never touches that permit — it is read and handed straight to
+/// `spawn_blocking` — so the work this actually costs was bounded by how many
+/// covers something asked for at once, which is a number a queue chooses and
+/// not one this app does. A window of a hundred rows, all cached, was a hundred
+/// simultaneous decodes, each allowed [`MAX_DECODED`] to itself.
+///
+/// Three, because a decode is tens of milliseconds and the list still fills
+/// faster than the eye follows, and because the worst case is then three
+/// decoder allocations rather than as many as the queue is long.
+const CONCURRENT_DECODES: usize = 3;
 
 /// Files kept on disk. Pruned to this on startup and every [`PRUNE_EVERY`]
 /// covers after that, oldest first.
@@ -125,6 +144,13 @@ pub const MAX_HOPS: usize = 5;
 /// 11004 on a Powernode — so a policy that only knew the public-address rule
 /// stopped every cover the player served.
 pub type Players = std::sync::Arc<Mutex<std::collections::HashSet<std::net::IpAddr>>>;
+
+/// How many addresses may be allowed at once. See [`Artwork::remember_player`].
+///
+/// The same figure the registry caps itself at, and for the same reason: far
+/// above any real system — the largest BluOS install is a few dozen zones — so
+/// the only thing this can turn away is a flood.
+const MAX_ART_HOSTS: usize = 256;
 
 /// Whether art may be fetched from `url`, given the players adopted so far.
 ///
@@ -224,6 +250,34 @@ fn is_private(addr: std::net::IpAddr) -> bool {
 /// the interface waits on.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many URLs are remembered as undecodable. See [`Artwork::undecodable`].
+///
+/// Small on purpose: a cover that cannot be read is a rarity, and this only
+/// has to outlive the redraws of the list it is in.
+const UNDECODABLE_REMEMBERED: usize = 64;
+
+/// And for how long. See [`Artwork::undecodable`].
+///
+/// Not for the session. The bytes that fail are not always the bytes the
+/// player will always serve: a player whose library service is still coming up
+/// answers `/Artwork` with its XML error document — the same reply
+/// [`looks_like_an_image`] was written for — and one of those used to cost
+/// that album its cover until the app was restarted, because the entry is
+/// consulted before anything else and 64 slots are not turned over in a normal
+/// session. Long enough that a cover which genuinely cannot be read is not
+/// re-fetched on every queue read, short enough that a service coming up is
+/// waited out rather than outlived.
+const UNDECODABLE_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// How many trips one call will start for a URL.
+///
+/// More than one because the first may find a trip already running and be
+/// left with nothing when that trip's owner is cancelled; see
+/// [`Artwork::bytes`]. Bounded because a URL whose owner keeps being
+/// cancelled is a queue somebody is scrolling, and the cover can wait for the
+/// next read of it rather than being chased here.
+const TRIPS_PER_CALL: usize = 2;
+
 /// The largest cover this will decode, per side, and the most memory it may
 /// take to do it.
 ///
@@ -249,12 +303,74 @@ struct Key {
     size: u32,
 }
 
+/// Where the bytes a decode is about to run on came from.
+///
+/// A decode that fails on bytes read from disk is worth one more try: the file
+/// is dropped and the network asked. The same failure on bytes just fetched
+/// means the cover itself cannot be read, and asking again would only fail
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Disk,
+    Network,
+}
+
+/// What one trip for a URL's bytes ends with: the bytes and where they came
+/// from, or nothing.
+///
+/// Behind an `Arc` because every caller waiting on the same trip gets a copy
+/// of the answer and none of them needs to own it.
+type Fetched = Option<(Arc<Vec<u8>>, Source)>;
+
+/// A trip already under way, for the callers that arrive while it runs.
+///
+/// `None` while it is still going, `Some` once it has ended — whether or not
+/// it produced anything. A `watch` rather than a lock held across the request:
+/// a waiter parks on the channel, and the one doing the work is not slowed by
+/// how many of them there are.
+type Running = tokio::sync::watch::Receiver<Option<Fetched>>;
+
+/// Takes a URL off the in-flight map however its fetch ends.
+///
+/// A plain removal at the end is not enough. This task can be dropped
+/// mid-request — the queue loader aborts its whole set when the user moves on
+/// — and an entry left behind is one that every later caller joins and then
+/// waits on for an answer nobody will ever send.
+struct Fetching<'a> {
+    inflight: &'a Mutex<HashMap<String, Running>>,
+    url: &'a str,
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(self.url);
+    }
+}
+
 pub struct Artwork {
     http: reqwest::Client,
     memory: Mutex<LruCache<Key, Pixels>>,
     /// One color per image, computed once when it is decoded. Keyed by URL
     /// alone: the same cover gives the same color at any size.
     tints: Mutex<LruCache<String, [u8; 3]>>,
+    /// URLs whose bytes would not decode, so they are not asked for again.
+    ///
+    /// The one re-fetch in [`Self::get`] bounds itself within a single call
+    /// and leaves the disk exactly as it found it — the fresh copy passes the
+    /// magic-byte check and is written back over the file that was just
+    /// dropped. So the next call read, deleted, fetched and rewrote the same
+    /// undecodable cover, and `load_thumbnails` runs on every queue read: one
+    /// such cover was a request to the player and two decodes per track
+    /// change, for ever. Remembering the failure is what makes the re-fetch
+    /// the one extra attempt it was meant to be.
+    ///
+    /// Keyed by URL alone, like `tints`: whether bytes decode is a property of
+    /// the bytes, not of the size they were wanted at — the size is only the
+    /// box the decoded image is scaled into afterwards.
+    ///
+    /// The value is when the entry stops counting; see [`UNDECODABLE_FOR`] for
+    /// why one reply is not allowed to settle a URL for the whole run.
+    undecodable: Mutex<LruCache<String, Instant>>,
     /// `None` when there is nowhere to write, which is not fatal: the memory
     /// cache and the network still work.
     disk: Option<PathBuf>,
@@ -262,6 +378,23 @@ pub struct Artwork {
     /// buys a look at the directory; see [`DISK_CACHE_FILES`].
     written: std::sync::atomic::AtomicUsize,
     limit: Semaphore,
+    /// And the same for decoding; see [`CONCURRENT_DECODES`].
+    ///
+    /// Shared rather than owned by the struct so a permit can outlive the
+    /// future that took it: the decode runs on the blocking pool and a
+    /// blocking task cannot be cancelled, so a permit released when its caller
+    /// is aborted is a permit released while the work it bounds is still
+    /// running. See where it is taken.
+    decoding: Arc<Semaphore>,
+    /// URLs being read or fetched right now, so the same cover wanted at two
+    /// sizes costs one trip rather than two.
+    ///
+    /// The queue asks for a 72px thumbnail and the sleeve for a 720px cover of
+    /// the same track at the same instant, and each size is a separate entry in
+    /// the memory cache — so both missed, both opened a connection, both read
+    /// the same bytes and both wrote the same file. The sizes still decode
+    /// separately, which is what they are for; only the bytes are shared.
+    inflight: Mutex<HashMap<String, Running>>,
     /// The addresses of players this app has adopted.
     ///
     /// A player serves its own cover art from its own address, which is on the
@@ -296,8 +429,14 @@ impl Artwork {
             tints: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
+            undecodable: Mutex::new(LruCache::new(
+                NonZeroUsize::new(UNDECODABLE_REMEMBERED)
+                    .expect("UNDECODABLE_REMEMBERED is not zero"),
+            )),
             disk: disk.filter(|d| d.is_dir()),
             limit: Semaphore::new(CONCURRENT_FETCHES),
+            decoding: Arc::new(Semaphore::new(CONCURRENT_DECODES)),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -317,8 +456,14 @@ impl Artwork {
             tints: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
+            undecodable: Mutex::new(LruCache::new(
+                NonZeroUsize::new(UNDECODABLE_REMEMBERED)
+                    .expect("UNDECODABLE_REMEMBERED is not zero"),
+            )),
             disk: None,
             limit: Semaphore::new(CONCURRENT_FETCHES),
+            decoding: Arc::new(Semaphore::new(CONCURRENT_DECODES)),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -345,14 +490,47 @@ impl Artwork {
 
     /// Note that this player's own address serves art that is allowed.
     ///
-    /// Called as players are adopted. Nothing is ever removed: a player that
-    /// goes away does not make the art it already served dangerous, and the
-    /// set is bounded by `MAX_TRACKED` adoptions either way.
+    /// Called as players are adopted, and bounded here rather than by the
+    /// caller. The registry's own cap used to be given as the bound, which
+    /// stopped being true the moment a player was allowed to move: retiring
+    /// the address a player has left is what makes room for the one it is
+    /// announcing from, so an announcement replaying one node id from a fresh
+    /// address each time kept the registry at its old size while adding an
+    /// entry here every time. LSDP is an unauthenticated broadcast, which
+    /// makes that a set grown by whoever is on the segment — and every address
+    /// in it is permanently exempt from [`permitted`]'s refusal to dial
+    /// private space, the one check that stops a player aiming this app's
+    /// fetches at the LAN. `Backend::moved_here` drops the address it
+    /// retires; this is the ceiling for whatever no retirement covers.
+    ///
+    /// Full is refused rather than evicted. An eviction would quietly take the
+    /// art away from a player the user is looking at, where a refusal only
+    /// declines the address that arrived last — and a household past this many
+    /// players is a flood rather than a house.
     pub fn remember_player(&self, host: std::net::IpAddr) {
         // Canonical for the same reason [`literal_address`] is: the two are
         // compared, and a player discovered as `::ffff:10.0.0.155` is the
         // player whose art is at `10.0.0.155`.
-        self.players.lock().unwrap().insert(host.to_canonical());
+        let host = host.to_canonical();
+        let mut players = self.players.lock().unwrap();
+        if players.len() >= MAX_ART_HOSTS && !players.contains(&host) {
+            tracing::warn!(
+                %host,
+                "not allowing art from another address: already allowing {MAX_ART_HOSTS}"
+            );
+            return;
+        }
+        players.insert(host);
+    }
+
+    /// And forget it, once nothing is tracked at that address any more.
+    ///
+    /// The other half of the bound above: an address a player has left is not
+    /// a player's own address, and leaving it in the set kept it fetchable for
+    /// the rest of the run. Called only where the registry says no entry
+    /// remains there, since one device can present two zones on one host.
+    pub fn forget_player(&self, host: std::net::IpAddr) {
+        self.players.lock().unwrap().remove(&host.to_canonical());
     }
 
     /// The cover for `url` as the desktop should be told of it, if at all.
@@ -434,15 +612,82 @@ impl Artwork {
         if let Some(hit) = self.cached(url, size) {
             return Some(hit);
         }
+        // Asked once and answered for a while. `get` is not the rare call it
+        // reads like — a queue read calls it for every distinct cover, and a
+        // browse page for every row — so a cover this build cannot read has to
+        // stop costing anything after the one attempt below. `get` rather than
+        // `peek`, unlike [`Self::cached`]: this is a cover somebody still
+        // wants drawn, so it should stay remembered for as long as it is
+        // being asked for.
+        //
+        // For a while and not for good: the entry is the memory of one reply,
+        // and a reply can be a player having a bad minute rather than a cover
+        // that is not a picture. See [`UNDECODABLE_FOR`].
+        if self
+            .undecodable
+            .lock()
+            .unwrap()
+            .get(url)
+            .is_some_and(|until| *until > Instant::now())
+        {
+            return None;
+        }
 
-        let bytes = self.bytes(url).await?;
+        // At most one second attempt, and only for bytes that came off the
+        // disk. A file that begins like an image and then will not decode —
+        // truncated by a crash before the write became a rename, or a format
+        // this build was not compiled for — passed the magic-byte check and
+        // failed the decode silently, every time, for as long as the file
+        // survived pruning. That cover was blank until then. Dropping it and
+        // asking the network once costs one request and ends it.
+        let mut refetched = false;
+        let decoded = loop {
+            let (bytes, from) = self.bytes(url).await?;
 
-        // Decoding a large JPEG is tens of milliseconds and would otherwise
-        // occupy an async worker doing nothing else.
-        let decoded = tokio::task::spawn_blocking(move || decode(&bytes, size))
+            // Decoding a large JPEG is tens of milliseconds and would otherwise
+            // occupy an async worker doing nothing else. The permit is held
+            // across it, unlike the fetch permit: see [`CONCURRENT_DECODES`].
+            //
+            // Owned, and moved into the closure rather than kept in a local
+            // here, so that it is dropped when the decode returns and not when
+            // this future does. The two are not the same moment: a walk being
+            // aborted drops this future at the await below, and the blocking
+            // task carries on because a blocking task has no cancellation
+            // point. Held in a local, the permit went back at the abort and
+            // the walk that replaced this one took a fresh one straight away,
+            // so the covers actually being decoded at once were three plus
+            // however many orphans were still going — which is no bound at
+            // all, and worst on exactly the player whose covers are large
+            // enough for the limit to matter.
+            let permit = Arc::clone(&self.decoding).acquire_owned().await.ok()?;
+            let out = tokio::task::spawn_blocking(move || {
+                let decoded = decode(&bytes, size);
+                drop(permit);
+                decoded
+            })
             .await
             .ok()
-            .flatten()?;
+            .flatten();
+
+            match out {
+                Some(decoded) => break decoded,
+                None if from == Source::Disk && !refetched => {
+                    refetched = true;
+                    self.discard(url).await;
+                }
+                // Nothing more to try: these are the bytes the player serves
+                // and they are not a picture. Written down rather than only
+                // dropped, because dropping the file is undone by the fetch
+                // that follows it — see [`Self::undecodable`].
+                None => {
+                    self.undecodable
+                        .lock()
+                        .unwrap()
+                        .put(url.to_owned(), Instant::now() + UNDECODABLE_FOR);
+                    return None;
+                }
+            }
+        };
 
         if let Some(tint) = dominant(&decoded) {
             self.tints.lock().unwrap().put(url.to_owned(), tint);
@@ -457,8 +702,77 @@ impl Artwork {
         Some(decoded)
     }
 
-    /// The bytes as fetched, from disk if they are there.
-    async fn bytes(&self, url: &str) -> Option<Vec<u8>> {
+    /// Forget the cached file for `url`, so the next call fetches it again.
+    async fn discard(&self, url: &str) {
+        let Some(dir) = &self.disk else { return };
+        let path = dir.join(file_name(url));
+        tracing::debug!(url, "dropping a cached cover that would not decode");
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+    }
+
+    /// The bytes as fetched, from disk if they are there — and shared, so one
+    /// URL wanted at two sizes costs one trip rather than two.
+    async fn bytes(&self, url: &str) -> Fetched {
+        // Twice at most, because a trip can end without an answer: the task
+        // that owned it was dropped. That is routine rather than exotic — the
+        // queue loader aborts its whole set the moment a newer one takes the
+        // generation — and the caller that had joined it is not a caller who
+        // learned there is no art. Read as a miss, one aborted loader blanked
+        // the sleeve and the sidebar card until the next track. So a waiter
+        // left with nothing goes round and tries to become the one doing the
+        // work; see [`TRIPS_PER_CALL`].
+        for _ in 0..TRIPS_PER_CALL {
+            // Either join the trip already running for this URL or become it,
+            // decided under one lock so that two callers arriving together
+            // cannot both decide they are the one doing the work.
+            let turn = {
+                let mut inflight = self.inflight.lock().unwrap();
+                match inflight.get(url) {
+                    Some(running) => Err(running.clone()),
+                    None => {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        inflight.insert(url.to_owned(), rx);
+                        Ok(tx)
+                    }
+                }
+            };
+
+            let answer = match turn {
+                Ok(answer) => answer,
+                Err(mut running) => {
+                    // `None` is "still going", and a sender dropped while it
+                    // still says so is a trip that was cancelled. The guard
+                    // below has already taken the URL off the map by then, so
+                    // going round makes this caller the new owner rather than
+                    // a second waiter on a trip nobody is running.
+                    while running.borrow().is_none() {
+                        if running.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    let ended = running.borrow().clone();
+                    match ended {
+                        Some(out) => return out,
+                        None => continue,
+                    }
+                }
+            };
+
+            // Off the map however this ends, cancellation included.
+            let _slot = Fetching {
+                inflight: &self.inflight,
+                url,
+            };
+
+            let out = self.read_or_fetch(url).await;
+            let _ = answer.send(Some(out.clone()));
+            return out;
+        }
+        None
+    }
+
+    /// One trip for a URL's bytes: the disk first, then the network.
+    async fn read_or_fetch(&self, url: &str) -> Fetched {
         let path = self.disk.as_ref().map(|dir| dir.join(file_name(url)));
 
         // Off the async workers. Reading a cover is a millisecond on a local
@@ -472,7 +786,9 @@ impl Artwork {
                 .ok()
                 .flatten();
             match cached.filter(|b| !b.is_empty()) {
-                Some(bytes) if looks_like_an_image(&bytes) => return Some(bytes),
+                Some(bytes) if looks_like_an_image(&bytes) => {
+                    return Some((Arc::new(bytes), Source::Disk));
+                }
                 // Written before the check above existed, or truncated by a
                 // crash mid-write. Dropped rather than returned, so the fetch
                 // below gets its turn instead of the cache answering wrongly
@@ -542,11 +858,12 @@ impl Artwork {
         }
         if !looks_like_an_image(&bytes) {
             tracing::debug!(url, "not caching a reply that is not an image");
-            return Some(bytes);
+            return Some((Arc::new(bytes), Source::Network));
         }
 
+        let bytes = Arc::new(bytes);
         if let Some(path) = path {
-            let copy = bytes.clone();
+            let copy = Arc::clone(&bytes);
             // Every so often, check the directory has not run away. Counted
             // here rather than timed, because writing is what fills it.
             let due = self
@@ -567,8 +884,8 @@ impl Artwork {
                     // accepts, since the read only checks the file is not
                     // empty. `panic = "abort"` makes dying mid-write an
                     // ordinary event rather than an exotic one.
-                    let temp = path.with_extension("part");
-                    let out = std::fs::write(&temp, copy)
+                    let temp = temp_name(&path);
+                    let out = std::fs::write(&temp, &*copy)
                         .and_then(|()| std::fs::rename(&temp, &path))
                         .inspect_err(|_| {
                             let _ = std::fs::remove_file(&temp);
@@ -584,8 +901,27 @@ impl Artwork {
                 }
             });
         }
-        Some(bytes)
+        Some((bytes, Source::Network))
     }
+}
+
+/// A name nothing else is writing, beside the file it will become.
+///
+/// The target is named for the URL alone, so two writes of one cover — the
+/// queue's thumbnail and the sleeve's, or this app running twice — were
+/// writing the same `.part`: each truncated what the other had put there, and
+/// each then renamed whatever was in it onto the cover. Both write the same
+/// bytes, so the result was usually right and occasionally a short file that
+/// every later read accepted as an image. A counter makes the collision
+/// impossible rather than unlikely, and the process id keeps a second instance
+/// out of this one's way.
+///
+/// Pruning sweeps up anything a crash leaves behind, the way it does the
+/// covers themselves.
+fn temp_name(path: &std::path::Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("{}-{n}.part", std::process::id()))
 }
 
 /// Decode and scale to fit a `size` box.
@@ -1040,6 +1376,425 @@ mod tests {
         assert!(count(&dir) > 0, "and it did not empty the directory");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cover server on the loopback, so the paths below can be walked with
+    /// no network at all.
+    ///
+    /// Loopback is the one address this module refuses out of hand, so every
+    /// test using it adopts a player there first — which is also the rule
+    /// being exercised. Nothing here speaks to anything off this machine.
+    struct Server {
+        addr: std::net::SocketAddr,
+        /// How many requests have arrived, which is the whole point of several
+        /// of the tests below.
+        served: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Serve `replies` in turn, the last one repeating, after waiting `delay`
+    /// each time.
+    ///
+    /// The delay is how a test makes two callers overlap: without it the first
+    /// fetch can finish before the second is even polled, and a test for
+    /// sharing one fetch would pass whether or not anything was shared.
+    ///
+    /// `Connection: close`, so each request is its own accept and the count is
+    /// a count of requests rather than of connections.
+    async fn serving(replies: Vec<Vec<u8>>, delay: Duration) -> Server {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let addr = listener.local_addr().expect("an address");
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let replies = replies.clone();
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    // Read the request head before answering. Windows sends RST
+                    // rather than FIN when a socket is closed with unread data
+                    // still in it, and the client then loses the reply it had
+                    // already been sent.
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = socket.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                        head.extend_from_slice(&buf[..read]);
+                        // The whole of a GET is its head; nothing here sends a
+                        // body.
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+
+                    let body = &replies[n.min(replies.len() - 1)];
+                    let mut out = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(body);
+                    let _ = socket.write_all(&out).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        Server { addr, served }
+    }
+
+    /// An [`Artwork`] caching into `dir`, with a player adopted on the
+    /// loopback so the server above counts as one.
+    fn art_in(dir: &std::path::Path) -> Artwork {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let art = Artwork {
+            disk: Some(dir.to_path_buf()),
+            ..Artwork::in_memory(reqwest::Client::new(), Players::default())
+        };
+        art.remember_player("127.0.0.1".parse().expect("an address"));
+        art
+    }
+
+    /// A directory of this test's own, emptied first.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("azzurro-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        dir
+    }
+
+    /// The queue wants a 72px thumbnail and the sleeve a 720px cover of the
+    /// same track at the same moment. Each size is its own entry in the memory
+    /// cache, so both missed — and before the fetches were shared, both opened
+    /// a connection and read the same bytes.
+    #[tokio::test]
+    async fn one_cover_wanted_at_two_sizes_is_fetched_once() {
+        let dir = scratch("art-shared");
+        let art = art_in(&dir);
+        let server = serving(vec![png_of(64, 64)], Duration::from_millis(200)).await;
+        let url = format!("http://{}/Artwork?album=Shared", server.addr);
+
+        let (thumb, cover) = tokio::join!(art.get(&url, 72), art.get(&url, 720));
+        assert!(thumb.is_some(), "the thumbnail did not decode");
+        assert!(cover.is_some(), "the cover did not decode");
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one cover at two sizes should be one request"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes that begin like a PNG and are not one: what a write cut short by
+    /// a crash leaves behind, and what a format this build cannot read looks
+    /// like. The magic-byte check passes them, so before this the decode
+    /// failed silently on every call and that cover stayed blank until pruning
+    /// reached the file.
+    fn a_broken_png() -> Vec<u8> {
+        [&[0x89u8, b'P', b'N', b'G'][..], &[0u8; 64][..]].concat()
+    }
+
+    #[tokio::test]
+    async fn a_cached_cover_that_will_not_decode_is_dropped_and_fetched_again() {
+        let dir = scratch("art-undecodable");
+        let art = art_in(&dir);
+        let server = serving(vec![png_of(32, 32)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Broken", server.addr);
+
+        std::fs::write(dir.join(file_name(&url)), a_broken_png()).expect("writes");
+
+        assert!(
+            art.get(&url, 72).await.is_some(),
+            "the file was kept and the network never asked"
+        );
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one bad file is worth exactly one more request"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And once, not once per call: a cover that is undecodable wherever it
+    /// comes from must not turn into a request every time it is drawn.
+    #[tokio::test]
+    async fn a_cover_that_is_undecodable_everywhere_is_asked_for_once() {
+        let dir = scratch("art-undecodable-twice");
+        let art = art_in(&dir);
+        let server = serving(vec![a_broken_png()], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Hopeless", server.addr);
+
+        std::fs::write(dir.join(file_name(&url)), a_broken_png()).expect("writes");
+
+        // Three calls, because one is the case that is bounded by
+        // construction: the re-fetch is a local flag, so a single `get` could
+        // never have asked twice. What the queue actually does is call this
+        // again on the next read — and the re-fetch had written the same
+        // undecodable bytes back over the file it had just dropped, so every
+        // later call read, deleted, fetched and rewrote them again.
+        for _ in 0..3 {
+            assert!(art.get(&url, 72).await.is_none(), "it cannot be decoded");
+        }
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refetch is one attempt, not one per call"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And not for ever. The reply that fails is not always the reply the
+    /// player will always give: one answered while its library service is
+    /// still coming up is the XML error document `looks_like_an_image` was
+    /// written for, and remembering that for the session cost the album its
+    /// cover until the app was restarted — the entry is consulted before
+    /// anything else, and 64 slots are not turned over in a normal session.
+    #[tokio::test]
+    async fn a_cover_that_failed_once_is_tried_again_later() {
+        let dir = scratch("art-undecodable-expires");
+        let art = art_in(&dir);
+        // Rubbish first, a real picture afterwards: the player has finished
+        // starting up.
+        let server = serving(vec![a_broken_png(), png_of(32, 32)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Recovering", server.addr);
+
+        assert!(
+            art.get(&url, 72).await.is_none(),
+            "the first reply is not a picture"
+        );
+        assert!(
+            art.get(&url, 72).await.is_none(),
+            "and is not asked for again while it is still remembered"
+        );
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refetch is one attempt, not one per call"
+        );
+
+        // Time passing, without waiting five minutes for it. The value is the
+        // instant the entry stops counting, so this is the entry as it will
+        // be then.
+        art.undecodable
+            .lock()
+            .unwrap()
+            .put(url.clone(), Instant::now());
+
+        assert!(
+            art.get(&url, 72).await.is_some(),
+            "once the failure has expired the cover is asked for again"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The allow-list is what exempts a player's own address from the rule
+    /// against fetching from private space, so it has to be bounded by
+    /// something the network cannot move. It used to be bounded by the
+    /// registry's adoption cap — which stopped being a bound the moment a
+    /// player was allowed to move, since retiring the address it left is what
+    /// makes room for the one it announced from.
+    #[test]
+    fn the_allowed_addresses_are_bounded_and_given_back() {
+        let art = Artwork::in_memory(reqwest::Client::new(), Players::default());
+
+        let address = |n: usize| {
+            std::net::IpAddr::from(std::net::Ipv4Addr::new(
+                10,
+                (n >> 8) as u8,
+                (n & 0xff) as u8,
+                1,
+            ))
+        };
+        for n in 0..MAX_ART_HOSTS + 10 {
+            art.remember_player(address(n));
+        }
+        assert_eq!(
+            art.players.lock().unwrap().len(),
+            MAX_ART_HOSTS,
+            "a flood of announcements must not grow the set without end"
+        );
+        let over = reqwest::Url::parse(&format!("http://{}/Artwork", address(MAX_ART_HOSTS)))
+            .expect("a URL");
+        assert!(
+            !allowed_by(&art.players, &over),
+            "and the ones past the cap are not allowed either"
+        );
+
+        // And an address given back is refused again, which is what makes room
+        // for a player that has genuinely moved.
+        art.forget_player(address(0));
+        let first = reqwest::Url::parse(&format!("http://{}/Artwork", address(0))).expect("a URL");
+        assert!(!allowed_by(&art.players, &first));
+        art.remember_player(address(MAX_ART_HOSTS));
+        assert!(allowed_by(&art.players, &over));
+    }
+
+    /// A trip is shared, so cancelling the task that happens to own it must
+    /// not answer everyone else waiting on it with "there is no art".
+    ///
+    /// Cancellation here is ordinary: `load_thumbnails` aborts its whole set
+    /// as soon as a newer loader takes the generation, and the aborted task
+    /// may be the one the sleeve and the sidebar card joined. Read as a miss,
+    /// that blanked both of them for the rest of the track — neither is asked
+    /// for again until the cover URL changes.
+    #[tokio::test]
+    async fn a_cancelled_fetch_is_not_a_miss_for_the_callers_that_joined_it() {
+        let dir = scratch("art-cancelled");
+        let art = Arc::new(art_in(&dir));
+        let server = serving(vec![png_of(64, 64)], Duration::from_millis(300)).await;
+        let url = format!("http://{}/Artwork?album=Aborted", server.addr);
+
+        // First in, so this one owns the trip.
+        let owner = tokio::spawn({
+            let art = Arc::clone(&art);
+            let url = url.clone();
+            async move { art.get(&url, 72).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The sleeve wants the same cover at another size and joins the trip
+        // already running.
+        let joined = tokio::spawn({
+            let art = Arc::clone(&art);
+            let url = url.clone();
+            async move { art.get(&url, 720).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Then the user scrolls, and the loader that owned the trip is gone.
+        owner.abort();
+
+        assert!(
+            joined.await.expect("joins").is_some(),
+            "a cover the user can see went missing because another caller was cancelled"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fetch limit bounds connections and nothing else, so a cover already
+    /// on disk used to reach `spawn_blocking` with no permit of any kind — and
+    /// a queue window of a hundred cached rows was a hundred decoders running
+    /// at once, each allowed `MAX_DECODED` to itself.
+    #[tokio::test]
+    async fn a_decode_waits_for_a_permit_of_its_own() {
+        let dir = scratch("art-decode-permit");
+        let art = Arc::new(art_in(&dir));
+        let server = serving(vec![png_of(32, 32)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Gated", server.addr);
+
+        // Every decode permit, held by this test.
+        let held = art
+            .decoding
+            .acquire_many(CONCURRENT_DECODES as u32)
+            .await
+            .expect("the semaphore is never closed");
+
+        let mine = Arc::clone(&art);
+        let wanted = url.clone();
+        let task = tokio::spawn(async move { mine.get(&wanted, 72).await.is_some() });
+
+        // Long enough that the fetch has certainly landed: what is left is the
+        // decode, which has nothing to run on.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !task.is_finished(),
+            "a cover decoded although every permit was held"
+        );
+
+        drop(held);
+        assert!(task.await.expect("joins"), "and decodes once one frees");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A permit handed back while the work it bounds is still running is not a
+    /// bound at all.
+    ///
+    /// A blocking task has no cancellation point, so aborting the caller ends
+    /// the future and not the decode. Held in a local across the await, the
+    /// permit went back at the abort and the walk that replaced this one took
+    /// a fresh one at once — and a walk being replaced is routine rather than
+    /// exotic: `start_walk` aborts up to six of these on every queue page and
+    /// every browse page. Against a player serving covers near [`MAX_SIDE`],
+    /// each orphan is another [`MAX_DECODED`] allocation with nothing above it
+    /// but the size of tokio's blocking pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aborted_decode_keeps_its_permit_until_it_has_finished() {
+        let dir = scratch("art-abort-permit");
+        let art = Arc::new(art_in(&dir));
+        // Big enough that the decode is certainly still going a moment after
+        // the abort lands, which is the whole thing being measured. The fetch
+        // is not delayed: what has to be reached is the decode.
+        let server = serving(vec![png_of(3072, 3072)], Duration::ZERO).await;
+
+        // One cover per permit, none of them the same, so every permit is
+        // inside a `spawn_blocking` when the aborts arrive.
+        let decoding: Vec<_> = (0..CONCURRENT_DECODES)
+            .map(|n| {
+                let art = Arc::clone(&art);
+                let url = format!("http://{}/Artwork?album={n}", server.addr);
+                tokio::spawn(async move { art.get(&url, 72).await })
+            })
+            .collect();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while art.decoding.available_permits() > 0 {
+            assert!(Instant::now() < deadline, "the decodes never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The walk these belong to is replaced.
+        for walk in &decoding {
+            walk.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            art.decoding.available_permits(),
+            0,
+            "the permits went back while the decodes were still running, so \
+             the next walk's three run alongside these three"
+        );
+
+        for walk in decoding {
+            let _ = walk.await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writes of one cover name the same file, so before this they named
+    /// the same temporary too — each truncating what the other had put there
+    /// and then renaming whatever was in it onto the cover.
+    #[test]
+    fn a_temporary_name_is_never_reused() {
+        let path = PathBuf::from("/var/cache/azzurro/artwork/00112233445566aa");
+        let first = temp_name(&path);
+        let second = temp_name(&path);
+
+        assert_ne!(first, second, "two writes of one cover would collide");
+        assert_ne!(first, path, "and neither is the cover itself");
+        assert_eq!(first.parent(), path.parent(), "written beside the target");
+        assert!(
+            first.to_string_lossy().ends_with(".part"),
+            "still recognizable as a part file: {first:?}"
+        );
     }
 
     #[test]

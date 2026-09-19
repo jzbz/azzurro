@@ -11,7 +11,7 @@
 //! covered by the tests, because a test that skips someone's track is not a
 //! test anyone wants to run.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
@@ -116,6 +116,22 @@ pub const DEFAULT_POLL: Duration = Duration::from_secs(100);
 /// deadline is always the one that fires first and a real network stall is
 /// still distinguishable from a quiet player.
 const POLL_SLACK: Duration = Duration::from_secs(15);
+
+/// The shortest one turn of the poll may be when nothing changed.
+///
+/// A long poll is a request that is *supposed* to come back empty-handed after
+/// a minute and a half, so asking again the moment it returns is the right
+/// thing to do against a player that honors the timeout. Against one that does
+/// not it is a busy loop: the fake player these tests run against answers
+/// `/Status` from memory, and so does any cache sitting between the two, and
+/// the poll then sends requests as fast as the loop can make them. So an
+/// unchanged reply that came back early is waited out to here — measured from
+/// when the request went out, so a caller that waited itself waits no longer.
+///
+/// Only the unchanged ones. A reply that carries a change is the player
+/// answering the question that was asked, and the next poll after one has to
+/// go straight back out or a burst of changes arrives a second apart.
+const MIN_POLL: Duration = Duration::from_secs(1);
 
 /// What `<repeat>` means. Note that off is 2, not 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1117,6 +1133,7 @@ impl Client {
             client: self.clone(),
             etag: None,
             poll: DEFAULT_POLL,
+            earliest: None,
         }
     }
 
@@ -1509,6 +1526,9 @@ pub struct StatusWatch {
     client: Client,
     etag: Option<String>,
     poll: Duration,
+    /// When the next request may go out, where the last one came back
+    /// unchanged and early. See [`MIN_POLL`].
+    earliest: Option<Instant>,
 }
 
 impl StatusWatch {
@@ -1533,9 +1553,20 @@ impl StatusWatch {
     }
 
     pub async fn next(&mut self) -> Result<Status> {
+        // Waited out before the request rather than after the reply, so that
+        // the floor is on how often this asks and never on how quickly the
+        // caller hears an answer.
+        if let Some(earliest) = self.earliest.take()
+            && let Some(left) = earliest.checked_duration_since(Instant::now())
+        {
+            tokio::time::sleep(left).await;
+        }
+
+        let asked_at = Instant::now();
         let seconds = self.poll.as_secs().to_string();
+        let asked_with = self.etag.clone();
         let mut query: Vec<(&str, &str)> = vec![("timeout", &seconds)];
-        if let Some(etag) = &self.etag {
+        if let Some(etag) = &asked_with {
             query.push(("etag", etag));
         }
 
@@ -1543,6 +1574,12 @@ impl StatusWatch {
             .client
             .get_xml("/Status", &query, self.poll + POLL_SLACK)
             .await?;
+        // The same etag back is the player saying nothing has changed, which
+        // is the answer a poll that came back early has no business asking
+        // again straight away. See [`MIN_POLL`].
+        if asked_with.as_deref() == Some(status.etag.as_str()) {
+            self.earliest = Some(asked_at + MIN_POLL);
+        }
         self.etag = Some(status.etag.clone());
         Ok(status)
     }
@@ -1892,6 +1929,44 @@ mod tests {
         });
 
         addr
+    }
+
+    /// A player that answers its long poll from memory is not a reason to ask
+    /// it again as fast as the loopback will carry it.
+    ///
+    /// The fake player is exactly that server — `/Status` comes back from a
+    /// map, timeout parameter and all — and so is any cache sitting between a
+    /// controller and a real one.
+    #[tokio::test]
+    async fn an_unchanged_reply_is_not_asked_for_again_at_once() {
+        let player = fake_player::Player::with_routes(vec![(
+            "/Status",
+            fake_player::fixtures::status_stopped().to_owned(),
+        )])
+        .await;
+        let mut watch = client_at(player.address()).watch();
+
+        // The first answer is a change, there having been nothing before it,
+        // and the poll after one goes straight back out.
+        let opened = Instant::now();
+        watch.next().await.expect("the first status");
+        watch.next().await.expect("and the second");
+        assert!(
+            opened.elapsed() < MIN_POLL,
+            "a reply that carried a change is followed at once"
+        );
+
+        // That second one sent the etag the first gave it and got the same
+        // document back, which is the player saying nothing has happened.
+        // Before the floor, this is where the loop spun.
+        let unchanged = Instant::now();
+        watch.next().await.expect("and the third");
+        assert!(
+            unchanged.elapsed() >= MIN_POLL,
+            "an unchanged reply was asked for again in {:?}",
+            unchanged.elapsed()
+        );
+        assert_eq!(player.asked().len(), 3, "three polls and no more");
     }
 
     #[tokio::test]

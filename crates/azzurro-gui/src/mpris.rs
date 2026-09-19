@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bluos::{DeviceId, Repeat, Status};
-use mpris_server::zbus::{Result as ZbusResult, fdo};
+use mpris_server::zbus::{self, Result as ZbusResult, fdo};
 use mpris_server::{
     LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface,
     Server, Signal, Time, TrackId, Volume,
@@ -44,6 +44,9 @@ struct Announced {
     can_go_previous: bool,
     track: TrackKey,
     position_secs: i64,
+    /// When this reading was announced, so the next one can be held against
+    /// where playing on would have carried the track by itself.
+    at: Instant,
 }
 
 /// The parts of a track that, taken together, mean "this is a different track".
@@ -56,6 +59,20 @@ struct TrackKey {
     length_micros: Option<i64>,
 }
 
+/// What came of trying to export one player.
+pub enum Attach {
+    /// Exported, and here is the object serving it.
+    Exported(Bridge),
+    /// There is no session bus to export onto: the app is running outside a
+    /// desktop session, or in a container without one. Nothing a player does
+    /// will conjure a bus, so the caller stops asking — this used to be tried
+    /// again on every status, which is a warning a second for as long as the
+    /// app runs.
+    NoBus,
+    /// Something else went wrong, and the next status may do better.
+    Failed,
+}
+
 /// The D-Bus object for one player, and the memory of what it last said.
 pub struct Bridge {
     server: Server<Exported>,
@@ -65,9 +82,9 @@ pub struct Bridge {
 impl Bridge {
     /// Claim a bus name for this player and start serving.
     ///
-    /// Returns `None` rather than failing the caller: a controller on a machine
-    /// with no session bus should still control speakers, just without the
-    /// desktop integration.
+    /// Answers with what went wrong rather than failing the caller: a
+    /// controller on a machine with no session bus should still control
+    /// speakers, just without the desktop integration.
     pub async fn attach(
         index: usize,
         id: DeviceId,
@@ -75,7 +92,7 @@ impl Bridge {
         registry: Registry,
         commands: mpsc::UnboundedSender<Command>,
         artwork: Arc<Artwork>,
-    ) -> Option<Self> {
+    ) -> Attach {
         // `org.mpris.MediaPlayer2.azzurro.instance<pid>_<n>`. The spec wants a
         // unique suffix and suggests a process id; the index disambiguates the
         // several players one process exports. Each dot-separated element has
@@ -95,14 +112,21 @@ impl Bridge {
         match Server::new(&suffix, exported).await {
             Ok(server) => {
                 tracing::info!(%id, bus = %server.bus_name(), "exported over MPRIS");
-                Some(Self {
+                Attach::Exported(Self {
                     server,
                     announced: Mutex::new(None),
                 })
             }
+            Err(e) if no_session_bus(&e) => {
+                // Said once, and quietly: a machine without a session bus is
+                // a headless one, where this is a fact about the machine
+                // rather than something wrong with the player.
+                tracing::info!(%id, "no session bus, so no desktop media controls: {e}");
+                Attach::NoBus
+            }
             Err(e) => {
                 tracing::warn!(%id, "no MPRIS for this player: {e}");
-                None
+                Attach::Failed
             }
         }
     }
@@ -110,17 +134,7 @@ impl Bridge {
     /// Announce whatever changed since the last status.
     pub async fn publish(&self, status: &Status) {
         let art = self.server.imp().art_url(status).await;
-        let current = Announced {
-            playback: playback_status(status),
-            loop_status: loop_status(status),
-            shuffle: status.shuffle_on(),
-            volume_percent: status.volume.unwrap_or(0),
-            can_seek: status.seekable(),
-            can_go_next: status.can_skip(),
-            can_go_previous: status.can_go_back(),
-            track: track_key(status, art.clone()),
-            position_secs: status.secs.unwrap_or(0) as i64,
-        };
+        let current = reading(status, art.clone(), Instant::now());
 
         let (properties, seeked) = {
             let mut guard = self.announced.lock().unwrap();
@@ -168,6 +182,52 @@ impl Bridge {
             tracing::debug!("MPRIS offline announcement failed: {e}");
         }
     }
+}
+
+/// One status as the bus sees it, at the moment it arrived.
+fn reading(status: &Status, art: Option<String>, at: Instant) -> Announced {
+    Announced {
+        playback: playback_status(status),
+        loop_status: loop_status(status),
+        shuffle: status.shuffle_on(),
+        volume_percent: status.volume.unwrap_or(0),
+        can_seek: status.seekable(),
+        can_go_next: status.can_skip(),
+        can_go_previous: status.can_go_back(),
+        track: track_key(status, art),
+        position_secs: status.secs.unwrap_or(0) as i64,
+        at,
+    }
+}
+
+/// Whether an export failed because there is no session bus to export onto.
+///
+/// The caller latches on a true and never tries that player again for the rest
+/// of the run, so this has to mean a fact about the machine and nothing less.
+/// No address to connect to is one outright. The two I/O failures are not: they
+/// carry a plain [`std::io::Error`], and every transient way a connection can
+/// fail arrives as one — the file-descriptor limit reached while several
+/// players attach within the same second at startup, the bus daemon being
+/// restarted, a socket momentarily refusing a backlog. Read as "this machine
+/// has no session bus", one of those cost a speaker its desktop media controls
+/// for the whole session, and said so at `info` on a machine where the bus was
+/// there all along.
+///
+/// So the error kind decides: a socket that is not there, will not have us, or
+/// refuses the connection is the machine; anything else is this attempt, and
+/// the next status may do better.
+fn no_session_bus(e: &zbus::Error) -> bool {
+    use std::io::ErrorKind;
+
+    let io = match e {
+        zbus::Error::Address(_) => return true,
+        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _) => io,
+        _ => return false,
+    };
+    matches!(
+        io.kind(),
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::PermissionDenied
+    )
 }
 
 /// Work out what to announce, and whether the position moved by more than
@@ -229,8 +289,21 @@ fn diff(
     // Only a jump *within* one track is a seek. A track change moves the
     // position too, and announcing that as a seek would make clients rewind a
     // progress bar they are about to rebuild anyway.
-    let seeked = (same_track
-        && (current.position_secs - previous.position_secs).abs() > SEEK_TOLERANCE_SECS)
+    //
+    // And only a jump past where the track would have reached on its own. The
+    // two raw positions were compared here, which made a seek of every gap
+    // between polls: a player long-polling a stream says nothing for a minute
+    // at a time, and every one of those reports came back a minute further on
+    // for no reason but time passing.
+    let implied = match previous.playback {
+        PlaybackStatus::Playing => {
+            let between = current.at.saturating_duration_since(previous.at).as_secs() as i64;
+            previous.position_secs + between
+        }
+        // Paused or stopped, the position is where it was left.
+        _ => previous.position_secs,
+    };
+    let seeked = (same_track && (current.position_secs - implied).abs() > SEEK_TOLERANCE_SECS)
         .then(|| Time::from_secs(current.position_secs));
 
     (properties, seeked)
@@ -300,7 +373,16 @@ fn track_key(status: &Status, art: Option<String>) -> TrackKey {
 /// track change they are watching for.
 fn track_id(status: &Status) -> TrackId {
     let key = match (status.pid, status.song) {
-        (Some(queue), Some(index)) if status.service.as_deref() != Some("Capture") => {
+        // `is_queue_based` is the test for whether the queue position means
+        // anything: a player working through its queue moves it on every
+        // track, and a player handed a URL to play — a radio stream, an
+        // input — keeps one position for as long as it plays. Reading only
+        // the service name here missed the stream, which is the source whose
+        // title changes most often, so every song on the radio shared one
+        // track id and no client ever saw the track change.
+        (Some(queue), Some(index))
+            if status.is_queue_based() && status.service.as_deref() != Some("Capture") =>
+        {
             format!("q{queue}s{index}")
         }
         _ => match status.title1.as_deref().filter(|s| !s.is_empty()) {
@@ -367,6 +449,20 @@ impl Exported {
         Some((entry.status.clone()?, entry.status_at?))
     }
 
+    /// Whether the player is still answering.
+    ///
+    /// The last status stays on the bus while a player is away — a blip
+    /// should not empty the desktop's media widget — but it is a description
+    /// of a track, not evidence that anything is playing now. A player
+    /// unplugged an hour ago answered every property read with "Playing", and
+    /// its progress bar was still advancing.
+    fn answering(&self) -> bool {
+        let guard = self.registry.lock().unwrap();
+        guard
+            .get(&self.id)
+            .is_some_and(|entry| entry.view.reachable)
+    }
+
     /// The cover's URL as the player named it, resolved against the player.
     fn player_art(&self, status: &Status) -> Option<String> {
         let art = status.artwork()?;
@@ -419,7 +515,7 @@ impl Exported {
             return 0;
         };
         let reported = status.secs.unwrap_or(0) as i64;
-        if !status.is_playing() {
+        if !status.is_playing() || !self.answering() {
             return reported;
         }
 
@@ -477,8 +573,12 @@ impl RootInterface for Exported {
         Ok(self.name.clone())
     }
 
+    /// The basename of the installed .desktop file, which is what a shell
+    /// looks up to find the app's icon and name. It is the application id,
+    /// not the binary's name — "azzurro" matches no file that is installed,
+    /// so a desktop reading it found nothing and drew a placeholder.
     async fn desktop_entry(&self) -> fdo::Result<String> {
-        Ok("azzurro".into())
+        Ok(crate::APP_ID.into())
     }
 
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
@@ -533,7 +633,13 @@ impl PlayerInterface for Exported {
         ))
     }
 
+    /// Stopped for a player that has gone quiet, whatever its last status
+    /// said — the same answer [`Bridge::publish_offline`] pushes, so a client
+    /// that asks and a client that listens are told the same thing.
     async fn playback_status(&self) -> fdo::Result<PlaybackStatus> {
+        if !self.answering() {
+            return Ok(PlaybackStatus::Stopped);
+        }
         Ok(self
             .snapshot()
             .map(|(s, _)| playback_status(&s))
@@ -649,6 +755,7 @@ impl PlayerInterface for Exported {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn status(state: &str) -> Status {
         Status {
@@ -731,6 +838,203 @@ mod tests {
 
         // Nothing to identify at all.
         assert_eq!(track_id(&Status::default()), TrackId::NO_TRACK);
+    }
+
+    /// The gap between two polls is not a seek.
+    ///
+    /// The player says nothing while nothing changes, which on a stream is a
+    /// minute at a time, and every one of those reports came back that much
+    /// further into the track — which is what playing *is*. Comparing the two
+    /// raw positions called each of them a seek, so every media widget on the
+    /// desktop was told to resync a progress bar that was already right.
+    #[test]
+    fn playing_on_between_polls_is_not_a_seek() {
+        let playing = |secs| Status {
+            state: Some("play".to_owned()),
+            title1: Some("A Song".to_owned()),
+            secs: Some(secs),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let before = reading(&playing(10), None, start);
+        let minute = start + Duration::from_secs(60);
+
+        let carried_on = playing(70);
+        let (_, seeked) = diff(
+            Some(&before),
+            &reading(&carried_on, None, minute),
+            &carried_on,
+            None,
+        );
+        assert!(
+            seeked.is_none(),
+            "a minute of playing lands a minute further on"
+        );
+
+        // Somewhere playing alone could not have reached in that minute.
+        let jumped = playing(600);
+        let (_, seeked) = diff(
+            Some(&before),
+            &reading(&jumped, None, minute),
+            &jumped,
+            None,
+        );
+        assert_eq!(seeked.map(|t| t.as_secs()), Some(600));
+
+        // Paused, the track is where it was left, so any move at all is one
+        // somebody made.
+        let paused = |secs| Status {
+            state: Some("pause".to_owned()),
+            ..playing(secs)
+        };
+        let held = reading(&paused(10), None, start);
+        let moved = paused(40);
+        let (_, seeked) = diff(Some(&held), &reading(&moved, None, minute), &moved, None);
+        assert_eq!(seeked.map(|t| t.as_secs()), Some(40));
+    }
+
+    /// A radio stream keeps one queue position while the songs go by, and
+    /// says which it is by carrying the URL it is playing. Reading the
+    /// service name alone let every song on a station share one track id,
+    /// which is the one source where the title changes most.
+    #[test]
+    fn track_id_follows_the_title_on_a_radio_stream() {
+        let one = Status {
+            pid: Some(692),
+            song: Some(0),
+            service: Some("TuneIn".to_owned()),
+            stream_url: Some("http://radio.example/listen".to_owned()),
+            title1: Some("The First Song".to_owned()),
+            ..Default::default()
+        };
+        let two = Status {
+            title1: Some("The Next Song".to_owned()),
+            ..one.clone()
+        };
+        assert_ne!(track_id(&one), track_id(&two));
+
+        // A player working through its queue still answers by queue position,
+        // which is what tells two identically titled tracks apart.
+        let queued = Status {
+            stream_url: None,
+            ..one.clone()
+        };
+        assert_eq!(
+            track_id(&queued).into_inner().as_str(),
+            "/app/azzurro/track/q692s0"
+        );
+    }
+
+    /// A player nobody can reach is not playing, whatever the last status it
+    /// managed to send said.
+    ///
+    /// The track stays on the bus on purpose — a blip should not empty the
+    /// desktop's media widget — but a property read used to answer out of it
+    /// as though the player were still there, so a speaker unplugged an hour
+    /// ago reported Playing with its progress bar still advancing.
+    #[tokio::test]
+    async fn a_player_that_has_gone_quiet_is_not_playing() {
+        // As `run` does, before the first client is built. Nothing here
+        // sends a request; the client is only what an `Entry` is made of.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let id = DeviceId::new(std::net::Ipv4Addr::LOCALHOST, 11000);
+        let http = reqwest::Client::new();
+        let (commands, _commands_rx) = mpsc::unbounded_channel();
+
+        let registry: Registry = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        registry.lock().unwrap().insert(
+            id,
+            crate::Entry {
+                client: bluos::Client::with_http(id, http.clone()),
+                identity: None,
+                poll: Arc::default(),
+                writes: Arc::default(),
+                upgrading: None,
+                view: crate::Device {
+                    reachable: true,
+                    ..Default::default()
+                },
+                status: Some(Status {
+                    state: Some("play".to_owned()),
+                    secs: Some(30),
+                    ..Default::default()
+                }),
+                // A minute ago, so the position has visibly run on since.
+                status_at: Some(Instant::now() - Duration::from_secs(60)),
+                queue: None,
+                sync: None,
+                cover_url: None,
+                card_cover: None,
+                card_cover_url: None,
+            },
+        );
+
+        let exported = Exported {
+            id,
+            name: "Kitchen".to_owned(),
+            registry: registry.clone(),
+            commands,
+            artwork: Arc::new(Artwork::in_memory(http, Default::default())),
+            art: Mutex::new(None),
+        };
+
+        assert_eq!(
+            exported.playback_status().await.unwrap(),
+            PlaybackStatus::Playing
+        );
+        assert_eq!(
+            exported.position().await.unwrap().as_secs(),
+            90,
+            "a playing track runs on between polls"
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .view
+            .reachable = false;
+
+        assert_eq!(
+            exported.playback_status().await.unwrap(),
+            PlaybackStatus::Stopped,
+            "a player that stopped answering is not playing"
+        );
+        assert_eq!(
+            exported.position().await.unwrap().as_secs(),
+            30,
+            "and its position stops running on"
+        );
+    }
+
+    /// Only a machine with no session bus is worth giving up over. Everything
+    /// else may come right on the next status.
+    #[test]
+    fn a_missing_bus_is_told_apart_from_a_failed_export() {
+        use std::io::{Error, ErrorKind};
+        use std::sync::Arc;
+
+        assert!(no_session_bus(&zbus::Error::Address(
+            "no address".to_owned()
+        )));
+        assert!(!no_session_bus(&zbus::Error::NameTaken));
+
+        // An I/O error is whichever of the two its kind says it is. There is
+        // no socket where the bus should be:
+        assert!(no_session_bus(&zbus::Error::InputOutput(Arc::new(
+            Error::from(ErrorKind::NotFound)
+        ))));
+        // ...but a bus daemon restarting under a connection, or a call cut
+        // short while several players attach within the same second, is this
+        // attempt and not this machine. Latching on one of those used to cost
+        // that player its media controls for the whole run.
+        assert!(!no_session_bus(&zbus::Error::InputOutput(Arc::new(
+            Error::from(ErrorKind::BrokenPipe)
+        ))));
+        assert!(!no_session_bus(&zbus::Error::InputOutput(Arc::new(
+            Error::from(ErrorKind::Interrupted)
+        ))));
     }
 
     #[test]

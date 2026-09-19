@@ -122,6 +122,17 @@ pub fn remember(players: &mut Vec<DeviceId>, id: DeviceId) -> bool {
     true
 }
 
+/// Drop an address, and say whether that changed anything.
+///
+/// For a player that has turned up somewhere else: the address it used to
+/// answer on is not a player any more, and left in the file it is probed at
+/// every start until it is pushed off the end. See [`crate::Backend::moved_here`].
+pub fn forget(players: &mut Vec<DeviceId>, id: DeviceId) -> bool {
+    let before = players.len();
+    players.retain(|kept| *kept != id);
+    players.len() != before
+}
+
 /// Render the list as the file's contents.
 fn body(players: &[DeviceId]) -> String {
     let mut body = String::from("# Players Azzurro has seen. One host:port per line.\n");

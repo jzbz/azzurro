@@ -2741,7 +2741,26 @@ export component AppWindow inherits Window {
                 // except that this one has to be made here rather than at the
                 // caller, because a screen finishing its fetch moves
                 // `arrived` and `changed arrived` claims unconditionally.
-                if (!root.searchable && !root.modal && !root.queue-naming) {
+                if (!root.searchable) {
+                    self.hand-back();
+                }
+            }
+
+            // The rest of `claim`, on its own, for the one caller that cannot
+            // ask the question above: the search box handing the keys back
+            // itself. `searchable` is true whenever that box is on screen and
+            // not under a scrim, so `claim` refuses for it by definition — the
+            // box takes the caret as it appears — and the box's own way back
+            // from a question therefore called `focus()` flat, dropping the
+            // two tests below with it. Split out rather than copied so that
+            // the next guard added here reaches both.
+            function hand-back() {
+                // Never over a question, which holds the keyboard from above
+                // its own card, and never out of the line that asks for a
+                // playlist name: that line is in the queue column beside the
+                // pane, so it is still there and still what the next letter is
+                // meant for. See `queue-naming`.
+                if (!root.modal && !root.queue-naming) {
                     self.focus();
                 }
             }
@@ -3309,20 +3328,39 @@ export component AppWindow inherits Window {
                             // appears — and this box did not appear, because a
                             // question no longer destroys it.
                             //
+                            // Three ways, because the question can have
+                            // borrowed the caret from three different places.
+                            // `pending` is the box never having had it: the
+                            // screen landed while the question was up, so
+                            // `init` below wrote the wish down instead of
+                            // taking the keyboard from the card, and this is
+                            // where it is spent. `take-focus` there for the
+                            // same reason `init` uses it — arriving on the
+                            // search screen is asking to type over whatever
+                            // query was kept.
+                            //
                             // `resume-focus` rather than `take-focus` where it
                             // had the caret: half a query is a word being
                             // typed rather than one to be replaced, and
                             // selecting it would let the next letter take the
                             // rest of it away. Where it did not, the keys go
                             // back to the window, which is where the question
-                            // borrowed them from.
+                            // borrowed them from — `hand-back` rather than
+                            // `keys.focus()`, because the window is only the
+                            // right place for them if nothing else in it is
+                            // being typed into, and the playlist name line
+                            // beside the pane can be.
                             property <bool> covered: root.modal;
                             changed covered => {
                                 if (!self.covered) {
-                                    if (root.browse-typing) {
+                                    if (self.pending) {
+                                        self.pending = false;
+                                        self.take-focus();
+                                        root.browse-typing = true;
+                                    } else if (root.browse-typing) {
                                         self.resume-focus();
                                     } else {
-                                        keys.focus();
+                                        keys.hand-back();
                                     }
                                 }
                             }
@@ -3335,6 +3373,10 @@ export component AppWindow inherits Window {
                                 root.browse-typing = false;
                                 keys.focus();
                             }
+                            // The box wants the caret and a question has it.
+                            // See `init` below and `changed covered` above,
+                            // which is where the wish is spent.
+                            property <bool> pending: false;
                             // Arriving on a screen with a search box means
                             // wanting to search: the caret goes in it and any
                             // query it kept is selected, so typing starts
@@ -3345,18 +3387,42 @@ export component AppWindow inherits Window {
                             // puts a box on that one screen and nowhere else,
                             // so "a box exists" is the same statement as "this
                             // is the search screen".
+                            //
+                            // Never over a question, which is the one guard
+                            // every other focus-claiming site in the window
+                            // carries and this one could once do without:
+                            // `search-drawn` drops the `!modal` term that
+                            // `browse-showing` has, on purpose, so the block
+                            // is no longer destroyed by a question — and can
+                            // therefore now be *built* behind one. The screen
+                            // is fetched over the network, and an update
+                            // notice arriving off a status poll while that
+                            // fetch is in flight is all it takes. Taking the
+                            // caret from the card there leaves the question
+                            // with no keyboard answer at all — the box is not
+                            // one of `Modal`'s children, so Tab, Enter and
+                            // Escape never reach the trap — and
+                            // `confirm-upgrade` ignores Escape on purpose, so
+                            // it would be answerable by mouse alone. The
+                            // letters would meanwhile go into a box under the
+                            // scrim and put a search on the wire for a list
+                            // nobody can see.
                             init => {
                                 root.want-search = false;
-                                self.take-focus();
-                                // Said out loud, because a change tracker
-                                // never fires on creation: the caret is taken
-                                // here, inside `init`, so `changed typing`
-                                // above has nothing to report and the window
-                                // would go on believing nobody was typing in
-                                // a box that had just claimed the keyboard.
-                                // The same reason the playlist name line says
-                                // so itself.
-                                root.browse-typing = true;
+                                if (root.modal) {
+                                    self.pending = true;
+                                } else {
+                                    self.take-focus();
+                                    // Said out loud, because a change tracker
+                                    // never fires on creation: the caret is
+                                    // taken here, inside `init`, so `changed
+                                    // typing` above has nothing to report and
+                                    // the window would go on believing nobody
+                                    // was typing in a box that had just
+                                    // claimed the keyboard. The same reason
+                                    // the playlist name line says so itself.
+                                    root.browse-typing = true;
+                                }
                             }
                         }
                     }

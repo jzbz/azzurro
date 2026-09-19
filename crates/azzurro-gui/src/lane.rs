@@ -1,4 +1,4 @@
-//! One queue for the requests that must not overtake each other.
+//! One queue per player for the requests that must not overtake each other.
 //!
 //! The command loop must never await a player. A player that has gone quiet
 //! takes the full ten-second request timeout to say so, and every press made
@@ -19,6 +19,13 @@
 //! arrived in; the returned future is awaited inside the task, where waiting
 //! costs nothing. Nothing here holds a lock across an await: the `Mutex` is
 //! held only long enough to swap one channel end.
+//!
+//! A lane belongs to one player and lives on that player's registry entry —
+//! see `Entry::writes`. Only the requests to one player have an order to keep
+//! between them, and a lane is a queue: a player that has gone quiet holds its
+//! own for the whole ten-second timeout, so a single lane for the app meant a
+//! press for the kitchen standing behind a speaker in a room nobody was in.
+//! Not answered late, either — not sent at all until the dead one gave up.
 
 use std::sync::Mutex;
 

@@ -69,16 +69,6 @@ const QUEUE_WINDOW: u32 = 500;
 /// between sources. See [`load_cover`].
 const COVER_SETTLE: Duration = Duration::from_millis(180);
 
-/// The cover on a player's row in the sidebar, at twice the 40px it is drawn
-/// in.
-///
-/// Its own tier because it is fetched for *every* player rather than only the
-/// one being looked at: in a house with speakers in four rooms the sidebar is
-/// a list of what each room is playing, and at this size that is a picture
-/// rather than a line of elided text. One of these is 25 KiB against the
-/// hero's 2 MiB, so the whole list costs less than a single sleeve.
-const CARD_SIZE: u32 = 80;
-
 /// The now-playing sleeve, at twice the largest box it is drawn in so it stays
 /// sharp on a HiDPI screen. Fetched once at this size rather than per scale
 /// factor.
@@ -142,9 +132,31 @@ const UPGRADE_PATIENCE: Duration = Duration::from_secs(20 * 60);
 /// saying. It reboots in the middle, so silence is expected for a stretch.
 const UPGRADE_SILENCE: Duration = Duration::from_secs(90);
 
+/// And how long where the request that started this was never answered.
+///
+/// Longer, because that branch exists for the player that is *already*
+/// installing: an unanswered trigger is read as "the player may have begun
+/// rewriting its flash mid-request", the user is told so, and then nothing
+/// this can see rules it out — [`silence_was_the_reboot`] refuses to call
+/// that silence evidence, so the watch runs to the end of its budget. At
+/// ninety seconds it ended by saying the update never started, ninety seconds
+/// after saying it might have; a BluOS install and reboot is routinely longer
+/// than that. Still short of [`UPGRADE_PATIENCE`], which is what a player
+/// seen updating gets.
+const UPGRADE_SILENCE_UNANSWERED: Duration = Duration::from_secs(5 * 60);
+
 /// How long an upgrade must have been running before an ordinary SyncStatus
 /// counts as "finished" rather than "the player has not started yet".
 const UPGRADE_SETTLE: Duration = Duration::from_secs(20);
+
+/// How long a player must have been unreachable for its silence to be the
+/// reboot in the middle of an upgrade rather than a dropped request.
+///
+/// Evidence, not patience: a player that goes quiet for this long and then
+/// answers as itself has been away long enough to have restarted, which is
+/// what makes "Update finished" true where no progress reading was ever
+/// caught. One missed poll is a blip and says nothing.
+const UPGRADE_REBOOT: Duration = Duration::from_secs(15);
 
 /// The longest label that shares a line with the others under the queue.
 ///
@@ -1072,15 +1084,101 @@ enum Action {
     Sleep,
 }
 
+/// What the shared upgrade strip says about one player.
+///
+/// Kept per player rather than only in the window because the strip is one
+/// row and a household can have two players updating at once: when one
+/// finishes, the other's progress goes back on the strip instead of the strip
+/// going blank over an upgrade still running.
+#[derive(Clone)]
+struct Upgrading {
+    /// The player's name for itself, which is what the strip shows.
+    name: String,
+    stage: String,
+    /// Zero where the player sends no counters, which is what a Powernode
+    /// does for the whole of an upgrade.
+    percent: f32,
+}
+
+/// The handle a player's poll loop is steered by from outside it.
+///
+/// The loop spends nearly all of its life inside a long poll or a backoff
+/// sleep, and both of the things that have to reach it arrive while it is
+/// there. An announcement means the player is back and the backoff it built up
+/// over the silence is now a wait for nothing; a retirement means the address
+/// it is polling is no longer the player's, and the loop has to stop rather
+/// than go on holding a bus name and a row for a room that moved.
+#[derive(Default)]
+struct Poll {
+    /// Set before `gone` is signalled, so that a loop between waits still sees
+    /// it on its next turn rather than only the loop that happened to be
+    /// waiting on the notification.
+    retired: std::sync::atomic::AtomicBool,
+    gone: tokio::sync::Notify,
+    heard: tokio::sync::Notify,
+}
+
+impl Poll {
+    /// Whether this player has been retired and its loop should stop.
+    fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// Stop the loop: this address is not the player any more.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        // `notify_one` rather than `notify_waiters`, here and below, because
+        // the loop is only sometimes waiting: a permit left for it is read by
+        // whichever wait comes next, where a notification sent to nobody would
+        // be the thing that leaves a poll running for another hundred seconds.
+        self.gone.notify_one();
+    }
+
+    /// Discovery has heard from this player, so stop waiting.
+    fn heard(&self) {
+        self.heard.notify_one();
+    }
+
+    /// Wait out `wait`, unless the player announces itself or is retired
+    /// first. Answers whether the wait was cut short.
+    ///
+    /// The caller takes a true as its cue to drop the backoff: the wait was
+    /// for a player that had gone quiet, and a player broadcasting its own
+    /// address is not quiet. Before this, one that came back a moment after
+    /// the backoff reached its ceiling sat unreachable in the window for
+    /// another thirty seconds.
+    async fn wait_out(&self, wait: Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(wait) => false,
+            () = self.heard.notified() => true,
+            () = self.gone.notified() => true,
+        }
+    }
+}
+
 /// One player as the backend tracks it.
 struct Entry {
     client: Client,
-    /// Whether this player is rewriting its own firmware.
+    /// What this player calls itself, independently of where it is answering:
+    /// the node id off its announcement, or the MAC on its `/SyncStatus`, both
+    /// as plain hex. See [`Backend::moved_here`].
+    identity: Option<String>,
+    /// How its poll loop is reached. See [`Poll`].
+    poll: Arc<Poll>,
+    /// The line this player's ordered writes stand in.
+    ///
+    /// One lane per player rather than one for the app. A lane is a queue, and
+    /// a player that has stopped answering holds its own for the whole request
+    /// timeout: shared, that was ten seconds of every other player's presses
+    /// waiting behind a room nobody is in. See [`lane`].
+    writes: Arc<lane::Lane>,
+    /// How far along this player is in rewriting its own firmware, or `None`
+    /// where it is not.
     ///
     /// While it is, it answers nothing useful and will reboot; the window
     /// takes its transport and volume away rather than offering controls that
     /// quietly do nothing. Cleared when it comes back.
-    upgrading: bool,
+    upgrading: Option<Upgrading>,
     /// What the window shows in the player list.
     view: Device,
     /// The last status the poller received, which is more than the list needs
@@ -1100,12 +1198,17 @@ struct Entry {
     /// start the fetch again, and so a fetch that lands late can tell whether
     /// it is still wanted.
     cover_url: Option<String>,
-    /// The same art at [`CARD_SIZE`], for this player's row in the sidebar.
+    /// The same art at [`THUMB_SIZE`], for this player's row in the sidebar.
     ///
     /// Held decoded rather than fetched at publish time: the player list is
     /// rebuilt on every status tick, and a fetch on that path would be a
     /// request per player per second.
     card_cover: Option<Pixels>,
+    /// Which address the art above was fetched from, so that a publish can
+    /// tell one sleeve from another. `cover_url` beside it is what the player
+    /// wants *now*; this is what is actually decoded and on the row, and the
+    /// two differ for as long as a fetch is out.
+    card_cover_url: Option<String>,
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
@@ -1158,9 +1261,22 @@ struct Backend {
     /// Addresses that have answered, remembered between runs. Oldest first
     /// and bounded; see [`known`].
     known: Arc<Mutex<Vec<DeviceId>>>,
-    /// The line the requests that must keep their order stand in. See
-    /// [`lane`]; the arms that use it say why they have to.
-    writes: Arc<lane::Lane>,
+    /// Where a player is believed to have moved from, against the address it
+    /// is now announcing from.
+    ///
+    /// The move itself is taken on an announcement's word, because it has to
+    /// be: a player that changed address says so in no other way. Striking the
+    /// old address out of the remembered-players file is a different thing
+    /// altogether — it is the durable half, it is what a network with LSDP
+    /// filtered has instead of discovery, and nothing puts it back. So the
+    /// file is left alone until the player has answered `/SyncStatus` from the
+    /// new address with the identity that claimed the move, which is evidence
+    /// a broadcast cannot forge. Until then the old address stays remembered
+    /// and is merely probed at the next start, which costs one request.
+    ///
+    /// See [`Backend::moved_here`], where entries are made, and [`read_sync`],
+    /// where they are spent.
+    vacated: Arc<Mutex<std::collections::HashMap<DeviceId, DeviceId>>>,
     /// How many searches have been asked for. Typing asks for one per
     /// keystroke, so each takes a number and checks it is still the highest
     /// before the request goes out — which collapses a typed word into one
@@ -1182,6 +1298,12 @@ struct Backend {
     openings: Arc<AtomicU64>,
     /// What the transport looked like when it was last sent.
     sent_transport: Arc<AtomicU64>,
+    /// And what its track-action pills looked like, which is a second memo
+    /// inside the first: the transport is published whenever the position
+    /// moves, and the pills are a model, so replacing them on that tick would
+    /// destroy and rebuild every button once a second. See
+    /// [`TransportView::actions_fingerprint`].
+    sent_track_actions: Arc<AtomicU64>,
     /// What the queue and the player list looked like when they were last sent
     /// to the window.
     ///
@@ -1239,6 +1361,20 @@ struct Backend {
     /// Which screen the window was last shown, so a new one can start at the
     /// top. See the note where it is read.
     sent_era: Arc<AtomicU64>,
+    /// How many queue-thumbnail loaders have been started.
+    ///
+    /// A loader takes the next number and stops as soon as the count has moved
+    /// past it. The queue starts one when it is first read, and that one walks
+    /// the whole list — so the loader still walking the queue before it is
+    /// only ever competing for the same artwork permits to fetch covers the
+    /// newer one is already fetching, and on a long queue there was one of
+    /// them left running per page. `load_browse_thumbnails` has `era` for
+    /// exactly this; the queue had nothing.
+    ///
+    /// A page does not take a number of its own — see [`Walk`]. It covers the
+    /// tracks below the walk already running rather than the same list again,
+    /// so it is not something for that walk to stand down for.
+    thumbnails: Arc<AtomicU64>,
     /// Whether a stale-screen refresh is already in flight.
     ///
     /// Staleness is decided by comparing the screen's `refreshOnStatusChange`
@@ -1261,6 +1397,21 @@ struct Backend {
     update_offer: Arc<Mutex<Option<DeviceId>>>,
     /// Section order per screen, as set by Customize Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
+    /// The cover walks running over each list, so that starting one that
+    /// replaces the list stops them at once rather than at their next
+    /// completed fetch. More than one because a page starts a walk of its own
+    /// and leaves the walk above it running: see [`Walk`] and [`start_walk`].
+    /// The redraw clock lives here too, for the reason in [`Walks`].
+    queue_walk: Arc<Mutex<Walks>>,
+    browse_walk: Arc<Mutex<Walks>>,
+    /// How many sweeps are running, so the window can say one is.
+    ///
+    /// A count rather than a flag because there can be two: Rescan starts a
+    /// sweep of its own, and the rebind loop starts one every time it binds a
+    /// fresh socket. With a flag the first of them to finish said so for both,
+    /// and the empty state went back to "No players found" with twelve seconds
+    /// of broadcasts still to run. See [`Looking`].
+    sweeping: Arc<AtomicU64>,
 }
 
 /// The player's own words, in American spelling.
@@ -1394,6 +1545,65 @@ fn track_actions(status: &bluos::Status) -> Vec<TrackActionData> {
         .collect()
 }
 
+/// Everything the transport bar draws, gathered before any of it is published.
+///
+/// One value rather than a handful of locals so that the memo can be taken
+/// over the whole of it: `stream_format` and the actions were drawn but not
+/// hashed, so Love pressed on a paused track — where nothing else here moves —
+/// never reached the window, and the format line under the badge stayed on the
+/// previous track's codec until the position happened to change.
+struct TransportView {
+    position: i64,
+    duration: i64,
+    seekable: bool,
+    shuffle: bool,
+    repeat: i32,
+    indexing: String,
+    quality: String,
+    stream_format: String,
+    actions: Vec<TrackActionData>,
+}
+
+impl TransportView {
+    /// Whether anything on the transport bar has moved.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.position.hash(&mut hash);
+        self.duration.hash(&mut hash);
+        self.seekable.hash(&mut hash);
+        self.shuffle.hash(&mut hash);
+        self.repeat.hash(&mut hash);
+        self.indexing.hash(&mut hash);
+        self.quality.hash(&mut hash);
+        self.stream_format.hash(&mut hash);
+        hash.write_u64(self.actions_fingerprint());
+        hash.finish()
+    }
+
+    /// And whether the pills in particular have.
+    ///
+    /// Their own memo because they are the one thing here that is a model
+    /// rather than a property. Everything else is set on a widget that is
+    /// already on screen; a model is replaced, which destroys every row drawn
+    /// from it — so publishing the pills on each tick of the position meant
+    /// rebuilding them once a second under the pointer, throwing away the
+    /// pressed state of a button held down and losing the click of one
+    /// released across the boundary. They change when the track does, so this
+    /// says when to replace them and [`TransportView::fingerprint`] above says
+    /// when there is anything to publish at all.
+    fn actions_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for action in &self.actions {
+            action.name.hash(&mut hash);
+            action.label.hash(&mut hash);
+            action.on.hash(&mut hash);
+        }
+        hash.finish()
+    }
+}
+
 /// A word for an action the player names.
 ///
 /// The player sends identifiers, not labels — `love`, `ban`, `shop` — and the
@@ -1454,16 +1664,18 @@ fn kilobits(raw: &str) -> Option<String> {
 /// Whether this is the same thing the window already has.
 ///
 /// Hashed rather than compared, because the rows carry decoded artwork and
-/// comparing that is more expensive than the redraw it would save. The
-/// artwork goes in only as whether it has arrived, which is the only thing
-/// about it that can change once it has.
+/// comparing that is more expensive than the redraw it would save. The artwork
+/// goes in as whether it has arrived where a row is about one thing and keeps
+/// its sleeve for as long as it exists, which is every list here but one: a
+/// player's card is about the player, and the record on it changes with the
+/// track, so that one hashes which sleeve it is. See
+/// [`player_row_fingerprint`].
 ///
-/// Every field that is drawn has to go in, and that is an obligation on each
-/// caller rather than something this can enforce: a field the window draws but
-/// the fingerprint omits is a cell that silently stops redrawing when it
-/// changes. Adding a field to a row means adding it here too. `Device.model`
-/// is the known exception — drawn, deliberately not hashed, because it is read
-/// once when a player is adopted and never changes after.
+/// Every field that is drawn has to go in, with no exceptions, and that is an
+/// obligation on each caller rather than something this can enforce: a field
+/// the window draws but the fingerprint omits is a cell that silently stops
+/// redrawing when it changes. Adding a field to a row means adding it here
+/// too.
 fn already_sent(seen: &AtomicU64, fingerprint: u64) -> bool {
     // Zero is the "nothing sent yet" value, so a fingerprint that happens to
     // be zero simply sends once more than it needs to.
@@ -1522,8 +1734,20 @@ fn models_replaced(ui: &AppWindow) {
 /// knob stayed where it was dropped. The same for two switches the player
 /// treats as exclusive, where turning one on turns the other off. Whenever the
 /// player restates one of those three, the element has to be built again to
-/// hear it. A text row carries none of them, so the caret this function exists
-/// to protect is not touched by the comparison.
+/// hear it.
+///
+/// Each of the three is shape only on the control that owns it, because only
+/// there is there a binding for a value to have broken. `on`, `option_index`
+/// and `number` are on every row whether or not anything draws them: the sleep
+/// row carries `on` for a pill that merely reads it, and a form carries
+/// `on: !held.is_empty()` on its text and password fields, where nothing reads
+/// it at all. Compared everywhere, those made a page rebuild itself for a value
+/// no element was bound to — the sleep timer starting flips `on` on the next
+/// status tick, and the field being typed into three rows above it dies for a
+/// pill's background. That is F1's shape let back in through a row that has no
+/// control behind it, so each comparison is asked only of the control it
+/// belongs to. A text row carries none of them either way, so the caret this
+/// function exists to protect is not touched by the comparison.
 ///
 /// `rebuild` is the caller saying that the elements themselves are what is
 /// wrong, whatever the shape says. Seating is re-reading: it writes `item` and
@@ -1543,12 +1767,13 @@ fn seat_settings(ui: &AppWindow, items: Vec<SettingItem>, rebuild: bool) -> bool
                 was.index == item.index
                     && was.control == item.control
                     && was.heading == item.heading
-                    // The three a control assigns to itself, compared by bits
-                    // for the float so that a row nobody has touched matches
-                    // itself.
-                    && was.on == item.on
-                    && was.option_index == item.option_index
-                    && was.number.to_bits() == item.number.to_bits()
+                    // The three a control assigns to itself, each asked only of
+                    // the control that assigns it. The float is compared by
+                    // bits so that a row nobody has touched matches itself.
+                    && (was.control != "boolean" || was.on == item.on)
+                    && (was.control != "list" || was.option_index == item.option_index)
+                    && (was.control != "range"
+                        || was.number.to_bits() == item.number.to_bits())
             })
         });
     if in_place {
@@ -1653,6 +1878,86 @@ async fn open_picker(
     backend.publish_pane();
 }
 
+/// What to say when a watched player answers `/SyncStatus` as itself again,
+/// or `None` to keep watching.
+///
+/// `upgraded` is whether anything has been seen that only an upgrade
+/// explains — a progress reading, or a silence long enough to have been the
+/// reboot. It is the whole of the difference between an upgrade that ended
+/// and one that never began: a player answering normally says nothing about
+/// an install by itself, and this used to read "Update finished" out of the
+/// clock alone, or out of one dropped request followed by an ordinary answer.
+///
+/// Split out from [`follow_upgrade`] so the rule can be read without a
+/// twenty-minute clock in front of it.
+fn upgrade_ended(upgraded: bool, watched: Duration) -> Option<&'static str> {
+    if upgraded {
+        return Some("Update finished");
+    }
+    // Long enough that an install asked for would have shown itself. Past
+    // that, the player is simply running, and the honest thing is to say the
+    // update did not take rather than to claim one finished.
+    (watched > UPGRADE_SETTLE).then_some("The player never started an update — check it for one")
+}
+
+/// Whether a failed request means the player never answered, rather than that
+/// it answered and said no.
+///
+/// A 4xx or 5xx is an answer: the player was there, read the request and
+/// declined it. A timeout or a refused connection is not — and on the request
+/// that starts an upgrade, no answer is exactly what a player that has begun
+/// rewriting its flash gives.
+fn unanswered(e: &bluos::Error) -> bool {
+    matches!(e, bluos::Error::Http { cause, .. } if !cause.is_status())
+}
+
+/// How the request that started an upgrade ended, as far as the watch below
+/// is concerned.
+///
+/// The difference decides what silence is allowed to mean. A player that took
+/// the request and then went quiet has given a reason for the quiet: it said
+/// yes and stopped answering, which is what rewriting flash looks like.
+/// A player that never answered the request has not — [`unanswered`] cannot
+/// tell "began rewriting its flash mid-request" from "nothing is listening on
+/// that address", so the silence that follows is the same silence the failed
+/// trigger already reported. Reading it as the reboot let a speaker that was
+/// switched off, asleep on the far side of a Wi-Fi drop or unplugged for half
+/// a minute be announced as having finished an update nobody ever started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// The player answered and took it.
+    Acknowledged,
+    /// The request got no answer at all.
+    Unanswered,
+}
+
+/// Whether a stretch of silence is evidence that an upgrade ran.
+///
+/// Only where the player took the request. A player that answered and then
+/// went quiet has given a reason for the quiet; one that never answered has
+/// not, and reading its silence as the reboot means announcing an update out
+/// of the very failure that said the update may not have started. There, only
+/// a real `Sync::Upgrading` reading counts — see [`Start`].
+///
+/// Split out beside [`upgrade_ended`] for the same reason: the rule is worth
+/// reading, and testing, without a twenty-minute poll loop around it.
+fn silence_was_the_reboot(start: Start, quiet: Duration) -> bool {
+    start == Start::Acknowledged && quiet > UPGRADE_REBOOT
+}
+
+/// How long silence is allowed to last before the watch gives up on it.
+///
+/// A player that took the request reaches [`silence_was_the_reboot`] first and
+/// is lost mid-update rather than never started, so the short budget only ever
+/// decides the unanswered case — the one where the install this cannot see is
+/// minutes long. See [`UPGRADE_SILENCE_UNANSWERED`].
+fn silence_budget(start: Start) -> Duration {
+    match start {
+        Start::Acknowledged => UPGRADE_SILENCE,
+        Start::Unanswered => UPGRADE_SILENCE_UNANSWERED,
+    }
+}
+
 /// Watch an upgrade through to the end, and tell the window what it is doing.
 ///
 /// Polled bare, every few seconds, rather than through the long poll the rest
@@ -1665,7 +1970,10 @@ async fn open_picker(
 ///
 /// Gives up after [`UPGRADE_PATIENCE`]. That is not a failure of the upgrade —
 /// nothing here can stop one — only of this app's willingness to keep asking.
-async fn follow_upgrade(backend: Backend, id: DeviceId) {
+///
+/// `start` says how the request that got here ended, which is what decides
+/// whether silence counts as the reboot. See [`Start`].
+async fn follow_upgrade(backend: Backend, id: DeviceId, start: Start) {
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
@@ -1674,10 +1982,17 @@ async fn follow_upgrade(backend: Backend, id: DeviceId) {
     // A player mid-reboot refuses connections for a while; that is the normal
     // middle of an upgrade, not a reason to stop watching.
     let mut quiet_since: Option<std::time::Instant> = None;
+    // Whether anything has been seen that only an upgrade explains: a
+    // progress reading, or — where the player took the request — a silence
+    // long enough to have been the reboot. Without one, a player answering as
+    // itself has not finished an upgrade; it is a player that never started
+    // one, and "Update finished" over an install that did not take is worse
+    // than saying nothing.
+    let mut upgraded = false;
 
     loop {
         if started.elapsed() > UPGRADE_PATIENCE {
-            backend.clear_upgrade();
+            backend.clear_upgrade(id);
             say(
                 &backend.ui,
                 "Still updating after twenty minutes — check the player itself",
@@ -1688,19 +2003,29 @@ async fn follow_upgrade(backend: Backend, id: DeviceId) {
         match client.sync_or_upgrade().await {
             Ok(bluos::client::Sync::Upgrading(progress)) => {
                 quiet_since = None;
+                upgraded = true;
                 backend.show_upgrade(id, &progress);
                 if progress.error {
-                    backend.clear_upgrade();
+                    backend.clear_upgrade(id);
                     say(&backend.ui, "The update failed — the player will say more");
                     return;
                 }
             }
-            // Back to answering as itself: the upgrade is over and the player
-            // has rebooted into whatever it now runs.
+            // Back to answering as itself. With an upgrade behind it that is
+            // the end of one: it has rebooted into whatever it now runs.
+            // Without, it is a player that has been answering normally all
+            // along, which is what a start that never took looks like.
             Ok(bluos::client::Sync::Status(_)) => {
-                if quiet_since.is_some() || started.elapsed() > UPGRADE_SETTLE {
-                    backend.clear_upgrade();
-                    say(&backend.ui, "Update finished");
+                // Cleared here as well as on a progress reading, because the
+                // silence that stands for the reboot has to be one silence
+                // rather than a total. Left alone, a dropped request minutes
+                // ago and a dropped request now added up to a reboot, on a
+                // player that had been answering normally the whole way
+                // between them.
+                quiet_since = None;
+                if let Some(word) = upgrade_ended(upgraded, started.elapsed()) {
+                    backend.clear_upgrade(id);
+                    say(&backend.ui, word);
                     return;
                 }
             }
@@ -1708,11 +2033,26 @@ async fn follow_upgrade(backend: Backend, id: DeviceId) {
             // Expected in the middle; only worth reporting if it lasts.
             Err(_) => {
                 let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() > UPGRADE_SILENCE {
-                    backend.clear_upgrade();
+                if silence_was_the_reboot(start, since.elapsed()) {
+                    upgraded = true;
+                }
+                if since.elapsed() > silence_budget(start) {
+                    backend.clear_upgrade(id);
+                    // Only a player that was seen updating can be lost while
+                    // updating. Where nothing was ever seen — the start went
+                    // unanswered and so has everything since — the honest
+                    // reading is a player that is not answering at all, which
+                    // is a different thing to tell somebody about. Not that
+                    // the update never began, which is the one thing this
+                    // branch cannot know and had been asserting: the toast
+                    // that sent the watch here said the opposite.
                     say(
                         &backend.ui,
-                        "Lost the player while it was updating — it may still be working",
+                        if upgraded {
+                            "Lost the player while it was updating — it may still be working"
+                        } else {
+                            "The player is still not answering — check it for an update in progress"
+                        },
                     );
                     return;
                 }
@@ -2182,6 +2522,91 @@ fn browse_row_fingerprint(row: &BrowseData, hash: &mut impl std::hash::Hasher) {
     row.playing.hash(hash);
     row.selected.hash(hash);
     row.has_menu.hash(hash);
+}
+
+/// Everything about a player's sidebar card that the window draws.
+///
+/// `cover` is what that row's art is *of* — the address it was fetched from —
+/// rather than whether there is any. Whether is not enough: a player that
+/// changes track has art both before and after, so hashing `is_some()` said
+/// nothing had happened and the card kept the previous record's sleeve until
+/// something else moved the fingerprint. See `Entry::card_cover_url`.
+///
+/// `model` included, though it used to be described here as the one field
+/// that never changes after adoption. It does: the row is seeded with the
+/// `model` TXT value off the announcement and `read_sync` then replaces it
+/// with `display_model()`, which prefers the player's `modelName` — so a card
+/// seeded with `N330` and told `POWERNODE` a moment later kept saying `N330`
+/// until some other field of that row happened to move. It is a
+/// `SharedString` like `name`, so hashing it costs what hashing the name does.
+fn player_row_fingerprint(row: &Device, cover: Option<&str>, hash: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    row.id.hash(hash);
+    row.name.hash(hash);
+    row.model.hash(hash);
+    row.now_playing.hash(hash);
+    row.title.hash(hash);
+    row.artist.hash(hash);
+    row.album.hash(hash);
+    row.volume.hash(hash);
+    row.muted.hash(hash);
+    row.playing.hash(hash);
+    row.reachable.hash(hash);
+    row.role.hash(hash);
+    row.in_group.hash(hash);
+    row.groupable.hash(hash);
+    row.upgrading.hash(hash);
+    // The badge's words as well as whether there is a badge at all. They
+    // follow the percentage, so this is a rebuild of the player model on every
+    // progress tick — which is the price of the badge saying anything: without
+    // it the card was published once, when `upgrading` flipped, and then sat
+    // at whatever stage the player happened to be on. An upgrade is minutes
+    // long and rare, and nothing else here ticks while one is running.
+    row.upgrade_line.hash(hash);
+    cover.hash(hash);
+}
+
+/// Which card the window's highlight belongs on, out of the rows it is about
+/// to be handed.
+///
+/// `showing` is the id of the row the window is on now and `selected` is the
+/// player the backend has chosen, and the order between them is the whole
+/// point. The window's own row used to be the only answer, reconstructed from
+/// the model it was an index into — which is right while the selection is a
+/// click, and silently wrong the moment the selection changes anywhere else.
+/// [`Backend::moved_here`] does exactly that: it takes the selected player out
+/// of the list, so the window's row becomes somebody else's card, and that
+/// card was then what every transport press named — the space bar pausing a
+/// player the user could not see while the queue, the cover and the pane
+/// belonged to the one they could.
+///
+/// So the backend answers first, and the window's row is the fallback for the
+/// one case the backend cannot answer: nothing selected yet, where the
+/// window's index is all there is. Falling back to zero past that would move
+/// the highlight onto whoever sorts first.
+///
+/// `None` means no row at all, which is what these rows have to say for a
+/// player the backend has selected and the list does not hold. That is the
+/// gap in the middle of a move — the old entry is gone and the new one is not
+/// tracked yet, a command loop away — and zero there is not a lesser answer,
+/// it is the wrong speaker: the window's `current` is what every transport
+/// press names, so the space bar would have paused whoever sorts first while
+/// the queue, the cover and the pane still belonged to the player that moved.
+/// The window reads a negative index as nothing selected, which leaves the
+/// transport unpressable for those few milliseconds rather than aimed.
+fn highlighted_row(
+    rows: &[Device],
+    showing: Option<&str>,
+    selected: Option<DeviceId>,
+) -> Option<usize> {
+    let at = |id: &str| rows.iter().position(|row| row.id.as_str() == id);
+    match selected {
+        Some(id) => at(&id.to_string()),
+        // Nothing chosen yet: a click writes the window's own row a command
+        // loop ahead of the backend hearing about it, and the first row is
+        // where a window with players on it starts.
+        None => showing.and_then(at).or(Some(0)),
+    }
 }
 
 /// The Lucide glyph for a [`Glyph`], out of the set the .slint file holds.
@@ -2808,11 +3233,15 @@ async fn run(
             ..Default::default()
         })),
         known: Arc::new(Mutex::new(Vec::new())),
-        writes: Arc::new(lane::Lane::default()),
+        queue_walk: Arc::default(),
+        browse_walk: Arc::default(),
+        sweeping: Arc::new(AtomicU64::new(0)),
+        vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
         searches: Arc::new(AtomicU64::new(0)),
         forms: Arc::new(AtomicU64::new(0)),
         openings: Arc::new(AtomicU64::new(0)),
         sent_transport: Arc::new(AtomicU64::new(0)),
+        sent_track_actions: Arc::new(AtomicU64::new(0)),
         sent_queue: Arc::new(AtomicU64::new(0)),
         sent_players: Arc::new(AtomicU64::new(0)),
         sent_settings: Arc::new(AtomicU64::new(0)),
@@ -2823,6 +3252,7 @@ async fn run(
         sent_browse: Arc::new(AtomicU64::new(0)),
         sent_index: Arc::new(AtomicU64::new(0)),
         sent_era: Arc::new(AtomicU64::new(0)),
+        thumbnails: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
     };
@@ -2888,27 +3318,118 @@ async fn run(
         return;
     };
 
-    // Said out loud for as long as it is true. The sweep spreads its
-    // broadcasts across twelve seconds, and for the whole of that a first-run
-    // window had nothing on it and no reason given — which is the moment
-    // somebody decides whether the app works at all.
-    backend.set_looking(true);
+    // The sweep spreads its broadcasts across twelve seconds, and for the
+    // whole of that a first-run window had nothing on it and no reason given —
+    // which is the moment somebody decides whether the app works at all.
+    // `sweep` says so for itself; see [`Backend::looking`].
     sweep(backend.clone(), discovery.clone(), http.clone()).await;
-    backend.set_looking(false);
 
+    // Returning here used to end discovery for as long as the app was open:
+    // nothing else listens, so a single failed read meant no player was ever
+    // found again, and the window gave no sign of it. A socket only errs now
+    // when it has failed over and over, which is the one case a fresh socket
+    // helps with — the interface it was bound through going away when a laptop
+    // sleeps or a VPN comes up. So wait, bind another, and carry on.
+    let mut wait = Duration::from_secs(1);
     loop {
         match discovery.recv().await {
             Ok(announces) => {
+                wait = Duration::from_secs(1);
                 for announce in announces {
                     backend.adopt(&announce, &http);
                 }
             }
             Err(e) => {
-                tracing::warn!("discovery stopped: {e}");
-                return;
+                tracing::warn!("discovery stopped, re-binding in {wait:?}: {e}");
+                tokio::time::sleep(wait).await;
+                // Backed off because a machine with no network at all will
+                // fail every attempt, and this loop should cost nothing while
+                // it waits for one.
+                wait = (wait * 2).min(Duration::from_secs(60));
+                match discovery.rebind() {
+                    // A socket that has just been bound has heard nothing.
+                    // Players announce themselves unprompted, but only when
+                    // they wake; one that has been on all along has to be
+                    // asked, and the whole schedule is worth spending because
+                    // this is a cold start again.
+                    // Said out loud like the cold start, and for the same
+                    // reason: this is twelve seconds during which a laptop
+                    // that woke on another network shows a stale player list
+                    // and no sign that anything is being done about it, which
+                    // is exactly when somebody reaches for Rescan. A Rescan
+                    // pressed during this one is a second sweep, which is why
+                    // [`Backend::looking`] counts rather than flags.
+                    Ok(()) => sweep(backend.clone(), discovery.clone(), http.clone()).await,
+                    Err(e) => tracing::warn!("could not re-bind the discovery port: {e}"),
+                }
             }
         }
     }
+}
+
+/// What a player calls itself, as plain lowercase hex.
+///
+/// Two things arrive claiming to be one: the node id on an LSDP announcement,
+/// which is six bytes of MAC on every player seen, and the `mac` attribute on
+/// `/SyncStatus`, which is those same six bytes written out with separators.
+/// Both come through here, so that a player first met as a typed address and
+/// later heard announcing itself is recognized as the one player it is.
+///
+/// Empty is not an identity. An announcement carrying no node id says nothing
+/// about who sent it, and a name every anonymous announcement shares would
+/// move one player's entry onto another player's address. Nor are the other
+/// non-names: see [`names_one_player`].
+fn identity_of(node_id: &[u8]) -> Option<String> {
+    use std::fmt::Write;
+
+    (!node_id.is_empty())
+        .then(|| {
+            node_id.iter().fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+        })
+        .filter(|hex| names_one_player(hex))
+}
+
+/// Whether a hex identity names one player, or is a value any number of them
+/// could be reporting.
+///
+/// Empty was the only thing refused, and it is not the only non-name. A
+/// player whose MAC field was never written reports `00:00:00:00:00:00`, and
+/// a cloned firmware image or a virtual player can report it too; all-ones is
+/// the broadcast address; a first octet with the multicast bit set is not a
+/// station address at all. Any of them taken as a name makes every player
+/// reporting it the same player, and [`Backend::moved_here`] then has two
+/// live speakers retiring each other on every announcement either one sends.
+///
+/// This is the same rule the empty case already stood for, applied to the
+/// rest of the values that are not a name.
+fn names_one_player(hex: &str) -> bool {
+    if hex.is_empty() || hex.bytes().all(|b| b == b'0') || hex.bytes().all(|b| b == b'f') {
+        return false;
+    }
+    // The low bit of the first octet is the multicast bit.
+    !matches!(
+        hex.get(..2).and_then(|first| u8::from_str_radix(first, 16).ok()),
+        Some(first) if first & 1 == 1
+    )
+}
+
+/// The same identity off a `/SyncStatus`, where it is written with separators.
+///
+/// Six bytes or nothing: anything else is a field this does not understand,
+/// and a wrong identity is worse than none — it retires a player that has not
+/// moved.
+fn identity_from_mac(mac: &str) -> Option<String> {
+    let hex: String = mac
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (hex.len() == 12)
+        .then_some(hex)
+        .filter(|hex| names_one_player(hex))
 }
 
 impl Backend {
@@ -2938,13 +3459,28 @@ impl Backend {
             return;
         }
 
+        let id = DeviceId::new(announce.address, player.port());
+
+        // Who is announcing, rather than where from. A player that is given a
+        // new address by a DHCP lease is the same speaker in the same room,
+        // and keyed by address alone it used to become a second row that
+        // never went away — while the first went on polling an address
+        // nothing answers, holding the name on the desktop's media controls.
+        let identity = identity_of(&announce.node_id);
+        // Before the cap below rather than after it: retiring the address the
+        // player has left is what makes room for the one it is announcing
+        // from, and a household at the cap would otherwise never be able to
+        // follow a move.
+        let carry = identity
+            .as_deref()
+            .is_some_and(|identity| self.moved_here(identity, id));
+
         // A cap on top, because a subnet is not itself small: one datagram can
         // carry dozens of identities and a wide netmask leaves room for
         // thousands. Every one of them would be a permanent poller and another
         // O(n) rebuild of the player list. Far above any real system — the
         // largest BluOS install is a few dozen zones — so the only thing this
         // can turn away is a flood.
-        let id = DeviceId::new(announce.address, player.port());
         {
             let registry = self.registry.lock().unwrap();
             if registry.len() >= MAX_TRACKED && !registry.contains_key(&id) {
@@ -2953,7 +3489,140 @@ impl Backend {
             }
         }
 
-        self.track(id, http, player.get("name"), player.get("model"));
+        self.track_as(id, http, player.get("name"), player.get("model"), identity);
+
+        // After the entry exists, not before. `Select` publishes the queue and
+        // the transport and warms the browser for the player it names, and one
+        // handled in the gap would have found nothing to do any of that from
+        // and left the pane empty.
+        if carry {
+            let _ = self.commands.send(Command::Select(id));
+        }
+    }
+
+    /// Retire whatever is tracked for this player at another address.
+    ///
+    /// Called with an announcement in hand, which is the moment the move
+    /// becomes knowable: the same identity from a different address means the
+    /// old entry is not a player any more, it is an address the player used to
+    /// have. The entry goes, its poll is told to stop, and the selection comes
+    /// with it — the row somebody was looking at is the same room, whatever
+    /// address it answers on now.
+    ///
+    /// Answers whether the selection was on the player that moved, which is
+    /// the caller's cue to select it again at its new address once it has been
+    /// tracked. Each lock singly, as everything here does: the registry, then
+    /// the pane, then the selection.
+    ///
+    /// The identity is a claim, like every other part of an announcement —
+    /// LSDP is an unauthenticated broadcast, which is the whole subject of the
+    /// comment in [`Backend::adopt`]. Anyone on the segment who knows a
+    /// speaker's MAC can therefore announce it from their own address and take
+    /// over its row. That a forged announcement can add a player is not new
+    /// and cannot be helped without something the protocol does not offer;
+    /// that one can now displace a player is, and it is the price of ever
+    /// noticing a move at all. The alternative on the table — refusing to move
+    /// a player whose old address still answers — buys that back only for as
+    /// long as the old address is still up, and leaves the duplicate row this
+    /// exists to remove standing for as long as a long poll takes to fail.
+    /// What a forged announcement cannot do is reach the remembered-players
+    /// file: the row is displaced at once, the durable record is not touched
+    /// until the new address has answered for itself. See [`Backend::vacated`].
+    ///
+    /// A move is a change of *address*, so the entry that moves has to be at
+    /// another host and not merely another port. A device that presents two
+    /// zones — a multi-zone amplifier on `:11000` and `:11010` — reports one
+    /// MAC for both, so matching on identity alone had each zone retire the
+    /// other on every announcement and the user could never keep both on
+    /// screen. And nothing moves at all where more than one entry answers to
+    /// the identity: two entries that cannot be told apart are not evidence
+    /// about which of them moved.
+    fn moved_here(&self, identity: &str, to: DeviceId) -> bool {
+        let (old, emptied) = {
+            let mut registry = self.registry.lock().unwrap();
+            let mut elsewhere = registry.iter().filter(|(at, entry)| {
+                at.host != to.host && entry.identity.as_deref() == Some(identity)
+            });
+            let Some(old) = elsewhere.next().map(|(at, _)| *at) else {
+                return false;
+            };
+            if elsewhere.next().is_some() {
+                tracing::warn!(
+                    %to,
+                    "several players answer to one identity; not moving any of them"
+                );
+                return false;
+            }
+            if let Some(entry) = registry.remove(&old) {
+                entry.poll.retire();
+            }
+            // Whether anything is still tracked at the address it left. One
+            // device can present two zones on one host — a multi-zone
+            // amplifier on `:11000` and `:11010` — and only the last of them
+            // to go takes the address with it.
+            let emptied = !registry.keys().any(|at| at.host == old.host);
+            (old, emptied)
+        };
+        if emptied {
+            // The art allow-list follows the registry rather than only
+            // growing. An address the player has left is not a player's own
+            // address, and left in the set it stayed exempt from the rule that
+            // refuses to fetch from private space on a player's say-so — for
+            // the rest of the run, one entry per announcement, on a broadcast
+            // anyone on the segment can send. See `Artwork::remember_player`.
+            self.artwork.forget_player(old.host);
+        }
+        tracing::info!(%old, %to, "a player has changed address");
+
+        // The pane before the selection, so that a settings page or an alarm
+        // editor belonging to the address that has gone is not left up over a
+        // player the window no longer tracks. Its owner is a `DeviceId`, and
+        // that id is nobody now.
+        let stranded = {
+            let mut browsing = self.browsing.lock().unwrap();
+            let stranded = browsing.pane.owner() == Some(old);
+            if stranded {
+                browsing.pane = Pane::Browse;
+            }
+            stranded
+        };
+        if stranded {
+            self.publish_pane();
+        }
+
+        // The address it used to be at is not a player any more, so it should
+        // go out of the remembered list as well rather than being probed at
+        // every start for the rest of that list's life — but not on the word
+        // of a broadcast. Written down here and spent in [`read_sync`], once
+        // the player has answered from the new address as the same player.
+        {
+            let mut vacated = self.vacated.lock().unwrap();
+            // Whatever the entry that has just gone was waiting to confirm is
+            // moot: there is nothing at that address to confirm it with, and
+            // an address that stays remembered costs one probe at the next
+            // start.
+            vacated.remove(&old);
+            vacated.insert(to, old);
+        }
+
+        // Left to the caller rather than assigned here, because choosing a
+        // player is more than writing down which one: the queue, the
+        // transport, the cover and the browse trail all belong to the address
+        // that has gone, and `Command::Select` is what replaces every one of
+        // them. It has to wait for the new entry to exist.
+        let carried = *self.selected.lock().unwrap() == Some(old);
+        self.publish();
+        carried
+    }
+
+    /// The line this player's ordered writes stand in. See [`Entry::writes`].
+    ///
+    /// A player that is no longer tracked gets a lane of its own and nothing
+    /// to wait for, which is the right answer for a request that has nowhere
+    /// to go: every caller has already given up by then.
+    fn write_lane(&self, id: DeviceId) -> Arc<lane::Lane> {
+        self.with_entry(id, |entry| entry.writes.clone())
+            .unwrap_or_default()
     }
 
     /// Start tracking a player, unless it is already tracked.
@@ -2962,6 +3631,19 @@ impl Backend {
     /// entirely for an address typed in by hand. `/SyncStatus` replaces them
     /// with the truth a moment later.
     fn track(&self, id: DeviceId, http: &reqwest::Client, name: Option<&str>, model: Option<&str>) {
+        self.track_as(id, http, name, model, None);
+    }
+
+    /// The same, with what the player calls itself where that is known — which
+    /// is to say, from an announcement rather than from a typed address.
+    fn track_as(
+        &self,
+        id: DeviceId,
+        http: &reqwest::Client,
+        name: Option<&str>,
+        model: Option<&str>,
+        identity: Option<String>,
+    ) {
         // A player serves its own art from its own address, which is on the
         // user's subnet — the space `artwork::permitted` refuses to dial on a
         // player's say-so. Recorded here, where an address becomes a player.
@@ -2969,7 +3651,28 @@ impl Backend {
 
         {
             let mut guard = self.registry.lock().unwrap();
-            if guard.contains_key(&id) {
+            if let Some(entry) = guard.get_mut(&id) {
+                // Already tracked, so there is nothing to start — but an
+                // announcement is still news where the player had gone quiet:
+                // it is saying it is back, and its poll is sitting out a
+                // backoff of up to thirty seconds it has no further reason to
+                // serve.
+                //
+                // Only where it had. A `Notify` with nobody waiting keeps the
+                // permit, and the poll of a healthy player is inside its long
+                // poll rather than inside a wait — so every sweep left one
+                // behind, and the first backoff after that player eventually
+                // did go quiet was skipped on the strength of an announcement
+                // from minutes before.
+                if !entry.view.reachable {
+                    entry.poll.heard();
+                }
+                // And an address typed in by hand has no identity until
+                // something says one. Filled in rather than replaced: the
+                // entry's own first answer is what settled it.
+                if entry.identity.is_none() {
+                    entry.identity = identity;
+                }
                 return;
             }
             // Seed the row from the announcement so the player appears
@@ -2978,7 +3681,10 @@ impl Backend {
                 id,
                 Entry {
                     client: Client::with_http(id, http.clone()),
-                    upgrading: false,
+                    identity,
+                    poll: Arc::default(),
+                    writes: Arc::default(),
+                    upgrading: None,
                     view: Device {
                         id: id.to_string().into(),
                         name: name.unwrap_or("BluOS player").into(),
@@ -2992,6 +3698,7 @@ impl Backend {
                     sync: None,
                     cover_url: None,
                     card_cover: None,
+                    card_cover_url: None,
                 },
             );
         }
@@ -3128,6 +3835,11 @@ impl Backend {
         // built in one pass over one lock and handed to the window together,
         // which is what keeps them aligned.
         let mut covers: Vec<Option<Pixels>> = Vec::new();
+        // And what each of those is of, which is the part the fingerprint can
+        // read. The pixels themselves are too expensive to hash on a path that
+        // runs on every status tick, and the address answers the only question
+        // the memo has: is this still the same sleeve as last time.
+        let mut cover_ids: Vec<Option<String>> = Vec::new();
 
         let rows: Vec<Device> = {
             let guard = self.registry.lock().unwrap();
@@ -3142,6 +3854,7 @@ impl Backend {
                 .iter()
                 .map(|(id, entry)| {
                     covers.push(entry.card_cover.clone());
+                    cover_ids.push(entry.card_cover_url.clone());
                     let mut view = entry.view.clone();
                     let sync = entry.sync.as_ref();
 
@@ -3191,34 +3904,12 @@ impl Backend {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             line.hash(&mut hash);
-            for row in &rows {
-                row.id.hash(&mut hash);
-                row.name.hash(&mut hash);
-                row.now_playing.hash(&mut hash);
-                row.title.hash(&mut hash);
-                row.artist.hash(&mut hash);
-                row.album.hash(&mut hash);
-                row.volume.hash(&mut hash);
-                row.muted.hash(&mut hash);
-                row.playing.hash(&mut hash);
-                row.reachable.hash(&mut hash);
-                row.role.hash(&mut hash);
-                row.in_group.hash(&mut hash);
-                row.groupable.hash(&mut hash);
-                // Not for the badge's words — those follow the percentage and
-                // would republish the whole model on every progress tick —
-                // but for whether there is a badge row at all, which decides
-                // how tall the picker's list has to be. `reachable` flips with
-                // it today, so this only makes the height's own input explicit
-                // rather than leaning on that.
-                row.upgrading.hash(&mut hash);
-            }
-            // Whether each row has its art yet. Art arrives after the row it
-            // belongs to, so without this the covers land in a model the memo
-            // then refuses to send — the same trap the queue's fingerprint
+            // The art goes in beside the row it belongs to. It arrives after
+            // that row, so without it the covers land in a model the memo then
+            // refuses to send — the same trap the queue's fingerprint
             // documents.
-            for cover in &covers {
-                cover.is_some().hash(&mut hash);
+            for (row, cover) in rows.iter().zip(&cover_ids) {
+                player_row_fingerprint(row, cover.as_deref(), &mut hash);
             }
             hash.finish()
         }) {
@@ -3231,14 +3922,14 @@ impl Backend {
 
             // Keep the selection on the same player rather than the same
             // index: a player appearing above the selected one would otherwise
-            // silently move the selection to its neighbor.
-            let selected_id = ui
+            // silently move the selection to its neighbor. Which player that
+            // is, is the backend's to say and only the window's where the
+            // backend has not chosen yet — see [`highlighted_row`].
+            let showing = ui
                 .get_devices()
                 .row_data(ui.get_selected() as usize)
                 .map(|d| d.id);
-            let restored = selected_id
-                .and_then(|id| rows.iter().position(|d| d.id == id))
-                .unwrap_or(0);
+            let restored = highlighted_row(&rows, showing.as_deref(), selected);
 
             ui.set_device_covers(ModelRc::new(VecModel::from(
                 covers
@@ -3248,12 +3939,50 @@ impl Backend {
             )));
             ui.set_devices(ModelRc::new(VecModel::from(rows)));
             ui.set_badged_players(badged);
-            ui.set_selected(restored as i32);
+            ui.set_selected(restored.map_or(-1, |at| at as i32));
             // Not the toast. This is a standing fact about the system rather
             // than something that just happened, and it was being republished
             // on every status change — which, once the toast was drawn, meant
             // "1 player" appearing over the window at every new song.
             ui.set_players_line(line.into());
+        });
+    }
+
+    /// Move the window's highlight onto the player the backend has selected.
+    ///
+    /// The window writes its own index when a card is clicked, which is how
+    /// the highlight keeps up with the mouse without waiting for a round trip.
+    /// Every other way the selection changes has no such press behind it —
+    /// [`Backend::moved_here`] carrying it to a player's new address is the
+    /// one that exists today — and [`Backend::publish`] alone cannot land it
+    /// promptly: the rows are memoized, so the next publish may be a status
+    /// tick away and until then the window is answering for a different
+    /// player than the one it is showing. Called from `Select`, which is the
+    /// only place the backend's selection is written.
+    ///
+    /// The row index is the registry's own order, which is the order
+    /// [`Backend::publish`] builds the model in. Nothing to push where the
+    /// player is not tracked: the publish that adds it carries the highlight
+    /// itself, by the same [`highlighted_row`] rule.
+    fn publish_selection(&self) {
+        // Selection first, then the registry: two locks, always in that order,
+        // everywhere.
+        let selected = *self.selected.lock().unwrap();
+        let Some(id) = selected else { return };
+        let Some(at) = self
+            .registry
+            .lock()
+            .unwrap()
+            .keys()
+            .position(|tracked| *tracked == id)
+        else {
+            return;
+        };
+
+        let ui = self.ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.set_selected(at as i32);
         });
     }
 
@@ -3277,10 +4006,24 @@ impl Backend {
     fn show_upgrade(&self, id: DeviceId, progress: &bluos::upgrade::Progress) {
         let stage = progress.stage().label().to_owned();
 
+        // A Powernode sends no counters at any point, so for that player the
+        // words carry the whole thing and the bar stays at zero. `bar()` is
+        // what decides there is something worth drawing.
+        let percent = progress.bar().unwrap_or(0) as f32;
+        let name = progress
+            .name
+            .clone()
+            .or_else(|| self.with_entry(id, |e| e.view.name.to_string()))
+            .unwrap_or_else(|| "The player".to_owned());
+
         {
             let mut registry = self.registry.lock().unwrap();
             if let Some(entry) = registry.get_mut(&id) {
-                entry.upgrading = true;
+                entry.upgrading = Some(Upgrading {
+                    name,
+                    stage: stage.clone(),
+                    percent,
+                });
             }
         }
 
@@ -3325,25 +4068,101 @@ impl Backend {
             view.reachable = false;
         });
 
-        // A Powernode sends no counters at any point, so for that player the
-        // words carry the whole thing and the bar stays at zero. `bar()` is
-        // what decides there is something worth drawing.
-        let percent = progress.bar().unwrap_or(0) as f32;
-        let name = progress
-            .name
-            .clone()
-            .or_else(|| self.with_entry(id, |e| e.view.name.to_string()))
-            .unwrap_or_else(|| "The player".to_owned());
+        self.publish_upgrade_strip(Some(id));
+        self.publish();
+    }
+
+    /// Put an upgrade on the strip above the player list, or take it away.
+    ///
+    /// `showing` is the player whose reading this is, so the strip follows
+    /// whichever player reported last. Where that player is no longer
+    /// upgrading — it has just finished — any other player still upgrading
+    /// takes the strip, and only when none is does it go blank.
+    fn publish_upgrade_strip(&self, showing: Option<DeviceId>) {
+        let strip = self.upgrade_strip(showing);
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui.upgrade() {
+                let (name, stage, percent) = match strip {
+                    Some(up) => (up.name, up.stage, up.percent),
+                    None => (String::new(), String::new(), 0.0),
+                };
                 ui.set_upgrading_player(name.into());
                 ui.set_upgrading_stage(stage.into());
                 ui.set_upgrading_percent(percent);
             }
         });
-        self.publish();
+    }
+
+    /// The reading the strip should carry, given whose reading arrived last.
+    fn upgrade_strip(&self, showing: Option<DeviceId>) -> Option<Upgrading> {
+        let registry = self.registry.lock().unwrap();
+        showing
+            .and_then(|id| registry.get(&id))
+            .and_then(|entry| entry.upgrading.clone())
+            .or_else(|| registry.values().find_map(|entry| entry.upgrading.clone()))
+    }
+
+    /// Walk the queue's covers, and stop whichever walks this one supersedes.
+    /// See [`Walk`] and [`start_walk`].
+    fn walk_queue(&self, id: DeviceId, rows: Walk) {
+        // The walk's own rows, held where the list can read them if it has to
+        // stop the walk for room. See [`Rows`].
+        let left: Rows = Arc::default();
+        start_walk(
+            &self.queue_walk,
+            rows,
+            left.clone(),
+            load_thumbnails(self.clone(), id, rows, left),
+        );
+    }
+
+    /// And the browse screen's.
+    fn walk_browse(&self, id: DeviceId, rows: Walk) {
+        let left: Rows = Arc::default();
+        start_walk(
+            &self.browse_walk,
+            rows,
+            left.clone(),
+            load_browse_thumbnails(self.clone(), id, rows, left),
+        );
+    }
+
+    /// Stop every walk over the browse screen, for a screen that is being left
+    /// without another being opened in its place.
+    ///
+    /// Backing out of a screen and clearing the search box both bump `era`,
+    /// which is what the walks check — but only between fetches, so what they
+    /// actually do is hold their requests and their share of the four artwork
+    /// permits for up to an `artwork::FETCH_TIMEOUT` against a player that
+    /// accepts connections and then says nothing. That is the stretch
+    /// [`start_walk`] exists to cut short, and opening a screen gets it for
+    /// free because it starts a [`Walk::Whole`]; leaving one has to ask.
+    ///
+    /// It matters more than it did: a screen that was paged while it was open
+    /// leaves a walk per page behind rather than one.
+    fn stop_browse_walks(&self) {
+        let mut walks = self.browse_walk.lock().unwrap();
+        for walk in walks.running.drain(..) {
+            walk.stop.abort();
+        }
+        // The rows any of them were carrying for a stopped walk belong to the
+        // screen being left, so they go with it.
+        walks.carried.clear();
+    }
+
+    /// Say that a sweep is running, until the answer is dropped.
+    ///
+    /// Held by [`sweep`] itself rather than bracketed at each call, because
+    /// the callers are the cold start, the rebind loop and Rescan — and
+    /// Rescan, the one a user presses and the one whose only feedback this is,
+    /// was the one that never bracketed anything.
+    fn looking(&self) -> Looking {
+        if self.sweeping.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.set_looking(true);
+        }
+        Looking(self.clone())
     }
 
     /// Whether discovery is still sweeping, so the window can say so.
@@ -3356,39 +4175,42 @@ impl Backend {
         });
     }
 
-    /// Put every player's controls back.
-    fn clear_upgrade(&self) {
-        let was: Vec<DeviceId> = {
+    /// Put one player's controls back, and nobody else's.
+    ///
+    /// Only the player named here: two players can be updating at once, and
+    /// this used to clear the flag on every entry in the registry and blank
+    /// the strip, so the first upgrade to end made a player halfway through
+    /// its own read as idle — with its transport offered again while it was
+    /// still not listening.
+    ///
+    /// And only a player that was marked. A watch can end having never seen
+    /// the player at all — the request that started it went unanswered and
+    /// nothing ever answered afterwards — and there is nothing to put back
+    /// there: saying the player is reachable because a watch gave up would
+    /// bring the transport and the volume back for a room nobody can reach,
+    /// until the next failed poll corrects it up to a backoff later. Whether
+    /// a player is reachable is the poll's to say; this only takes down what
+    /// [`Backend::show_upgrade`] put up.
+    fn clear_upgrade(&self, id: DeviceId) {
+        let was_upgrading = {
             let mut registry = self.registry.lock().unwrap();
-            let ids = registry
-                .iter()
-                .filter(|(_, e)| e.upgrading)
-                .map(|(id, _)| *id)
-                .collect();
-            for entry in registry.values_mut() {
-                entry.upgrading = false;
-            }
-            ids
+            registry
+                .get_mut(&id)
+                .is_some_and(|entry| entry.upgrading.take().is_some())
         };
+        if !was_upgrading {
+            return;
+        }
 
         // The next status puts the real state back; this only stops the
         // upgrade's words outliving it.
-        for id in was {
-            self.update(id, |view| {
-                view.upgrading = false;
-                view.upgrade_line = slint::SharedString::new();
-                view.reachable = true;
-            });
-        }
-
-        let ui = self.ui.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = ui.upgrade() {
-                ui.set_upgrading_player(slint::SharedString::new());
-                ui.set_upgrading_stage(slint::SharedString::new());
-                ui.set_upgrading_percent(0.0);
-            }
+        self.update(id, |view| {
+            view.upgrading = false;
+            view.upgrade_line = slint::SharedString::new();
+            view.reachable = true;
         });
+
+        self.publish_upgrade_strip(None);
         self.publish();
     }
 
@@ -5743,24 +6565,49 @@ impl Backend {
             None => (0, 0, false, false, 2),
         };
 
+        let view = TransportView {
+            position,
+            duration,
+            seekable,
+            shuffle,
+            repeat,
+            indexing,
+            quality,
+            stream_format,
+            actions: track_actions,
+        };
+
+        let pills = view.actions_fingerprint();
+
         // A paused player's position does not move, and neither does anything
         // else here, yet this ran once a second regardless — and each run
         // repainted the progress line, which spans the whole window. Nothing to
         // say means nothing to draw.
-        if already_sent(&self.sent_transport, {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            position.hash(&mut hash);
-            duration.hash(&mut hash);
-            seekable.hash(&mut hash);
-            shuffle.hash(&mut hash);
-            repeat.hash(&mut hash);
-            indexing.hash(&mut hash);
-            quality.hash(&mut hash);
-            hash.finish()
-        }) {
+        if already_sent(&self.sent_transport, view.fingerprint()) {
             return;
         }
+
+        // Taken apart again so that each field crosses into the event loop on
+        // its own, as they did before there was anything to fingerprint them
+        // together as.
+        let TransportView {
+            position,
+            duration,
+            seekable,
+            shuffle,
+            repeat,
+            indexing,
+            quality,
+            stream_format,
+            actions: track_actions,
+        } = view;
+
+        // The pills are replaced only when they differ. See
+        // [`TransportView::actions_fingerprint`]: everything below this is a
+        // property on a widget already drawn, and these are a model, whose
+        // replacement takes the row under the pointer with it.
+        let track_actions =
+            (!already_sent(&self.sent_track_actions, pills)).then_some(track_actions);
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -5775,16 +6622,18 @@ impl Backend {
             ui.set_indexing(indexing.as_str().into());
             ui.set_quality(quality.as_str().into());
             ui.set_stream_format(stream_format.as_str().into());
-            ui.set_track_actions(ModelRc::new(VecModel::from(
-                track_actions
-                    .into_iter()
-                    .map(|action| TrackAction {
-                        name: action.name.into(),
-                        label: action.label.into(),
-                        on: action.on,
-                    })
-                    .collect::<Vec<_>>(),
-            )));
+            if let Some(track_actions) = track_actions {
+                ui.set_track_actions(ModelRc::new(VecModel::from(
+                    track_actions
+                        .into_iter()
+                        .map(|action| TrackAction {
+                            name: action.name.into(),
+                            label: action.label.into(),
+                            on: action.on,
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
         });
     }
 
@@ -5921,7 +6770,7 @@ fn walk_settings(
                     .unwrap_or_else(|| group.id.clone());
                 rows.push(SettingData {
                     index: *index,
-                    glyph: glyphs::glyph_for(&label, None).or(Some(Glyph::Tweak)),
+                    glyph: Some(glyphs::setting_glyph(&label)),
                     label,
                     detail: group.description.clone().unwrap_or_default(),
                     heading: false,
@@ -5982,7 +6831,7 @@ fn walk_settings(
                     index: *index,
                     opens: false,
                     // Falls back rather than leaving a hole; see Icons.tweak.
-                    glyph: glyphs::glyph_for(setting.label(), None).or(Some(Glyph::Tweak)),
+                    glyph: Some(glyphs::setting_glyph(setting.label())),
                     label: setting.label().to_owned(),
                     detail: if !available {
                         setting
@@ -6281,6 +7130,14 @@ fn settings_page(uri: &str) -> Option<Option<String>> {
 /// enough to matter and a player that was asleep takes a moment to reply at
 /// all.
 async fn sweep(backend: Backend, discovery: Arc<Discovery>, http: reqwest::Client) {
+    // Said out loud for as long as it is true, and said here so that every
+    // caller says it. The empty state is the only thing that reads it and it
+    // is only drawn when no player has been found — which is exactly the
+    // window somebody presses Rescan from, and Rescan was the one sweep that
+    // ran twelve seconds of broadcasts under an unchanged headline, a still
+    // spinner and a button that read as dead.
+    let _saying = backend.looking();
+
     // Adopted as each answers rather than when the whole schedule has run: a
     // player that replies to the first broadcast used to wait out the other
     // eleven seconds before appearing, which on a first run is the whole of
@@ -6435,7 +7292,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                     backend.publish_sidebar();
                 }
             }
-            tokio::spawn(load_browse_thumbnails(backend, id, 0));
+            backend.walk_browse(id, Walk::Whole);
         }
         Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
     }
@@ -7129,6 +7986,9 @@ async fn run_search(backend: Backend, query: String, selection: Option<(DeviceId
                 browsing.trail.pop();
                 browsing.moved_on();
             }
+            // The results screen is gone, and nothing is opening another, so
+            // the walks over it have to be told rather than left to notice.
+            backend.stop_browse_walks();
             backend.publish_browse();
         }
         None => {}
@@ -7571,8 +8431,23 @@ async fn tick_position(backend: Backend) {
 async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<SyncStatus> {
     let sync = client.sync_status().await.ok()?;
 
+    // Whether the player answering here is the one this entry is for: the MAC
+    // it reports against the identity the entry was settled with. That is the
+    // evidence a move waits on — see [`Backend::vacated`] — and an
+    // announcement, which is all a move has to go on, cannot produce it.
+    let mut itself = false;
     if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
         entry.sync = Some(sync.clone());
+        let reported = sync.mac.as_deref().and_then(identity_from_mac);
+        // What the player calls itself, where nothing has said yet: an address
+        // typed in by hand arrives with no announcement behind it, and without
+        // this one could never be recognized when it moves. Filled in rather
+        // than replaced, so that the node id an announcement settled it with
+        // stands.
+        if entry.identity.is_none() {
+            entry.identity = reported.clone();
+        }
+        itself = reported.is_some() && entry.identity == reported;
     }
 
     // Asked once, here, for the same reason the address is written down here:
@@ -7606,11 +8481,22 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
         });
     }
 
+    // And the address this player left, if it has now shown from the new one
+    // that it is the same player. Taken before the list's own lock rather than
+    // under it: two leaf locks, held one at a time, like everything else here.
+    let vacated = itself
+        .then(|| backend.vacated.lock().unwrap().remove(&id))
+        .flatten();
+
     // Remembered only now, not when it was adopted: answering /SyncStatus is
     // what makes an address a player, so a mistyped one is never written down.
     {
         let mut known = backend.known.lock().unwrap();
-        if known::remember(&mut known, id) {
+        let mut changed = known::remember(&mut known, id);
+        if let Some(old) = vacated {
+            changed |= known::forget(&mut known, old);
+        }
+        if changed {
             // Handed over under the lock that changed it, which is where the
             // order comes from — not from this thread, which is one poller
             // task of several. Two players answering at the same moment both
@@ -7672,6 +8558,22 @@ async fn refresh_current(backend: Backend) {
     .await;
 }
 
+/// Holds one of the sweeps the window is being told about, and gives it back
+/// however the sweep ends — including a task dropped mid-schedule, which is
+/// what a window closed during a rescan leaves behind.
+struct Looking(Backend);
+
+impl Drop for Looking {
+    fn drop(&mut self) {
+        // The last one out says so. Two sweeps can overlap — see
+        // [`Backend::sweeping`] — and the first to finish speaks only for
+        // itself.
+        if self.0.sweeping.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.set_looking(false);
+        }
+    }
+}
+
 /// Holds the single refresh slot, and gives it back however the refresh ends.
 ///
 /// A plain store at the end of [`refresh_current`] is not enough: the function
@@ -7688,18 +8590,433 @@ impl Drop for Refreshing {
     }
 }
 
+/// Fetch a list of covers, a few at a time, for as long as they are wanted.
+///
+/// The one loop both cover walks are built from. They were the same twenty
+/// lines twice — the same `JoinSet`, the same six at once, the same refill on
+/// each completion, the same throttled republish — and the abandon check was
+/// missing from one of them for as long as they were separate. A third caller
+/// cannot now forget it.
+///
+/// `still_wanted` is asked between fetches and decides whether there is any
+/// point going on: the screen has been navigated away from, the player is no
+/// longer selected, a newer walk has the same list in hand. `publish` is the
+/// redraw, throttled to `every` because rebuilding a long list costs more than
+/// the fetch it is reporting.
+///
+/// The clock that throttle runs on belongs to the list rather than to this
+/// walk — it is [`Walks::drawn`], reached through `list`. A list being paged
+/// has several walks over it at once, and a timer apiece meant the redraw rate
+/// was a property of how many pages happened to be in flight: five walks over
+/// a queue rebuilt the whole model thirty-odd times a second between them,
+/// each rebuild cloning every row under the registry lock the status poll and
+/// every transport press also need. Claiming the interval under one lock makes
+/// it once per `every` however many walks are asking.
+///
+/// What this cannot do is notice while every fetch is still outstanding: the
+/// check sits between completions, so a walk whose player accepts connections
+/// and then says nothing holds its share of the artwork permits until one of
+/// them times out. That is what [`start_walk`] is for — a superseded walk is
+/// aborted from outside rather than left to find out.
+async fn walk_covers(
+    artwork: Arc<Artwork>,
+    urls: Vec<(String, u32)>,
+    left: Rows,
+    still_wanted: impl Fn() -> bool,
+    publish: impl Fn(),
+    list: Arc<Mutex<Walks>>,
+    every: Duration,
+) {
+    // A few at a time. A library's Albums page is four hundred rows, and one
+    // request per row means four hundred at once against a player that is also
+    // being long-polled — which stalls the poll, the artwork and the window
+    // together. The list fills in slightly later and stays responsive while it
+    // does. The covers also arrive in the order they are drawn in, which is
+    // what makes the top of a queue fill first.
+    const AT_ONCE: usize = 6;
+
+    // The rows go somewhere the list can read them rather than into a local
+    // iterator, because a walk stopped for room is aborted from outside and
+    // never gets a line of its own to hand them over in. Before the first
+    // await, so a walk the list holds is either stoppable or not yet started
+    // rather than somewhere in between. See [`Owed`].
+    {
+        let mut owed = left.lock().unwrap();
+        owed.listed = true;
+        owed.rows = urls.into_iter().map(Some).collect();
+    }
+
+    // Now that this one is countable, hold the list to its ceiling. Here
+    // rather than in [`start_walk`] because a walk that has not been polled
+    // has not worked out what it was going to fetch, so stopping it there
+    // would abandon rows nobody can name — and because whoever stops a walk
+    // has to be around to finish what it was owed. See [`trim_walks`].
+    trim_walks(&mut list.lock().unwrap(), &left);
+
+    // The next row to issue, and where it sits in `left` so its fetch can
+    // strike it off. Never held across an await.
+    let next = |at: &mut usize| {
+        let owed = left.lock().unwrap();
+        while *at < owed.rows.len() {
+            let row = *at;
+            *at += 1;
+            if let Some((url, size)) = owed.rows[row].clone() {
+                return Some((row, url, size));
+            }
+        }
+        None
+    };
+
+    // Claim the interval, then draw outside the lock: `publish` reaches the
+    // window and the registry, and the list's lock is taken by every walk
+    // over it starting or stopping.
+    let claim = |force: bool| {
+        let mut list = list.lock().unwrap();
+        let due = force || list.drawn.elapsed() >= every;
+        if due {
+            list.drawn = Instant::now();
+        }
+        due
+    };
+
+    let mut at = 0;
+    let mut fetched = false;
+    let mut fetches = tokio::task::JoinSet::new();
+    loop {
+        while fetches.len() < AT_ONCE {
+            let Some((row, url, size)) = next(&mut at) else {
+                break;
+            };
+            let artwork = artwork.clone();
+            fetches.spawn(async move {
+                artwork.get(&url, size).await;
+                row
+            });
+        }
+
+        while let Some(done) = fetches.join_next().await {
+            fetched = true;
+            if let Ok(row) = done {
+                // By index, which holds however this walk ends: a walk stopped
+                // for room has its rows cleared where they stand rather than
+                // taken out of the vector, precisely so that the fetches still
+                // outstanding under it have a slot to strike off when they
+                // return. See [`trim_walks`].
+                left.lock().unwrap().rows[row] = None;
+            }
+            if !still_wanted() {
+                fetches.abort_all();
+                return;
+            }
+            if let Some((row, url, size)) = next(&mut at) {
+                let artwork = artwork.clone();
+                fetches.spawn(async move {
+                    artwork.get(&url, size).await;
+                    row
+                });
+            }
+            if claim(false) {
+                publish();
+            }
+        }
+
+        // Its own rows are done, so it takes on whatever the walks stopped for
+        // room left owing. Nothing else is coming back for those: each walk
+        // covers its own page, and the list is not walked again until it is
+        // re-read or the screen is left. See [`Walks::carried`].
+        if !still_wanted() {
+            return;
+        }
+        // Under the one `list` lock, from reading that this walk is still
+        // running to writing the debt into its own rows. Both halves matter,
+        // and both are the same mistake: a walk that has been stopped for room
+        // is a few awaits from being dropped, so anything it adopts goes down
+        // with it, and a debt taken out under one guard and stored under the
+        // next spends the moment in between in a local variable, where a trim
+        // arriving on the other side of that lock cannot see it to harvest it
+        // again. Either way the whole backlog is gone — hundreds of rows on a
+        // long list — and the band of placeholder glyphs [`Walks::carried`]
+        // was written to remove comes straight back. `list` then `left` is the
+        // order [`trim_walks`] takes them in, so holding both cannot deadlock.
+        let mut walks = list.lock().unwrap();
+        let mut owed = left.lock().unwrap();
+        if owed.stopped {
+            return;
+        }
+        if walks.carried.is_empty() {
+            break;
+        }
+        owed.rows.extend(walks.carried.drain(..).map(Some));
+    }
+
+    // The last one is not throttled — nothing else will draw these rows — but
+    // it still stamps the clock, so a walk finishing does not hand the walks
+    // beside it a fresh interval to redraw in. A walk that fetched nothing has
+    // nothing to report: a page whose rows all came without pictures still
+    // comes through here, because it is also a chance to clear what is owed.
+    if fetched {
+        claim(true);
+        publish();
+    }
+}
+
+/// What a cover walk is being started for: a list replaced, or a list grown.
+///
+/// The distinction is the whole reason this is a type rather than the `done`
+/// count it carries. Both kinds skip the items the caller already had, and it
+/// would be easy to read that as "a newer walk has this list in hand" — but a
+/// page appended to rows that are still on screen supersedes nothing. The
+/// walk above it is fetching the covers for rows the user is looking at, and
+/// it is the only thing that will ever fetch them: `publish_queue` and
+/// `publish_browse` draw art out of the memory cache alone, and nothing walks
+/// a list a second time until the queue is re-read or the screen is left. Stop
+/// it where it stands and the rows between its position and the new page keep
+/// the placeholder for as long as the list is up.
+///
+/// Keeping the two in one value is what stops them drifting apart. `done` is
+/// where the caller's rows end; it is not where the walk being replaced got to,
+/// and only [`Walk::Whole`] says anything about the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Every row is new — a screen opened, a jump landed, a queue re-read — so
+    /// whatever was walking the rows this list replaces has nothing left to
+    /// fetch for anybody.
+    Whole,
+    /// A page has been grafted onto rows that are still on screen, `done` of
+    /// them, and the walks covering those rows run on.
+    From(usize),
+}
+
+impl Walk {
+    /// How many items at the front of the list a previous walk was given.
+    fn done(self) -> usize {
+        match self {
+            Walk::Whole => 0,
+            Walk::From(done) => done,
+        }
+    }
+
+    /// Whether the rows the running walks were started for are still there.
+    fn supersedes(self) -> bool {
+        self == Walk::Whole
+    }
+}
+
+/// What one walk still owes its list: the covers it has not fetched.
+///
+/// A row is cleared as its fetch returns, so what stands is every row that has
+/// not arrived — the handful in flight as well as the ones never issued. A
+/// walk stopped to make room for a page is stopped from outside and never
+/// reaches another line of its own, so the list reads this out of it instead.
+/// See [`Walks::carried`].
+#[derive(Default)]
+struct Owed {
+    /// Whether the walk has worked out its rows yet.
+    ///
+    /// It does that on its first poll, before its first await, so a walk this
+    /// is false for is one the runtime has not reached at all — no requests,
+    /// no permits, and no list of what it was going to fetch. Empty means "not
+    /// known yet" rather than "nothing left", which is the difference between
+    /// a walk that can be stopped and one that cannot.
+    listed: bool,
+    /// Whether the list has stopped it and taken back what it owed.
+    ///
+    /// Stopping is done from outside and lands at the walk's next await, so
+    /// for a moment there is a stopped walk still running whose rows somebody
+    /// else is now responsible for. What it must not do in that moment is take
+    /// on any more of them, since everything it adopted would be dropped with
+    /// it, so this is what it reads before it takes [`Walks::carried`] — under
+    /// the same `list` lock [`trim_walks`] sets it under, which is what makes
+    /// the two orderings the only two there are.
+    stopped: bool,
+    /// The covers it has not fetched, in the order it would fetch them.
+    ///
+    /// Cleared in place when the list harvests them rather than taken out
+    /// whole: the walk they belong to still holds row numbers into this.
+    rows: Vec<Option<(String, u32)>>,
+}
+
+type Rows = Arc<Mutex<Owed>>;
+
+/// One walk over a list, as the list holds it.
+struct Walking {
+    /// Stop it where it stands.
+    stop: tokio::task::AbortHandle,
+    /// What stopping it there would abandon.
+    left: Rows,
+}
+
+/// What the cover walks over one list share.
+///
+/// One value per list rather than per walk, because all of these are
+/// properties of the list: how many walks are allowed over it at once, how
+/// often it is redrawn, and which of its rows are owed a cover. A page starts
+/// a walk of its own and leaves the walk above it running — see [`Walk`] — so
+/// "per walk" quietly meant "per page in flight" for the first two, and a list
+/// being scrolled had no ceiling on either.
+struct Walks {
+    /// The walks still going, oldest first.
+    running: Vec<Walking>,
+    /// Rows the walks stopped for room had not fetched.
+    ///
+    /// A walk covers its own page and no other — `done` skips everything the
+    /// walk above it was given — so stopping one does not hand its rows to a
+    /// newer walk that was going to reach them anyway; it abandons them, and
+    /// nothing asks for them again while the list is up. They wait here
+    /// instead, and the next walk to run out of its own rows takes them on:
+    /// behind the rows somebody is looking at, which is the order the ceiling
+    /// is for, but still fetched.
+    carried: Vec<(String, u32)>,
+    /// When any of them last redrew the list. The throttle in [`walk_covers`]
+    /// reads and claims this, so the redraw rate is the list's and not each
+    /// walk's.
+    drawn: Instant,
+}
+
+impl Default for Walks {
+    fn default() -> Self {
+        Self {
+            running: Vec::new(),
+            carried: Vec::new(),
+            drawn: Instant::now(),
+        }
+    }
+}
+
+/// How many walks one list keeps going at once.
+///
+/// A bound is worth having: nothing retired a walk before, so paging a long
+/// list against a slow player left one alive per page, each with six requests
+/// queued ahead of the newest on four artwork permits — the page somebody just
+/// scrolled to filling last, which is the symptom the skip was added to
+/// remove.
+///
+/// What the ceiling must not do is throw rows away. A walk covers its own page
+/// and no other, since `done` skips everything the walk above it was given, so
+/// the older walks are not refetching what the newest will reach anyway: they
+/// are the only thing that will ever fetch the rows above it. Stopped where
+/// they stood, they left a band of permanent placeholders — one flick of a
+/// wheel chained seventeen pages and left rows 106 to 799 on the glyph for as
+/// long as the screen was open, and scrolling back into them asked for
+/// nothing, because both publishes draw from the memory cache alone. So a walk
+/// stopped for room hands what it owes to the list and the next walk to run
+/// out of its own rows finishes it: see [`Walks::carried`] and [`trim_walks`].
+///
+/// Three because two pages ahead of the newest is already further than a
+/// scroll gets before the one below it lands.
+const WALKS_AT_ONCE: usize = 3;
+
+/// Start a cover walk, and stop the ones it supersedes where they stand.
+///
+/// A walk only asks whether it is still wanted between fetches, so a
+/// superseded one used to keep up to six requests outstanding and their share
+/// of the four artwork permits until the first of them returned — a whole
+/// `artwork::FETCH_TIMEOUT` where the player accepts connections and then
+/// says nothing. For that stretch the newer walk, which is fetching the covers
+/// actually on screen, could be starved of every permit by the older one
+/// fetching covers nobody is looking at. Aborting from here ends it at its
+/// next await instead, which drops the requests and hands the permits back.
+///
+/// Only a [`Walk::Whole`] does that wholesale. A page runs alongside what is
+/// already walking, as it did before the abort existed — see [`Walk`] — so the
+/// slot holds however many walks are covering one list rather than the last
+/// one to start. Finished walks are dropped whenever another starts, and the
+/// ceiling on the unfinished ones is [`trim_walks`]', applied by each walk as
+/// it works out its rows: a list that pages forty times remembers neither
+/// forty handles nor forty walks.
+///
+/// One slot per list: the queue's walks and the browse screen's replace their
+/// own kind and leave the other alone.
+fn start_walk(
+    slot: &Mutex<Walks>,
+    rows: Walk,
+    left: Rows,
+    walk: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let started = tokio::spawn(walk);
+    let mut slot = slot.lock().unwrap();
+    if rows.supersedes() {
+        for replaced in std::mem::take(&mut slot.running) {
+            replaced.stop.abort();
+        }
+        // Owed against the list this one replaces, so owed to nobody.
+        slot.carried.clear();
+    } else {
+        // The walks above this page go on; the ones that have already reached
+        // the end of their own rows are only a handle apiece to keep.
+        slot.running.retain(|above| !above.stop.is_finished());
+    }
+    slot.running.push(Walking {
+        stop: started.abort_handle(),
+        left,
+    });
+}
+
+/// Hold one list to [`WALKS_AT_ONCE`] walks, oldest stopped first, carrying
+/// what each of them still owed.
+///
+/// Called by a walk once it has listed its rows, with `mine` its own, and
+/// never called with a `mine` it could stop. Both halves of that matter:
+///
+/// A walk that has not been polled has no requests out, no permits and no list
+/// of what it was going to fetch, so stopping it costs nothing and abandons
+/// rows nobody can name. Counting only the walks that have listed means the
+/// ceiling is on the walks that are actually fetching, which is what it was
+/// ever about, and a burst of pages grafted on faster than the runtime polls
+/// them settles to the ceiling as each one wakes up rather than being trimmed
+/// blind.
+///
+/// And whoever stops a walk has to be around to finish what it owed. The walk
+/// doing the trimming is the newest, so it is not a candidate for its own
+/// ceiling; it is therefore still running when it reaches the end of its own
+/// rows and takes on [`Walks::carried`]. A trimmer stopped later by a newer
+/// one hands its own remaining rows to the same place, so the debt always has
+/// a walk behind it.
+fn trim_walks(walks: &mut Walks, mine: &Rows) {
+    walks.running.retain(|walk| !walk.stop.is_finished());
+    while walks.running.len() > WALKS_AT_ONCE {
+        let oldest = walks
+            .running
+            .iter()
+            .position(|walk| !Arc::ptr_eq(&walk.left, mine) && walk.left.lock().unwrap().listed);
+        let Some(oldest) = oldest else {
+            // Only walks that have yet to be polled are left to stop, and
+            // stopping those is the one thing this must not do.
+            break;
+        };
+        let stopped = walks.running.remove(oldest);
+        stopped.stop.abort();
+        // Marked and emptied slot by slot, never taken out of the vector. The
+        // abort lands at the stopped walk's next await, so on another worker
+        // thread it is still running with up to six fetches outstanding, each
+        // of which strikes its own row off by index when it returns; shortening
+        // the vector under it is an out-of-bounds write and the release profile
+        // aborts on a panic, so the app would exit under the user's scroll. Its
+        // indices all stay good this way, and what they point at is already
+        // None, so nothing is fetched twice either.
+        let mut owed = stopped.left.lock().unwrap();
+        owed.stopped = true;
+        walks
+            .carried
+            .extend(owed.rows.iter_mut().filter_map(Option::take));
+    }
+}
+
 /// Fetch the icons and cover art for the screen on show.
 /// Fetch the pictures the browse screen needs.
 ///
-/// `done` is how many items at the front of the screen a previous run already
-/// walked. Paging appends to the screen rather than replacing it, so without
-/// this the second page re-derived every URL on the first, the third re-derived
-/// the first two, and a library page fetched forty times over — each one a
-/// cache lookup rather than a request, but the memory cache is bounded, and on
-/// a list long enough to page the early entries have been evicted by the time
-/// the walk reaches them again. Skipping them is also what stops the header's
-/// cover being re-queued ahead of the rows that actually just arrived.
-async fn load_browse_thumbnails(backend: Backend, id: DeviceId, done: usize) {
+/// `rows` says whether the screen was replaced or grown, and how many items at
+/// its front a previous run already walked. Paging appends to the screen
+/// rather than replacing it, so without the skip the second page re-derived
+/// every URL on the first, the third re-derived the first two, and a library
+/// page fetched forty times over — each one a cache lookup rather than a
+/// request, but the memory cache is bounded, and on a list long enough to page
+/// the early entries have been evicted by the time the walk reaches them
+/// again. Skipping them is also what stops the header's cover being re-queued
+/// ahead of the rows that actually just arrived.
+async fn load_browse_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left: Rows) {
+    let done = rows.done();
+
     // Registry first and released, then the browse state: never both at once.
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
@@ -7778,45 +9095,23 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, done: usize) {
             .collect()
     };
 
-    if urls.is_empty() {
-        return;
-    }
-
-    // A few at a time. A library's Albums page is four hundred rows, and one
-    // request per row means four hundred at once against a player that is also
-    // being long-polled — which stalls the poll, the artwork and the window
-    // together. The screen fills in slightly later and stays responsive while
-    // it does.
-    const AT_ONCE: usize = 6;
-    let mut urls = urls.into_iter();
-    let mut fetches = tokio::task::JoinSet::new();
-    for (url, size) in urls.by_ref().take(AT_ONCE) {
-        let artwork = backend.artwork.clone();
-        fetches.spawn(async move {
-            artwork.get(&url, size).await;
-        });
-    }
-
-    let mut last_publish = Instant::now();
-    while fetches.join_next().await.is_some() {
-        if backend.browsing.lock().unwrap().era != era {
-            return;
-        }
-        if let Some((url, size)) = urls.next() {
-            let artwork = backend.artwork.clone();
-            fetches.spawn(async move {
-                artwork.get(&url, size).await;
-            });
-        }
-        // Redrawing rebuilds every row, so on a long list it costs more than
-        // the fetch it is reporting. Often enough to look alive, rarely enough
-        // not to be the reason the list stutters.
-        if last_publish.elapsed() >= Duration::from_millis(400) {
-            backend.publish_browse();
-            last_publish = Instant::now();
-        }
-    }
-    backend.publish_browse();
+    // A page of rows drawn as glyphs derives no URLs and is still not an early
+    // return: this is where a walk takes on what a walk stopped for room left
+    // owing, and those rows are on the same screen.
+    //
+    // Redrawing rebuilds every row, so on a long list it costs more than the
+    // fetch it is reporting. Often enough to look alive, rarely enough not to
+    // be the reason the list stutters.
+    walk_covers(
+        backend.artwork.clone(),
+        urls,
+        left,
+        || backend.browsing.lock().unwrap().era == era,
+        || backend.publish_browse(),
+        backend.browse_walk.clone(),
+        Duration::from_millis(400),
+    )
+    .await;
 }
 
 /// Fetch the art for whatever the selected player is playing.
@@ -7837,8 +9132,16 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, done: usize) {
 async fn load_card_cover(backend: Backend, id: DeviceId) {
     let wanted = backend.with_entry(id, |e| e.cover_url.clone()).flatten();
 
+    // The thumbnail tier, not one of its own. The row draws this at 40px and
+    // had been asking for 80 — eleven percent larger than the 72 the queue
+    // asks for of the same cover, so the selected player's art was fetched
+    // once, decoded twice and held in two of the memory cache's entries for a
+    // difference nothing can see. Sharing the tier makes the second ask a
+    // cache hit, and 72 into 40 is still 1.8x, which is ample on a HiDPI
+    // screen. See `artwork::MEMORY_CACHE`, whose table is the record of which
+    // sizes exist.
     let pixels = match &wanted {
-        Some(url) => backend.artwork.get(url, CARD_SIZE).await,
+        Some(url) => backend.artwork.get(url, THUMB_SIZE).await,
         None => None,
     };
 
@@ -7854,9 +9157,14 @@ async fn load_card_cover(backend: Backend, id: DeviceId) {
         let mut registry = backend.registry.lock().unwrap();
         match registry.get_mut(&id) {
             Some(entry) => {
-                let was = entry.card_cover.is_some();
+                let was = entry.card_cover_url.take();
+                // The address only where there is art at it: a fetch that
+                // failed leaves the row drawing its speaker glyph, which is
+                // the same row as one that was never asked, and the two should
+                // not read as different sleeves.
+                entry.card_cover_url = wanted.filter(|_| pixels.is_some());
                 entry.card_cover = pixels;
-                was != entry.card_cover.is_some()
+                was != entry.card_cover_url
             }
             None => false,
         }
@@ -7864,7 +9172,10 @@ async fn load_card_cover(backend: Backend, id: DeviceId) {
 
     // Only when the row's appearance actually changed. The players model is
     // memo-guarded, so an unconditional publish would be a rebuild per fetch
-    // that the memo then throws away.
+    // that the memo then throws away. Which sleeve it is and not merely
+    // whether there is one: a track change on a player that had art and has
+    // art again is the ordinary case, and asking only whether art is present
+    // left the sidebar a track behind on every one of them.
     if changed {
         backend.publish();
     }
@@ -7939,8 +9250,37 @@ async fn load_cover(backend: Backend, id: DeviceId) {
 /// every track from one album the same artwork URL. The republishes are
 /// coalesced, so a queue filling in redraws a few times rather than once per
 /// image.
-async fn load_thumbnails(backend: Backend, id: DeviceId) {
-    let urls: Vec<String> = {
+///
+/// `rows` says whether the queue was replaced or grown, and how many tracks at
+/// its front a previous walk was already given; it is the same parameter
+/// [`load_browse_thumbnails`] carries for the same reason. A page appends to
+/// the queue rather than replacing it, so without the skip each page
+/// re-derived every URL above it — and the claim that the ones already held
+/// cost nothing is not true past the first page: the memory cache is 256
+/// entries shared with the browse tiles and the sleeve, while a queue window is
+/// 500 tracks, so the early covers have been evicted by the time the walk
+/// reaches them again and are re-read, re-decoded, or re-fetched. Worse than
+/// the cost, the rows that just arrived sit at the end of that walk, so the
+/// rows somebody scrolled to were the last to fill.
+///
+/// Counted in tracks and not in pictures, applied before the URL dedup and the
+/// empty-image filter, because tracks are what the caller knows it had.
+async fn load_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left: Rows) {
+    // The run this is. See `Backend::thumbnails`: a queue that is re-read
+    // starts another loader, and the one already walking the old list has
+    // nothing left to add.
+    //
+    // A page takes the number already standing rather than a new one. It is
+    // not a newer loader with the same list in hand — it has the tracks below
+    // the walk above it and nothing else — and taking a number of its own
+    // would tell that walk to stop, leaving the tracks it had not reached
+    // with nobody fetching them. The next re-read moves the number past both.
+    let mine = match rows {
+        Walk::Whole => backend.thumbnails.fetch_add(1, Ordering::Relaxed) + 1,
+        Walk::From(_) => backend.thumbnails.load(Ordering::Relaxed),
+    };
+
+    let urls: Vec<(String, u32)> = {
         let guard = backend.registry.lock().unwrap();
         let Some(entry) = guard.get(&id) else { return };
         let Some(queue) = &entry.queue else { return };
@@ -7949,39 +9289,33 @@ async fn load_thumbnails(backend: Backend, id: DeviceId) {
         queue
             .songs
             .iter()
+            .skip(rows.done())
             .filter_map(|song| song.image.as_deref().filter(|src| !src.is_empty()))
-            .map(|src| entry.client.image_url(src))
-            .filter(|url| seen.insert(url.clone()))
+            .map(|src| (entry.client.image_url(src), THUMB_SIZE))
+            .filter(|(url, _)| seen.insert(url.clone()))
             .collect()
     };
 
-    if urls.is_empty() {
-        return;
-    }
-    tracing::debug!(%id, covers = urls.len(), "fetching queue thumbnails");
-
-    let mut fetches = tokio::task::JoinSet::new();
-    for url in urls {
-        let artwork = backend.artwork.clone();
-        fetches.spawn(async move {
-            artwork.get(&url, THUMB_SIZE).await;
-        });
+    // A page with no covers of its own is not an early return: this is also
+    // where a walk picks up the rows a walk stopped for room left owing, and
+    // that is worth a pass through `walk_covers` even when there is nothing of
+    // its own to fetch.
+    if !urls.is_empty() {
+        tracing::debug!(%id, covers = urls.len(), "fetching queue thumbnails");
     }
 
-    let mut last_publish = Instant::now();
-    while fetches.join_next().await.is_some() {
-        // The user moved on; the rest of these covers are for a queue nobody
-        // is looking at.
-        if !backend.is_selected(id) {
-            fetches.abort_all();
-            return;
-        }
-        if last_publish.elapsed() >= Duration::from_millis(150) {
-            backend.publish_queue();
-            last_publish = Instant::now();
-        }
-    }
-    backend.publish_queue();
+    walk_covers(
+        backend.artwork.clone(),
+        urls,
+        left,
+        // The user moved on, or a newer loader has the same list in hand;
+        // either way the rest of these covers are not this task's to fetch.
+        || backend.is_selected(id) && backend.thumbnails.load(Ordering::Relaxed) == mine,
+        || backend.publish_queue(),
+        backend.queue_walk.clone(),
+        Duration::from_millis(150),
+    )
+    .await;
 }
 
 /// Read the selected player's queue and show it.
@@ -8003,7 +9337,7 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
             }
             backend.publish_queue();
             tokio::spawn(fetch_queue_buttons(backend.clone(), id));
-            tokio::spawn(load_thumbnails(backend, id));
+            backend.walk_queue(id, Walk::Whole);
         }
         Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
     }
@@ -8400,8 +9734,11 @@ async fn jump_to_letter(
         backend.scroll_browse_to(0.0);
     }
     // The rows are all new, so the artwork walk starts at the top of them.
-    if let Some(id) = backend.browsing.lock().unwrap().device {
-        tokio::spawn(load_browse_thumbnails(backend.clone(), id, 0));
+    // Which player, read and the lock let go: starting a walk takes a lock of
+    // its own, and nothing here needs to hold two.
+    let device = backend.browsing.lock().unwrap().device;
+    if let Some(id) = device {
+        backend.walk_browse(id, Walk::Whole);
     }
 }
 
@@ -8463,7 +9800,7 @@ async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option
         }
     };
 
-    let grew = {
+    let (grew, had) = {
         let mut guard = backend.registry.lock().unwrap();
         let Some(entry) = guard.get_mut(&id) else {
             return;
@@ -8484,18 +9821,24 @@ async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option
             return;
         }
 
+        // What the walk already running was given, taken before the page is
+        // grafted on. Without it the walk restarts at track zero on every
+        // page and every queue edit — see [`load_thumbnails`].
+        let had = queue.songs.len();
         queue.songs.extend(more.songs);
         // The player's own count wins: tracks can be added or removed between
         // one window and the next, and the header reads from this.
         queue.length = more.length;
-        queue.songs.len()
+        (queue.songs.len(), had)
     };
 
     tracing::debug!(%id, tracks = grew, "grew the queue");
     backend.publish_queue();
-    // Walks the whole list and skips what the cache already holds, so the
-    // rows that just arrived are the only ones that cost anything.
-    tokio::spawn(load_thumbnails(backend, id));
+    // A page rather than a queue: the rows that just arrived are the only ones
+    // this walk costs anything for — reached first rather than behind a
+    // re-decode of everything above them — and the walk still working through
+    // those rows above is left alone to finish them.
+    backend.walk_queue(id, Walk::From(had));
 }
 
 /// Read the queue's own document, for the buttons the player puts under it.
@@ -8558,7 +9901,8 @@ async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
     allow(unused_variables, unused_assignments, unused_mut)
 )]
 async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
-    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+    let Some((client, poll)) = backend.with_entry(id, |e| (e.client.clone(), e.poll.clone()))
+    else {
         return;
     };
 
@@ -8578,13 +9922,35 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
     // can reach. The bus name is claimed on the first real status instead.
     #[cfg(target_os = "linux")]
     let mut mpris: Option<mpris::Bridge> = None;
+    // Set once the machine has said it has no session bus, which no later
+    // status will change. Without it the export was attempted again on every
+    // status — a connection and a warning a second, for as long as the app
+    // ran on a headless machine.
+    #[cfg(target_os = "linux")]
+    let mut no_bus = false;
 
     let mut watch = client.watch();
     let mut backoff = Duration::from_secs(1);
     let mut unreadable = 0u32;
 
     loop {
-        match watch.next().await {
+        // A retired player is one that is answering somewhere else now, and
+        // this loop is the old address: it stops here rather than going on
+        // polling nothing, holding a bus name and reporting a room that has
+        // moved. See [`Poll`] and [`Backend::moved_here`].
+        if poll.retired() {
+            tracing::debug!(%id, "retired, so this poll stops");
+            return;
+        }
+        // The long poll is held open for a hundred seconds, which is how long
+        // a retirement would otherwise take to be noticed.
+        let polled = tokio::select! {
+            biased;
+            () = poll.gone.notified() => continue,
+            polled = watch.next() => polled,
+        };
+
+        match polled {
             Ok(status) => {
                 backoff = Duration::from_secs(1);
                 unreadable = 0;
@@ -8749,11 +10115,11 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
 
                 #[cfg(target_os = "linux")]
                 {
-                    if mpris.is_none() {
+                    if mpris.is_none() && !no_bus {
                         let name = backend
                             .with_entry(id, |e| e.view.name.to_string())
                             .unwrap_or_else(|| name.clone());
-                        mpris = mpris::Bridge::attach(
+                        match mpris::Bridge::attach(
                             mpris_index,
                             id,
                             name,
@@ -8761,7 +10127,12 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                             backend.commands.clone(),
                             backend.artwork.clone(),
                         )
-                        .await;
+                        .await
+                        {
+                            mpris::Attach::Exported(bridge) => mpris = Some(bridge),
+                            mpris::Attach::NoBus => no_bus = true,
+                            mpris::Attach::Failed => {}
+                        }
                     }
                     if let Some(bridge) = &mpris {
                         bridge.publish(&status).await;
@@ -8803,8 +10174,12 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 };
 
                 tracing::debug!(%id, "poll failed, retrying in {wait:?}: {e}");
-                tokio::time::sleep(wait).await;
-                if wait == backoff {
+                // Cut short when discovery hears the player announce itself,
+                // which is the player saying the silence this wait is for is
+                // over. The backoff goes back to the start with it.
+                if poll.wait_out(wait).await {
+                    backoff = Duration::from_secs(1);
+                } else if wait == backoff {
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
 
@@ -8886,7 +10261,10 @@ async fn run_commands(
                 // from being asked at all, since answering yes to something
                 // that will be refused is a worse experience than not being
                 // asked.
-                if backend.with_entry(id, |e| e.upgrading).unwrap_or(false) {
+                if backend
+                    .with_entry(id, |e| e.upgrading.is_some())
+                    .unwrap_or(false)
+                {
                     say(&backend.ui, "That player is already installing an update");
                     continue;
                 }
@@ -8939,7 +10317,22 @@ async fn run_commands(
                     match client.start_upgrade_for(member).await {
                         Ok(()) => {
                             say(&backend.ui, "Update started — leave the player powered on");
-                            follow_upgrade(backend.clone(), id).await;
+                            follow_upgrade(backend.clone(), id, Start::Acknowledged).await;
+                        }
+                        // A player that has begun rewriting its flash stops
+                        // answering mid-request, so a request that got no
+                        // answer is as likely to mean the update started as
+                        // that it did not. Saying it failed is a claim
+                        // nothing here can make; watching settles it, and
+                        // `follow_upgrade` says which it was — on the
+                        // evidence of a progress reading, since the silence
+                        // this started from cannot also be the evidence.
+                        Err(e) if unanswered(&e) => {
+                            say(
+                                &backend.ui,
+                                "The player stopped answering — checking whether it started",
+                            );
+                            follow_upgrade(backend.clone(), id, Start::Unanswered).await;
                         }
                         Err(e) => say(&backend.ui, format!("could not start the update: {e}")),
                     }
@@ -8995,6 +10388,11 @@ async fn run_commands(
                 {
                     backend.publish_pane();
                 }
+                // The card the window highlights, which is also the one every
+                // transport press names. A press puts it there already; a
+                // selection carried to a player's new address has nobody to
+                // put it there but this.
+                backend.publish_selection();
                 // Show whatever is already known straight away, and only go to
                 // the network when this is a player whose queue is not held.
                 backend.publish_queue();
@@ -9177,6 +10575,11 @@ async fn run_commands(
                 // a page reached from Help back to Help, out of a settings
                 // sub-page back to the page above it, out of a pane back to
                 // browsing, and only then back along the trail of screens.
+                //
+                // Set by the one arm that leaves a screen behind rather than a
+                // pane, since that is the only level whose covers are still
+                // being fetched.
+                let mut left_screen = false;
                 let moved = {
                     let mut browsing = backend.browsing.lock().unwrap();
                     match &mut browsing.pane {
@@ -9253,11 +10656,19 @@ async fn run_commands(
                             if deeper {
                                 browsing.trail.pop();
                                 browsing.moved_on();
+                                left_screen = true;
                             }
                             deeper
                         }
                     }
                 };
+                if left_screen {
+                    // The bump above is only read between fetches, and nothing
+                    // is opening a screen here to abort them: see
+                    // `stop_browse_walks`. After the `browsing` guard has
+                    // gone, so the two locks are never held together.
+                    backend.stop_browse_walks();
+                }
                 if moved {
                     backend.publish_pane();
                 }
@@ -9535,7 +10946,7 @@ async fn run_commands(
                 };
                 // In order, for the reason on the queue's edits: two of these
                 // in flight at once are two writes to one list.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -9763,7 +11174,7 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -9857,7 +11268,7 @@ async fn run_commands(
                 let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
                     continue;
                 };
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -10436,7 +11847,7 @@ async fn run_commands(
                     Some(Chosen::Write(setting, value)) => {
                         // Off the loop and in order, for the reason on
                         // `SettingEdit`.
-                        let mut ticket = backend.writes.enter();
+                        let mut ticket = backend.write_lane(id).enter();
                         let backend = backend.clone();
                         tokio::spawn(async move {
                             ticket.wait().await;
@@ -10843,7 +12254,7 @@ async fn run_commands(
                 // Off the loop, but in order: a form is a sequence of steps,
                 // and step two is submitted against what step one left on the
                 // player. See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11033,7 +12444,7 @@ async fn run_commands(
                 // per step, and the value the player is left holding has to be
                 // the last one asked for, not whichever reply came back last.
                 // See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11231,7 +12642,7 @@ async fn run_commands(
                 // Off the loop, but in order: `from` and `to` are positions
                 // in a list each of these requests rewrites, so two of them
                 // overtaking each other move the wrong track. See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11256,7 +12667,7 @@ async fn run_commands(
                 };
                 // Off the loop, but in order: `index` is a position in a list
                 // each removal shortens. See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11281,7 +12692,7 @@ async fn run_commands(
                 };
                 // Off the loop, and in the same line as the edits above: a
                 // save has to see the queue those left behind. See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11533,7 +12944,7 @@ async fn run_commands(
                 // Off the loop, but in order: unmounting two shares one after
                 // the other sends the second against the list the first left.
                 // See `lane`.
-                let mut ticket = backend.writes.enter();
+                let mut ticket = backend.write_lane(id).enter();
                 let backend = backend.clone();
                 tokio::spawn(async move {
                     ticket.wait().await;
@@ -11950,7 +13361,7 @@ async fn run_commands(
                                 crumb.screen.next = onward;
                             }
                             backend.publish_browse();
-                            tokio::spawn(load_browse_thumbnails(backend.clone(), id, had));
+                            backend.walk_browse(id, Walk::From(had));
                         }
                         Err(e) => {
                             // Take the cursor away, or the list asks for the
@@ -12302,7 +13713,7 @@ async fn run_commands(
                     .values()
                     // An upgrading player is not paused, for the same reason
                     // it is not played: it is not listening.
-                    .filter(|e| !e.upgrading)
+                    .filter(|e| e.upgrading.is_none())
                     .map(|e| e.client.clone())
                     .collect();
 
@@ -12331,7 +13742,7 @@ async fn run_commands(
         // and every control reading it dies. This app has one funnel rather
         // than that structure, so the funnel is where it goes.
         let Some(client) = backend
-            .with_entry(id, |e| (!e.upgrading).then(|| e.client.clone()))
+            .with_entry(id, |e| e.upgrading.is_none().then(|| e.client.clone()))
             .flatten()
         else {
             continue;
@@ -13697,6 +15108,21 @@ mod tests {
         // guard under test and it would pass on nothing.
         ui.set_station_typing(false);
         ui.set_settings_typing(false);
+        // And the search box drawn in the pane beside the column, which is the
+        // other field that answers a question going away. The two are
+        // independent — the box is in the pane, the line is in the column — so
+        // both are on screen at once and both are told the same thing when the
+        // question closes. The box's own way back used to hand the keys
+        // straight to the window with none of the tests `claim` makes, so
+        // whichever of the two handlers Slint ran second decided who held the
+        // caret, and the rest of the playlist name drove the shortcuts.
+        ui.set_browse_has_search(true);
+        settle(0);
+        assert!(
+            ui.get_browse_typing(),
+            "arriving on a screen with a box means wanting to search: the box \
+             takes the caret as it is built"
+        );
         let by_label = |label: &'static str| {
             i_slint_backend_testing::ElementQuery::from_root(&ui)
                 .match_descendants()
@@ -13719,6 +15145,11 @@ mod tests {
             ui.get_queue_naming(),
             "the line reports the caret as it appears: a change tracker never \
              fires on creation, so the field has to say so itself"
+        );
+        assert!(
+            !ui.get_browse_typing(),
+            "the line took the caret from the box, and the box says so: what \
+             the next letter is for is the name, not the query"
         );
 
         // Two publishes behind the column, which is what the guard is for.
@@ -13812,6 +15243,10 @@ mod tests {
             "and the letters after it are too: the caret goes back to the line \
              the question borrowed it from, not to nothing at all"
         );
+        // The box goes with the screen it was drawn on, which is where the
+        // rest of this section left off.
+        ui.set_browse_has_search(false);
+        settle(0);
 
         // And the way out that takes the column with it. The toggle beside the
         // volume is an IconButton — no focus scope, so the press does not move
@@ -13976,6 +15411,58 @@ mod tests {
             ui.get_models_replaced(),
             flipped.wrapping_add(1),
             "a switch the player moved must not go on reading where it was left"
+        );
+
+        // And the other side of it: a row that carries `on` with no control
+        // bound to it. The sleep row is `cycle`, a pill that only reads the
+        // flag for its background, and the status handler republishes the
+        // settings pane on every tick because the timer lives in `/Status`
+        // rather than in the settings document. So pressing Sleep while the
+        // name field has the caret flips `on` a second later — and if that
+        // counted as shape, the field three rows up would be destroyed
+        // mid-word for a pill's colour.
+        let timer = |on: bool, left: &str| SettingItem {
+            index: 2,
+            label: "Sleep".into(),
+            control: "cycle".into(),
+            on,
+            value: left.into(),
+            available: true,
+            ..Default::default()
+        };
+        assert!(seat_settings(
+            ui,
+            page("Larder", &[timer(false, "Off")]),
+            false
+        ));
+        let ticking = ui.get_models_replaced();
+        assert!(!seat_settings(
+            ui,
+            page("Larder", &[timer(true, "15 min")]),
+            false
+        ));
+        assert_eq!(
+            ui.get_models_replaced(),
+            ticking,
+            "a sleep timer starting must not take away the field being typed \
+             into three rows above it"
+        );
+        assert!(
+            ui.get_settings().row_data(2).is_some_and(|row| row.on),
+            "and the pill hears it, because nothing ever assigned that binding"
+        );
+
+        // The same for the flag a form puts on every field it draws: `on` is
+        // `!held.is_empty()` there, text and password included, where no
+        // element reads it at all. The first letter typed into one field would
+        // otherwise rebuild the page that field is on.
+        let mut holding = page("Larder", &[timer(true, "15 min")]);
+        holding[0].on = true;
+        assert!(!seat_settings(ui, holding, false));
+        assert_eq!(
+            ui.get_models_replaced(),
+            ticking,
+            "a flag no control is bound to is not shape, whatever row carries it"
         );
 
         // Back to a page with the name field on it, so that what follows is
@@ -14240,6 +15727,42 @@ mod tests {
             "the caret goes back where the question borrowed it from, and what \
              was being typed is a word rather than a query to be replaced"
         );
+
+        // The other order, which the same change made reachable: the box is
+        // not destroyed by a question any more, so it can be *built* behind
+        // one. The screen comes off the network and a status poll can raise an
+        // update notice while that fetch is in flight, which is how a search
+        // screen lands under a scrim that is already up.
+        ui.set_browse_has_search(false);
+        settle(0);
+        ui.set_queue_menu_open(true);
+        settle(200);
+        ui.set_browse_has_search(true);
+        settle(200);
+        press("x");
+        settle(0);
+        assert_eq!(
+            ui.get_browse_query().as_str(),
+            "beatl",
+            "a box built behind a question must not take the caret off the \
+             card: the letters would go into a list nobody can see, and the \
+             question — `confirm-upgrade` ignores Escape — would have no \
+             keyboard answer left at all"
+        );
+
+        // And the wish is kept rather than dropped: the screen was asked for
+        // in order to search it, so the caret goes in once the question does.
+        ui.set_queue_menu_open(false);
+        settle(200);
+        press("x");
+        settle(0);
+        assert_eq!(
+            ui.get_browse_query().as_str(),
+            "x",
+            "the box takes the caret when the question goes, on the same terms \
+             its `init` would have: what it arrived holding is a query to be \
+             typed over"
+        );
     }
 
     /// Which presses take the speaker away from what it was doing.
@@ -14331,6 +15854,103 @@ mod tests {
         // there is, and it is the tall one.
         assert_eq!(badged_cards(&[card("", true, false)]), 1);
         assert_eq!(badged_cards(&[card("Following Kitchen", false, false)]), 1);
+    }
+
+    /// The highlight follows the player, including to a new address.
+    ///
+    /// The window's index used to be reconstructed from the window's own row,
+    /// which cannot answer a selection that changed without a click.
+    /// `moved_here` takes the selected player out of the list, so the answer
+    /// fell through to row zero and then stuck to whoever was there: the pane,
+    /// the queue, the position bar and the cover were the moved player's while
+    /// `root.current` — and with it the space bar, the skip keys, the seek and
+    /// the volume slider — was the neighbor's.
+    #[test]
+    fn a_player_that_changes_address_keeps_the_highlight() {
+        let row = |id: &str| Device {
+            id: id.into(),
+            ..Default::default()
+        };
+        let old: DeviceId = "10.0.0.10:11000".parse().unwrap();
+        let new: DeviceId = "10.0.0.20:11000".parse().unwrap();
+        let other: DeviceId = "10.0.0.30:11000".parse().unwrap();
+        let rows = |ids: &[DeviceId]| {
+            ids.iter()
+                .map(|id| row(&id.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        // The ordinary case, and the one the window's own row was there for:
+        // a player appearing above the selected one moves every index by one
+        // and must not move the highlight.
+        assert_eq!(
+            highlighted_row(&rows(&[old, other]), Some("10.0.0.30:11000"), Some(other)),
+            Some(1)
+        );
+
+        // The move, published in the two halves `adopt` publishes it in. The
+        // old entry goes first, and for that publish the selected player is on
+        // no row at all: the new address is not tracked until `track_as`, a
+        // command loop away. Naming a row there names the neighbor, and the
+        // window's highlighted card is what every transport press is built
+        // from — so the answer is no row rather than row zero.
+        let carried = rows(&[other]);
+        assert_eq!(
+            highlighted_row(&carried, Some("10.0.0.10:11000"), Some(old)),
+            None,
+            "a player the list does not hold must not lend its highlight to \
+             whoever sorts first"
+        );
+
+        // Then the player is tracked at its new address and `Select` names it.
+        // The window is still showing the neighbor it was left on, and that
+        // stale row is exactly what used to win.
+        let settled = rows(&[new, other]);
+        assert_eq!(
+            highlighted_row(&settled, Some("10.0.0.30:11000"), Some(new)),
+            Some(0),
+            "the highlight belongs on the player the backend has selected, \
+             not on the row the window was left holding"
+        );
+
+        // Before anything has been chosen the window's row is all there is —
+        // a click writes it a command loop ahead of the backend hearing about
+        // it, and answering zero there would drag the highlight back off the
+        // card that was just pressed.
+        assert_eq!(
+            highlighted_row(&settled, Some("10.0.0.30:11000"), None),
+            Some(1)
+        );
+        assert_eq!(highlighted_row(&settled, None, None), Some(0));
+    }
+
+    /// Two sweeps can overlap, and the first to finish speaks only for itself.
+    ///
+    /// The window is told a sweep is running by `sweep` itself now, rather
+    /// than by each caller bracketing its own call — which is how Rescan, the
+    /// one sweep a user presses for and the only one whose feedback this is,
+    /// came to run twelve seconds of broadcasts under an unchanged headline
+    /// and a still spinner. A Rescan pressed during the rebind loop's own
+    /// sweep is then two at once, and a flag would have gone out at the end of
+    /// whichever finished first.
+    #[test]
+    fn overlapping_sweeps_are_counted_rather_than_flagged() {
+        let http = reqwest::Client::new();
+        let (backend, _commands) = selection_tests::backend(&http);
+
+        let rebinding = backend.looking();
+        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 1);
+        let rescan = backend.looking();
+        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 2);
+
+        drop(rebinding);
+        assert_eq!(
+            backend.sweeping.load(Ordering::SeqCst),
+            1,
+            "the sweep still running is still a sweep"
+        );
+        drop(rescan);
+        assert_eq!(backend.sweeping.load(Ordering::SeqCst), 0);
     }
 
     /// The one string on the alarms list that is not the player's wording.
@@ -14653,6 +16273,297 @@ mod tests {
                  would stop redrawing when it changes"
             );
         }
+    }
+
+    /// The same guard on the player cards, which have their own memo and had
+    /// two holes in it: the upgrade badge's words, and which sleeve the row's
+    /// art is.
+    #[test]
+    fn every_drawn_player_field_is_in_the_fingerprint() {
+        use std::hash::Hasher;
+
+        let print = |row: &Device, cover: Option<&str>| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            player_row_fingerprint(row, cover, &mut hash);
+            hash.finish()
+        };
+
+        let base = Device {
+            id: "10.0.0.2:11000".into(),
+            name: "Kitchen".into(),
+            model: "Powernode".into(),
+            volume: 30,
+            muted: false,
+            playing: true,
+            now_playing: "Kind of Blue".into(),
+            title: "So What".into(),
+            artist: "Miles Davis".into(),
+            album: "Kind of Blue".into(),
+            service: "LocalMusic".into(),
+            reachable: true,
+            role: "".into(),
+            in_group: false,
+            groupable: false,
+            upgrading: false,
+            upgrade_line: "".into(),
+        };
+        let art = Some("http://10.0.0.2:11000/Artwork?service=LocalMusic&id=1");
+        let baseline = print(&base, art);
+
+        let variants: Vec<(&str, Device)> = vec![
+            (
+                "id",
+                Device {
+                    id: "10.0.0.3:11000".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "name",
+                Device {
+                    name: "Study".into(),
+                    ..base.clone()
+                },
+            ),
+            // Drawn on an idle card in place of the record, and replaced by
+            // `read_sync` a moment after the announcement seeded it.
+            (
+                "model",
+                Device {
+                    model: "N330".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "volume",
+                Device {
+                    volume: 31,
+                    ..base.clone()
+                },
+            ),
+            (
+                "muted",
+                Device {
+                    muted: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "playing",
+                Device {
+                    playing: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "now_playing",
+                Device {
+                    now_playing: "Radio Paradise".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "title",
+                Device {
+                    title: "Blue in Green".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "artist",
+                Device {
+                    artist: "Bill Evans".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "album",
+                Device {
+                    album: "Portrait in Jazz".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "reachable",
+                Device {
+                    reachable: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "role",
+                Device {
+                    role: "Leading 1 player".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "in_group",
+                Device {
+                    in_group: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "groupable",
+                Device {
+                    groupable: true,
+                    ..base.clone()
+                },
+            ),
+            // The badge appears at all.
+            (
+                "upgrading",
+                Device {
+                    upgrading: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, row) in variants {
+            assert_ne!(
+                print(&row, art),
+                baseline,
+                "changing {field} did not change the fingerprint, so the card \
+                 would stop redrawing when it changes"
+            );
+        }
+
+        // What the badge says, which is the half that was missing: `upgrading`
+        // flips once and the words move with every progress report, so two
+        // rows alike but for the line have to print differently or the badge
+        // freezes at whichever stage the player was on when it appeared.
+        let upgrading = |line: &str| {
+            print(
+                &Device {
+                    upgrading: true,
+                    upgrade_line: line.into(),
+                    ..base.clone()
+                },
+                art,
+            )
+        };
+        assert_ne!(
+            upgrading("Downloading — 40%"),
+            upgrading("Downloading — 10%"),
+            "the upgrade badge has to redraw as the upgrade moves"
+        );
+
+        // The art, which used to go in as whether there was any. A track
+        // change on a player that had a sleeve and has another one is the
+        // ordinary case, and it has to move the fingerprint or the sidebar is
+        // left a track behind.
+        assert_ne!(
+            print(
+                &base,
+                Some("http://10.0.0.2:11000/Artwork?service=LocalMusic&id=2")
+            ),
+            baseline,
+            "a different sleeve on the same row has to be published"
+        );
+        assert_ne!(
+            print(&base, None),
+            baseline,
+            "and so does losing the sleeve altogether"
+        );
+    }
+
+    /// A transport bar with something on every part of it.
+    fn transport() -> TransportView {
+        TransportView {
+            position: 12,
+            duration: 240,
+            seekable: true,
+            shuffle: false,
+            repeat: 2,
+            indexing: String::new(),
+            quality: "HR".to_owned(),
+            stream_format: "FLAC 24/44.1".to_owned(),
+            actions: vec![
+                TrackActionData {
+                    name: "love".to_owned(),
+                    label: "Love".to_owned(),
+                    on: false,
+                },
+                TrackActionData {
+                    name: "ban".to_owned(),
+                    label: "Ban".to_owned(),
+                    on: false,
+                },
+            ],
+        }
+    }
+
+    /// The transport's memo, with the two things it did not used to hash: the
+    /// format line, and the pills.
+    #[test]
+    fn every_drawn_transport_field_is_in_the_fingerprint() {
+        let baseline = transport().fingerprint();
+        let changed = |field: &str, edit: fn(&mut TransportView)| {
+            let mut view = transport();
+            edit(&mut view);
+            assert_ne!(
+                view.fingerprint(),
+                baseline,
+                "changing {field} did not change the fingerprint, so the \
+                 transport would stop redrawing when it changes"
+            );
+        };
+
+        changed("position", |view| view.position += 1);
+        changed("duration", |view| view.duration += 1);
+        changed("seekable", |view| view.seekable = false);
+        changed("shuffle", |view| view.shuffle = true);
+        changed("repeat", |view| view.repeat = 0);
+        changed("indexing", |view| {
+            view.indexing = "Indexing the music library — 20 songs so far".to_owned()
+        });
+        changed("quality", |view| view.quality = "CD".to_owned());
+        changed("stream_format", |view| {
+            view.stream_format = "MP3 128 kb/s".to_owned()
+        });
+
+        // Love pressed on a paused track: nothing else about the transport
+        // moves, so the reply's status is the only thing that says the track
+        // is loved now, and the button has to redraw off it.
+        changed("a pill's state", |view| view.actions[0].on = true);
+        changed("a pill's name", |view| {
+            view.actions[0].name = "shop".to_owned()
+        });
+        changed("a pill's label", |view| {
+            view.actions[0].label = "Buy".to_owned()
+        });
+        changed("the pills going away", |view| view.actions.clear());
+    }
+
+    /// And the memo inside it: the pills are a model, so they are replaced
+    /// only when they differ rather than on every tick of the position.
+    #[test]
+    fn the_pills_are_left_alone_while_only_the_position_moves() {
+        let playing = transport();
+        let mut later = transport();
+        later.position += 1;
+
+        assert_ne!(
+            later.fingerprint(),
+            playing.fingerprint(),
+            "the bar itself still redraws once a second"
+        );
+        assert_eq!(
+            later.actions_fingerprint(),
+            playing.actions_fingerprint(),
+            "but rebuilding the pills under the pointer every second throws \
+             away the press of a button being held"
+        );
+
+        let mut loved = transport();
+        loved.actions[0].on = true;
+        assert_ne!(
+            loved.actions_fingerprint(),
+            playing.actions_fingerprint(),
+            "a pill that has changed is published"
+        );
     }
 
     #[test]
@@ -15016,6 +16927,141 @@ mod tests {
         assert_eq!(quality_label("-1"), "-1");
         assert_eq!(quality_label("1.5"), "1.5");
     }
+
+    /// An update nobody ever saw running did not finish.
+    ///
+    /// The watch used to end on the clock alone, so a player that answered
+    /// normally for twenty seconds — which is what a start that never took
+    /// looks like — was announced as updated, and so was a player that
+    /// dropped one request and answered the next.
+    #[test]
+    fn an_update_nobody_saw_running_is_not_announced_as_finished() {
+        use super::{UPGRADE_SETTLE, upgrade_ended};
+
+        assert_eq!(upgrade_ended(false, Duration::from_secs(1)), None);
+        assert_eq!(
+            upgrade_ended(false, UPGRADE_SETTLE + Duration::from_secs(1)),
+            Some("The player never started an update — check it for one")
+        );
+
+        // Seen upgrading, and now answering as itself: that is the end of one,
+        // whenever it comes.
+        assert_eq!(
+            upgrade_ended(true, Duration::from_secs(1)),
+            Some("Update finished")
+        );
+    }
+
+    /// And silence is only evidence where the player took the request.
+    ///
+    /// The watch is entered on a start that got no answer, because a player
+    /// that has begun rewriting its flash stops answering mid-request. So does
+    /// a speaker that is switched off, asleep behind a Wi-Fi drop or unplugged
+    /// — and `unanswered` cannot tell the two apart. Reading the silence that
+    /// follows as the reboot announced "Update finished" over an install that
+    /// was never started, out of the same quiet the failed trigger had already
+    /// reported.
+    #[test]
+    fn silence_is_only_the_reboot_when_the_player_took_the_request() {
+        use super::{Start, UPGRADE_REBOOT, UPGRADE_SETTLE, silence_was_the_reboot, upgrade_ended};
+
+        let rebooting = UPGRADE_REBOOT + Duration::from_secs(1);
+        assert!(silence_was_the_reboot(Start::Acknowledged, rebooting));
+        assert!(!silence_was_the_reboot(
+            Start::Acknowledged,
+            Duration::from_secs(1)
+        ));
+        assert!(
+            !silence_was_the_reboot(Start::Unanswered, rebooting),
+            "the quiet that follows a request nobody answered is the same \
+             quiet the request already failed on"
+        );
+
+        // And through to the words, which is where the user meets it: the
+        // player comes back a minute later and answers as itself.
+        assert_eq!(
+            upgrade_ended(
+                silence_was_the_reboot(Start::Unanswered, rebooting),
+                UPGRADE_SETTLE + Duration::from_secs(1)
+            ),
+            Some("The player never started an update — check it for one")
+        );
+    }
+
+    /// A player that never answered is given longer to be installing.
+    ///
+    /// That branch exists for the player that may have begun rewriting its
+    /// flash mid-request — the user is told so — and then nothing it can see
+    /// rules it out, so it ran to the end of its budget every time. Ninety
+    /// seconds of it, which is shorter than a BluOS install and reboot: the
+    /// watch ended by contradicting the toast that started it.
+    #[test]
+    fn a_trigger_nobody_answered_is_given_an_install_worth_of_silence() {
+        use super::{
+            Start, UPGRADE_PATIENCE, UPGRADE_REBOOT, UPGRADE_SILENCE, silence_budget,
+            silence_was_the_reboot,
+        };
+
+        assert_eq!(silence_budget(Start::Acknowledged), UPGRADE_SILENCE);
+        assert!(
+            silence_budget(Start::Unanswered) > UPGRADE_SILENCE,
+            "the install this cannot rule out is minutes long"
+        );
+        assert!(
+            silence_budget(Start::Unanswered) < UPGRADE_PATIENCE,
+            "and still short of what a player seen updating is given"
+        );
+
+        // The short budget only ever decides the acknowledged case in theory:
+        // that path has already read its silence as the reboot long before,
+        // so it ends as a player lost mid-update rather than one that never
+        // started.
+        assert!(silence_was_the_reboot(
+            Start::Acknowledged,
+            UPGRADE_REBOOT + Duration::from_secs(1)
+        ));
+        assert!(UPGRADE_REBOOT < UPGRADE_SILENCE);
+    }
+
+    /// A request the player never answered is not the player saying no.
+    #[tokio::test]
+    async fn a_request_that_got_no_answer_is_told_from_a_refusal() {
+        use super::unanswered;
+        use fake_player::Player;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+
+        // Nothing listens on port 9, and a short timeout keeps this quick
+        // wherever a refused connection is slow to come back.
+        let device = bluos::DeviceId::new(std::net::Ipv4Addr::LOCALHOST, 9);
+        let cause = http
+            .get("http://127.0.0.1:9/upgrade")
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .expect_err("nothing answers on port 9");
+        assert!(unanswered(&bluos::Error::Http {
+            device,
+            cause,
+            body: String::new(),
+        }));
+
+        // A player that answered, with a status or with a refusal of this
+        // crate's own, said no and meant it.
+        let player = Player::with_routes(Vec::new()).await;
+        let answered = Client::with_http(player.id(), http)
+            .start_upgrade_for(None)
+            .await
+            .expect_err("the player serves no /upgrade at all");
+        assert!(
+            !unanswered(&answered),
+            "a 404 is an answer, got {answered:?}"
+        );
+        assert!(!unanswered(&bluos::Error::Refused(
+            "the player says it has no upgrade to install".to_owned()
+        )));
+    }
 }
 
 /// Replies that come back for a player after another has been chosen.
@@ -15035,7 +17081,7 @@ mod selection_tests {
     /// else, so the browsing state is what a test reads. Nothing here reads or
     /// writes the user's own config or cache: the orders and recent searches
     /// start empty, and the artwork cache is kept in memory.
-    fn backend(http: &reqwest::Client) -> (Backend, mpsc::UnboundedReceiver<Command>) {
+    pub(super) fn backend(http: &reqwest::Client) -> (Backend, mpsc::UnboundedReceiver<Command>) {
         let (commands, rx) = mpsc::unbounded_channel();
         let backend = Backend {
             registry: Arc::new(Mutex::new(BTreeMap::new())),
@@ -15046,11 +17092,15 @@ mod selection_tests {
             artwork: Arc::new(Artwork::in_memory(http.clone(), Default::default())),
             browsing: Arc::new(Mutex::new(Browsing::default())),
             known: Arc::new(Mutex::new(Vec::new())),
-            writes: Arc::new(lane::Lane::default()),
+            queue_walk: Arc::default(),
+            browse_walk: Arc::default(),
+            sweeping: Arc::new(AtomicU64::new(0)),
+            vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
             searches: Arc::new(AtomicU64::new(0)),
             forms: Arc::new(AtomicU64::new(0)),
             openings: Arc::new(AtomicU64::new(0)),
             sent_transport: Arc::new(AtomicU64::new(0)),
+            sent_track_actions: Arc::new(AtomicU64::new(0)),
             sent_queue: Arc::new(AtomicU64::new(0)),
             sent_players: Arc::new(AtomicU64::new(0)),
             sent_settings: Arc::new(AtomicU64::new(0)),
@@ -15061,6 +17111,7 @@ mod selection_tests {
             sent_browse: Arc::new(AtomicU64::new(0)),
             sent_index: Arc::new(AtomicU64::new(0)),
             sent_era: Arc::new(AtomicU64::new(0)),
+            thumbnails: Arc::new(AtomicU64::new(0)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orders: Arc::new(Mutex::new(order::Orders::new())),
         };
@@ -15069,12 +17120,15 @@ mod selection_tests {
 
     /// Put a player in the registry the way `track` would, without the
     /// long-poll and the remembered-players file that come with it.
-    fn add(backend: &Backend, player: &Player, http: &reqwest::Client) {
+    pub(super) fn add(backend: &Backend, player: &Player, http: &reqwest::Client) {
         backend.registry.lock().unwrap().insert(
             player.id(),
             Entry {
                 client: Client::with_http(player.id(), http.clone()),
-                upgrading: false,
+                identity: None,
+                poll: Arc::default(),
+                writes: Arc::default(),
+                upgrading: None,
                 view: Device::default(),
                 status: None,
                 status_at: None,
@@ -15082,6 +17136,7 @@ mod selection_tests {
                 sync: None,
                 cover_url: None,
                 card_cover: None,
+                card_cover_url: None,
             },
         );
     }
@@ -18447,5 +20502,1123 @@ mod selection_tests {
 
         let _ = backend.commands.send(Command::SettingEscaped(0));
         until("the line to be taken back", || naming() == Some(false)).await;
+    }
+
+    /// One update finishing says nothing about another player's.
+    ///
+    /// Both flags lived in one place: finishing cleared `upgrading` on every
+    /// entry in the registry and blanked the strip, so a player halfway
+    /// through rewriting its own firmware read as idle and was offered its
+    /// transport back while it was not listening.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_update_finishing_leaves_the_other_player_updating() {
+        let (backend, first, second) = two_players().await;
+
+        let progress = |percent| bluos::upgrade::Progress {
+            second_stage: true,
+            step: Some(1),
+            total: Some(3),
+            percent: Some(percent),
+            ..Default::default()
+        };
+        backend.show_upgrade(first.id(), &progress(20));
+        backend.show_upgrade(second.id(), &progress(40));
+
+        backend.clear_upgrade(first.id());
+
+        assert!(
+            backend
+                .with_entry(first.id(), |e| e.upgrading.is_none())
+                .unwrap(),
+            "the player that finished is done"
+        );
+        assert!(
+            backend
+                .with_entry(second.id(), |e| e.upgrading.is_some())
+                .unwrap(),
+            "the other player is still updating and must stay marked"
+        );
+        assert!(
+            backend
+                .with_entry(second.id(), |e| e.view.upgrading && !e.view.reachable)
+                .unwrap(),
+            "and its row must keep saying so"
+        );
+
+        // The strip is one row for any number of players, so it falls back to
+        // the upgrade still running rather than going blank over it.
+        let strip = backend
+            .upgrade_strip(None)
+            .expect("the strip must keep the upgrade that is still running");
+        assert_eq!(strip.percent, 40.0);
+    }
+
+    /// Giving up on a watch does not make an unreachable player reachable.
+    ///
+    /// The watch can be entered on a request the player never answered, and
+    /// end at `UPGRADE_SILENCE` having never seen it answer anything. Clearing
+    /// the upgrade then wrote `reachable = true` on a speaker that is
+    /// switched off: the row stopped saying "Not responding" and its transport
+    /// and volume came back live for a room nobody could reach, until the next
+    /// failed poll — up to a backoff later — put it back. Every press made in
+    /// that window did nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn giving_up_on_an_update_that_never_ran_leaves_reachability_alone() {
+        let (backend, player, _other) = two_players().await;
+        backend.update(player.id(), |view| view.reachable = false);
+
+        // Nothing ever marked this player as upgrading: the start request went
+        // unanswered and no progress was ever read.
+        backend.clear_upgrade(player.id());
+
+        assert!(
+            backend
+                .with_entry(player.id(), |e| !e.view.reachable)
+                .unwrap(),
+            "whether a player is reachable is the poll's to say"
+        );
+    }
+
+    /// A player given a new address is the same player, not a second one.
+    ///
+    /// Keyed by `host:port` with nothing ever removed, a DHCP lease that moved
+    /// a speaker left two rows in the sidebar: the one that worked, and one
+    /// nobody could reach that went on polling for ever and holding the name
+    /// on the desktop's media controls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_that_changes_address_moves_instead_of_doubling() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+
+        // What the announcement calls it, which is what `/SyncStatus` calls it
+        // too: the same six bytes, written two ways.
+        let identity = identity_of(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+        assert_eq!(
+            identity_from_mac("AA:BB:CC:DD:EE:FF").as_ref(),
+            Some(&identity)
+        );
+        let was = player.id();
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&was)
+            .unwrap()
+            .identity = Some(identity.clone());
+        let poll = backend.with_entry(was, |e| e.poll.clone()).unwrap();
+        *backend.selected.lock().unwrap() = Some(was);
+        // As `track_as` does for every adoption: this player's own address is
+        // where its art comes from.
+        backend.artwork.remember_player(was.host);
+
+        // The same player, announcing from another address. The selection is
+        // the room rather than the address, so it comes along: `adopt` sends
+        // the `Select` this answer asks for, once the new entry exists.
+        let now = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), was.port);
+        assert!(
+            backend.moved_here(&identity, now),
+            "the selection was on the player that moved, and has to be carried"
+        );
+
+        assert!(
+            backend.with_entry(was, |_| ()).is_none(),
+            "the address it used to be at is not a player any more"
+        );
+        assert!(
+            backend.registry.lock().unwrap().is_empty(),
+            "and nothing is left over to draw a second row from"
+        );
+        assert!(
+            poll.retired(),
+            "its poll is told to stop rather than run on"
+        );
+
+        // The row is displaced at once; the remembered-players file is not.
+        // An announcement is an unauthenticated broadcast, and a move it
+        // claims is undone by the next poll — where striking the address out
+        // of the file is not undone by anything. It waits for the player to
+        // answer from the new address as itself.
+        assert_eq!(
+            backend.vacated.lock().unwrap().get(&now).copied(),
+            Some(was),
+            "the address it left has to wait for evidence, not go on a broadcast"
+        );
+
+        // The art allow-list follows the registry rather than only growing.
+        // Left in, the address it departed stayed exempt from the rule that
+        // refuses to fetch from private space on a player's say-so — one more
+        // permanently allowed host per announcement, on a broadcast anyone on
+        // the segment can send.
+        assert!(
+            backend
+                .artwork
+                .offered(&format!("http://{}/Artwork", was.host))
+                .is_none(),
+            "an address no player is tracked at is not a player's own address"
+        );
+    }
+
+    /// A second zone on one box is not the first zone having moved.
+    ///
+    /// A multi-zone amplifier answers on `:11000` and `:11010` and reports one
+    /// MAC for both, so on identity alone each zone retired the other on every
+    /// announcement it sent: two rows taking turns evicting each other, and no
+    /// way to keep both on screen. A move is a change of address, which the
+    /// port is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_zone_on_the_same_box_is_not_a_move() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+
+        let identity = identity_of(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+        let first = player.id();
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&first)
+            .unwrap()
+            .identity = Some(identity.clone());
+
+        let second = DeviceId::new(first.host, first.port + 10);
+        assert!(
+            !backend.moved_here(&identity, second),
+            "a sibling zone on the same host is another zone, not a move"
+        );
+        assert!(
+            backend.with_entry(first, |_| ()).is_some(),
+            "and the zone the user was looking at stays on screen"
+        );
+    }
+
+    /// An identity two players both report is not a name either of them can
+    /// be moved by.
+    ///
+    /// A MAC field that was never written reads `00:00:00:00:00:00`, and a
+    /// cloned or virtual player can report the same. Taken as a name, the two
+    /// take turns retiring each other on every announcement.
+    #[test]
+    fn a_placeholder_is_not_an_identity() {
+        assert_eq!(identity_from_mac("00:00:00:00:00:00"), None);
+        assert_eq!(identity_of(&[0; 6]), None);
+        assert_eq!(identity_from_mac("ff:ff:ff:ff:ff:ff"), None);
+        assert_eq!(identity_of(&[0xff; 6]), None);
+        // The low bit of the first octet says this is a group rather than a
+        // station, so no one player is at it.
+        assert_eq!(identity_from_mac("01:00:5e:00:00:01"), None);
+        assert_eq!(identity_of(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]), None);
+
+        // An ordinary MAC is still a name, written either way.
+        assert_eq!(
+            identity_from_mac("AA:BB:CC:DD:EE:FF").as_deref(),
+            Some("aabbccddeeff")
+        );
+        assert_eq!(
+            identity_of(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).as_deref(),
+            Some("aabbccddeeff")
+        );
+    }
+
+    /// Another player answering is not the first one having moved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_player_is_not_mistaken_for_one_that_moved() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let kitchen = Player::start().await;
+        let study = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &kitchen, &http);
+        add(&backend, &study, &http);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&kitchen.id())
+            .unwrap()
+            .identity = Some("aabbccddeeff".to_owned());
+
+        // A different node id from a different address retires nobody, and
+        // neither does an announcement carrying no node id at all: see
+        // `identity_of`, which answers `None` rather than a name every
+        // anonymous announcement would share.
+        assert!(!backend.moved_here("001122334455", study.id()));
+        assert_eq!(identity_of(&[]), None);
+
+        assert_eq!(
+            backend.registry.lock().unwrap().len(),
+            2,
+            "both players are still tracked"
+        );
+    }
+
+    /// A player that has just announced itself does not sit out a backoff
+    /// meant for its silence.
+    ///
+    /// The poll doubles its wait up to thirty seconds, so a speaker plugged
+    /// back in was drawn as unreachable for half a minute after it had said
+    /// where it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_announcement_ends_the_poll_backoff() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+        let poll = backend.with_entry(player.id(), |e| e.poll.clone()).unwrap();
+
+        // The wait the loop is in after half a minute of nothing.
+        let waiting = tokio::spawn(async move { poll.wait_out(Duration::from_secs(30)).await });
+
+        // Discovery hearing it again comes through `track`, which finds the
+        // player already tracked — and used to do nothing whatever with that.
+        backend.track(player.id(), &http, None, None);
+
+        let cut_short = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait ends when the player announces itself")
+            .unwrap();
+        assert!(cut_short, "and says so, so the backoff starts again at one");
+    }
+
+    /// A write to a player that has stopped answering does not hold up a write
+    /// to another player.
+    ///
+    /// One lane for the whole app meant the line was shared: a press for the
+    /// kitchen stood behind a ten-second request to a speaker in a room
+    /// nobody was in, and was not even sent until it had timed out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_players_write_does_not_hold_up_anothers() {
+        let (backend, first, second) = two_players().await;
+        // What a player that has been unplugged looks like: the request goes
+        // out and nothing comes back for the length of the timeout.
+        first.delay("/Delete", SLOW * 6);
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        let _ = backend.commands.send(Command::QueueRemove(1));
+        let _ = backend.commands.send(Command::Select(second.id()));
+        let _ = backend.commands.send(Command::QueueRemove(1));
+
+        until_within(SLOW * 2, "the other player's write to go out", || {
+            asked(&second, "/Delete") == 1
+        })
+        .await;
+        assert_eq!(
+            asked(&first, "/Delete"),
+            1,
+            "and the first player's write is still out, which is the point"
+        );
+    }
+}
+
+/// Cover walks: what an older one does once a newer one has taken over the
+/// list, what it does when the newer one has only added to it, and what one
+/// list's worth of them costs between them.
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::selection_tests::{add, backend};
+    use super::*;
+    use fake_player::Player;
+
+    /// A queue long enough that walking the whole of it is unmistakable.
+    const COVERS: u32 = 60;
+
+    /// That queue, with a cover of its own on every track.
+    ///
+    /// Distinct covers on purpose: the loader deduplicates by URL first, so a
+    /// queue of one album is one fetch however long it is — and a test built
+    /// from one would not notice a loader that never stopped.
+    fn queue_of_covers() -> bluos::Queue {
+        bluos::Queue {
+            length: COVERS,
+            songs: (0..COVERS)
+                .map(|id| bluos::QueueSong {
+                    id,
+                    image: Some(format!("/Artwork?album={id}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// How many covers the player has been asked for so far. The replies are
+    /// 404s, which is all this needs: what is counted is what was asked for.
+    fn covers_asked(player: &Player) -> usize {
+        player
+            .asked()
+            .iter()
+            .filter(|seen| seen.starts_with("/Artwork"))
+            .count()
+    }
+
+    /// A queue that is re-read or that grows starts another loader, and the
+    /// one already walking the old list has nothing left to add: it competes
+    /// for the same four artwork permits to fetch covers the newer loader is
+    /// fetching too. On a long queue there was one of them left running per
+    /// page, each walking its whole list to the end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_superseded_queue_loader_stops_where_it_is() {
+        // As `run` does, before the first client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        // Loopback is the one address the artwork rules refuse out of hand, so
+        // the player serving these covers is adopted the way a real one is.
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+        // Slow enough that the loader is certainly still walking the list when
+        // the newer one takes the number.
+        player.delay("/Artwork", Duration::from_millis(100));
+
+        let loading = tokio::spawn(load_thumbnails(
+            backend.clone(),
+            player.id(),
+            Walk::Whole,
+            Arc::default(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while covers_asked(&player) == 0 {
+            assert!(Instant::now() < deadline, "no cover was ever asked for");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // What the next read of the queue does before it starts walking.
+        backend.thumbnails.fetch_add(1, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(20), loading)
+            .await
+            .expect("the superseded loader never finished")
+            .expect("joins");
+
+        let asked = covers_asked(&player);
+        assert!(
+            asked < COVERS as usize / 2,
+            "the superseded loader walked on: {asked} of {COVERS} covers asked for"
+        );
+    }
+
+    /// And it stops when it is superseded, not when its next fetch happens to
+    /// return.
+    ///
+    /// The generation is only read between completions, so a walk whose player
+    /// accepts connections and then says nothing held up to six requests and
+    /// their share of the four artwork permits until one of them timed out —
+    /// twenty seconds during which the newer walk, fetching the covers
+    /// actually on screen, could be starved of every permit. Starting a walk
+    /// aborts the one it replaces instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_walk_that_is_replaced_gives_its_permits_back_at_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+        // A player that takes the request and then says nothing for longer
+        // than anybody is willing to wait, which is the case the permits are
+        // held through.
+        player.delay("/Artwork", Duration::from_secs(30));
+
+        backend.walk_queue(player.id(), Walk::Whole);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while covers_asked(&player) == 0 {
+            assert!(Instant::now() < deadline, "no cover was ever asked for");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = {
+            let slot = backend.queue_walk.lock().unwrap();
+            assert_eq!(slot.running.len(), 1, "the walk registered itself");
+            slot.running[0].stop.clone()
+        };
+
+        // The next read of the queue, while every one of those requests is
+        // still outstanding.
+        backend.walk_queue(player.id(), Walk::Whole);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !first.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the replaced walk was still holding its fetches"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A page of queue does not send the walk back to track zero.
+    ///
+    /// `grow_queue` appends, so a walk starting from the top re-derives every
+    /// URL above the rows that just arrived — and the claim that those cost
+    /// nothing stops being true past the first page, since the memory cache is
+    /// 256 entries shared with the browse tiles and the sleeve while a queue
+    /// window is 500 tracks. The rows on screen are also at the end of that
+    /// walk, so they fill last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grown_queue_walks_on_rather_than_starting_again() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+
+        // The page that just arrived is the last ten tracks of it.
+        let had = COVERS as usize - 10;
+        load_thumbnails(
+            backend.clone(),
+            player.id(),
+            Walk::From(had),
+            Arc::default(),
+        )
+        .await;
+
+        let asked = covers_asked(&player);
+        assert!(
+            asked <= 10,
+            "the walk went back over the covers a previous one had: \
+             {asked} asked for where ten arrived"
+        );
+        assert!(asked > 0, "and it did fetch the rows that arrived");
+    }
+
+    /// Wait for every cover in `queue_of_covers` to have been asked for, or
+    /// say how far it got.
+    ///
+    /// `covers` is what the whole list comes to. Generous on time because the
+    /// covers are deliberately slow here and only four fetch permits exist;
+    /// what is being measured is whether the walk stops, not how fast it is.
+    async fn walked_it_all(player: &Player, covers: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while covers_asked(player) < covers {
+            assert!(
+                Instant::now() < deadline,
+                "the walk above the page stopped where it was: \
+                 {} of {covers} covers asked for",
+                covers_asked(player)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until a walk is under way but nowhere near done.
+    async fn walking(player: &Player) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while covers_asked(player) == 0 {
+            assert!(Instant::now() < deadline, "no cover was ever asked for");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A queue page does not stop the walk covering the rows above it.
+    ///
+    /// The two numbers a page carries are not the same number: `had` is where
+    /// the rows the caller held end, and the walk already running is somewhere
+    /// well before that. Stopping it and starting at `had` left every track
+    /// between the two with nobody fetching for it — and `publish_queue` draws
+    /// art out of the memory cache alone, so those rows stayed blank until the
+    /// queue was re-read, which for a queue being scrolled is the rest of the
+    /// session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_page_leaves_the_walk_above_it_running() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+        // Slow enough that the page below certainly arrives mid-walk, which is
+        // the whole case: a player serving covers in a couple of hundred
+        // milliseconds is still near the top of a long queue when the user
+        // reaches the bottom of what is on screen.
+        player.delay("/Artwork", Duration::from_millis(50));
+
+        backend.walk_queue(player.id(), Walk::Whole);
+        walking(&player).await;
+
+        // The page, as `fetch_more_queue` grafts it on: ten more tracks, and
+        // the walk for them starts where the rows the caller held ended.
+        const PAGE: u32 = 10;
+        {
+            let mut registry = backend.registry.lock().unwrap();
+            let queue = registry
+                .get_mut(&player.id())
+                .expect("the player is still there")
+                .queue
+                .as_mut()
+                .expect("the queue is still there");
+            queue
+                .songs
+                .extend((COVERS..COVERS + PAGE).map(|id| bluos::QueueSong {
+                    id,
+                    image: Some(format!("/Artwork?album={id}")),
+                    ..Default::default()
+                }));
+            queue.length = COVERS + PAGE;
+        }
+        backend.walk_queue(player.id(), Walk::From(COVERS as usize));
+
+        walked_it_all(&player, (COVERS + PAGE) as usize).await;
+    }
+
+    /// The same for a browse page, which is the common path: a library list
+    /// whose first page does not fill the pane asks for the next one as soon
+    /// as its rows are laid out, so the walk that was started for page one is
+    /// only a few covers in when page two lands.
+    ///
+    /// Nothing bumps `era` on a page — only leaving the screen does — so
+    /// before the abort existed the first walk ran on to the end of its own
+    /// page and the gap could not open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browse_page_leaves_the_walk_above_it_running() {
+        use bluos::screen::Section;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // A cover on every row and no two the same, so a walk that stops early
+        // shows up as covers nobody asked for. The image source is the
+        // player's own artwork endpoint, which is what keeps the glyph reading
+        // off these rows: a row the player sent a picture for is drawn with
+        // it.
+        let tile = |id: u32| bluos::screen::Item {
+            title: Some(format!("Album {id}")),
+            image: Some(format!("/Artwork?album={id}")),
+            ..Default::default()
+        };
+        backend.browsing.lock().unwrap().trail.push(Crumb {
+            uri: "/ui/browseGrouped?type=Album".to_owned(),
+            screen: Screen {
+                sections: vec![Section {
+                    paged: true,
+                    items: (0..COVERS).map(tile).collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            query: None,
+            page: COVERS,
+        });
+
+        player.delay("/Artwork", Duration::from_millis(50));
+
+        backend.walk_browse(player.id(), Walk::Whole);
+        walking(&player).await;
+
+        // The page arriving, as `grow_screen` grafts it on: appended to the
+        // section already on screen, and walked from where those rows ended.
+        const PAGE: u32 = 10;
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            let screen = browsing.trail.last_mut().expect("the crumb is still on");
+            let rows = &mut screen.screen.sections[0].items;
+            rows.extend((COVERS..COVERS + PAGE).map(tile));
+        }
+        backend.walk_browse(player.id(), Walk::From(COVERS as usize));
+
+        walked_it_all(&player, (COVERS + PAGE) as usize).await;
+    }
+
+    /// A list being paged does not collect a walk per page.
+    ///
+    /// Nothing retired one: a page deliberately supersedes nothing, so a queue
+    /// scrolled twenty pages against a player whose covers are slow had
+    /// twenty-one walks alive at once. Each held six requests against the four
+    /// artwork permits, so the page somebody had just scrolled to queued
+    /// behind every older walk and filled last — which is the symptom the skip
+    /// was added to remove — and each rebuilt the whole model on its own
+    /// clock. The oldest stand down instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_list_paged_over_and_over_keeps_only_the_newest_walks() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(queue_of_covers());
+        // A player that takes the request and then says nothing, so no walk
+        // ever reaches the end of its own rows: what is still registered is
+        // what was kept rather than what happened not to have finished.
+        player.delay("/Artwork", Duration::from_secs(30));
+
+        backend.walk_queue(player.id(), Walk::Whole);
+        walking(&player).await;
+        let oldest = backend.queue_walk.lock().unwrap().running[0].stop.clone();
+
+        // Twenty pages, as scrolling a long queue asks for them: each grafted
+        // below the rows the last one brought.
+        const PAGES: usize = 20;
+        for page in 1..=PAGES {
+            backend.walk_queue(player.id(), Walk::From(page * 2));
+        }
+
+        // Waited for rather than read straight away: the ceiling is applied by
+        // each walk as it works out its rows, so twenty pages grafted on in
+        // one synchronous stretch are all registered for as long as it takes
+        // the runtime to poll them. See [`trim_walks`] for why it is not
+        // applied from here, where none of them has listed anything yet.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let kept = backend.queue_walk.lock().unwrap().running.len();
+            if kept <= WALKS_AT_ONCE {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a walk was kept per page: {kept} of {} still registered",
+                PAGES + 1
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // And the ones let go were stopped rather than merely forgotten. A
+        // forgotten walk is the expensive case: it keeps its requests and its
+        // share of the permits for a whole fetch timeout against exactly this
+        // player.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !oldest.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the oldest walk was dropped from the list but left running"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// And the rows those walks were stopped part way through still arrive.
+    ///
+    /// The ceiling was reasoned about as though a newer walk covered
+    /// everything past its own start, which is not what a walk covers: `done`
+    /// skips the rows the walk above it was given, so each one has its own
+    /// page and no other. Stopping one therefore abandoned the rest of its
+    /// page, and nothing asks again while the list is up — both publishes draw
+    /// from the memory cache alone. Measured in the rig, one flick of a wheel
+    /// chained seventeen pages and left rows 106 to 799 on the placeholder
+    /// glyph for as long as the screen stayed open, scrolling back into them
+    /// included.
+    ///
+    /// Paged here faster than the covers come back, which is the case that
+    /// chains pages: every one of them is stopped for room except the last
+    /// few, so a walk that takes what it is handed is the only way the middle
+    /// of the list is ever fetched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_a_stopped_walk_had_not_reached_are_still_fetched() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player was just added")
+            .queue = Some(bluos::Queue::default());
+
+        // Twenty pages, which is seventeen more than the list keeps.
+        const PAGE: u32 = 10;
+        const PAGES: u32 = 20;
+        const TRACKS: u32 = PAGE * PAGES;
+        // Slow enough that no page finishes before the next lands: a cover
+        // apiece on four permits is fifty at a time at best, against two
+        // hundred rows.
+        player.delay("/Artwork", Duration::from_millis(40));
+
+        for page in 0..PAGES {
+            let had = {
+                let mut registry = backend.registry.lock().unwrap();
+                let queue = registry
+                    .get_mut(&player.id())
+                    .expect("the player is still there")
+                    .queue
+                    .as_mut()
+                    .expect("the queue is still there");
+                let had = queue.songs.len();
+                queue
+                    .songs
+                    .extend((page * PAGE..(page + 1) * PAGE).map(|id| bluos::QueueSong {
+                        id,
+                        image: Some(format!("/Artwork?album={id}")),
+                        ..Default::default()
+                    }));
+                queue.length = queue.songs.len() as u32;
+                had
+            };
+            // The first read of the queue, then a page at a time onto it.
+            backend.walk_queue(
+                player.id(),
+                if page == 0 {
+                    Walk::Whole
+                } else {
+                    Walk::From(had)
+                },
+            );
+        }
+
+        // Distinct covers, not requests: a row that was in flight when its
+        // walk was stopped is asked for twice, and what has to hold is that
+        // every row is asked for at all.
+        let wanted: std::collections::BTreeSet<String> = (0..TRACKS)
+            .map(|id| format!("/Artwork?album={id}"))
+            .collect();
+        let seen = |player: &Player| -> std::collections::BTreeSet<String> {
+            player
+                .asked()
+                .into_iter()
+                .filter(|path| path.starts_with("/Artwork"))
+                .collect()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let asked = seen(&player);
+            if wanted.is_subset(&asked) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} of {TRACKS} covers were never asked for, the first at row {:?}",
+                wanted.difference(&asked).count(),
+                wanted.difference(&asked).next()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Stopping a walk leaves it the row slots its fetches are about to write.
+    ///
+    /// `abort` lands at the stopped walk's next await, and it has up to six
+    /// fetches outstanding on other worker threads; each of them strikes its
+    /// own row off by index when it returns. Harvesting the rows by taking the
+    /// vector left every one of those indices pointing past the end — and the
+    /// two threads meet on the very mutex that orders them, the walk's write
+    /// queueing behind the guard the trim holds while it takes them, so the
+    /// losing order is the ordinary one. The release profile sets
+    /// `panic = "abort"`, so what the user sees is the app closing under a
+    /// scroll.
+    #[tokio::test]
+    async fn stopping_a_walk_empties_its_rows_without_shrinking_them() {
+        const EACH: u32 = 4;
+
+        let mut walks = Walks::default();
+        let mut lists = Vec::new();
+        // One walk more than the list keeps, so exactly the oldest is stopped.
+        for walk in 0..=WALKS_AT_ONCE as u32 {
+            let left: Rows = Arc::default();
+            {
+                let mut owed = left.lock().unwrap();
+                // As a walk marks itself on its first poll: only a walk that
+                // has listed its rows is a candidate for the ceiling.
+                owed.listed = true;
+                owed.rows = (0..EACH)
+                    .map(|row| Some((format!("/Artwork?album={walk}-{row}"), THUMB_SIZE)))
+                    .collect();
+            }
+            walks.running.push(Walking {
+                // Never polled, so never finished: what is being tested is the
+                // harvest and not which walk the ceiling picks.
+                stop: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                left: left.clone(),
+            });
+            lists.push(left);
+        }
+
+        let mine = lists
+            .last()
+            .expect("a walk of my own is registered")
+            .clone();
+        trim_walks(&mut walks, &mine);
+
+        let oldest = lists[0].lock().unwrap();
+        assert_eq!(
+            oldest.rows.len(),
+            EACH as usize,
+            "the stopped walk's row numbers no longer point at rows, so a fetch \
+             returning under it writes past the end of the vector"
+        );
+        assert!(
+            oldest.rows.iter().all(Option::is_none),
+            "and they are cleared, so nothing is fetched twice"
+        );
+        assert!(oldest.stopped, "the walk is told it was stopped");
+        assert_eq!(
+            walks.carried.len(),
+            EACH as usize,
+            "the rows it owed are the list's debt now"
+        );
+    }
+
+    /// A walk that has been stopped does not become the holder of that debt.
+    ///
+    /// It is a few awaits from being dropped, so every row it adopts is
+    /// dropped with it — and on a list long enough to page that is the whole
+    /// backlog, hundreds of rows that nothing asks for again while the screen
+    /// is up. Reachable because `listed` is set before the ceiling is applied:
+    /// a walk waiting on the list lock is already a candidate, and in the
+    /// burst this is all for it is the oldest one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_walk_does_not_take_on_the_lists_debt() {
+        let artwork = Arc::new(Artwork::new(reqwest::Client::new(), Arc::default()));
+
+        // The debt of the walks already stopped, which is what must survive.
+        let list: Arc<Mutex<Walks>> = Arc::default();
+        let owing: Vec<(String, u32)> = (0..8)
+            .map(|row| {
+                (
+                    format!("http://player.invalid/Artwork?album={row}"),
+                    THUMB_SIZE,
+                )
+            })
+            .collect();
+        list.lock().unwrap().carried = owing.clone();
+
+        // A walk stopped the moment it listed its rows: nothing of its own
+        // left, which is exactly the state that reaches for `carried`.
+        let left: Rows = Arc::default();
+        left.lock().unwrap().stopped = true;
+
+        walk_covers(
+            artwork,
+            Vec::new(),
+            left.clone(),
+            || true,
+            || {},
+            list.clone(),
+            Duration::from_millis(400),
+        )
+        .await;
+
+        assert_eq!(
+            list.lock().unwrap().carried,
+            owing,
+            "a walk on its way out took the list's backlog with it, and nothing \
+             re-derives those URLs while the list is up"
+        );
+        assert!(
+            left.lock().unwrap().rows.is_empty(),
+            "and it did not write them into rows nobody will read"
+        );
+    }
+
+    /// The redraw clock belongs to the list, not to each walk over it.
+    ///
+    /// `publish_queue` and `publish_browse` rebuild every row, which is why
+    /// the interval exists at all. Held as a local in `walk_covers` it bounded
+    /// how often one walk asked, and a list being paged has a walk per page:
+    /// five over one queue rebuilt it five times an interval, cloning every
+    /// row under the registry lock the status poll and every transport press
+    /// also need.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_list_redraws_at_its_own_rate_however_many_walks_it_has() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        backend.artwork.remember_player(player.address().ip());
+        let client = backend
+            .with_entry(player.id(), |e| e.client.clone())
+            .expect("the player was just added");
+
+        const WALKS: u32 = 5;
+        // Far more covers than four permits can get through in the window
+        // below, so none of these walks reaches its end: what is counted is
+        // the throttle, not the unthrottled draw a walk finishing does.
+        const EACH: u32 = 5_000;
+        const EVERY: Duration = Duration::from_millis(300);
+        const WINDOW: Duration = Duration::from_millis(1500);
+        player.delay("/Artwork", Duration::from_millis(5));
+
+        let list: Arc<Mutex<Walks>> = Arc::default();
+        let drawn = Arc::new(AtomicUsize::new(0));
+        let mut running = Vec::new();
+        for walk in 0..WALKS {
+            // No URL twice, here or between walks: a cover already in memory
+            // is not a fetch, and it is between fetches that a walk asks
+            // whether the list is due a redraw.
+            let urls = (0..EACH)
+                .map(|n| {
+                    (
+                        client.image_url(&format!("/Artwork?album={walk}-{n}")),
+                        THUMB_SIZE,
+                    )
+                })
+                .collect();
+            let drawn = drawn.clone();
+            running.push(tokio::spawn(walk_covers(
+                backend.artwork.clone(),
+                urls,
+                Arc::default(),
+                || true,
+                move || {
+                    drawn.fetch_add(1, Ordering::Relaxed);
+                },
+                list.clone(),
+                EVERY,
+            )));
+        }
+
+        tokio::time::sleep(WINDOW).await;
+        let drew = drawn.load(Ordering::Relaxed);
+        for walk in running {
+            walk.abort();
+        }
+
+        // Five walks with a timer apiece draw five times an interval; one
+        // clock between them draws once. Twice the interval's worth is loose
+        // enough for a slow machine and nowhere near five times it: what must
+        // not hold is the rate scaling with the pages in flight.
+        let ceiling = 2 * (WINDOW.as_millis() / EVERY.as_millis()) as usize;
+        assert!(
+            drew <= ceiling,
+            "the list redrew {drew} times in {WINDOW:?}, which is a rate per walk and not per list"
+        );
+        assert!(drew > 1, "and it did redraw while the walks ran: {drew}");
+    }
+
+    /// Backing out of a screen stops the walks over it where they stand.
+    ///
+    /// Back bumps `era`, and a walk reads `era` between fetches — so what it
+    /// actually does on a player that accepts connections and then says
+    /// nothing is hold six requests and their share of the four artwork
+    /// permits for a whole fetch timeout, starving the screen that was backed
+    /// out to. Opening a screen gets the abort for free because it replaces
+    /// the list; leaving one has to ask for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backing_out_of_a_screen_stops_its_cover_walks() {
+        use bluos::screen::Section;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, commands) = backend(&http);
+        add(&backend, &player, &http);
+        tokio::spawn(run_commands(commands, backend.clone(), None, http.clone()));
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // Two screens deep, so Back is the one level that leaves a screen
+        // rather than a pane. The covers are on the screen being left.
+        let tile = |id: u32| bluos::screen::Item {
+            title: Some(format!("Album {id}")),
+            image: Some(format!("/Artwork?album={id}")),
+            ..Default::default()
+        };
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            browsing.trail.push(Crumb {
+                uri: "/ui/Configuration".to_owned(),
+                screen: Screen::default(),
+                query: None,
+                page: 0,
+            });
+            browsing.trail.push(Crumb {
+                uri: "/ui/browseGrouped?type=Album".to_owned(),
+                screen: Screen {
+                    sections: vec![Section {
+                        paged: true,
+                        items: (0..COVERS).map(tile).collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                query: None,
+                page: COVERS,
+            });
+        }
+        player.delay("/Artwork", Duration::from_secs(30));
+
+        // The screen, and a page of it, so there is more than one walk to
+        // leave behind — which is what makes this worth aborting.
+        backend.walk_browse(player.id(), Walk::Whole);
+        walking(&player).await;
+        backend.walk_browse(player.id(), Walk::From(10));
+        let left: Vec<_> = backend
+            .browse_walk
+            .lock()
+            .unwrap()
+            .running
+            .iter()
+            .map(|walk| walk.stop.clone())
+            .collect();
+        assert_eq!(left.len(), 2, "both walks registered themselves");
+
+        let _ = backend.commands.send(Command::BrowseBack);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while left.iter().any(|walk| !walk.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "a walk over the screen that was left is still holding its fetches"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.browsing.lock().unwrap().trail.len(),
+            1,
+            "and Back did leave the screen"
+        );
     }
 }
