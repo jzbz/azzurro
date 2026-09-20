@@ -1708,6 +1708,31 @@ fn action_label(name: &str) -> String {
     }
 }
 
+/// The tier for one queue row, from whichever document knows more about it.
+///
+/// Two answer this and they disagree. `/Playlist` carries what the library
+/// wrote down when it scanned the file; `/Status` carries what the decoder
+/// found on opening the stream, and the second is the better informed — a FLAC
+/// the library filed as `cd` comes back from the decoder as `mqaAuthored`, with
+/// the stream's own original sample rate beside it, because opening it is how
+/// MQA authoring is discovered at all. Drawn from the queue document alone, one
+/// track wore two badges at once: MQA under the sleeve and CD on its own row.
+///
+/// The status describes the track being played and no other, so only that row
+/// takes it. Every other row keeps the library's word, which is the whole of
+/// what is known about a file nothing has opened.
+fn row_quality<'a>(library: &'a str, status: &'a bluos::Status, playing: bool) -> &'a str {
+    if !playing {
+        return library;
+    }
+    status
+        .quality
+        .as_deref()
+        .map(str::trim)
+        .filter(|decoded| !decoded.is_empty())
+        .unwrap_or(library)
+}
+
 /// The badge's word for a tier the player names.
 ///
 /// `cd` and `mqa` are already what anyone writes, and `hd` is this player's
@@ -5273,6 +5298,13 @@ impl Backend {
                         line.hash(&mut hash);
                         cursor_row.hash(&mut hash);
                         live.hash(&mut hash);
+                        // The playing row draws the decoder's tier rather than
+                        // the library's, and the decoder can change its mind
+                        // about a track it is already playing — MQA authoring
+                        // is found by reading the stream, not by looking at the
+                        // queue. Without this the row keeps the word it was
+                        // built with until something else about the queue moves.
+                        status.quality.hash(&mut hash);
                         for song in &queue.songs {
                             song.id.hash(&mut hash);
                             song.title.hash(&mut hash);
@@ -5327,7 +5359,11 @@ impl Backend {
                                 title: song.title.clone().unwrap_or_default(),
                                 artist: song.artist.clone().unwrap_or_default(),
                                 duration: song.duration().unwrap_or_default(),
-                                quality: quality_label(song.quality.as_deref().unwrap_or_default()),
+                                quality: quality_label(row_quality(
+                                    song.quality.as_deref().unwrap_or_default(),
+                                    status,
+                                    at_cursor && live,
+                                )),
                                 cursor: at_cursor,
                                 live: at_cursor && live,
                                 cover,
@@ -18319,6 +18355,34 @@ mod tests {
         // which is the point of the fallback and worth keeping pinned.
         assert_eq!(quality_label("dsd"), "DSD");
         assert_eq!(quality_label("128000"), "128k");
+    }
+
+    #[test]
+    fn the_playing_row_takes_the_decoders_word_and_the_rest_keep_the_librarys() {
+        // The track that prompted this: the library filed the file as cd, and
+        // the decoder found MQA authoring in the stream. Both are the player's
+        // own answers, from /Playlist and /Status, and they disagree.
+        let status = bluos::Status {
+            quality: Some("mqaAuthored".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(row_quality("cd", &status, true), "mqaAuthored");
+        assert_eq!(quality_label(row_quality("cd", &status, true)), "MQA");
+
+        // Every other row is a file nothing has opened, so the library's word
+        // is the whole of what is known about it.
+        assert_eq!(row_quality("cd", &status, false), "cd");
+
+        // A player that says nothing about what it is decoding leaves the row
+        // as the library filed it rather than blanking the badge.
+        let quiet = bluos::Status::default();
+        assert_eq!(row_quality("cd", &quiet, true), "cd");
+        let blank = bluos::Status {
+            quality: Some("   ".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(row_quality("hd", &blank, true), "hd");
     }
 
     #[test]
