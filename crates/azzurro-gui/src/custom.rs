@@ -192,7 +192,7 @@ pub fn load() -> Vec<Station> {
     STORE.read().map(|text| read(&text)).unwrap_or_default()
 }
 
-/// Whether the file is there and could not be read.
+/// Whether a station typed in now will still be here at the next start.
 ///
 /// [`load`] answers an unreadable file the same way it answers a missing one,
 /// with an empty list, because that is what the pane can draw either way — but
@@ -200,7 +200,11 @@ pub fn load() -> Vec<Station> {
 /// is kept nowhere else: not on the player, not in the official app, not on
 /// another machine. So the pane asks, once, as it comes up, and says so.
 ///
-/// Answers for the last [`load`], which is what opening the pane does.
+/// An unreadable file is only one of the ways the answer is no — a machine
+/// with no config directory and a write that did not land are the others, and
+/// they are worth the same word for the same reason. See [`Store::sealed`].
+///
+/// [`Store::sealed`]: crate::store::Store::sealed
 pub fn sealed() -> bool {
     STORE.sealed()
 }

@@ -13,7 +13,7 @@
 //! use bluos::{Client, Discovery, discovery::DEFAULT_SWEEP};
 //!
 //! let discovery = Discovery::bind()?;
-//! for announce in discovery.sweep(DEFAULT_SWEEP).await? {
+//! for announce in discovery.sweep(DEFAULT_SWEEP).await {
 //!     let Some(player) = announce.player() else { continue };
 //!     let client = Client::new(bluos::DeviceId::new(announce.address, player.port()))?;
 //!

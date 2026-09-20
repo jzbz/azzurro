@@ -41,17 +41,24 @@ pub fn load() -> Orders {
     STORE.read().map(|text| parse(&text)).unwrap_or_default()
 }
 
-/// Whether the file is there and could not be read, so nothing arranged this
-/// run will be written back over it.
+/// Whether nothing arranged this run will be in the file at the next start.
 ///
 /// Not to interrupt anyone with, the way the hand-typed stations are: an
 /// arrangement is a drag or two to make again. It is here because Customize
 /// Home says out loud what became of the arrangement it was given, and
-/// "Home rearranged" is a claim about the next start as well as this one. A
-/// sealed store keeps the file for repair and writes nothing for the life of
-/// the run, so the claim has to know.
+/// "Home rearranged" is a claim about the next start as well as this one, so
+/// the claim has to know.
 ///
-/// Answers for the last [`load`], which is the one at startup.
+/// Three ways for it to be true and one sentence for all of them; see
+/// [`Store::sealed`], which is where they are told apart. The file could not
+/// be read, so it is kept for repair and written to by nothing; or there is no
+/// config directory on this machine, so there is nowhere to write at all; or
+/// the last write did not land. Only the first of those was asked about here
+/// once, which left the other two claiming an arrangement that would not
+/// survive the next start — the same broken promise this wording exists to
+/// close.
+///
+/// [`Store::sealed`]: crate::store::Store::sealed
 pub fn sealed() -> bool {
     STORE.sealed()
 }

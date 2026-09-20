@@ -65,6 +65,12 @@ winresource = "0.1.31"
 slint-build = "1.17"
 
 [dev-dependencies]
+# The paused clock, and nothing else. The upgrade watch measures twenty
+# minutes of patience and five of silence, which no test can sit through and
+# none should: `start_paused` runs the whole of it against the runtime's own
+# clock in the time the refused connections take. A dev-dependency feature, so
+# it reaches the tests and never the shipped binary.
+tokio = { workspace = true, features = ["test-util"] }
 # Already in the tree by way of slint's backend selector, and already in
 # packaging/cargo-sources.json, so naming it here costs no download and no
 # regeneration of the offline source list.

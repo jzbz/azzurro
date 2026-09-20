@@ -135,6 +135,28 @@ impl Screen {
             .or_else(|| self.sections.len().checked_sub(1))
     }
 
+    /// How many of the screen's items stand at or above the window, counted
+    /// flat and in screen order.
+    ///
+    /// Where the next page's rows will land, since a page is grafted into the
+    /// window's own section: everything after that section — a shelf under a
+    /// list — keeps its place behind the new rows rather than being pushed
+    /// down by them. A caller measuring the screen instead lands short by
+    /// whatever follows the list, and a walk skipping that many items misses
+    /// the first rows that just arrived.
+    ///
+    /// Named rather than spelled out where it is needed because it is the one
+    /// number that ties a page to the rows it brought, and the two halves —
+    /// this and [`Screen::window`] — have to agree on which section that is.
+    pub fn window_end(&self) -> usize {
+        self.window().map_or(0, |at| {
+            self.sections[..=at]
+                .iter()
+                .map(|section| section.items.len())
+                .sum()
+        })
+    }
+
     /// Take a page's rows out of it, to be put onto the screen it continues.
     ///
     /// Only the counted section's where there is one. A page asked for by
@@ -2857,6 +2879,16 @@ mod tests {
         assert_eq!(screen.sections.len(), 3);
         assert_eq!(screen.window(), Some(1), "the songs, not the trailing row");
         assert_eq!(screen.paged().map(|s| s.items.len()), Some(30));
+
+        // And where the next page's rows will land, which is the end of the
+        // songs rather than the end of the screen: the shelf under them keeps
+        // its place behind whatever arrives. Measuring the screen instead is
+        // one row too far here and however long the shelf is in general, which
+        // is exactly how far past the new rows a walk skipping by this number
+        // would start.
+        let whole: usize = screen.sections.iter().map(|s| s.items.len()).sum();
+        assert_eq!(screen.window_end(), 33);
+        assert_eq!(whole, 34, "and the shelf is no part of it");
 
         // A page asked for by number is the whole screen again. Only its songs
         // are the continuation.

@@ -81,6 +81,15 @@ pub struct Store {
     /// Whether the file was there and could not be read. See the note above:
     /// a sealed store writes nothing.
     sealed: AtomicBool,
+    /// Whether the last write of this file did not reach the disk.
+    ///
+    /// Separate from `sealed` because it must not stop the next write: a full
+    /// disk empties, a directory that could not be made can be made later, and
+    /// the body is still staged for whoever tries next. It is here so that
+    /// [`Self::sealed`] can answer the question its callers actually ask —
+    /// whether what they are about to promise will survive the next start —
+    /// rather than only the one about reading.
+    failed: AtomicBool,
 }
 
 impl Store {
@@ -101,6 +110,7 @@ impl Store {
             pending: Mutex::new(None),
             writing: Mutex::new(()),
             sealed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -144,16 +154,35 @@ impl Store {
         }
     }
 
-    /// Whether the file is there and could not be read, so that nothing this
-    /// run does will be written back over it.
+    /// Whether nothing this run puts in this file will be in it at the next
+    /// start.
     ///
-    /// Answers for the last [`Self::read`]. For the one caller that has to say
-    /// it out loud: the stations are typed in by hand and kept nowhere else,
-    /// so a list that cannot be written is worth a word before more is typed
-    /// into it. The others rebuild themselves and are not worth interrupting
-    /// anyone over.
+    /// Three ways for that to be true, and a caller saying so out loud cannot
+    /// tell them apart — which is the point: what it has to say is the same
+    /// sentence either way.
+    ///
+    /// The file is there and could not be read, so nothing will be written
+    /// back over it; that one answers for the last [`Self::read`]. Or there is
+    /// no config directory on this machine at all, so `path` is `None` and
+    /// [`Self::flush`] has nowhere to go — a store with nowhere to write can
+    /// never keep anything. Or the last write was attempted and did not land,
+    /// which says the next one probably will not either.
+    ///
+    /// That last one is a report of what already happened rather than a
+    /// promise about what will: the write runs off the calling thread, so the
+    /// failure it describes is the one before this. The first arrangement made
+    /// over a full disk is still claimed; the second is not. Better than never
+    /// saying it, and cheaper than holding the toast for a round trip to the
+    /// disk.
+    ///
+    /// For the callers that have to say it out loud: the stations are typed in
+    /// by hand and kept nowhere else, so a list that cannot be written is
+    /// worth a word before more is typed into it, and Customize Home makes a
+    /// claim about the next start every time it rearranges a screen.
     pub fn sealed(&self) -> bool {
-        self.sealed.load(Ordering::Relaxed)
+        self.path.is_none()
+            || self.sealed.load(Ordering::Relaxed)
+            || self.failed.load(Ordering::Relaxed)
     }
 
     /// Say what the file should hold, without writing it.
@@ -239,12 +268,20 @@ impl Store {
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             tracing::debug!("cannot make {}: {e}", parent.display());
+            // Written down rather than only logged, so that whoever is about
+            // to promise this file will hold something can find out that the
+            // last attempt to make it hold anything failed. The body stays
+            // staged and the next `sync` still tries, which is why this is not
+            // the seal above. See [`Self::sealed`].
+            self.failed.store(true, Ordering::Relaxed);
             return;
         }
         if let Err(e) = self.write(path, &body) {
             tracing::debug!("cannot write {}: {e}", path.display());
+            self.failed.store(true, Ordering::Relaxed);
             return;
         }
+        self.failed.store(false, Ordering::Relaxed);
 
         // On the disk, so it is the file's to answer with rather than this
         // run's — unless something newer was staged while the write was out,
@@ -537,6 +574,56 @@ mod tests {
             store.read().as_deref(),
             Some("something else\n"),
             "what was typed is still this session's, unwritable or not"
+        );
+    }
+
+    #[test]
+    fn a_store_with_nowhere_to_write_says_so() {
+        // A machine with no config directory at all. Nothing is read, nothing
+        // is written, and the one thing a caller can do about it is say so
+        // before promising that an arrangement will still be there tomorrow.
+        // Reported as a seal because it is the same sentence out loud: what
+        // was typed in is this session's and no more than that.
+        let store = Store::at(None, Durability::Rename);
+        assert!(store.read().is_none());
+        assert!(
+            store.sealed(),
+            "a store with nowhere to write can never keep anything"
+        );
+
+        // And what is typed into it is still the session's, exactly as over an
+        // unreadable file.
+        store.save_here("something\n".to_owned());
+        assert_eq!(store.read().as_deref(), Some("something\n"));
+    }
+
+    #[test]
+    fn a_write_that_could_not_be_made_says_so_too() {
+        // The third way a file ends the run holding nothing this run put in
+        // it: it was readable, there was somewhere to put it, and the write
+        // itself did not land. Arranged as above, by putting a directory where
+        // the temp file wants to be.
+        let dir = Dir::new("said");
+        let store = dir.store(Durability::Rename);
+        assert!(!store.sealed(), "nothing has gone wrong yet");
+
+        std::fs::create_dir_all(temp_name(&dir.file())).expect("the temp name taken");
+        store.save_here("first\n".to_owned());
+        assert!(
+            store.sealed(),
+            "a write that did not land is a file that will not hold what it \
+             was given"
+        );
+
+        // And it is a report rather than a seal: the body is still staged and
+        // the next write still tries, which is what makes the file readable
+        // again at all.
+        std::fs::remove_dir(temp_name(&dir.file())).expect("the temp name freed");
+        store.save_here("second\n".to_owned());
+        assert_eq!(std::fs::read_to_string(dir.file()).unwrap(), "second\n");
+        assert!(
+            !store.sealed(),
+            "a write that landed answers for the ones before it"
         );
     }
 

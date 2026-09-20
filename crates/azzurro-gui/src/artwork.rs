@@ -63,7 +63,7 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// is fixed and each entry is capped by the size that was asked for. Whether
 /// tens of megabytes of decoded pixels is the right price for not re-decoding
 /// is a separate question from recording what the price is.
-const MEMORY_CACHE: usize = 256;
+pub(crate) const MEMORY_CACHE: usize = 256;
 
 /// Fetches allowed at once. Enough to fill a list quickly, few enough that
 /// opening a long queue does not put thirty connections into a speaker that is
@@ -347,12 +347,83 @@ impl Drop for Fetching<'_> {
     }
 }
 
-pub struct Artwork {
-    http: reqwest::Client,
+/// Where a decoded cover lands: the two caches it fills and the count that
+/// announces it.
+///
+/// Together behind one `Arc` rather than three fields on [`Artwork`], because
+/// the writing is done by the blocking closure that decodes and not by the
+/// future that awaited it. The two are not the same lifetime: a walk stood
+/// down for a re-read drops up to six `get` futures where they stand, and a
+/// blocking task has no cancellation point, so those decodes run on and keep
+/// all three [`CONCURRENT_DECODES`] permits either way. Written from inside,
+/// the work they finish is in the cache when the walk that replaced them
+/// looks — which is the same cover, since it is walking the same list — and
+/// what the abort cost is the future rather than the decode. Written by the
+/// caller, it went on the floor: the new walk queued behind three decodes
+/// whose output had been dropped and then read the same bytes off the disk
+/// and decoded them a second time, on exactly the player whose covers are
+/// large enough for the permit limit to matter.
+struct Landing {
+    /// Decoded images, by where they came from and the size they were scaled
+    /// to. See [`Key`].
     memory: Mutex<LruCache<Key, Pixels>>,
     /// One color per image, computed once when it is decoded. Keyed by URL
     /// alone: the same cover gives the same color at any size.
     tints: Mutex<LruCache<String, [u8; 3]>>,
+    /// Decoded images that have landed in `memory` since the process started.
+    ///
+    /// A number that only goes up, so anything drawing from the cache can ask
+    /// "has anything at all decoded since I last looked?" for the price of one
+    /// atomic load. The queue's memo needs that as a gate: what it used to hash
+    /// was [`Artwork::cached`] per row, which is the memory lock taken once a
+    /// track and answers a narrower question at five hundred times the cost.
+    ///
+    /// It is only a gate, because it counts every decode in the process — a
+    /// browse thumbnail, another player's sidebar card — and a queue watching
+    /// it alone is a queue rebuilt several times a second for covers that are
+    /// not its own. What arrived is asked separately, of the URLs the asker
+    /// actually named, in [`Artwork::any_decoded`].
+    arrivals: std::sync::atomic::AtomicU64,
+}
+
+impl Landing {
+    fn new() -> Self {
+        Self {
+            memory: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
+            )),
+            tints: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
+            )),
+            arrivals: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Take in a decoded cover, and the color drawn from it.
+    ///
+    /// The count goes up last, after the entry is in, so a memo that sees the
+    /// new number and rebuilds finds the picture the number is announcing.
+    fn keep(&self, url: &str, size: u32, image: &Pixels) {
+        if let Some(tint) = dominant(image) {
+            self.tints.lock().unwrap().put(url.to_owned(), tint);
+        }
+        self.memory.lock().unwrap().put(
+            Key {
+                url: url.to_owned(),
+                size,
+            },
+            image.clone(),
+        );
+        self.arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub struct Artwork {
+    http: reqwest::Client,
+    /// What a decode leaves behind, shared with the decode itself. See
+    /// [`Landing`].
+    decoded: Arc<Landing>,
     /// URLs whose bytes would not decode, so they are not asked for again.
     ///
     /// The one re-fetch in [`Self::get`] bounds itself within a single call
@@ -377,28 +448,26 @@ pub struct Artwork {
     /// Covers written since the process started. Every [`PRUNE_EVERY`] of them
     /// buys a look at the directory; see [`DISK_CACHE_FILES`].
     written: std::sync::atomic::AtomicUsize,
-    /// Decoded images that have landed in `memory` since the process started.
+    /// How many rows have asked [`Self::cached`] what is decoded.
     ///
-    /// A number that only goes up, so anything drawing from the cache can ask
-    /// "has anything at all decoded since I last looked?" for the price of one
-    /// atomic load. The queue's memo needs that as a gate: what it used to hash
-    /// was [`Self::cached`] per row, which is the memory lock taken once a
-    /// track and answers a narrower question at five hundred times the cost.
-    ///
-    /// It is only a gate, because it counts every decode in the process — a
-    /// browse thumbnail, another player's sidebar card — and a queue watching
-    /// it alone is a queue rebuilt several times a second for covers that are
-    /// not its own. What arrived is asked separately, of the URLs the asker
-    /// actually named, in [`Self::any_decoded`].
-    arrivals: std::sync::atomic::AtomicU64,
-    /// And how many rows have asked [`Self::cached`] what is decoded.
-    ///
-    /// The other side of the same story: every one of those is a turn of the
-    /// memory lock, taken while whoever is drawing holds a lock of its own.
+    /// The other side of [`Landing::arrivals`]: every one of those is a turn
+    /// of the memory lock, taken while whoever is drawing holds one of its own.
     /// The queue's memo is written so that this grows by the length of the
     /// window when the window has changed and by nothing when it has not, and
     /// a test watches the number to say so.
     peeks: std::sync::atomic::AtomicU64,
+    /// How many URLs [`Self::any_decoded`] has been handed.
+    ///
+    /// The memo that stopped taking a turn of the lock per row takes one walk
+    /// of the outstanding set instead, and that walk is the cost it added. A
+    /// test measuring only [`Self::peeks`] would be weighing what was removed
+    /// without weighing what replaced it, and the replacement is the number
+    /// that grows with a queue nothing decodes for: the memory cache is
+    /// [`MEMORY_CACHE`] entries across all three sizes and a queue window is
+    /// longer than that, so the set a full queue is short of never empties.
+    /// Counted by the length offered rather than by how far the walk got,
+    /// because the bound is what is being watched.
+    probes: std::sync::atomic::AtomicU64,
     limit: Semaphore,
     /// And the same for decoding; see [`CONCURRENT_DECODES`].
     ///
@@ -444,15 +513,10 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
-            arrivals: std::sync::atomic::AtomicU64::new(0),
             peeks: std::sync::atomic::AtomicU64::new(0),
+            probes: std::sync::atomic::AtomicU64::new(0),
             players,
-            memory: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
-            )),
-            tints: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
-            )),
+            decoded: Arc::new(Landing::new()),
             undecodable: Mutex::new(LruCache::new(
                 NonZeroUsize::new(UNDECODABLE_REMEMBERED)
                     .expect("UNDECODABLE_REMEMBERED is not zero"),
@@ -473,15 +537,10 @@ impl Artwork {
         Self {
             http,
             written: std::sync::atomic::AtomicUsize::new(0),
-            arrivals: std::sync::atomic::AtomicU64::new(0),
             peeks: std::sync::atomic::AtomicU64::new(0),
+            probes: std::sync::atomic::AtomicU64::new(0),
             players,
-            memory: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
-            )),
-            tints: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
-            )),
+            decoded: Arc::new(Landing::new()),
             undecodable: Mutex::new(LruCache::new(
                 NonZeroUsize::new(UNDECODABLE_REMEMBERED)
                     .expect("UNDECODABLE_REMEMBERED is not zero"),
@@ -513,7 +572,7 @@ impl Artwork {
             url: url.to_owned(),
             size,
         };
-        self.memory.lock().unwrap().peek(&key).cloned()
+        self.decoded.memory.lock().unwrap().peek(&key).cloned()
     }
 
     /// Whether any of `urls` is decoded at `size`, in one turn of the lock.
@@ -524,18 +583,22 @@ impl Artwork {
     /// prospect, so the walk is over the URLs a list still lacks rather than
     /// over the whole of it.
     ///
-    /// Deliberately not counted in [`Self::peeks`], which measures what the
-    /// rows cost: this is one turn of the lock for the whole list and clones
-    /// nothing. `peek` rather than `get`, for the reason given on
-    /// [`Self::cached`] — asking is not using.
+    /// Not counted in [`Self::peeks`], which measures what the rows cost:
+    /// this is one turn of the lock for the whole list and clones nothing. It
+    /// has a count of its own in [`Self::probes`] rather than none, so that
+    /// what this added is weighed on the same scale as what it took away.
+    /// `peek` rather than `get`, for the reason given on [`Self::cached`] —
+    /// asking is not using.
     pub fn any_decoded(&self, urls: &[String], size: u32) -> bool {
+        self.probes
+            .fetch_add(urls.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // One key, refilled, rather than one allocated per URL: a queue that
         // is still waiting asks this every time anything anywhere decodes.
         let mut key = Key {
             url: String::new(),
             size,
         };
-        let memory = self.memory.lock().unwrap();
+        let memory = self.decoded.memory.lock().unwrap();
         urls.iter().any(|url| {
             key.url.clear();
             key.url.push_str(url);
@@ -552,7 +615,10 @@ impl Artwork {
     /// is under test is which URLs moved and not what they look like.
     #[cfg(test)]
     pub fn note_arrival(&self, url: &str, size: u32) {
-        self.memory.lock().unwrap().put(
+        // The two fields rather than [`Landing::keep`]: a blank pixel has no
+        // dominant color worth remembering, and the tint is not what this
+        // stages.
+        self.decoded.memory.lock().unwrap().put(
             Key {
                 url: url.to_owned(),
                 size,
@@ -561,7 +627,8 @@ impl Artwork {
         );
         // After the entry is in, exactly as in `get`: a memo that sees the new
         // number goes looking for the picture it is announcing.
-        self.arrivals
+        self.decoded
+            .arrivals
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
@@ -575,6 +642,13 @@ impl Artwork {
         self.peeks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// And how many URLs the narrower question has walked. See
+    /// [`Self::probes`].
+    #[cfg(test)]
+    pub fn probes(&self) -> u64 {
+        self.probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many decoded images have landed since the process started.
     ///
     /// For a memo that draws from the cache: the number standing still is a
@@ -583,7 +657,9 @@ impl Artwork {
     /// narrower question. The number moving proves nothing on its own — see
     /// [`Self::arrivals`] and [`Self::any_decoded`].
     pub fn arrivals(&self) -> u64 {
-        self.arrivals.load(std::sync::atomic::Ordering::Acquire)
+        self.decoded
+            .arrivals
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Note that this player's own address serves art that is allowed.
@@ -696,7 +772,7 @@ impl Artwork {
     /// The color to tint a panel with behind this artwork, if it has been
     /// decoded. See [`dominant`].
     pub fn tint(&self, url: &str) -> Option<[u8; 3]> {
-        self.tints.lock().unwrap().get(url).copied()
+        self.decoded.tints.lock().unwrap().get(url).copied()
     }
 
     /// Decoded art at `size`, fetching and decoding if it is not already held.
@@ -757,9 +833,19 @@ impl Artwork {
             // however many orphans were still going — which is no bound at
             // all, and worst on exactly the player whose covers are large
             // enough for the limit to matter.
+            //
+            // What it decodes is kept from in there too, for the same reason
+            // the permit is: the work outlives the future that asked for it,
+            // and a result handed back through the join alone is a result the
+            // aborted caller drops on the floor. See [`Landing`].
             let permit = Arc::clone(&self.decoding).acquire_owned().await.ok()?;
+            let landing = Arc::clone(&self.decoded);
+            let keeping = url.to_owned();
             let out = tokio::task::spawn_blocking(move || {
                 let decoded = decode(&bytes, size);
+                if let Some(image) = &decoded {
+                    landing.keep(&keeping, size, image);
+                }
                 drop(permit);
                 decoded
             })
@@ -787,20 +873,8 @@ impl Artwork {
             }
         };
 
-        if let Some(tint) = dominant(&decoded) {
-            self.tints.lock().unwrap().put(url.to_owned(), tint);
-        }
-        self.memory.lock().unwrap().put(
-            Key {
-                url: url.to_owned(),
-                size,
-            },
-            decoded.clone(),
-        );
-        // After the entry is in, so a memo that sees the new number and
-        // rebuilds finds the picture the number is announcing.
-        self.arrivals
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Already in the cache and already counted: the decode did both
+        // before it gave this back.
         Some(decoded)
     }
 
@@ -1713,6 +1787,11 @@ mod tests {
     /// makes room for the one it announced from.
     #[test]
     fn the_allowed_addresses_are_bounded_and_given_back() {
+        // As every other test here that builds a client: the provider is
+        // process-global and `reqwest::Client::new` panics without one, so a
+        // test that leaves it to a neighbour passes or fails on the order the
+        // harness happens to run them in.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let art = Artwork::in_memory(reqwest::Client::new(), Players::default());
 
         let address = |n: usize| {
@@ -1863,21 +1942,96 @@ mod tests {
         }
 
         // The walk these belong to is replaced.
+        let before = art.arrivals();
         for walk in &decoding {
             walk.abort();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(
-            art.decoding.available_permits(),
-            0,
-            "the permits went back while the decodes were still running, so \
-             the next walk's three run alongside these three"
-        );
+        // Watched rather than timed. A fixed sleep and one look afterwards
+        // decided this on the clock: the covers are an all-zero 3072 square,
+        // which compresses to almost nothing and decodes into a 37 MB pixel
+        // write, and a fast machine can land one inside the sleep — a permit
+        // back for the right reason, read as the bug.
+        //
+        // What holds at every moment instead is the pairing. The blocking
+        // closure keeps its image before it drops its permit, so a permit that
+        // is free is a decode that has already arrived, and no more of them
+        // can be free than there are arrivals. Released at the abort, all
+        // three are free against nothing kept, and the first look says so.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            // Permits first: an arrival between the two reads may only make
+            // the count this is compared against larger, never smaller.
+            let free = art.decoding.available_permits();
+            let landed = (art.arrivals() - before) as usize;
+            assert!(
+                free <= landed,
+                "{free} permits went back against {landed} covers decoded, so \
+                 the next walk's three run alongside these three"
+            );
+            if landed == CONCURRENT_DECODES {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the decodes never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         for walk in decoding {
             let _ = walk.await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And what it decoded is kept, rather than dropped with the caller.
+    ///
+    /// The decode runs on after the abort either way — that is what the test
+    /// above is about — so the only question is whether its three permits'
+    /// worth of work is worth anything afterwards. Written by the caller, it
+    /// was not: the future was gone, the `Pixels` went on the floor, and the
+    /// walk that replaced this one queued behind decodes of covers it was
+    /// itself about to ask for, then read the same bytes off the disk and
+    /// decoded them a second time. Written by the decode, the replacement
+    /// finds the cover already there. See [`Landing`].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aborted_callers_decode_is_kept_rather_than_dropped() {
+        let dir = scratch("art-abort-keeps");
+        let art = Arc::new(art_in(&dir));
+        // Big for the same reason as above: the abort has to land while the
+        // decode is still going, which is the case worth keeping.
+        let server = serving(vec![png_of(3072, 3072)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Replaced", server.addr);
+
+        let before = art.arrivals();
+        let getting = tokio::spawn({
+            let art = Arc::clone(&art);
+            let url = url.clone();
+            async move { art.get(&url, 72).await }
+        });
+
+        // Aborted once the decode holds a permit, which is the window a walk
+        // stood down for a re-read lands in.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while art.decoding.available_permits() == CONCURRENT_DECODES {
+            assert!(Instant::now() < deadline, "the decode never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        getting.abort();
+        let _ = getting.await;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while art.cached(&url, 72).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the decode finished into nothing, so the walk that replaced \
+                 this one decodes the same cover again"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            art.arrivals() > before,
+            "and it was announced, so a list waiting on it rebuilds"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

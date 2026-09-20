@@ -15,10 +15,13 @@ import "fonts/geist-semibold.ttf";
 import "fonts/geist-bold.ttf";
 import "fonts/geo.ttf";
 
-// Re-exported so Rust can reach the glyph set: only globals exported from the
-// entry file get generated bindings, and the browse rows pick their icon on
-// the Rust side.
-export { Icons }
+// Re-exported so Rust can reach them: only globals exported from the entry
+// file get generated bindings. `Icons` because the browse rows pick their icon
+// on the Rust side, and `Theme` because the picker's list height is pinned
+// against the two card heights in it — a test that wrote those numbers out
+// again would pass while the card and the list disagreed, which is the one
+// thing the height exists to prevent.
+export { Icons, Theme }
 
 // One player, flattened for display. The backend owns the real state; this is
 // only what has to cross into the UI thread.
@@ -48,6 +51,17 @@ export struct Device {
     // `role` is not one it can share.
     upgrading: bool,
     upgrade-line: string,
+    // Whether this card draws its badge row — the line under the level that
+    // carries the group role, the upgrade line and the Group button.
+    //
+    // Worked out in Rust and published here rather than asked of the three
+    // fields above again inside `DeviceCard`. The picker's list is a `ListView`
+    // and so takes a fixed height, which is summed from a count of the badged
+    // cards made over these same rows; with the condition written out in both
+    // places the two were kept in step by hand, and a card that grew a badge
+    // the count did not know about would take the Ungroup button off the
+    // bottom of the list again. One bit, one definition.
+    badged: bool,
 }
 
 /// One thing the service offers for what is playing — Love, Ban, Shop.
@@ -174,9 +188,20 @@ export struct BrowseRow {
 // walk in, and building one of these costs five strings and a glyph lookup.
 // The publisher compares the items it is about to send against the ones the
 // window is holding and writes only the ones that moved; see
-// `Backend::sent_items`. Neither half has been measured again on the machine
-// the figures above came from, so what is recorded here is what was changed
-// and why, not a new number.
+// `Backend::sent_items`.
+//
+// That second half has its own number now, taken on the same machine as the
+// figures above and under the release profile: comparing a two-thousand-row
+// Songs list costs the publisher about 380µs a publish — 230 to flatten it,
+// 150 to fingerprint and compare it — and spares the event loop the 400µs of
+// building two thousand items, where the one item a cover lands on costs
+// about 2µs. Close to the same number of microseconds either way, and on
+// purpose not the same microseconds: the comparison is on the walk's own
+// task and the building is between two frames. What is outside that figure
+// is the seating, because a model handed over whole also makes the list drop
+// and re-instantiate every row it has placed — which is what the 100ms above
+// was made of — and timing that needs a window, which the test binary can
+// only give one test.
 export struct BrowseItem {
     // 0 = a row of a plain list, 1 = a shelf of tiles, 2 = a strip of service
     // chips, 3 = a section that is a way in and holds nothing itself,
@@ -876,7 +901,7 @@ component DeviceCard inherits Rectangle {
             toggle-mute => { root.toggle-mute(); }
         }
 
-        if root.device.upgrading || root.device.role != "" || root.device.groupable: HorizontalLayout {
+        if root.device.badged: HorizontalLayout {
             spacing: Theme.gap;
             padding-top: 2px;
 
@@ -2250,10 +2275,10 @@ export component AppWindow inherits Window {
     // How many players have answered. Shown where the players are.
     in property <string> players-line: "";
     // How many of `devices` draw `DeviceCard`'s badge row, which is the only
-    // thing that makes a card 130px instead of 96px. Counted in Rust, from the
-    // same three flags the card itself asks about: nothing in Slint can sum a
-    // condition over a model, and the picker's list is a fixed height because
-    // a `ListView` has no other kind.
+    // thing that makes a card 130px instead of 96px. Counted in Rust over the
+    // rows' own `badged`, which is the same bit the card draws the row from:
+    // nothing in Slint can sum a condition over a model, and the picker's list
+    // is a fixed height because a `ListView` has no other kind.
     //
     // The list used to take the taller number for every row but one, on the
     // reasoning that the selected player is the only one grouping is not
@@ -2264,6 +2289,30 @@ export component AppWindow inherits Window {
     // off the bottom held the Ungroup button — the one control that undoes the
     // grouping.
     in property <int> badged-players: 0;
+    // How tall the picker's list is told to be: what its cards actually come
+    // to, capped at two and a half of them.
+    //
+    // The half is the affordance, since a list cut on a card boundary looks
+    // complete when it is not. 330px of list under the 140px of chrome above
+    // it puts the whole popup at the same 470px it was meant to stop at. Under
+    // that, the cards' own sum — they are two sizes, a badge row being 34px of
+    // card, and which row is which is what `badged-players` counts. One number
+    // for both was 132px, which is more than the taller of them, so a single
+    // player sat above a third of a card of empty list and two players above
+    // most of one.
+    //
+    // Named rather than written inline on the `ListView` because this is the
+    // one part of the arrangement nothing else can pin: the count is Rust's
+    // and testable there, the badge row is the card's and drawn from a
+    // published bit, and this sum lives inside a popup where no test reaches
+    // it. Swapping the two heights here, or dropping `badged-players` out of
+    // the sum, left every other test in the repo green and the Ungroup button
+    // off the bottom of the list.
+    out property <length> picker-list-height: root.devices.length == 0
+        ? 0px
+        : min(root.badged-players * Theme.player-card-badged
+                + (root.devices.length - root.badged-players) * Theme.player-card,
+            330px);
     // Which row of the queue the player is sitting on, or -1. Worked out in
     // Rust because it needs the status, which the row model does not carry.
     in property <int> queue-cursor: -1;
@@ -5870,33 +5919,12 @@ export component AppWindow inherits Window {
                                                 }
                                             }
 
-                                            // Two and a half cards: the half is
-                                            // the affordance, since a list cut on
-                                            // a card boundary looks complete when
-                                            // it is not. 330px of list under the
-                                            // 140px of chrome measured above puts
-                                            // the whole popup at the same 470px
-                                            // it was meant to stop at.
-                                            //
-                                            // Under that, what the cards actually
-                                            // come to. They are two sizes — a
-                                            // badge row is 34px of card — and
-                                            // which row is which is counted in
-                                            // Rust; see `badged-players`. One
-                                            // number for both was 132px, which is
-                                            // more than the taller of them, so a
-                                            // single player sat above a third of a
-                                            // card of empty list and two players
-                                            // above most of one.
+                                            // What the cards come to, capped at
+                                            // two and a half of them. The sum
+                                            // and the why of it are on
+                                            // `picker-list-height`.
                                             ListView {
-                                                height: root.devices.length == 0
-                                                    ? 0px
-                                                    : min(root.badged-players
-                                                            * Theme.player-card-badged
-                                                        + (root.devices.length
-                                                                - root.badged-players)
-                                                            * Theme.player-card,
-                                                        330px);
+                                                height: root.picker-list-height;
                                                 accessible-item-count: root.devices.length;
 
                                                 for device[i] in root.devices: DeviceCard {

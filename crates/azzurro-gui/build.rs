@@ -10,9 +10,22 @@ fn main() {
     // query — "requires the presence of debug info" — and a test that wanted
     // to press a row or type into a field could only fall back to invoking the
     // window's own callbacks, which is the boundary those tests exist to
-    // cross. Debug builds only: this is what the tests are built as, and a
-    // release build should not carry element names it will never be asked for.
-    let config = config.with_debug_info(std::env::var("PROFILE").as_deref() == Ok("debug"));
+    // cross.
+    //
+    // Asked for in every profile rather than in debug alone. Gating it on
+    // `PROFILE` kept the element names out of the shipped binary, and that is
+    // worth 86 KiB: built here twice over the same tree, thin LTO and
+    // stripped, the Linux release binary was 39,966,600 bytes without them and
+    // 40,054,792 with — two tenths of one percent. What the saving cost was a
+    // UI compiled one way for the tests and another for the artifact, which is
+    // the thing .cargo/config.toml refuses for the Windows runtime in the same
+    // words: what is tested has to be what ships. The ten element queries in
+    // the suite could not run under `--release` either, so every layout and
+    // accessibility assertion was only ever made against the debug
+    // compilation. Unconditional, the whole workspace suite passes under both
+    // profiles, which is also what makes the timing rig over
+    // `Backend::sent_items` worth running.
+    let config = config.with_debug_info(true);
 
     slint_build::compile_with_config("ui/app-window.slint", config)
         .expect("compiling ui/app-window.slint");

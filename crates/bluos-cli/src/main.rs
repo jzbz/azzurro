@@ -226,7 +226,7 @@ async fn discover(seconds: u64) -> Result<()> {
     } else {
         Duration::from_secs(seconds)
     };
-    let found = discovery.sweep(window).await?;
+    let found = discovery.sweep(window).await;
 
     if found.is_empty() {
         eprintln!("nothing answered. Players asleep, on another subnet, or broadcast filtered.");

@@ -193,11 +193,17 @@ impl Discovery {
     /// This is the one-shot form, for a command line or a cold start. A running
     /// app should call [`Discovery::query`] once and then keep [`Discovery::recv`]
     /// in a loop, so that arrivals and address changes land without another sweep.
-    pub async fn sweep(&self, window: Duration) -> Result<Vec<Announce>> {
+    ///
+    /// Infallible for the same reason [`Discovery::query`] is: a sweep is
+    /// bounded by its window and ends with whatever answered inside it, so
+    /// there is no failure for a caller to abandon the players already found
+    /// over. Handing back an always-`Ok` `Result` only invited a `?` that
+    /// would throw them away the day the error became real.
+    pub async fn sweep(&self, window: Duration) -> Vec<Announce> {
         let mut found = Vec::new();
         self.sweep_with(window, |announce| found.push(announce.clone()))
-            .await?;
-        Ok(found)
+            .await;
+        found
     }
 
     /// The same sweep, handing each player over as it answers.
@@ -212,11 +218,13 @@ impl Discovery {
     ///
     /// Each node is handed over once. A player answering three broadcasts is
     /// still one player — see [`worth_handing_over`] for the one exception.
-    pub async fn sweep_with(
-        &self,
-        window: Duration,
-        mut found_one: impl FnMut(&Announce),
-    ) -> Result<()> {
+    ///
+    /// Nothing is handed back. A socket that stops receiving mid-sweep is
+    /// logged and ends the window early, because the players that answered
+    /// before it did are already the caller's — which is the whole reason this
+    /// form streams rather than collecting. An error return would have been a
+    /// `?` waiting to discard them.
+    pub async fn sweep_with(&self, window: Duration, mut found_one: impl FnMut(&Announce)) {
         let start = Instant::now();
         let mut pending: VecDeque<Duration> = QUERY_SCHEDULE
             .iter()
@@ -226,9 +234,16 @@ impl Discovery {
 
         loop {
             let elapsed = start.elapsed();
-            let Some(remaining) = window.checked_sub(elapsed) else {
+            // A window that has run out fires nothing, including at the
+            // instant it runs out: the check is `>=` rather than a subtraction
+            // that only fails once `elapsed` has gone past `window`. Otherwise
+            // a zero window — which is how a caller asks for a sweep that does
+            // nothing — could still put its first broadcast on the wire, since
+            // the schedule's first slot is at zero too.
+            if elapsed >= window {
                 break;
-            };
+            }
+            let remaining = window - elapsed;
 
             // Fire any query whose slot has arrived before going back to sleep.
             if let Some(at) = pending.front().copied()
@@ -268,8 +283,6 @@ impl Discovery {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -596,13 +609,14 @@ mod tests {
     }
 
     /// Whether this machine tells a connected UDP socket that its peer is not
-    /// there — the behaviour the test below is built on.
+    /// there — the behaviour the two tests below are built on.
     ///
     /// Not every machine does. A container can have ICMP suppressed, and a
     /// platform is free to surface the condition on the `send` instead of on
-    /// the next read. Either has nothing for that test to exercise, which is a
-    /// reason to skip it rather than to fail: an environment the code cannot
-    /// affect should not read as a regression in the code.
+    /// the next read. Either has nothing for those tests to exercise, which is
+    /// a reason to skip them rather than to fail: an environment the code
+    /// cannot affect should not read as a regression in the code. Both ask,
+    /// since a guard on one of them only moves the failure to the other.
     async fn port_unreachable_reaches_the_reader() -> bool {
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = dead.local_addr().unwrap();
@@ -685,9 +699,20 @@ mod tests {
     /// waking on another network leaves behind.
     #[tokio::test]
     async fn a_socket_that_fails_every_read_is_handed_back_as_an_error() {
-        // The same ICMP the test above uses, kept coming: each datagram to a
-        // port nobody is listening on draws one, and a connected socket
-        // reports it to the next read.
+        // The same ICMP the test above uses, so the same skip: a machine that
+        // does not report a port-unreachable to the reader has no failing read
+        // to count, and `recv` would simply park until the timeout below
+        // panicked on it.
+        if !port_unreachable_reaches_the_reader().await {
+            eprintln!(
+                "skipping: this machine does not report a UDP port-unreachable \
+                 to the reader, so there is no failed read to recover from"
+            );
+            return;
+        }
+
+        // Kept coming: each datagram to a port nobody is listening on draws
+        // one, and a connected socket reports it to the next read.
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = dead.local_addr().unwrap();
         drop(dead);
