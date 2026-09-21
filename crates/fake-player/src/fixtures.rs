@@ -58,6 +58,27 @@ pub fn status_playing() -> &'static str {
 </status>"#
 }
 
+/// Playing the queue's one track, a FLAC whose master was authored as MQA.
+///
+/// The shape is a Powernode on 4.16 playing a library file: the decoder's
+/// word for it is `mqaAuthored`, with the master's sample rate as `mqaOFS`
+/// beside it, while [`queue`] files the same song as `cd` — the library's
+/// word, from scanning the file rather than decoding it.
+pub fn status_playing_mqa() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<status etag="mqa-play"><album>A Record</album><artist>A Band</artist><canMovePlayback>true</canMovePlayback><canSeek>1</canSeek><cursor>0</cursor><db>-52.2</db><fn>/var/mnt/share/A Band - A Song.flac</fn><image>/Artwork?service=LocalMusic&amp;fn=%2Fvar%2Fmnt%2Fshare%2FA+Band+-+A+Song.flac</image><indexing>0</indexing><isFavourite>0</isFavourite><mid>227</mid><mode>1</mode><mqaOFS>44100</mqaOFS><mute>0</mute><name>A Song</name><pid>7</pid><prid>61</prid><quality>mqaAuthored</quality><repeat>0</repeat><secs>12</secs><service>LocalMusic</service><serviceIcon>/images/LibraryIcon.png</serviceIcon><serviceName>Library</serviceName><serviceType>LocalMusic</serviceType><shuffle>0</shuffle><sid>6</sid><sleep></sleep><song>0</song><state>play</state><streamFormat>16/44.1</streamFormat><syncStat>316</syncStat><title1>A Song</title1><title2>A Band</title2><title3>A Record</title3><totlen>240</totlen><twoline_title1>A Song</twoline_title1><twoline_title2>A Band • A Record</twoline_title2><volume>10</volume></status>"#
+}
+
+/// [`status_playing_mqa`] paused, changed exactly as the player changes it.
+///
+/// Four elements differ, over three pauses on hardware and every one alike:
+/// `state` and `secs`, and `quality` and `mqaOFS` are gone. Everything that
+/// names the track, and `streamFormat`, stays as it was.
+pub fn status_paused_mqa() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<status etag="mqa-pause"><album>A Record</album><artist>A Band</artist><canMovePlayback>true</canMovePlayback><canSeek>1</canSeek><cursor>0</cursor><db>-52.2</db><fn>/var/mnt/share/A Band - A Song.flac</fn><image>/Artwork?service=LocalMusic&amp;fn=%2Fvar%2Fmnt%2Fshare%2FA+Band+-+A+Song.flac</image><indexing>0</indexing><isFavourite>0</isFavourite><mid>227</mid><mode>1</mode><mute>0</mute><name>A Song</name><pid>7</pid><prid>61</prid><repeat>0</repeat><secs>40</secs><service>LocalMusic</service><serviceIcon>/images/LibraryIcon.png</serviceIcon><serviceName>Library</serviceName><serviceType>LocalMusic</serviceType><shuffle>0</shuffle><sid>6</sid><sleep></sleep><song>0</song><state>pause</state><streamFormat>16/44.1</streamFormat><syncStat>316</syncStat><title1>A Song</title1><title2>A Band</title2><title3>A Record</title3><totlen>240</totlen><twoline_title1>A Song</twoline_title1><twoline_title2>A Band • A Record</twoline_title2><volume>10</volume></status>"#
+}
+
 /// Which screens the player offers, and the routes for the queue and its
 /// context menus.
 ///

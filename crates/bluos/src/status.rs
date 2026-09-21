@@ -288,7 +288,19 @@ pub struct Status {
     pub stream_url: Option<String>,
     #[serde(rename = "streamFormat")]
     pub stream_format: Option<String>,
+    /// What the decoder found in the stream: `cd`, `hd`, `mqaAuthored`, a
+    /// bitrate for a station.
+    ///
+    /// Only while it is decoding. A Powernode on an MQA-authored FLAC sends
+    /// `mqaAuthored` in every document while it plays and leaves the element
+    /// out of every document while it is paused, keeping the rest — the same
+    /// `streamFormat`, `pid`, `song` and `fn` — as they were. Absent is "not
+    /// decoding right now", not "no longer MQA".
     pub quality: Option<String>,
+    /// The file the player has open, for library playback. `fn` is a Rust
+    /// keyword.
+    #[serde(rename = "fn")]
+    pub file: Option<String>,
 
     #[serde(rename = "inputId")]
     pub input_id: Option<String>,
@@ -322,6 +334,16 @@ pub struct Status {
 
     /// What the current source can actually do. See [`Status::can`].
     pub actions: Option<Actions>,
+}
+
+/// What names a track in a status. See [`Status::same_track`].
+#[derive(PartialEq, Eq)]
+struct Track<'a> {
+    file: Option<&'a str>,
+    song: Option<u32>,
+    queue: Option<u32>,
+    stream: Option<&'a str>,
+    title: Option<&'a str>,
 }
 
 /// The `<actions>` wrapper, which exists only to hold the list.
@@ -483,6 +505,54 @@ impl Status {
         }
     }
 
+    /// Whether `other` is about the same track as this one, however else the
+    /// two differ.
+    ///
+    /// For carrying something the player says about a track across documents
+    /// that leave it out: the decoder's tier is dropped on pause, and the
+    /// pause is the same track. Five fields name the track, and all five have
+    /// to agree:
+    ///
+    /// - `fn`, the file that was opened. `song` is a position and `pid` a
+    ///   queue, and neither says which file sits there.
+    /// - `song`, which a skip moves, paused or not.
+    /// - `pid`, which a replaced queue moves.
+    /// - `streamUrl`, which is what changes when the player goes to an input or
+    ///   a station — `pid` and `song` stay put there.
+    /// - `title1`, for a source that names nothing else: a service track with
+    ///   no file, an input.
+    ///
+    /// Everything that changes on one track — position, state, volume, the
+    /// tier itself — is left out. So is `title2`, on purpose: on a station
+    /// `title1` is the station and `title2` its live track (see
+    /// `docs/protocol.md`), and a station's bitrate is the station's, so the
+    /// whole broadcast is one track here. A status that names no track at all is the
+    /// same as nothing, not as another such status: two stopped players with
+    /// empty queues have nothing in common worth carrying.
+    pub fn same_track(&self, other: &Status) -> bool {
+        match (self.track(), other.track()) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => false,
+        }
+    }
+
+    /// The fields [`Status::same_track`] compares, or `None` where nothing
+    /// names a track. Blank and absent are one thing here: the player sends
+    /// empty elements as readily as it omits them.
+    fn track(&self) -> Option<Track<'_>> {
+        fn text(field: &Option<String>) -> Option<&str> {
+            field.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        let track = Track {
+            file: text(&self.file),
+            song: self.song,
+            queue: self.pid,
+            stream: text(&self.stream_url),
+            title: text(&self.title1),
+        };
+        (track.song.is_some() || track.title.is_some() || track.file.is_some()).then_some(track)
+    }
+
     /// A single line for a notification or an MPRIS title.
     pub fn now_playing(&self) -> Option<String> {
         let title = self.title1.as_deref().filter(|s| !s.is_empty())?;
@@ -615,6 +685,102 @@ mod tests {
         // Fields the player did not send stay absent rather than becoming "".
         assert_eq!(s.artist, None);
         assert_eq!(s.totlen, None);
+    }
+
+    /// The pause that prompted [`Status::same_track`]: the player keeps
+    /// everything that names the track and drops the decoder's word for it.
+    #[test]
+    fn a_pause_is_the_same_track_the_play_was() {
+        let play: Status = quick_xml::de::from_str(fake_player::fixtures::status_playing_mqa())
+            .expect("a playing status");
+        let pause: Status = quick_xml::de::from_str(fake_player::fixtures::status_paused_mqa())
+            .expect("a paused status");
+
+        assert!(play.same_track(&pause));
+        assert!(pause.same_track(&play));
+
+        assert_eq!(play.quality.as_deref(), Some("mqaAuthored"));
+        assert_eq!(pause.quality, None, "the pause says nothing of the decoder");
+        assert_eq!(
+            pause.stream_format.as_deref(),
+            Some("16/44.1"),
+            "and keeps the format"
+        );
+        assert_eq!(
+            pause.file.as_deref(),
+            Some("/var/mnt/share/A Band - A Song.flac")
+        );
+    }
+
+    #[test]
+    fn each_part_of_a_tracks_name_tells_two_tracks_apart() {
+        let track: Status = quick_xml::de::from_str(fake_player::fixtures::status_paused_mqa())
+            .expect("a paused status");
+        let apart = |change: fn(&mut Status)| {
+            let mut other = track.clone();
+            change(&mut other);
+            !track.same_track(&other) && !other.same_track(&track)
+        };
+
+        assert!(apart(
+            |s| s.file = Some("/var/mnt/share/Another.flac".into())
+        ));
+        assert!(
+            apart(|s| s.file = None),
+            "a file against none is not a match"
+        );
+        assert!(apart(|s| s.song = Some(1)), "skipped while paused");
+        assert!(apart(|s| s.pid = Some(8)), "the queue was replaced");
+        assert!(apart(|s| s.stream_url = Some("Capture:hw:in".into())));
+        assert!(apart(|s| s.title1 = Some("The Next Song".into())));
+
+        // An input keeps the queue's pid and song, and is still not the
+        // track at the cursor: the captured HDMI status sits on song 0.
+        let hdmi: Status = quick_xml::de::from_str(STATUS).unwrap();
+        let mut queued = track.clone();
+        queued.pid = hdmi.pid;
+        assert_eq!(queued.song, hdmi.song);
+        assert!(!queued.same_track(&hdmi));
+    }
+
+    #[test]
+    fn what_moves_on_one_track_is_not_part_of_its_name() {
+        let track: Status = quick_xml::de::from_str(fake_player::fixtures::status_playing_mqa())
+            .expect("a playing status");
+        let together = |change: fn(&mut Status)| {
+            let mut other = track.clone();
+            change(&mut other);
+            track.same_track(&other) && other.same_track(&track)
+        };
+
+        assert!(together(|s| s.etag = "another".into()));
+        assert!(together(|s| s.state = Some("stop".into())));
+        assert!(together(|s| s.secs = Some(200)));
+        assert!(together(|s| s.quality = None));
+        assert!(together(|s| s.stream_format = None));
+        assert!(together(|s| s.volume = Some(40)));
+        assert!(together(|s| s.cursor = Some(12)), "tracks were added");
+        assert!(together(|s| s.is_favourite = Some(1)));
+        assert!(together(|s| s.image = None));
+        assert!(together(|s| s.title2 = Some("A Band, again".into())));
+        // Blank and absent are one thing: the player sends either.
+        assert!(together(|s| s.stream_url = Some(" ".into())));
+    }
+
+    #[test]
+    fn a_status_naming_no_track_is_not_one_track() {
+        assert!(!Status::default().same_track(&Status::default()));
+
+        let stopped: Status =
+            quick_xml::de::from_str(fake_player::fixtures::status_stopped()).unwrap();
+        assert!(!stopped.same_track(&stopped.clone()));
+
+        let blank = Status {
+            title1: Some(String::new()),
+            file: Some("  ".into()),
+            ..Default::default()
+        };
+        assert!(!blank.same_track(&blank.clone()));
     }
 
     /// A group master. Built from the shapes the official controller's own

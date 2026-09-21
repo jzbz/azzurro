@@ -1192,6 +1192,10 @@ struct Entry {
     view: Device,
     /// The last status the poller received, which is more than the list needs
     /// but exactly what MPRIS and the queue view ask for.
+    ///
+    /// As received, but for one element: a paused player stops naming the
+    /// decoder's tier, and this keeps the one it last named for the same
+    /// track. See [`carry_decoded`].
     status: Option<Status>,
     /// When that status arrived, so a position can be extrapolated from it.
     status_at: Option<Instant>,
@@ -1718,11 +1722,12 @@ fn action_label(name: &str) -> String {
 /// MQA authoring is discovered at all. Drawn from the queue document alone, one
 /// track wore two badges at once: MQA under the sleeve and CD on its own row.
 ///
-/// The status describes the track being played and no other, so only that row
-/// takes it. Every other row keeps the library's word, which is the whole of
-/// what is known about a file nothing has opened.
-fn row_quality<'a>(library: &'a str, status: &'a bluos::Status, playing: bool) -> &'a str {
-    if !playing {
+/// The status describes the track the player is on and no other, so only that
+/// row takes it — playing or paused, since a pause is the same file. Every
+/// other row keeps the library's word, which is the whole of what is known
+/// about a file nothing has opened.
+fn row_quality<'a>(library: &'a str, status: &'a bluos::Status, current: bool) -> &'a str {
+    if !current {
         return library;
     }
     status
@@ -1731,6 +1736,70 @@ fn row_quality<'a>(library: &'a str, status: &'a bluos::Status, playing: bool) -
         .map(str::trim)
         .filter(|decoded| !decoded.is_empty())
         .unwrap_or(library)
+}
+
+/// The badge on one queue row, as [`Backend::publish_queue`] draws it.
+///
+/// The row the player is on is the cursor, and only while the player is
+/// working through this queue. It is not only while the queue is *playing*:
+/// gated on that, a pause handed the row back to the library's word, and an
+/// MQA track read CD for as long as it sat paused. Nor is it the cursor
+/// alone, because a player on an input or a station keeps its place in the
+/// queue, and whatever tier that status carries is about the sound coming in,
+/// not the file at the cursor.
+fn row_tier(queue: &bluos::Queue, song: &bluos::QueueSong, status: &bluos::Status) -> String {
+    let current = queue.cursor(status) == Some(song.id) && queue.is_playing_from(status);
+    quality_label(row_quality(
+        song.quality.as_deref().unwrap_or_default(),
+        status,
+        current,
+    ))
+}
+
+/// Keep the decoder's tier across a status that leaves it out, for as long as
+/// the status is about the same track.
+///
+/// The decoder only speaks while it decodes. A Powernode on an MQA-authored
+/// FLAC sends `mqaAuthored` in every document while it plays and drops the
+/// element from every document while it is paused, and stored as sent, each
+/// pause blanked the badge under the sleeve and handed the queue row back to
+/// the library's `cd` — for a file whose master was no less MQA for being
+/// paused. So a document that names no tier takes the one before it, provided
+/// it describes the same track (see [`bluos::Status::same_track`]): a skip, a
+/// replaced queue or a switch to an input is a different track, and the tier
+/// goes with the one it was found on.
+///
+/// What the player does say always wins, so a decoder that changes its mind is
+/// believed at once. And since the stored status is the one carried from, a
+/// run of paused documents — a volume change, a seek — each carry it on.
+fn carry_decoded(previous: Option<&bluos::Status>, next: &mut bluos::Status) {
+    fn named(status: &bluos::Status) -> Option<&str> {
+        status
+            .quality
+            .as_deref()
+            .filter(|tier| !tier.trim().is_empty())
+    }
+    if named(next).is_some() {
+        return;
+    }
+    if let Some(previous) = previous.filter(|previous| previous.same_track(next))
+        && let Some(tier) = named(previous)
+    {
+        next.quality = Some(tier.to_owned());
+    }
+}
+
+/// The transport's badge and the line under the sleeve, both from the same
+/// status — the badge the tier alone, the line the format with the kind of
+/// MQA beside it.
+fn tier_and_format(status: Option<&bluos::Status>) -> (String, String) {
+    let quality = status
+        .and_then(|status| status.quality.as_deref())
+        .unwrap_or_default();
+    let format = status
+        .and_then(|status| status.stream_format.as_deref())
+        .unwrap_or_default();
+    (quality_label(quality), format_line(format, quality))
 }
 
 /// The badge's word for a tier the player names.
@@ -5363,6 +5432,12 @@ impl Backend {
                         // queue. Without this the row keeps the word it was
                         // built with until something else about the queue moves.
                         status.quality.hash(&mut hash);
+                        // And whether it is this queue's row the tier is
+                        // about. A paused queue and a paused station on the
+                        // same cursor, carrying the same bitrate, hash alike on
+                        // everything above, and only the first lends it to the
+                        // row. See [`row_tier`].
+                        queue.is_playing_from(status).hash(&mut hash);
                         for song in &queue.songs {
                             song.id.hash(&mut hash);
                             song.title.hash(&mut hash);
@@ -5417,11 +5492,7 @@ impl Backend {
                                 title: song.title.clone().unwrap_or_default(),
                                 artist: song.artist.clone().unwrap_or_default(),
                                 duration: song.duration().unwrap_or_default(),
-                                quality: quality_label(row_quality(
-                                    song.quality.as_deref().unwrap_or_default(),
-                                    status,
-                                    at_cursor && live,
-                                )),
+                                quality: row_tier(queue, song, status),
                                 cursor: at_cursor,
                                 live: at_cursor && live,
                                 cover,
@@ -7254,12 +7325,17 @@ impl Backend {
         // whole of what the player knows.
         // "cd", "hd", "mqa" — the player's own word for what it is decoding,
         // shown the way the official controller shows it.
-        let quality = quality_label(
-            snapshot
-                .as_ref()
-                .and_then(|(status, _)| status.quality.as_deref())
-                .unwrap_or_default(),
-        );
+        //
+        // The player writes its own phrase beside it — "MP3 128 kb/s" for a
+        // stream, "16/44.1" for a library track — and it says what the badge
+        // cannot: the codec where it names one, and the depth and rate behind
+        // a tier. Too long for the badge, so it goes on the line below it,
+        // where Now Playing has the room. The badge says MQA for every
+        // spelling of it, so the kind is said on that line, where the format
+        // already is: "16/44.1 · MQA authored" is the whole of what the
+        // player told us about this track, and neither half of it contradicts
+        // the other.
+        let (quality, stream_format) = tier_and_format(snapshot.as_ref().map(|(status, _)| status));
 
         // What the service offers for this track, beyond the transport.
         //
@@ -7278,26 +7354,6 @@ impl Backend {
             .as_ref()
             .map(|(status, _)| track_actions(status))
             .unwrap_or_default();
-
-        // The player writes its own phrase for this — "MP3 128 kb/s" for a
-        // stream, "FLAC 24/44.1" for a library track — and it says what the
-        // badge cannot: the codec, and the depth and rate behind a tier. Too
-        // long for the badge, so it goes on the line below it, where Now
-        // Playing has the room.
-        // The badge above says MQA for every spelling of it, so the kind is
-        // said here, where the format already is: "FLAC 16/44.1 · MQA
-        // authored" is the whole of what the player told us about this track,
-        // and neither half of it contradicts the other.
-        let stream_format = format_line(
-            snapshot
-                .as_ref()
-                .and_then(|(status, _)| status.stream_format.as_deref())
-                .unwrap_or_default(),
-            snapshot
-                .as_ref()
-                .and_then(|(status, _)| status.quality.as_deref())
-                .unwrap_or_default(),
-        );
 
         let indexing = match snapshot.as_ref().and_then(|(status, _)| status.indexing) {
             Some(songs) if songs > 0 => {
@@ -10832,6 +10888,39 @@ async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
     }
 }
 
+/// Store a status the poll just received, and say whether the queue was
+/// replaced and whether an index has just finished.
+///
+/// `status` comes back as it was stored, which is not always as it was sent:
+/// a document that leaves out the decoder's tier takes the last one for the
+/// same track. See [`carry_decoded`].
+fn take_status(entry: &mut Entry, status: &mut bluos::Status) -> (bool, bool) {
+    // `pid` is the queue's identity. When it changes the player has replaced
+    // the queue, which is the cue the device itself gives through
+    // `refreshOnStatusChange` on its queue screen.
+    //
+    // The first status of all is not a replacement, however different it
+    // looks from the nothing that preceded it — treating it as one would throw
+    // away the queue the adoption just fetched and fetch it again.
+    let replaced = match &entry.status {
+        Some(previous) => previous.pid != status.pid,
+        None => false,
+    };
+    // The banner says nothing once the count stops, so the one moment worth a
+    // word is the moment it stops: the count was climbing and now it is not.
+    let indexed = match &entry.status {
+        Some(previous) => previous.indexing.unwrap_or(0) > 0 && status.indexing.unwrap_or(0) == 0,
+        None => false,
+    };
+    if replaced {
+        entry.queue = None;
+    }
+    carry_decoded(entry.status.as_ref(), status);
+    entry.status = Some(status.clone());
+    entry.status_at = Some(Instant::now());
+    (replaced, indexed)
+}
+
 /// Keep one player's row, its queue and its MPRIS object current for as long as
 /// the app runs.
 ///
@@ -10894,42 +10983,16 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
         };
 
         match polled {
-            Ok(status) => {
+            Ok(mut status) => {
                 backoff = Duration::from_secs(1);
                 unreadable = 0;
 
-                // `pid` is the queue's identity. When it changes the player has
-                // replaced the queue, which is the cue the device itself gives
-                // through `refreshOnStatusChange` on its queue screen.
-                //
-                // The first status of all is not a replacement, however
-                // different it looks from the nothing that preceded it —
-                // treating it as one would throw away the queue the adoption
-                // just fetched and fetch it again.
                 let (queue_replaced, indexed) = {
                     let mut guard = backend.registry.lock().unwrap();
                     let Some(entry) = guard.get_mut(&id) else {
                         return;
                     };
-                    let replaced = match &entry.status {
-                        Some(previous) => previous.pid != status.pid,
-                        None => false,
-                    };
-                    // The banner says nothing once the count stops, so the one
-                    // moment worth a word is the moment it stops: the count was
-                    // climbing and now it is not.
-                    let indexed = match &entry.status {
-                        Some(previous) => {
-                            previous.indexing.unwrap_or(0) > 0 && status.indexing.unwrap_or(0) == 0
-                        }
-                        None => false,
-                    };
-                    if replaced {
-                        entry.queue = None;
-                    }
-                    entry.status = Some(status.clone());
-                    entry.status_at = Some(Instant::now());
-                    (replaced, indexed)
+                    take_status(entry, &mut status)
                 };
 
                 if indexed && backend.is_selected(id) {
@@ -18443,8 +18506,8 @@ mod tests {
         assert_eq!(row_quality("cd", &status, true), "mqaAuthored");
         assert_eq!(quality_label(row_quality("cd", &status, true)), "MQA");
 
-        // Every other row is a file nothing has opened, so the library's word
-        // is the whole of what is known about it.
+        // Every row but the one the player is on is a file nothing has opened,
+        // so the library's word is the whole of what is known about it.
         assert_eq!(row_quality("cd", &status, false), "cd");
 
         // A player that says nothing about what it is decoding leaves the row
@@ -18458,11 +18521,209 @@ mod tests {
         assert_eq!(row_quality("hd", &blank, true), "hd");
     }
 
+    /// [`fake_player::fixtures::status_playing_mqa`], as the client reads it:
+    /// the fields this looks at, built by hand because this crate reads XML
+    /// only through the client. The document itself goes through the client in
+    /// `a_paused_player_keeps_the_badge_it_was_playing_with`.
+    fn playing_mqa() -> bluos::Status {
+        bluos::Status {
+            etag: "mqa-play".to_owned(),
+            state: Some("play".to_owned()),
+            secs: Some(12),
+            totlen: Some(240.0),
+            service: Some("LocalMusic".to_owned()),
+            title1: Some("A Song".to_owned()),
+            title2: Some("A Band".to_owned()),
+            file: Some("/var/mnt/share/A Band - A Song.flac".to_owned()),
+            stream_format: Some("16/44.1".to_owned()),
+            quality: Some("mqaAuthored".to_owned()),
+            pid: Some(7),
+            song: Some(0),
+            cursor: Some(0),
+            volume: Some(10),
+            ..Default::default()
+        }
+    }
+
+    /// The same track paused, changed exactly as the player changes it: the
+    /// state and the position move, and the tier is gone.
+    fn paused_mqa() -> bluos::Status {
+        bluos::Status {
+            etag: "mqa-pause".to_owned(),
+            state: Some("pause".to_owned()),
+            secs: Some(40),
+            quality: None,
+            ..playing_mqa()
+        }
+    }
+
+    /// Two library tracks, both filed as `cd`, on the queue those statuses
+    /// are about.
+    fn queue_of_two() -> bluos::Queue {
+        let song = |id: u32, title: &str| bluos::QueueSong {
+            id,
+            title: Some(title.to_owned()),
+            quality: Some("cd".to_owned()),
+            ..Default::default()
+        };
+        bluos::Queue {
+            length: 2,
+            id: Some(7),
+            songs: vec![song(0, "A Song"), song(1, "The Next Song")],
+            ..Default::default()
+        }
+    }
+
+    /// What prompted [`carry_decoded`]: the Powernode drops `<quality>` from
+    /// every paused document, and a pause blanked the badge under the sleeve
+    /// and took "MQA authored" off the line beside it.
+    #[test]
+    fn a_pause_keeps_the_tier_the_decoder_found() {
+        let play = playing_mqa();
+        let mut pause = paused_mqa();
+
+        assert_eq!(
+            tier_and_format(Some(&pause)),
+            (String::new(), "16/44.1".to_owned()),
+            "the pause as the player sends it, which is the bug"
+        );
+
+        carry_decoded(Some(&play), &mut pause);
+        assert_eq!(pause.quality.as_deref(), Some("mqaAuthored"));
+        assert_eq!(
+            tier_and_format(Some(&pause)),
+            ("MQA".to_owned(), "16/44.1 · MQA authored".to_owned())
+        );
+        assert_eq!(tier_and_format(Some(&pause)), tier_and_format(Some(&play)));
+    }
+
+    /// Carried from what was stored, so a paused player whose volume moves —
+    /// a new document, still paused, still without the tier — keeps it too.
+    #[test]
+    fn the_tier_lasts_as_long_as_the_pause_does() {
+        let mut stored = playing_mqa();
+        let paused = paused_mqa();
+        let mut louder = paused.clone();
+        louder.etag = "louder".to_owned();
+        louder.volume = Some(20);
+        let mut sought = paused.clone();
+        sought.etag = "sought".to_owned();
+        sought.secs = Some(90);
+
+        for mut next in [paused, louder, sought] {
+            carry_decoded(Some(&stored), &mut next);
+            stored = next;
+            assert_eq!(tier_and_format(Some(&stored)).0, "MQA");
+        }
+    }
+
+    /// The tier is the file's, and a skip while paused is another file that
+    /// nothing has decoded yet.
+    #[test]
+    fn the_tier_does_not_follow_the_player_to_another_track() {
+        let play = playing_mqa();
+        let mut paused = paused_mqa();
+        carry_decoded(Some(&play), &mut paused);
+
+        let mut skipped = paused.clone();
+        skipped.quality = None;
+        skipped.song = Some(1);
+        skipped.title1 = Some("The Next Song".to_owned());
+        skipped.file = Some("/var/mnt/share/A Band - The Next Song.flac".to_owned());
+        carry_decoded(Some(&paused), &mut skipped);
+        assert_eq!(skipped.quality, None);
+
+        // And going back, still paused, finds nothing to carry either: the
+        // document it would have come from is the one about the other track.
+        let mut back = paused_mqa();
+        carry_decoded(Some(&skipped), &mut back);
+        assert_eq!(back.quality, None);
+
+        // Nor to an input, which keeps the queue's pid and song.
+        let mut hdmi = paused_mqa();
+        hdmi.stream_url = Some("Capture:hw:imxspdif,0/1/25/2?id=input4".to_owned());
+        hdmi.title1 = Some("HDMI ARC".to_owned());
+        hdmi.file = None;
+        carry_decoded(Some(&paused), &mut hdmi);
+        assert_eq!(hdmi.quality, None);
+    }
+
+    #[test]
+    fn the_players_own_word_wins_over_a_remembered_one() {
+        let play = playing_mqa();
+
+        let mut changed = playing_mqa();
+        changed.quality = Some("cd".to_owned());
+        carry_decoded(Some(&play), &mut changed);
+        assert_eq!(changed.quality.as_deref(), Some("cd"));
+
+        // Blank is not a word, and is carried over like absent is.
+        let mut blank = paused_mqa();
+        blank.quality = Some("  ".to_owned());
+        carry_decoded(Some(&play), &mut blank);
+        assert_eq!(blank.quality.as_deref(), Some("mqaAuthored"));
+    }
+
+    /// A window opened on a player that is already paused has heard nothing
+    /// from the decoder, and says nothing for it.
+    #[test]
+    fn nothing_is_made_up_for_a_player_first_heard_paused() {
+        let mut paused = paused_mqa();
+        carry_decoded(None, &mut paused);
+        assert_eq!(paused.quality, None);
+        assert_eq!(
+            tier_and_format(Some(&paused)),
+            (String::new(), "16/44.1".to_owned())
+        );
+
+        let queue = queue_of_two();
+        assert_eq!(row_tier(&queue, &queue.songs[0], &paused), "CD");
+    }
+
+    /// The row half of the pause: gated on the queue *playing*, the row the
+    /// player sat paused on went back to the library's word even with the
+    /// tier in hand.
+    #[test]
+    fn the_paused_row_keeps_the_decoders_word() {
+        let queue = queue_of_two();
+        let rows = |status: &bluos::Status| {
+            queue
+                .songs
+                .iter()
+                .map(|song| row_tier(&queue, song, status))
+                .collect::<Vec<_>>()
+        };
+
+        let play = playing_mqa();
+        assert_eq!(rows(&play), ["MQA", "CD"]);
+
+        let mut paused = paused_mqa();
+        carry_decoded(Some(&play), &mut paused);
+        assert!(!queue.is_live(&paused), "the queue is not playing");
+        assert_eq!(rows(&paused), ["MQA", "CD"], "and its row is still MQA");
+
+        // A station on the same cursor: its bitrate is about the station.
+        let mut station = paused.clone();
+        station.stream_url = Some("http://stream.example/radio".to_owned());
+        station.quality = Some("320000".to_owned());
+        assert_eq!(rows(&station), ["CD", "CD"]);
+
+        // A status about a queue since replaced is about no row of this one.
+        let mut replaced = paused.clone();
+        replaced.pid = Some(8);
+        assert_eq!(rows(&replaced), ["CD", "CD"]);
+    }
+
     #[test]
     fn the_line_under_the_sleeve_carries_both_halves() {
         // The track that prompted this: a FLAC the player decodes as a FLAC
         // and reports as MQA-authored, whose badge said MQAAUTHORED while the
-        // queue row beside it said CD.
+        // queue row beside it said CD. Its `streamFormat` is the depth and
+        // rate alone, with no codec in front.
+        assert_eq!(
+            format_line("16/44.1", "mqaAuthored"),
+            "16/44.1 · MQA authored"
+        );
         assert_eq!(
             format_line("FLAC 16/44.1", "mqaAuthored"),
             "FLAC 16/44.1 · MQA authored"
@@ -19197,6 +19458,116 @@ mod selection_tests {
     /// past that for the reply to have been dealt with.
     const SLOW: Duration = Duration::from_millis(400);
     const SETTLED: Duration = Duration::from_millis(600);
+
+    /// The pause as the poll meets it: two documents off the wire, through the
+    /// client's own parser, stored by the function the poll stores them with,
+    /// and read back as the badge, the line under the sleeve and the queue row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_paused_player_keeps_the_badge_it_was_playing_with() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        let client = backend
+            .with_entry(player.id(), |entry| entry.client.clone())
+            .expect("the player was just added");
+
+        // The queue files the song as the library does.
+        let queue = client.queue().await.expect("a queue");
+        assert_eq!(queue.songs[0].quality.as_deref(), Some("cd"));
+
+        let store = |status: &mut bluos::Status| {
+            let mut guard = backend.registry.lock().unwrap();
+            let entry = guard.get_mut(&player.id()).expect("in the registry");
+            entry.queue = Some(queue.clone());
+            take_status(entry, status);
+        };
+        let drawn = || {
+            let guard = backend.registry.lock().unwrap();
+            let entry = guard.get(&player.id()).expect("in the registry");
+            let status = entry.status.as_ref().expect("a status was stored");
+            let row = row_tier(&queue, &queue.songs[0], status);
+            let (badge, line) = tier_and_format(Some(status));
+            (badge, line, row)
+        };
+        let mqa = || {
+            (
+                "MQA".to_owned(),
+                "16/44.1 · MQA authored".to_owned(),
+                "MQA".to_owned(),
+            )
+        };
+
+        player.serve("/Status", fixtures::status_playing_mqa());
+        let mut playing = client.status().await.expect("a playing status");
+        store(&mut playing);
+        assert_eq!(drawn(), mqa());
+
+        player.serve("/Status", fixtures::status_paused_mqa());
+        let mut paused = client.status().await.expect("a paused status");
+        assert_eq!(paused.quality, None, "the player sends no tier");
+        store(&mut paused);
+        assert_eq!(
+            paused.quality.as_deref(),
+            Some("mqaAuthored"),
+            "and the poll goes on with the one it stored"
+        );
+        assert_eq!(drawn(), mqa(), "the pause looks as the play did");
+    }
+
+    /// The queue's memo hashes what the rows are built from, and whether this
+    /// queue is what the player is working through is one of those things
+    /// now: nothing else hashed tells a paused queue from a paused station
+    /// sitting on the same cursor with the same bitrate, and only the first
+    /// lends the row its tier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_queue_is_redrawn_when_the_player_leaves_it_for_a_station() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+
+        let client = backend
+            .with_entry(player.id(), |entry| entry.client.clone())
+            .expect("the player was just added");
+        let queue = client.queue().await.expect("a queue");
+        let paused = bluos::Status {
+            state: Some("pause".to_owned()),
+            pid: queue.id,
+            song: Some(0),
+            quality: Some("320000".to_owned()),
+            ..Default::default()
+        };
+        let station = bluos::Status {
+            stream_url: Some("http://stream.example/radio".to_owned()),
+            ..paused.clone()
+        };
+        let set = |status: &bluos::Status| {
+            let mut guard = backend.registry.lock().unwrap();
+            let entry = guard.get_mut(&player.id()).expect("in the registry");
+            entry.queue = Some(queue.clone());
+            entry.status = Some(status.clone());
+        };
+
+        set(&paused);
+        backend.publish_queue();
+        let on_the_queue = backend.sent_queue.load(Ordering::Relaxed);
+        assert_ne!(on_the_queue, 0, "the queue was drawn");
+        assert_eq!(row_tier(&queue, &queue.songs[0], &paused), "320k");
+
+        set(&station);
+        backend.publish_queue();
+        assert_ne!(
+            backend.sent_queue.load(Ordering::Relaxed),
+            on_the_queue,
+            "the row went from the station's bitrate back to the library's \
+             word, and the memo did not notice"
+        );
+        assert_eq!(row_tier(&queue, &queue.songs[0], &station), "CD");
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_slow_home_does_not_take_the_pane_from_the_player_chosen_after_it() {
