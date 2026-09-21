@@ -12,6 +12,7 @@
 
 mod artwork;
 mod custom;
+mod decoded;
 mod glyphs;
 mod known;
 mod lane;
@@ -1479,6 +1480,10 @@ struct Backend {
     update_offer: Arc<Mutex<Option<DeviceId>>>,
     /// Section order per screen, as set by Customize Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
+    /// The last tier each player's decoder named, and for which track, kept on
+    /// disk so a window opened on a paused player has something to carry. See
+    /// [`decoded`].
+    decoded: Arc<Mutex<decoded::Heard>>,
     /// The cover walks running over each list, so that starting one that
     /// replaces the list stops them at once rather than at their next
     /// completed fetch. More than one because a page starts a walk of its own
@@ -3183,6 +3188,7 @@ fn settle_files() {
     known::flush();
     searches::flush();
     order::flush();
+    decoded::flush();
 }
 
 /// Point every callback at the command channel.
@@ -3673,6 +3679,7 @@ async fn run(
         thumbnails: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
+        decoded: Arc::new(Mutex::new(decoded::load())),
     };
 
     tokio::spawn(run_commands(
@@ -9341,6 +9348,14 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
             known::save(&known);
         }
     }
+    // What its decoder last named goes with it, and before its first status
+    // here, which is what would otherwise find nothing to carry.
+    if let Some(old) = vacated {
+        let mut heard = backend.decoded.lock().unwrap();
+        if decoded::moved(&mut heard, old, id) {
+            decoded::save(&heard);
+        }
+    }
 
     let name = sync.name.clone();
     let model = sync.display_model().to_owned();
@@ -10894,7 +10909,18 @@ async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
 /// `status` comes back as it was stored, which is not always as it was sent:
 /// a document that leaves out the decoder's tier takes the last one for the
 /// same track. See [`carry_decoded`].
-fn take_status(entry: &mut Entry, status: &mut bluos::Status) -> (bool, bool) {
+///
+/// That last one is the status stored before this, or, where that is about
+/// another track or there is none, `heard`: what the file says this player's
+/// decoder last named. A window opened on a paused player has nothing else to
+/// go on — the player will not name the tier again until it plays — and nor
+/// does one that has skipped away and back while paused, whose stored status
+/// is about the track it skipped to. See [`decoded`].
+fn take_status(
+    entry: &mut Entry,
+    status: &mut bluos::Status,
+    heard: Option<&bluos::Status>,
+) -> (bool, bool) {
     // `pid` is the queue's identity. When it changes the player has replaced
     // the queue, which is the cue the device itself gives through
     // `refreshOnStatusChange` on its queue screen.
@@ -10916,9 +10942,32 @@ fn take_status(entry: &mut Entry, status: &mut bluos::Status) -> (bool, bool) {
         entry.queue = None;
     }
     carry_decoded(entry.status.as_ref(), status);
+    carry_decoded(heard, status);
     entry.status = Some(status.clone());
     entry.status_at = Some(Instant::now());
     (replaced, indexed)
+}
+
+/// Take a status the poll received for the player at `id`: store it, with
+/// whatever tier it carries (see [`take_status`]), and write down what its
+/// decoder named for the next run. `None` where the player is no longer
+/// tracked, which is the poll's cue to stop.
+fn hear(backend: &Backend, id: DeviceId, status: &mut bluos::Status) -> Option<(bool, bool)> {
+    // Read before the registry's lock rather than under it: two leaf locks,
+    // held one at a time.
+    let heard = decoded::about(&backend.decoded.lock().unwrap(), id).cloned();
+    let taken = {
+        let mut guard = backend.registry.lock().unwrap();
+        let entry = guard.get_mut(&id)?;
+        take_status(entry, status, heard.as_ref())
+    };
+    // Written down once a track, and handed over under the lock that changed
+    // it, which is what keeps an older body from landing after a newer one.
+    let mut heard = backend.decoded.lock().unwrap();
+    if decoded::remember(&mut heard, id, status) {
+        decoded::save(&heard);
+    }
+    Some(taken)
 }
 
 /// Keep one player's row, its queue and its MPRIS object current for as long as
@@ -10987,12 +11036,8 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 backoff = Duration::from_secs(1);
                 unreadable = 0;
 
-                let (queue_replaced, indexed) = {
-                    let mut guard = backend.registry.lock().unwrap();
-                    let Some(entry) = guard.get_mut(&id) else {
-                        return;
-                    };
-                    take_status(entry, &mut status)
+                let Some((queue_replaced, indexed)) = hear(&backend, id, &mut status) else {
+                    return;
                 };
 
                 if indexed && backend.is_selected(id) {
@@ -19364,6 +19409,7 @@ mod selection_tests {
             thumbnails: Arc::new(AtomicU64::new(0)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orders: Arc::new(Mutex::new(order::Orders::new())),
+            decoded: Arc::default(),
         };
         (backend, rx)
     }
@@ -19481,7 +19527,7 @@ mod selection_tests {
             let mut guard = backend.registry.lock().unwrap();
             let entry = guard.get_mut(&player.id()).expect("in the registry");
             entry.queue = Some(queue.clone());
-            take_status(entry, status);
+            take_status(entry, status, None);
         };
         let drawn = || {
             let guard = backend.registry.lock().unwrap();
@@ -19514,6 +19560,179 @@ mod selection_tests {
             "and the poll goes on with the one it stored"
         );
         assert_eq!(drawn(), mqa(), "the pause looks as the play did");
+    }
+
+    /// The restart: the last run heard the decoder name MQA and was closed,
+    /// and this one opens on the same track, paused. The player says nothing
+    /// of the tier until it plays again, so the only word there is is the one
+    /// written down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_window_opened_on_a_pause_shows_what_the_last_run_heard() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        let client = backend
+            .with_entry(player.id(), |entry| entry.client.clone())
+            .expect("the player was just added");
+        let queue = client.queue().await.expect("a queue");
+
+        // The last run, as far as this one can know it.
+        let mut heard = decoded::Heard::new();
+        player.serve("/Status", fixtures::status_playing_mqa());
+        let playing = client.status().await.expect("a playing status");
+        assert!(decoded::remember(&mut heard, player.id(), &playing));
+
+        // This one: nothing stored yet, and the player paused.
+        player.serve("/Status", fixtures::status_paused_mqa());
+        let open = |heard: Option<bluos::Status>| {
+            let backend = backend.clone();
+            let client = client.clone();
+            let queue = queue.clone();
+            let id = player.id();
+            async move {
+                let mut paused = client.status().await.expect("a paused status");
+                let mut guard = backend.registry.lock().unwrap();
+                let entry = guard.get_mut(&id).expect("in the registry");
+                entry.status = None;
+                entry.queue = Some(queue.clone());
+                take_status(entry, &mut paused, heard.as_ref());
+                let status = entry.status.as_ref().expect("stored");
+                (
+                    tier_and_format(Some(status)).0,
+                    row_tier(&queue, &queue.songs[0], status),
+                )
+            }
+        };
+
+        assert_eq!(
+            open(None).await,
+            (String::new(), "CD".to_owned()),
+            "with nothing written down, which is the bug"
+        );
+        assert_eq!(
+            open(decoded::about(&heard, player.id()).cloned()).await,
+            ("MQA".to_owned(), "MQA".to_owned())
+        );
+
+        // Written down for another track, it is about another track.
+        let mut elsewhere = decoded::about(&heard, player.id())
+            .expect("written down")
+            .clone();
+        elsewhere.song = Some(3);
+        assert_eq!(
+            open(Some(elsewhere)).await,
+            (String::new(), "CD".to_owned())
+        );
+    }
+
+    /// What was written down stands in wherever the run has nothing for the
+    /// track: before it has heard anything, and after it has heard about
+    /// another track. Where it has heard the decoder itself, that wins.
+    #[test]
+    fn the_file_speaks_where_the_run_has_nothing_for_the_track() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let id = DeviceId::new([192u8, 0, 2, 1], 11000);
+        let entry = || Entry {
+            client: Client::with_http(id, http.clone()),
+            identity: None,
+            poll: Arc::default(),
+            writes: Arc::default(),
+            upgrading: None,
+            view: Device::default(),
+            status: None,
+            status_at: None,
+            queue: None,
+            sync: None,
+            cover_url: None,
+            card_cover: None,
+            card_cover_url: None,
+        };
+
+        let track = bluos::Status {
+            state: Some("pause".to_owned()),
+            pid: Some(7),
+            song: Some(0),
+            title1: Some("A Song".to_owned()),
+            file: Some("/var/mnt/share/A Band - A Song.flac".to_owned()),
+            ..Default::default()
+        };
+        let said = |tier: &str| bluos::Status {
+            quality: Some(tier.to_owned()),
+            ..track.clone()
+        };
+
+        let mut fresh = entry();
+        let mut paused = track.clone();
+        take_status(&mut fresh, &mut paused, Some(&said("mqaAuthored")));
+        assert_eq!(paused.quality.as_deref(), Some("mqaAuthored"));
+
+        // This run heard `cd` for the same track; the file's older word loses.
+        let mut running = entry();
+        running.status = Some(said("cd"));
+        let mut paused = track.clone();
+        take_status(&mut running, &mut paused, Some(&said("mqaAuthored")));
+        assert_eq!(paused.quality.as_deref(), Some("cd"));
+
+        // Paused on the track, skipped to another and back, still paused: the
+        // status stored is about the other one, and the file still has this.
+        let mut skipping = entry();
+        skipping.status = Some(track.clone());
+        let mut other = bluos::Status {
+            song: Some(1),
+            title1: Some("The Next Song".to_owned()),
+            file: Some("/var/mnt/share/A Band - The Next Song.flac".to_owned()),
+            ..track.clone()
+        };
+        take_status(&mut skipping, &mut other, Some(&said("mqaAuthored")));
+        assert_eq!(other.quality, None, "the file is about the first track");
+        let mut back = track.clone();
+        take_status(&mut skipping, &mut back, Some(&said("mqaAuthored")));
+        assert_eq!(back.quality.as_deref(), Some("mqaAuthored"));
+    }
+
+    /// The poll's own path: what it hands [`hear`] is stored with the tier the
+    /// file had for it, and what the decoder names is written down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_poll_reads_the_file_and_writes_to_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        let client = backend
+            .with_entry(player.id(), |entry| entry.client.clone())
+            .expect("the player was just added");
+
+        player.serve("/Status", fixtures::status_playing_mqa());
+        let mut playing = client.status().await.expect("a playing status");
+        assert!(hear(&backend, player.id(), &mut playing).is_some());
+        assert_eq!(
+            decoded::about(&backend.decoded.lock().unwrap(), player.id())
+                .and_then(|status| status.quality.clone())
+                .as_deref(),
+            Some("mqaAuthored"),
+            "written down while it plays"
+        );
+
+        // A new run: nothing stored, the file as the last one left it.
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("in the registry")
+            .status = None;
+        player.serve("/Status", fixtures::status_paused_mqa());
+        let mut paused = client.status().await.expect("a paused status");
+        assert!(hear(&backend, player.id(), &mut paused).is_some());
+        assert_eq!(paused.quality.as_deref(), Some("mqaAuthored"));
+
+        // Gone from the registry, the poll is told to stop.
+        backend.registry.lock().unwrap().remove(&player.id());
+        assert!(hear(&backend, player.id(), &mut paused).is_none());
     }
 
     /// The queue's memo hashes what the rows are built from, and whether this

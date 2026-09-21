@@ -1,9 +1,10 @@
 //! The small files this app keeps beside itself.
 //!
-//! Four of them — the players seen before, the searches made before, the
-//! stations typed in by hand, and the order the home screen's sections were
-//! put in. Each is small, each is rewritten whole rather than edited, and each
-//! was written with `std::fs::write`, which truncates the file first and then
+//! Five of them — the players seen before, the searches made before, the
+//! stations typed in by hand, the order the home screen's sections were put
+//! in, and what each player's decoder last named. Each is small and each is
+//! rewritten whole rather than edited. The first four were written with
+//! `std::fs::write`, which truncates the file first and then
 //! writes into it. A crash, a full disk or a machine losing power between
 //! those two leaves nothing behind, and the stations file is the one where
 //! that matters: it is typed in by hand and kept nowhere else, so what it

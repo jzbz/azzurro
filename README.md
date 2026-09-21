@@ -115,9 +115,12 @@ lives in the app's config directory: `~/.config/azzurro` on Linux (or under
 `$XDG_CONFIG_HOME`), `~/Library/Application Support/azzurro` on macOS, and
 `%APPDATA%\azzurro` on Windows.
 
-Three more files sit beside it, all plain text and all the app's own: the
-stations typed in by hand, the searches made, and the order Home's shelves were
-dragged into. The only other thing written is downloaded cover art, cached in
+Four more files sit beside it, all plain text and all the app's own: the
+stations typed in by hand, the searches made, the order Home's shelves were
+dragged into, and the tier each player's decoder last named, with the track it
+named it for — a paused player will not say it again until it plays, so a
+window opened on one has nothing else to go on. The only other thing written is
+downloaded cover art, cached in
 `~/.cache/azzurro/artwork` on Linux (or under `$XDG_CACHE_HOME`),
 `~/Library/Caches/azzurro/artwork` on macOS, and
 `%LOCALAPPDATA%\azzurro\artwork` on Windows; deleting it costs nothing but the

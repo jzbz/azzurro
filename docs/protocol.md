@@ -183,13 +183,16 @@ Library playback also adds fields an input does not carry: `serviceName` and
 the decoder only speaks while it decodes. A 16/44.1 FLAC whose master was
 authored as MQA reports `<quality>mqaAuthored</quality>` and
 `<mqaOFS>44100</mqaOFS>` in every document while it plays, and neither in any
-document while it is paused. Over three pauses those two, `state` and `secs` were the only
-differences; `fn`, `pid`, `song`, `title1` and `streamFormat` (`16/44.1` for
-this file, with no codec in front) all held. `/Playlist` files the same song as
-`<quality>cd</quality>` throughout, which is the library's word from scanning
-the file rather than decoding it. So an absent `quality` on a paused player is
-"not decoding right now", and a client that wants the badge to survive a pause
-has to remember the last one for the same track.
+document while it is paused. Over three pauses those two, `state` and `secs`
+were the only differences; `fn`, `pid`, `song`, `title1` and `streamFormat`
+(`16/44.1` for this file, with no codec in front) all held. `/Playlist` files
+the same song as `<quality>cd</quality>` throughout, which is the library's
+word from scanning the file rather than decoding it, and
+`/Info?category=technical` for the file says `FLAC 16/44.1` and nothing of MQA,
+paused or not. So an absent `quality` on a paused player is "not decoding right
+now", and a client that wants the badge to survive a pause has to remember the
+last one for the same track — across its own restarts too, since one started
+on a paused player is never told.
 
 ### The play queue
 
