@@ -3878,8 +3878,14 @@ impl Backend {
     /// Answers whether the selection was on the player that moved, which is
     /// the caller's cue to select it again at its new address once it has been
     /// tracked. The id is moved here — see the note at the bottom — so that no
-    /// publish in between names a player the rows do not hold; what `Select`
-    /// is still for is everything else choosing a player means.
+    /// publish from this path names a player the rows do not hold; what
+    /// `Select` is still for is everything else choosing a player means.
+    ///
+    /// The queue this takes from the entry at the new address is read back
+    /// here rather than by the caller. That entry is not the player that
+    /// moved, so a `Select` for the move never names it, and where it is the
+    /// selected player the caller is told nothing at all — the selection did
+    /// not change. Repairing what this broke belongs with the breaking.
     /// One of the backend's own locks at a time, as everything here
     /// does: the registry, then the pane, then the selection. The art
     /// allow-list is taken inside the registry's guard rather than after it,
@@ -3910,7 +3916,7 @@ impl Backend {
     /// the identity: two entries that cannot be told apart are not evidence
     /// about which of them moved.
     fn moved_here(&self, identity: &str, to: DeviceId) -> bool {
-        let old = {
+        let (old, occupied) = {
             let mut registry = self.registry.lock().unwrap();
             let mut elsewhere = registry.iter().filter(|(at, entry)| {
                 at.host != to.host && entry.identity.as_deref() == Some(identity)
@@ -3956,12 +3962,23 @@ impl Backend {
             // queue on it was read from whichever player used to answer there.
             // Everything else that entry holds is refreshed by its poll within
             // a status; the queue is not — it is read when a player is chosen
-            // and when its own list changes — so dropped here, which is also
-            // what has the `Select` this move asks for read it again.
-            if let Some(entry) = registry.get_mut(&to) {
+            // and when its own list changes — so dropped here, and asked for
+            // again below.
+            //
+            // Whether there was one is the answer to two questions, which is
+            // why it is carried out of the guard. A queue taken from the
+            // player somebody is looking at has to be read back, and the
+            // `Select` that would have done it is only sent for a selection
+            // that came with the move; see the choice below. And an address
+            // already tracked is an address with a row, which is what decides
+            // whether this can publish at all; see the publish at the end.
+            let occupied = if let Some(entry) = registry.get_mut(&to) {
                 entry.queue = None;
-            }
-            old
+                true
+            } else {
+                false
+            };
+            (old, occupied)
         };
         tracing::info!(%old, %to, "a player has changed address");
 
@@ -4028,10 +4045,10 @@ impl Backend {
         // Left until the command was drained that blank stood for as long as
         // the loop took to get to it, which turned a change of DHCP lease into
         // a visible flash of an empty window. Moved now, so the very first
-        // publish that carries the new row already names it: the one below
-        // still finds no row — the entry is made by `track_as`, a moment
-        // later — but `track_as` publishes too, and that one has it.
-        let carried = {
+        // publish that carries the new row already names it — and no publish
+        // before that one names a player the rows do not hold; see the publish
+        // at the end.
+        let (carried, requeue) = {
             let mut selected = self.selected.lock().unwrap();
             let carried = *selected == Some(old);
             if carried {
@@ -4043,7 +4060,15 @@ impl Backend {
                 // address to answer for them any more.
                 self.selections.fetch_add(1, Ordering::SeqCst);
             }
-            carried
+            // Whether the queue taken above was the one on screen. It is
+            // exactly when the entry already tracked at this address is the
+            // selected player — which is the case the branch above is not, so
+            // no `Select` is sent for it and nothing else reads that queue
+            // back. The status loop is no help: it re-reads on a queue id that
+            // differs from the last one, and two players that both report none
+            // compare equal, which left the pane drawn as a bare "Queue" line
+            // with no rows under it for the rest of the session.
+            (carried, !carried && occupied && *selected == Some(to))
         };
 
         // After the selection, not with the write above: `publish_help` asks
@@ -4054,7 +4079,40 @@ impl Backend {
             self.publish_help();
         }
 
-        self.publish();
+        // Only where the new address already has a row. The list is drawn from
+        // the registry and the selection is drawn against it, so publishing in
+        // the gap between removing the old entry and `track_as` making the new
+        // one publishes a selected player on no row at all — which the window
+        // reads as no selection and draws as an empty `Device`: no player
+        // name, no track line, no sleeve, a dead transport. Moving the id
+        // early closed the half of that the command loop was responsible for;
+        // this closes the half this path was, which is as much as one path
+        // can close: a poll landing in the same window publishes from its own
+        // task and draws the same blank, and the only thing that would rule
+        // that out is removing the old entry and inserting the new one under
+        // one registry guard — a larger change than this, and `track_as` is
+        // the other side of it.
+        //
+        // Nothing is lost by staying quiet. `adopt` publishes through
+        // `track_as` a moment later, unless the cap between them turns the
+        // announcement away — which it cannot do to a move, since removing the
+        // old entry is what left room under it. Where the address was already
+        // tracked there is no gap to fall into: the row is there and
+        // `track_as` keeps it, taking the early path that publishes nothing,
+        // so this is the publish that carries the removal of the old row.
+        if occupied {
+            self.publish();
+        }
+
+        // And the queue taken from the entry at that address, read back. Sent
+        // from here rather than left to the caller because the caller is told
+        // only whether the selection moved, and this is the case where it did
+        // not: there is no `Select` behind it, and no status tick that will
+        // notice. The entry is there to be read into — it is the one the drop
+        // was made on, and `track_as` keeps it.
+        if requeue {
+            tokio::spawn(fetch_queue(self.clone(), to));
+        }
         carried
     }
 
@@ -9797,6 +9855,11 @@ where
 /// scroll chained, which is the starvation the ceiling is for. Asked again
 /// after each fetch, the walk that could not trim finds its elders listed the
 /// moment they wake up and the list settles where it should.
+///
+/// The oldest walk is the one exception, and is told no rather than asked
+/// back: nothing is ever in front of it, so there is nothing it may yet stop
+/// however long it waits. The ceiling is still applied — by the walks that do
+/// have elders, which is all of the others.
 fn trim_walks(walks: &mut Walks, mine: &Rows) -> bool {
     walks.running.retain(|walk| !walk.stop.is_finished());
     while walks.running.len() > WALKS_AT_ONCE {
@@ -9820,8 +9883,18 @@ fn trim_walks(walks: &mut Walks, mine: &Rows) -> bool {
             // Only walks that have yet to be polled are left to stop, and
             // stopping those is the one thing this must not do. They are over
             // the ceiling all the same, so this one is owed another look once
-            // the runtime has reached them.
-            return true;
+            // the runtime has reached them — unless this is the oldest walk
+            // on the list, which is owed nothing. Its slice of elders is empty
+            // and stays empty: `running` is only appended to, and the two
+            // things that take a walk out of it — the finished-walk retain
+            // above and the trim below — can only lower an index, never raise
+            // one, so a walk at the head stays at the head. Answering `true`
+            // had the longest-lived walk on a paged list re-run this after
+            // every completed fetch for the rest of its life, taking the slot
+            // lock each time — the same lock every publish and every
+            // `start_walk` takes — to be told again that there is nothing it
+            // may stop.
+            return age > 0;
         };
         let stopped = walks.running.remove(oldest);
         stopped.stop.abort();
@@ -21994,11 +22067,20 @@ mod selection_tests {
         let (backend, first, _second) = two_players().await;
         first.serve("/upgrade", UPGRADE_WAITING);
         choose(&backend, &first).await;
+        let before = backend.sent_settings.load(Ordering::Relaxed);
         let _ = backend
             .commands
             .send(Command::HelpAction(help_row(HelpKind::Upgrade)));
         until("the check to offer Install", || {
             install_offered(&backend) == Some(first.id())
+        })
+        .await;
+        // And for the page that carries it. The offer is written under the
+        // browsing lock and published by the statement after, so waiting on
+        // the field alone can leave that publish in flight — where it would
+        // land on the zeroed memo below and be counted as the move's.
+        until("the page the check publishes", || {
+            backend.sent_settings.load(Ordering::Relaxed) != before
         })
         .await;
 
@@ -22012,19 +22094,49 @@ mod selection_tests {
             .expect("the player is tracked")
             .identity = Some(identity.clone());
         let now = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), first.id().port);
+        // Zeroed so the publish the move makes is visible as one: every
+        // publish swaps its own fingerprint in, and nothing else writes this.
+        backend.sent_settings.store(0, Ordering::Relaxed);
         assert!(backend.moved_here(&identity, now));
+        let published = backend.sent_settings.load(Ordering::Relaxed);
 
         assert_eq!(
             install_offered(&backend),
             Some(now),
             "the check was this player's, and it is the same player answering on a new address"
         );
-        // Which is the condition `publish_help` draws the row by, so the page
-        // the user is looking at keeps an Install that means something.
+        assert_ne!(
+            published, 0,
+            "and the page on screen was drawn again, rather than left as it was \
+             for whatever publishes next to notice"
+        );
+
+        // Which page it was, and this is the half the offer alone cannot
+        // answer. `publish_help` draws Install only while the offer is the
+        // selected player, so the same call made before the selection had
+        // moved publishes the page without its Install row — and nothing
+        // draws it back, because `Command::Select` for a player that is
+        // already selected does not republish the pane. Rebuilt here in the
+        // state the move left, which is the page with the row on it.
+        backend.sent_settings.store(0, Ordering::Relaxed);
+        backend.publish_help();
         assert_eq!(
-            install_offered(&backend),
-            *backend.selected.lock().unwrap(),
-            "an offer the selection has moved past is a row that is drawn and dead"
+            published,
+            backend.sent_settings.load(Ordering::Relaxed),
+            "the page the move published is the one built after the selection \
+             moved, not the one built before it"
+        );
+
+        // And the two are different pages, or the assertion above would hold
+        // whichever way round the move did it.
+        *backend.selected.lock().unwrap() = None;
+        backend.sent_settings.store(0, Ordering::Relaxed);
+        backend.publish_help();
+        assert_ne!(
+            published,
+            backend.sent_settings.load(Ordering::Relaxed),
+            "a page whose offer is not the selected player is drawn without its \
+             Install row, and that is a different page"
         );
     }
 
@@ -22794,6 +22906,155 @@ mod selection_tests {
         );
     }
 
+    /// And nothing is published while the player is between addresses.
+    ///
+    /// Moving the id early closed half of the blank: the window no longer
+    /// waits for `Command::Select` to be drained before it knows which player
+    /// is chosen. The other half was this function's own publish. The list is
+    /// drawn from the registry and the selection is drawn against that list,
+    /// so a publish between removing the old entry and `track_as` making the
+    /// new one names a selected player on no row at all — which the window
+    /// reads as no selection and draws as an empty `Device`: no player name,
+    /// no track line, no sleeve, a dead transport, for as long as it takes the
+    /// next statement in `adopt` to run. Staying quiet costs nothing, because
+    /// that statement publishes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_onto_an_untracked_address_publishes_nothing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+
+        let identity = identity_of(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+        let was = player.id();
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&was)
+            .unwrap()
+            .identity = Some(identity.clone());
+        *backend.selected.lock().unwrap() = Some(was);
+
+        // The memo is what says whether a publish happened at all: every
+        // publish swaps its fingerprint in, and nothing else writes it.
+        backend.sent_players.store(0, Ordering::Relaxed);
+        let now = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), was.port);
+        assert!(backend.moved_here(&identity, now));
+
+        assert_eq!(
+            backend.sent_players.load(Ordering::Relaxed),
+            0,
+            "a publish in the gap names a selected player the rows do not hold, \
+             which the window draws as an empty pane"
+        );
+    }
+
+    /// A queue taken from the player on screen is read back.
+    ///
+    /// Whatever was already tracked at the address being moved onto was
+    /// somebody else, so the queue on that entry belongs to a player that is
+    /// not there any more and is dropped. That is right, and it left a hole:
+    /// the caller is told only whether the selection moved, and this is the
+    /// case where it did not — the selection is on the entry at the new
+    /// address, not on the player that moved — so no `Select` followed the
+    /// drop. Nothing else re-reads a queue either: the status loop goes by the
+    /// queue id changing, and two players that both report none compare equal,
+    /// so the pane drew a bare "Queue" line with no rows under it for the rest
+    /// of the session.
+    ///
+    /// Watched as the queue coming back rather than as a flag being set: the
+    /// re-read is the whole of the fix, and a test that stops at the decision
+    /// pins nothing that draws.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_taken_from_the_selected_player_is_asked_for_again() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        // What the address holds now, and what the re-read has to find: a
+        // different length from the queue seeded below, so the two cannot be
+        // confused for one another.
+        const THEIRS: u32 = 6;
+        const DEPARTED: u32 = 4;
+        player.hold_queue(THEIRS);
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+
+        // The selected player, with a queue read from whoever answered here
+        // before, and on screen.
+        let here = player.id();
+        *backend.selected.lock().unwrap() = Some(here);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&here)
+            .expect("the player was just added")
+            .queue = Some(bluos::Queue {
+            length: DEPARTED,
+            songs: (0..DEPARTED)
+                .map(|id| bluos::QueueSong {
+                    id,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+
+        // And somebody else, tracked at another address, about to announce
+        // from this one. Put in by hand rather than tracked: `track_as` starts
+        // a poll, nothing answers at that address, and the first failure
+        // publishes — which is one of the things this test watches for.
+        let identity = identity_of(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+        let elsewhere = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), here.port);
+        backend.registry.lock().unwrap().insert(
+            elsewhere,
+            Entry {
+                client: Client::with_http(elsewhere, http.clone()),
+                identity: Some(identity.clone()),
+                poll: Arc::default(),
+                writes: Arc::default(),
+                upgrading: None,
+                view: Device::default(),
+                status: None,
+                status_at: None,
+                queue: None,
+                sync: None,
+                cover_url: None,
+                card_cover: None,
+                card_cover_url: None,
+            },
+        );
+
+        backend.sent_players.store(0, Ordering::Relaxed);
+        assert!(
+            !backend.moved_here(&identity, here),
+            "the selection did not move — it was already on this address, which \
+             is the case that used to leave the queue unasked for"
+        );
+        assert_ne!(
+            backend.sent_players.load(Ordering::Relaxed),
+            0,
+            "an address that already has a row has no gap to fall into, so this \
+             is the publish that carries the removal of the old one"
+        );
+
+        until("the queue to be read again", || {
+            backend
+                .with_entry(here, |entry| {
+                    entry.queue.as_ref().map(|queue| queue.length) == Some(THEIRS)
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            player.asked_for("/Playlist"),
+            "and it was read from the player answering there now, not carried \
+             over from the one that left"
+        );
+    }
+
     /// A second zone on one box is not the first zone having moved.
     ///
     /// A multi-zone amplifier answers on `:11000` and `:11010` and reports one
@@ -23539,7 +23800,16 @@ mod thumbnail_tests {
     /// under test is that those two are read together. The gap is made wide
     /// enough to step into by holding the lock `publish_queue` takes first,
     /// from a thread of its own so nothing here holds a lock across an await.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// Two workers, named rather than left to the machine: the paging task
+    /// parks one of them outright — `publish_queue` takes `queue_art` with a
+    /// std mutex, which blocks the worker rather than yielding it — and the
+    /// test body has to keep running to open the gap again. On a one-core
+    /// machine, or a container pinned to one CPU, the default is a single
+    /// worker and the release is never reached: the test hangs until the
+    /// harness kills it, its own deadline being inside the loop that cannot
+    /// run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_page_measured_against_a_queue_that_was_re_read_stands_down() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::new();
@@ -24405,6 +24675,47 @@ mod thumbnail_tests {
             walks.carried.len(),
             2 * EACH as usize,
             "and what the stopped walks owed is the list's debt"
+        );
+    }
+
+    /// But the oldest walk is told no rather than asked back.
+    ///
+    /// The answer means "over the ceiling, with something this walk may yet
+    /// stop", and for the walk at the head of the list the second half can
+    /// never become true: `running` is only appended to, and a trim only ever
+    /// removes something in front of the walk doing it, so nothing will ever
+    /// be in front of that one. Answered `true` there, the longest-lived walk
+    /// on a paged list — the one with the most rows, so the one that lives
+    /// longest — re-ran the trim after every completed fetch for the rest of
+    /// its life, taking the slot lock each time to be told again that it has
+    /// nothing to stop. That lock is the one every publish and every
+    /// `start_walk` takes.
+    #[tokio::test]
+    async fn the_oldest_walk_is_not_asked_back_for_a_trim_it_can_never_do() {
+        let mut walks = Walks::default();
+        let mut lists = Vec::new();
+        // One walk more than the list keeps, every one of them polled: the
+        // ceiling is live, and what it may stop is the question.
+        for _ in 0..=WALKS_AT_ONCE {
+            let left: Rows = Arc::default();
+            left.lock().unwrap().listed = true;
+            walks.running.push(Walking {
+                stop: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                left: left.clone(),
+            });
+            lists.push(left);
+        }
+
+        let oldest = lists.first().expect("a walk at the head").clone();
+        assert!(
+            !trim_walks(&mut walks, &oldest),
+            "there is nothing in front of the oldest walk and there never will \
+             be, so it is owed no further look"
+        );
+        assert_eq!(
+            walks.running.len(),
+            WALKS_AT_ONCE + 1,
+            "and it stopped nothing: everything on the list is newer than it is"
         );
     }
 
