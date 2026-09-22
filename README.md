@@ -118,8 +118,9 @@ lives in the app's config directory: `~/.config/azzurro` on Linux (or under
 Four more files sit beside it, all plain text and all the app's own: the
 stations typed in by hand, the searches made, the order Home's shelves were
 dragged into, and the tier each player's decoder last named, with the track it
-named it for — a paused player will not say it again until it plays, so a
-window opened on one has nothing else to go on. The only other thing written is
+named it for — a player paused on an MQA track does not say MQA again until it
+plays, so a window opened on one has nothing else to go on. The only other
+thing written is
 downloaded cover art, cached in
 `~/.cache/azzurro/artwork` on Linux (or under `$XDG_CACHE_HOME`),
 `~/Library/Caches/azzurro/artwork` on macOS, and

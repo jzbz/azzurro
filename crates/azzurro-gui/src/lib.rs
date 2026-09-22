@@ -1194,9 +1194,9 @@ struct Entry {
     /// The last status the poller received, which is more than the list needs
     /// but exactly what MPRIS and the queue view ask for.
     ///
-    /// As received, but for one element: a paused player stops naming the
-    /// decoder's tier, and this keeps the one it last named for the same
-    /// track. See [`carry_decoded`].
+    /// As received, but for one element: a paused player can stop naming the
+    /// decoder's tier — it does for MQA — and this keeps the one it last named
+    /// for the same track. See [`carry_decoded`].
     status: Option<Status>,
     /// When that status arrived, so a position can be extrapolated from it.
     status_at: Option<Instant>,
@@ -1764,12 +1764,14 @@ fn row_tier(queue: &bluos::Queue, song: &bluos::QueueSong, status: &bluos::Statu
 /// Keep the decoder's tier across a status that leaves it out, for as long as
 /// the status is about the same track.
 ///
-/// The decoder only speaks while it decodes. A Powernode on an MQA-authored
-/// FLAC sends `mqaAuthored` in every document while it plays and drops the
-/// element from every document while it is paused, and stored as sent, each
-/// pause blanked the badge under the sleeve and handed the queue row back to
-/// the library's `cd` — for a file whose master was no less MQA for being
-/// paused. So a document that names no tier takes the one before it, provided
+/// MQA is only said while the decoder is running. A Powernode on an
+/// MQA-authored FLAC sends `mqaAuthored` in every document while it plays and
+/// drops the element from every document while it is paused, and stored as
+/// sent, each pause blanked the badge under the sleeve and handed the queue row
+/// back to the library's `cd` — for a file whose master was no less MQA for
+/// being paused. (A 24/96 FLAC keeps its `hd` through a pause, and has nothing
+/// here to be carried.) So a document that names no tier takes the one before
+/// it, provided
 /// it describes the same track (see [`bluos::Status::same_track`]): a skip, a
 /// replaced queue or a switch to an input is a different track, and the tier
 /// goes with the one it was found on.
@@ -10913,7 +10915,7 @@ async fn fetch_queue_buttons(backend: Backend, id: DeviceId) {
 /// That last one is the status stored before this, or, where that is about
 /// another track or there is none, `heard`: what the file says this player's
 /// decoder last named. A window opened on a paused player has nothing else to
-/// go on — the player will not name the tier again until it plays — and nor
+/// go on — the player will not name MQA again until it plays — and nor
 /// does one that has skipped away and back while paused, whose stored status
 /// is about the track it skipped to. See [`decoded`].
 fn take_status(

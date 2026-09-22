@@ -1,12 +1,13 @@
 //! What each player's decoder last said, and about which track.
 //!
-//! The player names the decoder's tier only while it decodes: an MQA-authored
+//! The player names MQA only while the decoder is running: an MQA-authored
 //! FLAC is `mqaAuthored` in every status while it plays and in none while it
-//! is paused. Within a run the stored status carries the tier across the pause
-//! (see `carry_decoded`), but a window opened on a player that is already
-//! paused has no stored status to carry it from, and drew the library's word —
-//! no badge, and CD on the row — for a file it had shown as MQA a minute
-//! before it was closed.
+//! is paused. (A 24/96 FLAC goes on saying `hd` through a pause, and needs
+//! none of this.) Within a run the stored status carries the tier across the
+//! pause (see `carry_decoded`), but a window opened on a player that is
+//! already paused has no stored status to carry it from, and drew the
+//! library's word — no badge, and CD on the row — for a file it had shown as
+//! MQA a minute before it was closed.
 //!
 //! So the last tier each player's decoder named is written down, with what
 //! says which track it named it for, and the first status of the next run

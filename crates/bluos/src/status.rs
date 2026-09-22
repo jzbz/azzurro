@@ -291,11 +291,12 @@ pub struct Status {
     /// What the decoder found in the stream: `cd`, `hd`, `mqaAuthored`, a
     /// bitrate for a station.
     ///
-    /// Only while it is decoding. A Powernode on an MQA-authored FLAC sends
+    /// Not always there on a pause. A Powernode on an MQA-authored FLAC sends
     /// `mqaAuthored` in every document while it plays and leaves the element
     /// out of every document while it is paused, keeping the rest — the same
-    /// `streamFormat`, `pid`, `song` and `fn` — as they were. Absent is "not
-    /// decoding right now", not "no longer MQA".
+    /// `streamFormat`, `pid`, `song` and `fn` — as they were. The same player
+    /// paused on a 24/96 FLAC goes on saying `hd`. So absent on a paused
+    /// player is "not saying right now", not "no longer MQA".
     pub quality: Option<String>,
     /// The file the player has open, for library playback. `fn` is a Rust
     /// keyword.
