@@ -2,11 +2,12 @@
 # Lay out Azzurro.app around a universal binary.
 #
 # A .app is a directory with a particular shape and a plist that names the
-# executable; nothing here needs Xcode. Signing and notarization are not done
-# here — Gatekeeper refuses an unsigned bundle outright, so this is an input to
-# packaging/macos-sign.sh, which signs and notarizes it on the machine holding
-# the Developer ID key. `release.yml` calls this script and ships what it makes
-# as the `-unsigned` zip.
+# executable; nothing here needs Xcode. The bundle is signed ad hoc at the end
+# and no more than that: Developer ID signing and notarization are done by
+# packaging/macos-sign.sh, on the machine holding the key, and it replaces the
+# ad hoc signature outright. `release.yml` calls this script and ships what it
+# makes as the `-unsigned` zip — not Developer ID signed, which is what
+# Gatekeeper asks of a download, so still refused by it.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -79,5 +80,15 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# Signed ad hoc — no identity, no team, no key — so the bundle has a code
+# identity at all. Without one, macOS 26 records Local Network access as
+# allowed for it and goes on refusing every connection with "No route to
+# host": a CI build run on a test Mac never reached a player until it was
+# signed this way, and did at once afterwards. It proves nothing about who
+# built it, and macos-sign.sh's `--force` discards it for the Developer ID
+# signature. No `--deep`, for the reason macos-sign.sh gives: there is no
+# nested code here, and `--deep` is deprecated for signing.
+codesign --force --sign - "$app"
 
 echo "built $app"
