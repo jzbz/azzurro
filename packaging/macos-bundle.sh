@@ -70,9 +70,12 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <!-- Named without its extension, which is what Finder expects. -->
   <key>CFBundleIconFile</key><string>azzurro</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <!-- Discovery is a UDP broadcast to every interface, which macOS treats as
-       reaching out to devices on the local network and gates behind a prompt.
-       Without this the prompt has no wording and the request is refused. -->
+  <!-- Discovery is a UDP broadcast to every interface, and every player is on
+       the local network, which macOS gates behind a prompt. This is what the
+       prompt says. Without it macOS 26 still asks, in its own words, that the
+       app be let "discover, connect to, and collect data from devices on
+       your networks": the request is not refused for the want of it, but
+       the question arrives without the reason. -->
   <key>NSLocalNetworkUsageDescription</key>
   <string>Azzurro looks for BluOS players on your network.</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
