@@ -179,11 +179,12 @@ client.
 ## Installing
 
 Releases carry a Flatpak bundle for `x86_64` and `aarch64`, a universal `.app`
-for macOS, and one self-contained `.exe` for Windows. The macOS bundle is signed
-with a Developer ID and notarized by Apple, so it opens without being allowed
-past Gatekeeper by hand; the Windows executable is not signed, so SmartScreen
-warns on first run and then lets you through. Installing it through winget
-avoids that warning entirely.
+for macOS, and for Windows one self-contained `.exe` and a per-user installer
+around that same `.exe`. The macOS bundle is signed with a Developer ID and
+notarized by Apple, so it opens without being allowed past Gatekeeper by hand;
+neither Windows file is signed, so SmartScreen warns the first time one
+downloaded in a browser is run, and then lets you through. Installing through
+winget avoids that warning.
 
 ```bash
 brew install --cask jzbz/tap/azzurro               # macOS, from the tap
@@ -191,8 +192,19 @@ flatpak install ./azzurro-*.flatpak                # Linux, from the bundle
 winget install Azzurro.Azzurro                     # Windows, once the manifest lands
 ```
 
-The winget manifest is submitted rather than merged — until a moderator takes
-it, the Windows route is the `.exe` from the release.
+The installer, `azzurro-vX.Y.Z-x86_64-setup.exe` from the release after 0.1.0
+on, installs Azzurro for your account only and without asking for an
+administrator: Azzurro goes in the Start Menu and in Apps & Features, Win+R
+`azzurro` starts it from a normal, not elevated, Run box, and uninstalling it,
+with Azzurro closed, takes all of that away again without touching the players,
+stations and everything else Azzurro remembers. The bare `.exe` keeps those in
+the same places, so moving from one to the other loses nothing.
+
+It is also what winget will install. The winget manifest is submitted rather
+than merged: the submission still open carries 0.1.0's bare `.exe`, and is to be
+switched to the first release with an installer before it merges. Until a
+moderator takes it, the Windows route is a file from the release;
+`packaging/winget/README.md` has the detail.
 
 Every release ships a `SHA256SUMS` signed with the maintainer's PGP key. It is
 the one artifact that survives a compromise of GitHub, winget or the Homebrew
@@ -229,7 +241,9 @@ is the whole of it — the binary sets `windows_subsystem = "windows"` in releas
 so it does not open a console behind the window, and `.cargo/config.toml` links
 the Visual C++ runtime into it. Without that the exe exits on any machine
 without the redistributable, which is most of them: `0xC0000135`, no window and
-nothing in the event log.
+nothing in the event log. `packaging/windows/` wraps that exe in the per-user
+installer, and its README says how to build one and how to check one against a
+release.
 
 `packaging/blue.azzurro.Azzurro.yml` is a Flatpak manifest for the same
 thing. It needs `packaging/cargo-sources.json`, which is generated from
