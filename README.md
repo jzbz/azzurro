@@ -109,11 +109,18 @@ wake, so one switched on an hour later still appears without a rescan.
 
 Neither of those helps a player that was asleep at startup or sits behind
 something that eats broadcast traffic, so addresses that have answered are
-remembered in a file called `players` and tried again next time. One can be
-pinned there by hand, or typed into the box under the player list. The file
-lives in the app's config directory: `~/.config/azzurro` on Linux (or under
-`$XDG_CONFIG_HOME`), `~/Library/Application Support/azzurro` on macOS, and
-`%APPDATA%\azzurro` on Windows.
+remembered in a file called `players` and tried again next time. Beside each
+address it records the MAC the player answered with there, so a player that
+takes a new address while the app is closed is recognized when it announces
+from the new one, rather than left behind as a second row that never answers.
+Until a player is chosen, the selection does not stay on a remembered address
+that turns out not to answer: it moves to the first player that does. A player
+that has stopped responding can also be forgotten from the player list, which
+takes its address out of the file. An address can be pinned there by hand, or
+typed into the box under the player list. The file lives in the app's config
+directory: `~/.config/azzurro` on Linux (or under `$XDG_CONFIG_HOME`),
+`~/Library/Application Support/azzurro` on macOS, and `%APPDATA%\azzurro` on
+Windows.
 
 Four more files sit beside it, all plain text and all the app's own: the
 stations typed in by hand, the searches made, the order Home's shelves were

@@ -781,6 +781,7 @@ component DeviceCard inherits Rectangle {
     callback volume-changed(int);
     callback toggle-mute();
     callback toggle-group();
+    callback forget();
 
     // The card names the player and says whether it is the one being
     // controlled; the volume and group controls inside it carry their own
@@ -871,10 +872,19 @@ component DeviceCard inherits Rectangle {
                     overflow: elide;
                 }
 
+                // With the address while it is not answering. A row that has
+                // never answered is called "BluOS player", however many of
+                // them there are, and the address is the one thing that says
+                // which is which — and which one Forget would take away. The
+                // address first: a line too long for the card is cut from its
+                // end, and an IPv6 address typed in by hand is long enough to
+                // lose its last few characters behind the words, which are
+                // the same on every row, while those characters are what
+                // tell two such addresses apart.
                 Text {
                     text: root.device.reachable
                         ? (root.device.now-playing == "" ? root.device.model : root.device.now-playing)
-                        : "Not responding";
+                        : root.device.id + " · not responding";
                     font-size: Theme.small-size;
                     color: root.device.reachable ? Theme.dim : Theme.faint;
                     overflow: elide;
@@ -887,6 +897,22 @@ component DeviceCard inherits Rectangle {
                 width: 13px;
                 height: 13px;
                 y: 4px;
+            }
+
+            // Beside the play mark rather than in its place. A player that
+            // stopped answering mid-song still wears it: the failed poll that
+            // turns the row to not responding leaves the rest of the row as
+            // it was, so both can be drawn, and the header fits the two
+            // without the card growing. Not offered on one that is installing
+            // an update: that says not responding too while it reboots, and
+            // it is coming back. Declared after the card's own touch area, so
+            // the press is this button's and not a choice of the player.
+            if !root.device.reachable && !root.device.upgrading: IconButton {
+                glyph: Icons.clear;
+                label: "Forget this player";
+                size: 26px;
+                glyph-size: 14px;
+                clicked => { root.forget(); }
             }
         }
 
@@ -2506,6 +2532,8 @@ export component AppWindow inherits Window {
     callback toggle-mute(string);
     callback select(string);
     callback toggle-group(string);
+    // Stop tracking a player that is not responding, and stop remembering it.
+    callback forget-player(string);
     callback play-track(string, int);
     callback browse-activate(int);
     callback browse-menu(int);
@@ -5940,6 +5968,11 @@ export component AppWindow inherits Window {
                                                     volume-changed(v) => { root.set-volume(device.id, v); }
                                                     toggle-mute => { root.toggle-mute(device.id); }
                                                     toggle-group => { root.toggle-group(device.id); }
+                                                    // The list stays open: the
+                                                    // row goes, and the rest of
+                                                    // it is what is left to
+                                                    // choose from.
+                                                    forget => { root.forget-player(device.id); }
                                                 }
                                             }
 

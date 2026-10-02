@@ -134,6 +134,17 @@ pub fn moved(heard: &mut Heard, from: DeviceId, to: DeviceId) -> bool {
     true
 }
 
+/// Drop the line for the player at `id`, and say whether there was one.
+///
+/// For a player the user has told the app to forget: no address answers for
+/// it any more, so its line would only wait to be pushed off the front. See
+/// [`crate::Backend::forget`].
+pub fn forget(heard: &mut Heard, id: DeviceId) -> bool {
+    let before = heard.len();
+    heard.retain(|(player, _)| *player != id);
+    heard.len() != before
+}
+
 /// Read the file's contents.
 ///
 /// Separate from `load` so the whole of the parsing can be tested without a
@@ -438,5 +449,25 @@ mod tests {
             about(&heard, player(11030)).and_then(|s| s.quality.as_deref()),
             Some("cd")
         );
+    }
+
+    /// A forgotten player's line goes, and only that player's.
+    #[test]
+    fn a_forgotten_player_takes_its_line_with_it() {
+        let mut heard = Heard::new();
+        assert!(remember(&mut heard, player(11000), &playing_mqa()));
+        assert!(remember(&mut heard, player(11010), &playing_mqa()));
+
+        assert!(forget(&mut heard, player(11000)));
+        assert!(about(&heard, player(11000)).is_none());
+        assert!(
+            about(&heard, player(11010)).is_some(),
+            "another player's line is not this one's"
+        );
+        assert!(
+            !forget(&mut heard, player(11000)),
+            "nothing left to drop, so nothing to write"
+        );
+        assert_eq!(read(&body(&heard)).len(), 1);
     }
 }

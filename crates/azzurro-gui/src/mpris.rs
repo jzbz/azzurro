@@ -947,6 +947,7 @@ mod tests {
             crate::Entry {
                 client: bluos::Client::with_http(id, http.clone()),
                 identity: None,
+                provenance: crate::Provenance::Settled,
                 poll: Arc::default(),
                 writes: Arc::default(),
                 upgrading: None,

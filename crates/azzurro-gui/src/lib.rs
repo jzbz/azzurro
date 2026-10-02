@@ -201,9 +201,31 @@ enum Command {
     UpgradeAnswer(bool),
     /// Track a player at an address typed in by hand.
     AddPlayer(String),
+    /// Stop tracking a player that is not responding, and stop remembering
+    /// it. See [`Backend::forget`].
+    Forget(DeviceId),
     /// Show this player's queue. The window's selection is the backend's cue
     /// to fetch one, since fetching every player's queue would be waste.
+    ///
+    /// Sent for the user's own choice and nothing else: a press on a card, or
+    /// Show on an update notice. It marks the selection as chosen, which is
+    /// what keeps [`Backend::reconsider_selection`] from moving it; anything
+    /// the backend selects by itself goes by one of the two commands below.
     Select(DeviceId),
+    /// Everything choosing this player means, for a selection
+    /// [`Backend::moved_here`] has already carried to the player's new
+    /// address. Leaves the selection as chosen or unchosen as it was — it is
+    /// the same speaker in the same room — and does nothing where the
+    /// selection has gone somewhere else since.
+    Carried(DeviceId),
+    /// Move a selection nobody chose from `from`, a player that has never
+    /// answered, to `to`, one that has — unless, by the time this is handled,
+    /// the selection is somewhere else or somebody has chosen it. See
+    /// [`Backend::reconsider_selection`].
+    AutoSelect {
+        from: DeviceId,
+        to: DeviceId,
+    },
     /// Do something to one player.
     Player(DeviceId, Action),
     /// Put this player into the selected player's group, or take it out.
@@ -618,6 +640,24 @@ impl Pane {
             Pane::Alarms(page) => Some(page.device),
             _ => None,
         }
+    }
+
+    /// Whether this pane is a page of `id`'s: any of the panes [`Pane::owner`]
+    /// answers for, and the ones it leaves out because nothing further is
+    /// opened from them — the playlist chooser, a preset being renamed, and
+    /// the presets being rearranged. Each of those still sends what it holds
+    /// to the player it names.
+    ///
+    /// For a player that is going for good, when every page of its has to go
+    /// with it. See [`Backend::forget`].
+    fn belongs_to(&self, id: DeviceId) -> bool {
+        self.owner() == Some(id)
+            || match self {
+                Pane::Playlists(page) => page.device == id,
+                Pane::EditPreset(page) => page.device == id,
+                Pane::Customise(page) => page.presets.is_some_and(|(owner, _)| owner == id),
+                _ => false,
+            }
     }
 
     /// The form being filled in, if one is.
@@ -1166,13 +1206,43 @@ impl Poll {
     }
 }
 
+/// What an entry's identity rests on.
+///
+/// A player that took a new address while the app was closed leaves its old
+/// one in the players file, and that address never answers again: nothing in
+/// the run would ever say whose it was, so when the player announced from its
+/// new address [`Backend::moved_here`] found nothing to retire, and the old
+/// address stayed as a second row that answered nothing, run after run.
+/// So the file remembers who answered at each address, and an entry made from
+/// it starts with that. But a memory is not an answer — a lease can have gone
+/// to another speaker since — so it is held to a different rule from an
+/// identity heard in this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provenance {
+    /// Heard in this run, or nothing yet: the node id off an announcement, or
+    /// the MAC on the entry's own `/SyncStatus`. Filled in where there is
+    /// none and never replaced, so the first to say it is the one that stands.
+    Settled,
+    /// Only what the players file says this address answered with before.
+    /// Matched by [`Backend::moved_here`] like any other — that is what it is
+    /// for — but replaced outright by the first `/SyncStatus` here, even with
+    /// nothing where the answer has no MAC that names anyone; see
+    /// [`read_sync`]. An announcement does not replace it: that is a claim
+    /// anyone can broadcast, and the address's own answer settles it moments
+    /// later anyway.
+    Remembered,
+}
+
 /// One player as the backend tracks it.
 struct Entry {
     client: Client,
     /// What this player calls itself, independently of where it is answering:
     /// the node id off its announcement, or the MAC on its `/SyncStatus`, both
-    /// as plain hex. See [`Backend::moved_here`].
+    /// as plain hex — or, until this address answers, the MAC the players file
+    /// says it answered with in an earlier run. See [`Backend::moved_here`].
     identity: Option<String>,
+    /// Which of those `identity` is. See [`Provenance`].
+    provenance: Provenance,
     /// How its poll loop is reached. See [`Poll`].
     poll: Arc<Poll>,
     /// The line this player's ordered writes stand in.
@@ -1223,6 +1293,37 @@ struct Entry {
     /// wants *now*; this is what is actually decoded and on the row, and the
     /// two differ for as long as a fetch is out.
     card_cover_url: Option<String>,
+}
+
+impl Entry {
+    /// Whether this player has answered anything in this run: a status, or
+    /// its `/SyncStatus`. Neither is ever cleared, so once it has, it has.
+    ///
+    /// Not `view.reachable`, which a row is drawn with from the moment it is
+    /// tracked until its first poll fails, and so says nothing about whether
+    /// anything is at the address at all.
+    fn answered(&self) -> bool {
+        self.status.is_some() || self.sync.is_some()
+    }
+
+    /// Whether the selection can be handed to this player without anybody
+    /// choosing it: it has answered in this run, still is answering, and is
+    /// not installing an update. See [`Backend::forget`] and
+    /// [`Backend::reconsider_selection`].
+    fn working(&self) -> bool {
+        self.answered() && self.view.reachable && self.upgrading.is_none()
+    }
+
+    /// Whether this address last answered `/SyncStatus` as `identity` — the
+    /// evidence a recorded move waits for. See [`Backend::vacated`].
+    fn answered_as(&self, identity: &str) -> bool {
+        self.sync
+            .as_ref()
+            .and_then(|sync| sync.mac.as_deref())
+            .and_then(identity_from_mac)
+            .as_deref()
+            == Some(identity)
+    }
 }
 
 type Registry = Arc<Mutex<BTreeMap<DeviceId, Entry>>>;
@@ -1282,15 +1383,31 @@ struct Backend {
     /// than a field of either mutex, so the check can be made with `browsing`
     /// held without nesting two locks.
     selections: Arc<AtomicU64>,
+    /// Whether the selection is one the user made: a card pressed, or Show on
+    /// an update notice. Read and written only under `selected`'s lock, like
+    /// `selections` beside it, so it is never seen out of step with the id.
+    ///
+    /// The selection a run starts with is nobody's. It is whichever player is
+    /// tracked first, and the players file is oldest first, so after a lease
+    /// has moved a player the address it left is tracked first at every start
+    /// and its dead row is the one selected — an empty pane and an empty queue
+    /// until somebody presses something. A selection nobody made is moved off
+    /// a row like that to one that answers; one somebody made stays where
+    /// they put it. See [`Backend::reconsider_selection`].
+    ///
+    /// Beside the id rather than inside its mutex, which would change the type
+    /// every reader of the selection goes through.
+    chosen: Arc<std::sync::atomic::AtomicBool>,
     commands: mpsc::UnboundedSender<Command>,
     ui: slint::Weak<AppWindow>,
     artwork: Arc<Artwork>,
     browsing: Arc<Mutex<Browsing>>,
-    /// Addresses that have answered, remembered between runs. Oldest first
-    /// and bounded; see [`known`].
-    known: Arc<Mutex<Vec<DeviceId>>>,
-    /// Where a player is believed to have moved from, against the address it
-    /// is now announcing from.
+    /// Addresses that have answered, and who answered at each, remembered
+    /// between runs. Oldest first and bounded; see [`known`].
+    known: Arc<Mutex<Vec<known::Remembered>>>,
+    /// Where a player is believed to have moved from, and the identity the
+    /// announcement claiming the move gave, against the address it is now
+    /// announcing from.
     ///
     /// The move itself is taken on an announcement's word, because it has to
     /// be: a player that changed address says so in no other way. Striking the
@@ -1302,9 +1419,19 @@ struct Backend {
     /// a broadcast cannot forge. Until then the old address stays remembered
     /// and is merely probed at the next start, which costs one request.
     ///
-    /// See [`Backend::moved_here`], where entries are made, and [`read_sync`],
-    /// where they are spent.
-    vacated: Arc<Mutex<std::collections::HashMap<DeviceId, DeviceId>>>,
+    /// The identity is kept because it is what the answer is checked against.
+    /// The entry's own identity will not do: one nothing had named yet is
+    /// filled in by the answer, one the players file seeded is replaced by it,
+    /// and one settled as somebody else agrees with that somebody's — so the
+    /// entry agreed with whoever answered, and a forged announcement claiming
+    /// a player had moved onto a live speaker's address had the player's real
+    /// address struck out of the file the moment that speaker answered as
+    /// itself.
+    ///
+    /// See [`Backend::moved_here`], where entries are made — or, where the new
+    /// address has already answered, spent at once — and [`read_sync`], where
+    /// they are spent.
+    vacated: Arc<Mutex<std::collections::HashMap<DeviceId, (DeviceId, String)>>>,
     /// How many searches have been asked for. Typing asks for one per
     /// keystroke, so each takes a number and checks it is still the highest
     /// before the request goes out — which collapses a typed word into one
@@ -3568,6 +3695,13 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
         let _ = tx.send(Command::AddPlayer(text.to_string()));
     });
 
+    let tx = commands.clone();
+    ui.on_forget_player(move |id| {
+        if let Ok(id) = id.parse() {
+            let _ = tx.send(Command::Forget(id));
+        }
+    });
+
     ui.on_rescan(move || {
         let _ = commands.send(Command::Rescan);
     });
@@ -3646,6 +3780,7 @@ async fn run(
         registry: Arc::new(Mutex::new(BTreeMap::new())),
         selected: Arc::new(Mutex::new(None)),
         selections: Arc::new(AtomicU64::new(0)),
+        chosen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         commands,
         ui: ui.clone(),
         artwork: Arc::new(Artwork::new(art, players)),
@@ -3724,16 +3859,14 @@ async fn run(
 
     let (here, elsewhere): (Vec<_>, Vec<_>) = remembered
         .into_iter()
-        .partition(|id| bluos::discovery::is_local(id.host));
+        .partition(|player| bluos::discovery::is_local(player.id.host));
     if !elsewhere.is_empty() {
         tracing::debug!(
             "{} remembered players are on another network",
             elsewhere.len()
         );
     }
-    for id in here {
-        backend.track(id, &http, None, None);
-    }
+    backend.track_remembered(here, &http);
 
     // The sweep is only the cold start. Players announce themselves unprompted
     // when they wake, so the same socket keeps listening afterwards and a
@@ -3874,6 +4007,25 @@ fn identity_from_mac(mac: &str) -> Option<String> {
         .filter(|hex| names_one_player(hex))
 }
 
+/// What a row is called until the player says its own name: an address typed
+/// in by hand, or remembered from the players file, has no announcement to
+/// take one from.
+const UNNAMED: &str = "BluOS player";
+
+/// What to call the player at `id` in a sentence about it.
+///
+/// Its name, unless all it has is [`UNNAMED`] — which is every row that has
+/// never answered, and so every row there is a reason to talk about when one
+/// has stopped. Two of those read the same, and the address is the one thing
+/// that tells them apart.
+fn called(name: &str, id: DeviceId) -> String {
+    if name.is_empty() || name == UNNAMED {
+        format!("the player at {id}")
+    } else {
+        name.to_owned()
+    }
+}
+
 impl Backend {
     /// Start tracking a player found by discovery.
     fn adopt(&self, announce: &bluos::Announce, http: &reqwest::Client) {
@@ -3931,16 +4083,28 @@ impl Backend {
             }
         }
 
-        self.track_as(id, http, player.get("name"), player.get("model"), identity);
+        self.track_as(
+            id,
+            http,
+            player.get("name"),
+            player.get("model"),
+            identity,
+            Provenance::Settled,
+        );
 
-        // After the entry exists, not before. `Select` publishes the queue and
-        // the transport and warms the browser for the player it names, and one
-        // handled in the gap would have found nothing to do any of that from
-        // and left the pane empty. Which player is selected has already moved,
-        // inside `moved_here`, because that part cannot wait for a command to
-        // be drained without the window blanking; see the note there.
+        // After the entry exists, not before. `Carried` publishes the queue
+        // and the transport and warms the browser for the player it names, and
+        // one handled in the gap would have found nothing to do any of that
+        // from and left the pane empty. Which player is selected has already
+        // moved, inside `moved_here`, because that part cannot wait for a
+        // command to be drained without the window blanking; see the note
+        // there.
+        //
+        // Not `Select`, which is a person's choice. The move is nobody's: a
+        // selection nobody had chosen stays one that can still give way to a
+        // player that answers, and one somebody had chosen stays theirs.
         if carry {
-            let _ = self.commands.send(Command::Select(id));
+            let _ = self.commands.send(Command::Carried(id));
         }
     }
 
@@ -3957,11 +4121,12 @@ impl Backend {
     /// the caller's cue to select it again at its new address once it has been
     /// tracked. The id is moved here — see the note at the bottom — so that no
     /// publish from this path names a player the rows do not hold; what
-    /// `Select` is still for is everything else choosing a player means.
+    /// `Command::Carried` is still for is everything else choosing a player
+    /// means.
     ///
     /// The queue this takes from the entry at the new address is read back
     /// here rather than by the caller. That entry is not the player that
-    /// moved, so a `Select` for the move never names it, and where it is the
+    /// moved, so a `Carried` for the move never names it, and where it is the
     /// selected player the caller is told nothing at all — the selection did
     /// not change. Repairing what this broke belongs with the breaking.
     /// One of the backend's own locks at a time, as everything here
@@ -3990,51 +4155,69 @@ impl Backend {
     /// zones — a multi-zone amplifier on `:11000` and `:11010` — reports one
     /// MAC for both, so matching on identity alone had each zone retire the
     /// other on every announcement and the user could never keep both on
-    /// screen. And nothing moves at all where more than one entry answers to
-    /// the identity: two entries that cannot be told apart are not evidence
-    /// about which of them moved.
+    /// screen. And nothing moves at all where entries on more than one other
+    /// host answer to the identity: two entries that cannot be told apart are
+    /// not evidence about which of them moved.
+    ///
+    /// Entries on one other host are told apart by the port, and that holds
+    /// for one of them as much as for several. They are the zones of that
+    /// same box, which answers for all of them with one MAC, so a lease that
+    /// moves it leaves every zone behind at the old host, and each zone's
+    /// announcement from the new one finds whichever of them are still there.
+    /// The one that moved is the one on the port announcing; the rest follow
+    /// on their own announcements, one at a time, each finding one fewer — a
+    /// zone already moved is on the announcing host and not counted.
+    ///
+    /// One left is not one that moved. A zone that has already followed the
+    /// box goes on announcing, and while a sibling is still behind, that
+    /// sibling is the only other entry answering to the identity. Taken for a
+    /// move on that alone, it was retired onto the announcing zone's address:
+    /// its selection went into the other room, its decoder's last word went
+    /// to that zone or, where that zone had one of its own, nowhere, and the
+    /// zone it really was turned up later as a fresh row with neither. So an
+    /// entry on another port moves nothing, alone or not. A lease hands out a
+    /// host and not a port, so the price is a player that came back on
+    /// another port as well, which is not followed — and that is no worse
+    /// than being unable to tell a box's zones apart.
     fn moved_here(&self, identity: &str, to: DeviceId) -> bool {
-        let (old, occupied) = {
+        let (old, occupied, answered) = {
             let mut registry = self.registry.lock().unwrap();
-            let mut elsewhere = registry.iter().filter(|(at, entry)| {
-                at.host != to.host && entry.identity.as_deref() == Some(identity)
-            });
-            let Some(old) = elsewhere.next().map(|(at, _)| *at) else {
-                return false;
+            let elsewhere: Vec<DeviceId> = registry
+                .iter()
+                .filter(|(at, entry)| {
+                    at.host != to.host && entry.identity.as_deref() == Some(identity)
+                })
+                .map(|(at, _)| *at)
+                .collect();
+            let old = match elsewhere[..] {
+                [] => return false,
+                [first, ..] if elsewhere.iter().all(|at| at.host == first.host) => {
+                    let Some(old) = elsewhere.iter().find(|at| at.port == to.port) else {
+                        // Not a warning: every repeat announcement from a
+                        // zone that has followed its box lands here for as
+                        // long as a sibling is still behind, which is the
+                        // ordinary course of a multi-zone box changing
+                        // address.
+                        tracing::debug!(
+                            %to,
+                            "only other zones of this player are left at its old host; \
+                             not moving any of them"
+                        );
+                        return false;
+                    };
+                    *old
+                }
+                _ => {
+                    tracing::warn!(
+                        %to,
+                        "several players answer to one identity; not moving any of them"
+                    );
+                    return false;
+                }
             };
-            if elsewhere.next().is_some() {
-                tracing::warn!(
-                    %to,
-                    "several players answer to one identity; not moving any of them"
-                );
-                return false;
-            }
-            if let Some(entry) = registry.remove(&old) {
-                entry.poll.retire();
-            }
-            // Whether anything is still tracked at the address it left. One
-            // device can present two zones on one host — a multi-zone
-            // amplifier on `:11000` and `:11010` — and only the last of them
-            // to go takes the address with it.
-            //
-            // The art allow-list follows the registry rather than only
-            // growing. An address the player has left is not a player's own
-            // address, and left in the set it stayed exempt from the rule that
-            // refuses to fetch from private space on a player's say-so — for
-            // the rest of the run, one entry per announcement, on a broadcast
-            // anyone on the segment can send. See `Artwork::remember_player`.
-            //
-            // Decided and acted on under the one guard. `adopt` is not
-            // single-threaded — the listening loop and a Rescan sweep both
-            // call it — so with the edit outside the lock the other zone of a
-            // multi-zone amplifier could be adopted between the two: it
-            // remembers its host, this reads a registry that does not hold it
-            // yet, and the forget then strips the permission a player that is
-            // tracked and polling needs, leaving every cover it serves refused
-            // until it happens to announce again.
-            if !registry.keys().any(|at| at.host == old.host) {
-                self.artwork.forget_player(old.host);
-            }
+            // The address it left goes, and the art allow-list's entry for it
+            // with the last row there, under this same guard; see `retire`.
+            self.retire(&mut registry, old);
             // Anything already tracked at the address being moved onto was
             // somebody else: `track_as` keeps an entry it already has, and the
             // queue on it was read from whichever player used to answer there.
@@ -4046,17 +4229,21 @@ impl Backend {
             // Whether there was one is the answer to two questions, which is
             // why it is carried out of the guard. A queue taken from the
             // player somebody is looking at has to be read back, and the
-            // `Select` that would have done it is only sent for a selection
+            // `Carried` that would have done it is only sent for a selection
             // that came with the move; see the choice below. And an address
             // already tracked is an address with a row, which is what decides
             // whether this can publish at all; see the publish at the end.
-            let occupied = if let Some(entry) = registry.get_mut(&to) {
+            //
+            // And whether that entry has already answered `/SyncStatus` as the
+            // player claiming the move, which is the evidence the file waits
+            // for; see the record of the move below.
+            let (occupied, answered) = if let Some(entry) = registry.get_mut(&to) {
                 entry.queue = None;
-                true
+                (true, entry.answered_as(identity))
             } else {
-                false
+                (false, false)
             };
-            (old, occupied)
+            (old, occupied, answered)
         };
         tracing::info!(%old, %to, "a player has changed address");
 
@@ -4100,6 +4287,13 @@ impl Backend {
         // every start for the rest of that list's life — but not on the word
         // of a broadcast. Written down here and spent in [`read_sync`], once
         // the player has answered from the new address as the same player.
+        //
+        // Unless it already has. A player remembered at its new address is
+        // tracked from the file at startup, ahead of the sweep, so it has
+        // usually answered `/SyncStatus` before its first announcement lands
+        // here — and nothing reads that again until its grouping changes. A
+        // record left waiting for that answer waited all run, and the address
+        // it left stayed in the file to be probed at every start.
         {
             let mut vacated = self.vacated.lock().unwrap();
             // Whatever the entry that has just gone was waiting to confirm is
@@ -4107,11 +4301,40 @@ impl Backend {
             // an address that stays remembered costs one probe at the next
             // start.
             vacated.remove(&old);
-            vacated.insert(to, old);
+            if !answered {
+                vacated.insert(to, (old, identity.to_owned()));
+            }
+        }
+        // And read again once the record is down, for an answer that landed
+        // in between. `read_sync` writes the answer into the registry and
+        // then looks for a record; this read the registry before the record
+        // was made, and looks again after. Each lock orders the two sides, so
+        // whichever goes second sees what the other did — and without this
+        // one an answer between the two was seen by neither: the record
+        // waited for an answer nothing would ask for again until the
+        // player's grouping changed, and the address it left stayed in the
+        // file. Spent only if it is still the one made here, so that where
+        // `read_sync` has spent it as well, the address is struck once.
+        let late = !answered
+            && self
+                .with_entry(to, |entry| entry.answered_as(identity))
+                .unwrap_or(false);
+        let spent_late = late && {
+            let mut vacated = self.vacated.lock().unwrap();
+            let ours = vacated
+                .get(&to)
+                .is_some_and(|(left, claimed)| *left == old && claimed == identity);
+            if ours {
+                vacated.remove(&to);
+            }
+            ours
+        };
+        if answered || spent_late {
+            self.strike_vacated(old, to);
         }
 
         // Which player is selected is written down here; everything else
-        // choosing one means is the caller's, through `Command::Select`. The
+        // choosing one means is the caller's, through `Command::Carried`. The
         // queue, the transport, the cover and the browse trail all belong to
         // the address that has gone, and only that command replaces them — and
         // it has to wait for the new entry to exist.
@@ -4137,11 +4360,14 @@ impl Backend {
                 // replies down, which is right — there is nothing at that
                 // address to answer for them any more.
                 self.selections.fetch_add(1, Ordering::SeqCst);
+                // `chosen` is left as it is: this is the same player selected
+                // at a new address, and the selection is as much somebody's
+                // choice as it was before.
             }
             // Whether the queue taken above was the one on screen. It is
             // exactly when the entry already tracked at this address is the
             // selected player — which is the case the branch above is not, so
-            // no `Select` is sent for it and nothing else reads that queue
+            // no `Carried` is sent for it and nothing else reads that queue
             // back. The status loop is no help: it re-reads on a queue id that
             // differs from the last one, and two players that both report none
             // compare equal, which left the pane drawn as a bare "Queue" line
@@ -4185,13 +4411,464 @@ impl Backend {
         // And the queue taken from the entry at that address, read back. Sent
         // from here rather than left to the caller because the caller is told
         // only whether the selection moved, and this is the case where it did
-        // not: there is no `Select` behind it, and no status tick that will
+        // not: there is no `Carried` behind it, and no status tick that will
         // notice. The entry is there to be read into — it is the one the drop
         // was made on, and `track_as` keeps it.
         if requeue {
             tokio::spawn(fetch_queue(self.clone(), to));
         }
         carried
+    }
+
+    /// Take the address a player has left out of the files, now that the
+    /// player has answered `/SyncStatus` from the one it moved to as the
+    /// player that claimed the move. See [`Backend::vacated`].
+    ///
+    /// Out of the players file, so the old address is not probed at every
+    /// start for the rest of that list's life. And the decoder's last word
+    /// follows the player, before its first status at the new address, which
+    /// is what would otherwise find nothing to carry.
+    ///
+    /// One lock at a time, and each file's body handed over under the lock
+    /// that changed it, which is where the order the writes land in comes
+    /// from; see [`known::save`].
+    fn strike_vacated(&self, old: DeviceId, to: DeviceId) {
+        {
+            let mut known = self.known.lock().unwrap();
+            if known::forget(&mut known, old) {
+                known::save(&known);
+            }
+        }
+        let mut heard = self.decoded.lock().unwrap();
+        if decoded::moved(&mut heard, old, to) {
+            decoded::save(&heard);
+        }
+    }
+
+    /// Take the entry at `id` out of the registry, with the registry's guard
+    /// already held: its poll is told to stop, and its host leaves the art
+    /// allow-list if nothing else is tracked there. For a player that has
+    /// moved — see [`Backend::moved_here`] — and for one the user has
+    /// forgotten — see [`Backend::forget`].
+    ///
+    /// Whether anything is still tracked at the address is asked after the
+    /// removal. One device can present two zones on one host — a multi-zone
+    /// amplifier on `:11000` and `:11010` — and only the last of them to go
+    /// takes the address with it.
+    ///
+    /// The art allow-list follows the registry rather than only growing. An
+    /// address no player is tracked at is not a player's own address, and
+    /// left in the set it stayed exempt from the rule that refuses to fetch
+    /// from private space on a player's say-so — for the rest of the run, one
+    /// entry per announcement, on a broadcast anyone on the segment can send.
+    /// See `Artwork::remember_player`.
+    ///
+    /// Decided and acted on under the one guard, which is why this takes the
+    /// guard rather than the lock. `adopt` is not single-threaded — the
+    /// listening loop and a Rescan sweep both call it — so with the edit
+    /// outside the lock the other zone of a multi-zone amplifier could be
+    /// adopted between the two: it remembers its host, this reads a registry
+    /// that does not hold it yet, and the forget then strips the permission a
+    /// player that is tracked and polling needs, leaving every cover it serves
+    /// refused until it happens to announce again. The allow-list is a leaf,
+    /// as `Artwork`'s own locks all are, so holding the registry over it
+    /// closes no cycle.
+    fn retire(&self, registry: &mut BTreeMap<DeviceId, Entry>, id: DeviceId) {
+        if let Some(entry) = registry.remove(&id) {
+            entry.poll.retire();
+        }
+        if !registry.keys().any(|at| at.host == id.host) {
+            self.artwork.forget_player(id.host);
+        }
+    }
+
+    /// Stop tracking a player that is not responding, and stop remembering it,
+    /// because the user said so. Answers whether it was forgotten.
+    ///
+    /// A player that took a new address while the app was closed, or was
+    /// sold, or was typed in wrong, is left as a row that answers nothing.
+    /// [`Backend::moved_here`] retires one only when the player announces
+    /// from somewhere else as the same player, which is no help when the
+    /// players file never learned who was at the address, or when nothing is
+    /// going to announce at all; and the file is oldest first, so an address a
+    /// lease moved a player away from is tracked first at every start and the
+    /// dead row is the one selected. This is the way to be rid of it.
+    ///
+    /// Only for a row that says "not responding", which is the only row the
+    /// window offers it on — checked again here, since the player can have
+    /// answered between the drawing and the press. Not for one that is
+    /// installing an update either, which says the same thing while it
+    /// reboots: its install is still being watched, and the watching is not
+    /// stopped by this.
+    ///
+    /// Everything kept against the id goes, which is more than a move takes:
+    /// a move hands the row on to the same player at its new address, and
+    /// this hands it to nobody. The players file and the decoder's file lose
+    /// the address at once rather than waiting for evidence the way a move
+    /// does: that wait is for a broadcast's word, and this is the user's.
+    ///
+    /// Not for good. An address that announces itself again, is found by a
+    /// Rescan, or is typed in again is tracked again, and written down again
+    /// once it answers — which is right for a player that has come back.
+    ///
+    /// No request goes to the player, and nothing here waits on one: this
+    /// runs on the command loop, which must never wait on a player. One of
+    /// the backend's own locks at a time, as everywhere: the registry, the
+    /// selection, the registry again — and the two again in turn, where the
+    /// selection moved, to read it back; see
+    /// [`Backend::keep_selection_on_a_row`] — the pane, and then the files
+    /// and the update offer one after another.
+    fn forget(&self, id: DeviceId) -> bool {
+        // Whether this is a row the window would have offered it on, what to
+        // call it afterwards, and who takes the selection if it has it — all
+        // read under the one guard, before anything changes.
+        //
+        // The next selection is the first other player that has answered in
+        // this run and still is answering, in the order the rows are drawn
+        // in. A row is drawn reachable from the moment it is tracked until its
+        // first poll fails, so reachable alone would hand the selection to
+        // another dead address the file started this run with, and the user
+        // would be forgetting rows one at a time to reach a player that
+        // works. Failing that, the first other row of any kind: a selection
+        // on a row is better than a window with rows and nothing chosen,
+        // which the backend and the window would each read differently.
+        let read = {
+            let registry = self.registry.lock().unwrap();
+            let Some(entry) = registry.get(&id) else {
+                return false;
+            };
+            let name = called(&entry.view.name, id);
+            if entry.upgrading.is_some() {
+                Err(format!("Not forgotten: {name} is installing an update"))
+            } else if entry.view.reachable {
+                Err(format!("Not forgotten: {name} is answering again"))
+            } else {
+                let others = || registry.iter().filter(|(at, _)| **at != id);
+                let next = others()
+                    .find(|(_, other)| other.working())
+                    .or_else(|| others().next())
+                    .map(|(at, _)| *at);
+                Ok((name, next))
+            }
+        };
+        let (name, next) = match read {
+            Ok(read) => read,
+            Err(kept) => {
+                say(&self.ui, kept);
+                return false;
+            }
+        };
+
+        // The selection before the row, the other way round from a move. A
+        // publish from any poll can land between any two of these steps, and
+        // one that found the selection still naming a row that had gone would
+        // draw no selection at all: an empty `Device`, a blank pane and a dead
+        // transport. See [`highlighted_row`]. Moved first, the worst a publish
+        // in between can show is the forgotten row still there and not chosen,
+        // for the moment until the removal below.
+        //
+        // This is the backend choosing, not the user: what choosing a player
+        // means is done below through `after_selecting`, and not by sending
+        // `Command::Select`, which is what a press on a card sends.
+        let moved = {
+            let mut selected = self.selected.lock().unwrap();
+            let moved = *selected == Some(id);
+            if moved {
+                *selected = next;
+                // Bumped under the same guard as the id is written; see
+                // [`Backend::selection`]. Replies still out for the forgotten
+                // player are stood down by it.
+                self.selections.fetch_add(1, Ordering::SeqCst);
+                // And unchosen, whoever chose the row that has gone. Where
+                // nobody here answers, the replacement is merely the first row
+                // left, and it should give way to the first player that does,
+                // as the selection a run starts with does.
+                self.chosen.store(false, Ordering::SeqCst);
+            }
+            moved
+        };
+
+        self.retire(&mut self.registry.lock().unwrap(), id);
+        tracing::info!(%id, "forgot a player");
+
+        // The replacement was chosen from the rows under one guard and written
+        // under another, and the rows can have changed in between: the player
+        // chosen can have moved away, or, where there was nobody to choose, a
+        // player tracked for the first time can have found the selection still
+        // on this row and left it alone. Read back now that the row has gone,
+        // and put right.
+        let landed = if moved {
+            self.keep_selection_on_a_row(next, None)
+        } else {
+            None
+        };
+
+        // Any page of the player's goes with it. Every one of them sends what
+        // it holds to the player it was read from, which is nobody now: a
+        // press there did nothing, and the page stayed up for as long as
+        // nothing else was opened over it. A Help page's Install offer is
+        // retired rather than repointed, as a move repoints it: there is no
+        // other address this player is answering on. The page itself is facts
+        // and stays. And the lit sidebar entry kept for it is dropped: nothing
+        // will draw that player's sidebar again, and a player tracked at the
+        // same address later is a new one.
+        let (stranded, unoffered) = {
+            let mut browsing = self.browsing.lock().unwrap();
+            let stranded = browsing.pane.belongs_to(id);
+            if stranded {
+                browsing.pane = Pane::Browse;
+            }
+            let unoffered = match &mut browsing.pane {
+                Pane::HelpDetail(_, _, _, offer) if *offer == Some(id) => {
+                    *offer = None;
+                    true
+                }
+                _ => false,
+            };
+            browsing.highlighted.remove(&id);
+            (stranded, unoffered)
+        };
+
+        // A move this address was waiting to confirm, from either end. Where
+        // it is the address being moved onto, nothing is left there to
+        // answer; where it is the address being moved from, it is being
+        // struck out of the file below anyway, and a confirmation landing
+        // later would only carry its decoder's line to the new address after
+        // that line had been dropped.
+        {
+            let mut vacated = self.vacated.lock().unwrap();
+            vacated.remove(&id);
+            vacated.retain(|_, (old, _)| *old != id);
+        }
+
+        // Out of the files, so it is not tried and selected again at the next
+        // start, which is the whole of what the user is asking for. Each body
+        // handed over under the lock that changed it; see [`known::save`].
+        {
+            let mut known = self.known.lock().unwrap();
+            if known::forget(&mut known, id) {
+                known::save(&known);
+            }
+        }
+        {
+            let mut heard = self.decoded.lock().unwrap();
+            if decoded::forget(&mut heard, id) {
+                decoded::save(&heard);
+            }
+        }
+
+        // An update offered for it is an offer about nobody: answered with
+        // Show, it selected an id with no row, which the window draws as no
+        // player at all. Taken, and taken off the screen. And the once-a-run
+        // record of having offered goes with the rest, so a player that comes
+        // back at this address is asked about like any new one.
+        let offered = {
+            let mut offer = self.update_offer.lock().unwrap();
+            let offered = *offer == Some(id);
+            if offered {
+                *offer = None;
+            }
+            offered
+        };
+        self.told_about_update.lock().unwrap().remove(&id);
+        if offered {
+            let ui = self.ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_update_notice("".into());
+                }
+            });
+        }
+
+        if stranded {
+            self.publish_pane();
+        }
+        // After the selection, which is what decides whether Install is drawn;
+        // see `publish_help`.
+        if unoffered {
+            self.publish_help();
+        }
+        // Always: unlike a move, no `track_as` follows to draw the rows
+        // without this one.
+        self.publish();
+        if moved {
+            match landed {
+                Some(landed) => self.after_selecting(landed, true),
+                // Nobody left to show, or somebody else has moved the
+                // selection since — a move carrying it, or a first player
+                // tracked taking it — and does the rest of choosing for it.
+                // The window draws its empty state in place of the list; the
+                // queue and the transport are drawn again from whatever is
+                // selected now, or they go on showing the forgotten player's.
+                None => {
+                    self.publish_queue();
+                    self.publish_transport();
+                }
+            }
+        }
+
+        say(&self.ui, format!("Forgot {name}"));
+        true
+    }
+
+    /// Read a selection this path has just written back against the rows,
+    /// and put it right if they changed under it. Answers the player the
+    /// selection is on for this path to do the rest of choosing for, or
+    /// `None` where it is on nobody, or somebody else has moved it since and
+    /// does that themselves.
+    ///
+    /// The selection and the rows are behind two locks that are never held
+    /// together, so a choice made from the rows under one guard is written
+    /// under the other with a gap between, and two things can land in it.
+    /// [`Backend::moved_here`] removes the entry a player has left and only
+    /// then asks whether it was selected; one that asked before the write
+    /// left the selection on a row that has gone, which the window draws as
+    /// no player at all and nothing moves it off. And [`Backend::track_as`]
+    /// inserts a new entry and only then asks whether anything is selected;
+    /// one that asked before a write of nothing left rows with none of them
+    /// selected, which the window and the backend each read differently, and
+    /// nothing put that right either.
+    ///
+    /// Both write one lock and then read the other, and this reads back in
+    /// the other order, so whichever side goes second sees what the first
+    /// did. Either the other side has moved the selection already, which the
+    /// compare below finds and leaves alone, or this finds the row gone or a
+    /// new row there, and moves the selection to `instead` while that still
+    /// has a row, or to the first row, or to nobody. A correction is a write
+    /// like the first, so it is read back the same way. `chosen` is left as
+    /// it is: no path that comes here writes a person's choice.
+    fn keep_selection_on_a_row(
+        &self,
+        mut wrote: Option<DeviceId>,
+        mut instead: Option<DeviceId>,
+    ) -> Option<DeviceId> {
+        loop {
+            let next = {
+                let registry = self.registry.lock().unwrap();
+                if wrote.is_some_and(|id| registry.contains_key(&id)) {
+                    return wrote;
+                }
+                instead
+                    .filter(|id| registry.contains_key(id))
+                    .or_else(|| registry.keys().next().copied())
+            };
+            if wrote.is_none() && next.is_none() {
+                return None;
+            }
+            {
+                let mut selected = self.selected.lock().unwrap();
+                if *selected != wrote {
+                    return None;
+                }
+                *selected = next;
+                // Bumped under the same guard as the id is written; see
+                // [`Backend::selection`].
+                self.selections.fetch_add(1, Ordering::SeqCst);
+            }
+            wrote = next;
+            instead = None;
+        }
+    }
+
+    /// Everything choosing `id` means beyond writing it down, once it has
+    /// been written: the highlight, the queue, the transport, the cover, and
+    /// the browser warmed for it. For `Command::Select`, a press on a card;
+    /// for `Command::Carried`, a selection carried to a player's new address;
+    /// and for a selection the backend moves without anyone choosing it — see
+    /// [`Backend::forget`] and `Command::AutoSelect`. `changed` is whether the
+    /// selection named another player before.
+    fn after_selecting(&self, id: DeviceId, changed: bool) {
+        // An Install offered for one player is drawn only while that player
+        // is selected (see `publish_help`), and the page itself does not
+        // change with the choice, so it is drawn again here.
+        if changed
+            && matches!(
+                self.browsing.lock().unwrap().pane,
+                Pane::HelpDetail(_, _, _, Some(_))
+            )
+        {
+            self.publish_pane();
+        }
+        // The card the window highlights, which is also the one every
+        // transport press names. A press puts it there already; a selection
+        // the backend moved has nobody to put it there but this.
+        self.publish_selection();
+        // Show whatever is already known straight away, and only go to the
+        // network when this is a player whose queue is not held.
+        self.publish_queue();
+        self.publish_transport();
+        tokio::spawn(load_cover(self.clone(), id));
+        // Warm the browser for this player, so the tab is not a wait.
+        let fresh = {
+            let browsing = self.browsing.lock().unwrap();
+            browsing.device != Some(id)
+                || browsing.configured != Some(id)
+                || browsing.trail.is_empty()
+        };
+        if fresh {
+            let _ = self.commands.send(Command::BrowseHome);
+        }
+        if changed || self.with_entry(id, |e| e.queue.is_none()).unwrap_or(false) {
+            tokio::spawn(fetch_queue(self.clone(), id));
+        }
+    }
+
+    /// Move a selection nobody chose off a player that has never answered,
+    /// once it has been seen failing, to one that answers.
+    ///
+    /// The selection a run starts with is whichever row is tracked first, and
+    /// the players file is tracked oldest first, ahead of the sweep. After a
+    /// lease has moved a player, the address it left is the oldest line, so
+    /// that dead row was selected at every start: no queue, a pane that never
+    /// filled, and a transport that pressed nothing, beside a row for the same
+    /// player that answered — until somebody worked out to press it.
+    ///
+    /// Three conditions keep this from moving anything a person would miss.
+    /// The selection must be nobody's choice: see [`Backend::chosen`]. The
+    /// player it is on must never have answered in this run, so a player
+    /// somebody has been browsing keeps the selection through a blip on the
+    /// network rather than losing their place to another room. And that
+    /// player must have been seen failing — a row is drawn answering until its
+    /// first poll fails — so that two players that both answer do not race
+    /// for it: the one tracked first would lose it whenever it was the slower
+    /// of the two to reply. Where all three hold, the first row in the order
+    /// the rows are drawn in that is [`working`](Entry::working) takes it.
+    ///
+    /// Asked at the two moments the answer can change, rather than on a
+    /// timer: when a poll fails, which is where the selected row comes to be
+    /// seen failing, and when a player answers after not answering — its
+    /// first answer of the run included — which is where something to move
+    /// to appears. Whichever of those comes second is the one that moves it.
+    ///
+    /// Decided here and done on the command loop, as `Command::AutoSelect`,
+    /// where it lands in order with a press on a card. A press handled first
+    /// marks the selection chosen, and the move is dropped; a press handled
+    /// after it simply wins. One lock at a time: the selection, then the
+    /// registry.
+    fn reconsider_selection(&self) {
+        let from = {
+            let selected = self.selected.lock().unwrap();
+            match *selected {
+                Some(from) if !self.chosen.load(Ordering::SeqCst) => from,
+                _ => return,
+            }
+        };
+        let to = {
+            let registry = self.registry.lock().unwrap();
+            let Some(stuck) = registry.get(&from) else {
+                return;
+            };
+            if stuck.answered() || stuck.view.reachable {
+                return;
+            }
+            registry
+                .iter()
+                .find(|(at, entry)| **at != from && entry.working())
+                .map(|(at, _)| *at)
+        };
+        if let Some(to) = to {
+            let _ = self.commands.send(Command::AutoSelect { from, to });
+        }
     }
 
     /// The line this player's ordered writes stand in. See [`Entry::writes`].
@@ -4210,11 +4887,30 @@ impl Backend {
     /// entirely for an address typed in by hand. `/SyncStatus` replaces them
     /// with the truth a moment later.
     fn track(&self, id: DeviceId, http: &reqwest::Client, name: Option<&str>, model: Option<&str>) {
-        self.track_as(id, http, name, model, None);
+        self.track_as(id, http, name, model, None, Provenance::Settled);
     }
 
-    /// The same, with what the player calls itself where that is known — which
-    /// is to say, from an announcement rather than from a typed address.
+    /// Start tracking the players the file remembers, each with the identity
+    /// it last answered with there.
+    ///
+    /// In the file's order, which is oldest first. The partition into this
+    /// network's addresses and other networks' is the caller's: the test for
+    /// it refuses the loopback, which is where every test's players are.
+    fn track_remembered(&self, players: Vec<known::Remembered>, http: &reqwest::Client) {
+        for player in players {
+            self.track_as(
+                player.id,
+                http,
+                None,
+                None,
+                player.identity,
+                Provenance::Remembered,
+            );
+        }
+    }
+
+    /// The same, with what the player calls itself where that is known — from
+    /// an announcement, or from the players file — and which of those it is.
     fn track_as(
         &self,
         id: DeviceId,
@@ -4222,6 +4918,7 @@ impl Backend {
         name: Option<&str>,
         model: Option<&str>,
         identity: Option<String>,
+        provenance: Provenance,
     ) {
         {
             let mut guard = self.registry.lock().unwrap();
@@ -4254,9 +4951,15 @@ impl Backend {
                 }
                 // And an address typed in by hand has no identity until
                 // something says one. Filled in rather than replaced: the
-                // entry's own first answer is what settled it.
-                if entry.identity.is_none() {
+                // entry's own first answer is what settled it, and one the
+                // players file seeded is replaced by that answer and not by a
+                // broadcast; see [`Provenance`]. Nor does the file fill in an
+                // address that has already answered with no name to give.
+                if entry.identity.is_none()
+                    && (provenance == Provenance::Settled || entry.sync.is_none())
+                {
                     entry.identity = identity;
+                    entry.provenance = provenance;
                 }
                 return;
             }
@@ -4267,12 +4970,13 @@ impl Backend {
                 Entry {
                     client: Client::with_http(id, http.clone()),
                     identity,
+                    provenance,
                     poll: Arc::default(),
                     writes: Arc::default(),
                     upgrading: None,
                     view: Device {
                         id: id.to_string().into(),
-                        name: name.unwrap_or("BluOS player").into(),
+                        name: name.unwrap_or(UNNAMED).into(),
                         model: model.unwrap_or_default().into(),
                         reachable: true,
                         ..Default::default()
@@ -4542,24 +5246,25 @@ impl Backend {
     /// The window writes its own index when a card is clicked, which is how
     /// the highlight keeps up with the mouse without waiting for a round trip.
     /// Every other way the selection changes has no such press behind it —
-    /// [`Backend::moved_here`] carrying it to a player's new address is the
-    /// one that exists today — and [`Backend::publish`] alone cannot land it
-    /// promptly: the rows are memoized, so the next publish may be a status
-    /// tick away and until then the window is answering for a different
-    /// player than the one it is showing.
+    /// [`Backend::moved_here`] carrying it to a player's new address,
+    /// [`Backend::forget`] handing it on from the row forgotten, and
+    /// `Command::AutoSelect` moving it off a row that never answered — and
+    /// [`Backend::publish`] alone cannot land it promptly: the rows are
+    /// memoized, so the next publish may be a status tick away and until then
+    /// the window is answering for a different player than the one it is
+    /// showing.
     ///
-    /// Two places write the backend's selection, and only one of them calls
-    /// this. `Command::Select` is the press, and it calls this because the
-    /// press may have been somebody else's — a card clicked writes the
-    /// window's own index, a selection carried to a new address does not.
-    /// `moved_here` is the other: it writes the id itself, ahead of the
-    /// `Select` it asks for, so that no publish in between names a player the
-    /// rows do not hold. It does not call this, and does not need to — the row
-    /// it would point at is made a moment later by `track_as`, and the publish
-    /// that adds the row carries the highlight with it by the
-    /// [`highlighted_row`] rule below. The `Select` it asks for then arrives
-    /// and does call this, which is what covers the case where the row was
-    /// already there.
+    /// Called from [`Backend::after_selecting`], which all of those go
+    /// through, and `Command::Select` with them: the user's choice is not
+    /// always a card — Show on an update notice selects a player too, and
+    /// writes no index of the window's. `moved_here` writes the id itself,
+    /// ahead of the `Command::Carried` it asks for, so that no publish in
+    /// between names a player the rows do not hold. It does not call this,
+    /// and does not need to — the row it would point at is made a moment
+    /// later by `track_as`, and the publish that adds the row carries the
+    /// highlight with it by the [`highlighted_row`] rule below. The `Carried`
+    /// it asks for then arrives and does call this, which is what covers the
+    /// case where the row was already there.
     ///
     /// The row index is the registry's own order, which is the order
     /// [`Backend::publish`] builds the model in. Nothing to push where the
@@ -9271,26 +9976,43 @@ async fn tick_position(backend: Backend) {
 ///
 /// This is where grouping becomes visible: who is leading, who is following,
 /// and whether a follower has lost sight of its leader.
+///
+/// `None` where the player did not answer, or answered after it stopped being
+/// tracked — which leaves nothing to fold the answer into.
 async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<SyncStatus> {
     let sync = client.sync_status().await.ok()?;
 
-    // Whether the player answering here is the one this entry is for: the MAC
-    // it reports against the identity the entry was settled with. That is the
-    // evidence a move waits on — see [`Backend::vacated`] — and an
-    // announcement, which is all a move has to go on, cannot produce it.
-    let mut itself = false;
-    if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
+    // Who is answering here, by the MAC it reports. This is the evidence a
+    // move waits on — see [`Backend::vacated`] — and an announcement, which is
+    // all a move has to go on, cannot produce it.
+    let reported = sync.mac.as_deref().and_then(identity_from_mac);
+    {
+        let mut registry = backend.registry.lock().unwrap();
+        // An answer for an address that is no longer tracked is an answer to
+        // nobody: the player was forgotten, or moved away, while the request
+        // was out. It is no reason to write the address back into the players
+        // file — a forgotten one was taken out of it on the user's word, and
+        // written back it was tried and selected again at the next start —
+        // nor to ask about firmware and offer an update for a row that is not
+        // there. Everything below is for a tracked player, so all of it is
+        // skipped.
+        let entry = registry.get_mut(&id)?;
         entry.sync = Some(sync.clone());
-        let reported = sync.mac.as_deref().and_then(identity_from_mac);
         // What the player calls itself, where nothing has said yet: an address
         // typed in by hand arrives with no announcement behind it, and without
         // this one could never be recognized when it moves. Filled in rather
         // than replaced, so that the node id an announcement settled it with
         // stands.
-        if entry.identity.is_none() {
+        //
+        // Replaced where all there was is what the players file remembered:
+        // the address has now said for itself who is at it, which a lease
+        // handed to another speaker since can make a different answer — or
+        // none, and a remembered identity left standing on an address that
+        // has stopped giving one would retire a player that has not moved.
+        if entry.identity.is_none() || entry.provenance == Provenance::Remembered {
             entry.identity = reported.clone();
+            entry.provenance = Provenance::Settled;
         }
-        itself = reported.is_some() && entry.identity == reported;
     }
 
     // Asked once, here, for the same reason the address is written down here:
@@ -9298,7 +10020,11 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
     // task because the check is the slowest request the player answers — the
     // player goes and asks somebody else — and nothing about starting up
     // should wait on it.
-    if backend.told_about_update.lock().unwrap().insert(id) {
+    //
+    // Whether this call is the one that wrote the record down is kept: it is
+    // taken back out below if the player has stopped being tracked by then.
+    let told = backend.told_about_update.lock().unwrap().insert(id);
+    if told {
         let backend = backend.clone();
         tokio::spawn(async move {
             // Logged either way. Whether an offer appears is otherwise
@@ -9325,20 +10051,47 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
     }
 
     // And the address this player left, if it has now shown from the new one
-    // that it is the same player. Taken before the list's own lock rather than
-    // under it: two leaf locks, held one at a time, like everything else here.
-    let vacated = itself
-        .then(|| backend.vacated.lock().unwrap().remove(&id))
-        .flatten();
+    // that it is the player that claimed the move. Checked against the claim
+    // itself rather than against the entry, whose identity may have been
+    // replaced by this very answer just above. Taken before the list's own
+    // lock rather than under it: two leaf locks, held one at a time, like
+    // everything else here.
+    let vacated = {
+        let mut vacated = backend.vacated.lock().unwrap();
+        let confirmed = vacated
+            .get(&id)
+            .is_some_and(|(_, claimed)| reported.as_deref() == Some(claimed.as_str()));
+        confirmed
+            .then(|| vacated.remove(&id))
+            .flatten()
+            .map(|(old, _)| old)
+    };
+    // Struck before this address is written down rather than after: out of a
+    // full list that makes room for it, where afterwards the new address would
+    // already have pushed the oldest one off the front for nothing. And before
+    // its first status here, which is what the decoder's last word is carried
+    // to.
+    if let Some(old) = vacated {
+        backend.strike_vacated(old, id);
+    }
 
     // Remembered only now, not when it was adopted: answering /SyncStatus is
     // what makes an address a player, so a mistyped one is never written down.
-    {
+    // And who answered with it, under the same lock and in the same write, so
+    // that the file says who was here when the address next fails to answer.
+    //
+    // And who is no longer anywhere else: any other host the file still
+    // names this player at is an address it has left, by the same evidence a
+    // recorded move waits for above, whether or not a move was ever seen —
+    // see [`known::claim`]. First, for the same reason as the strike above.
+    let added = {
         let mut known = backend.known.lock().unwrap();
-        let mut changed = known::remember(&mut known, id);
-        if let Some(old) = vacated {
-            changed |= known::forget(&mut known, old);
-        }
+        let mut changed = reported
+            .as_deref()
+            .is_some_and(|reported| known::claim(&mut known, id, reported));
+        let added = known::remember(&mut known, id);
+        changed |= added;
+        changed |= known::identify(&mut known, id, reported.as_deref());
         if changed {
             // Handed over under the lock that changed it, which is where the
             // order comes from — not from this thread, which is one poller
@@ -9349,13 +10102,32 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
             // written on the way out is the one without it.
             known::save(&known);
         }
-    }
-    // What its decoder last named goes with it, and before its first status
-    // here, which is what would otherwise find nothing to carry.
-    if let Some(old) = vacated {
-        let mut heard = backend.decoded.lock().unwrap();
-        if decoded::moved(&mut heard, old, id) {
-            decoded::save(&heard);
+        added
+    };
+
+    // The check at the top is of the moment the answer was folded in, and
+    // the player can be forgotten between that and the writes since: the
+    // reply to a `/SyncStatus` sent while it was answering can land up to a
+    // request timeout after its row turned to not responding, which is when
+    // Forget is offered. [`Backend::forget`] takes the entry out of the
+    // registry before it strikes the file and clears the record of having
+    // asked about firmware, so a write here that came after those is followed
+    // by this read, which finds the entry gone, and is undone. Only what this
+    // call wrote: an address a move has taken out of the registry is still
+    // written down on purpose until the move is confirmed — see
+    // [`Backend::vacated`] — and `remember` found it already there. And
+    // where the address is tracked again by now, by a Rescan or typed in
+    // again, the writes stand, as they would for any player that has come
+    // back.
+    if (added || told) && backend.with_entry(id, |_| ()).is_none() {
+        if added {
+            let mut known = backend.known.lock().unwrap();
+            if known::forget(&mut known, id) {
+                known::save(&known);
+            }
+        }
+        if told {
+            backend.told_about_update.lock().unwrap().remove(&id);
         }
     }
 
@@ -10995,8 +11767,16 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
     let mut name = backend
         .with_entry(id, |e| e.view.name.to_string())
         .unwrap_or_default();
+    // Whether the last request this loop made was answered. The turn from
+    // silence to an answer, the first answer of the run included, is one of
+    // the two moments a selection left on a dead row can move to this player;
+    // see [`Backend::reconsider_selection`]. Kept here so that it is asked at
+    // the turn rather than at every status.
+    let mut answering = false;
     if let Some(sync) = read_sync(&backend, id, &client).await {
         name = sync.name.clone();
+        answering = true;
+        backend.reconsider_selection();
     }
 
     // Deliberately not exported yet. An address that never answers — one typed
@@ -11071,6 +11851,13 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                         .unwrap_or_default()
                         .into();
                 });
+
+                // After the row is drawn answering, not before: a selection
+                // is only moved to a row that is. See [`Entry::working`].
+                if !answering {
+                    answering = true;
+                    backend.reconsider_selection();
+                }
 
                 // `syncStat` mirrors /SyncStatus's own etag, so a change in it
                 // means the player's grouping moved — without a second request
@@ -11198,7 +11985,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 // player that answered with a document this crate cannot read
                 // is perfectly alive, and it does emit one on occasion while
                 // it changes input. Taking the whole app offline over that —
-                // graying the transport and writing "Not responding" under
+                // graying the transport and writing "not responding" under
                 // the name — is what makes switching inputs look like a
                 // freeze, and it lasted as long as the backoff.
                 let answered = matches!(e, bluos::Error::Xml { .. });
@@ -11215,6 +12002,10 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 } else {
                     unreadable = 0;
                     backend.update(id, |view| view.reachable = false);
+                    // The other moment: where this is the selected row and it
+                    // has never answered, it has now been seen failing.
+                    answering = false;
+                    backend.reconsider_selection();
 
                     // The last known track stays on the bus — a blip should
                     // not wipe the desktop's media widget — but it stops
@@ -11259,6 +12050,13 @@ async fn run_commands(
                 if backend.update_offer.lock().unwrap().is_some() {
                     continue;
                 }
+                // Nor for a player that is no longer tracked. The check is
+                // asked off the loop and can answer after the player has been
+                // forgotten, or has moved; Show would then select an id with
+                // no row, which the window draws as no player at all.
+                if backend.with_entry(id, |_| ()).is_none() {
+                    continue;
+                }
                 let name = backend
                     .with_entry(id, |e| e.view.name.to_string())
                     .unwrap_or_else(|| "a player".to_owned());
@@ -11282,6 +12080,7 @@ async fn run_commands(
                 }
                 // Select it first: the page reads the selection, and the offer
                 // may be about a player other than the one being looked at.
+                // As a choice of the user's, which it is: Show was pressed.
                 let _ = backend.commands.send(Command::Select(id));
                 let _ = backend.commands.send(Command::OpenHelp);
                 // Found rather than written down: these rows are addressed by
@@ -11414,15 +12213,32 @@ async fn run_commands(
                 continue;
             }
             Command::Select(id) => {
+                // Not for a player that is no longer tracked. A press names a
+                // row as the window last drew it, and the row can have gone
+                // since: forgotten by a command just ahead of this one, or
+                // moved by an announcement, whose `Carried` for the new
+                // address then waits behind this on the loop. Written down,
+                // the selection would name a player with no row, which the
+                // window draws as no player at all — and as somebody's choice
+                // nothing would move it off: the `Carried` finds the selection
+                // elsewhere and does nothing, and a dead row somebody chose is
+                // theirs. Dropped, the selection stays where the forget or the
+                // move put it. Show on an update notice comes through here as
+                // well. This narrows the gap rather than closing it: a move
+                // that takes the row between this and the write below still
+                // leaves the selection on it, until the next press on a card.
+                if backend.with_entry(id, |_| ()).is_none() {
+                    continue;
+                }
                 let already = {
                     let mut selected = backend.selected.lock().unwrap();
                     let already = *selected == Some(id);
                     *selected = Some(id);
-                    // Before `fresh` is read below, and that order is what
-                    // closes the race `selections` is for: a write for the
-                    // last player either lands before this bump, and `fresh`
-                    // then sees it and fetches this player's own over it, or
-                    // lands after and is dropped.
+                    // Before `fresh` is read in `after_selecting`, and that
+                    // order is what closes the race `selections` is for: a
+                    // write for the last player either lands before this
+                    // bump, and `fresh` then sees it and fetches this
+                    // player's own over it, or lands after and is dropped.
                     //
                     // That holds only because `fresh` looks at everything
                     // such a write changes. `BrowseHome` writes twice, a round
@@ -11433,46 +12249,72 @@ async fn run_commands(
                     if !already {
                         backend.selections.fetch_add(1, Ordering::SeqCst);
                     }
+                    // Somebody's choice, whether or not it changed anything:
+                    // a press on the card already selected is still a person
+                    // saying that is the player they want.
+                    backend.chosen.store(true, Ordering::SeqCst);
                     already
                 };
-                // An Install offered for one player is drawn only while that
-                // player is selected (see `publish_help`), and the page itself
-                // does not change with the choice, so it is drawn again here.
-                if !already
-                    && matches!(
-                        backend.browsing.lock().unwrap().pane,
-                        Pane::HelpDetail(_, _, _, Some(_))
-                    )
-                {
-                    backend.publish_pane();
+                backend.after_selecting(id, !already);
+                continue;
+            }
+            Command::Carried(id) => {
+                // The move wrote the id before this was sent, so there is
+                // nothing to write — and where the selection is not there any
+                // more, somebody chose another player while this waited its
+                // turn. A `Select` used to be sent for the move, and it took
+                // that choice straight back.
+                if backend.is_selected(id) {
+                    backend.after_selecting(id, false);
                 }
-                // The card the window highlights, which is also the one every
-                // transport press names. A press puts it there already; a
-                // selection carried to a player's new address has nobody to
-                // put it there but this.
-                backend.publish_selection();
-                // Show whatever is already known straight away, and only go to
-                // the network when this is a player whose queue is not held.
-                backend.publish_queue();
-                backend.publish_transport();
-                tokio::spawn(load_cover(backend.clone(), id));
-                // Warm the browser for this player, so the tab is not a wait.
-                let fresh = {
-                    let browsing = backend.browsing.lock().unwrap();
-                    browsing.device != Some(id)
-                        || browsing.configured != Some(id)
-                        || browsing.trail.is_empty()
+                continue;
+            }
+            Command::AutoSelect { from, to } => {
+                // Decided off the loop, from a poll, so what it was decided on
+                // is asked again here. The player it goes to must still have a
+                // row: a selection naming none is drawn as no player at all.
+                // And the one it leaves must still never have answered, which
+                // is the promise that nobody browsing a player loses it.
+                let still = {
+                    let registry = backend.registry.lock().unwrap();
+                    registry.contains_key(&to) && !registry.get(&from).is_some_and(Entry::answered)
                 };
-                if fresh {
-                    let _ = backend.commands.send(Command::BrowseHome);
+                if !still {
+                    continue;
                 }
-                if !already
-                    || backend
-                        .with_entry(id, |e| e.queue.is_none())
-                        .unwrap_or(false)
-                {
-                    tokio::spawn(fetch_queue(backend.clone(), id));
+                // The compare and the set under one guard. A press handled
+                // since the decision has either chosen this same player, which
+                // `chosen` says, or another, which the id says; either way the
+                // press stands.
+                let moved = {
+                    let mut selected = backend.selected.lock().unwrap();
+                    let moved = *selected == Some(from) && !backend.chosen.load(Ordering::SeqCst);
+                    if moved {
+                        *selected = Some(to);
+                        backend.selections.fetch_add(1, Ordering::SeqCst);
+                    }
+                    moved
+                };
+                if !moved {
+                    continue;
                 }
+                // And read back, because `to` was asked after under another
+                // guard, and an announcement can have moved it off its row in
+                // between. Back to the row it was taken from, where that is
+                // still there: the player that moved answers at its new
+                // address in a moment, and its first answer there is one of
+                // the moments this is weighed at again.
+                let Some(landed) = backend.keep_selection_on_a_row(Some(to), Some(from)) else {
+                    continue;
+                };
+                if landed == to {
+                    tracing::info!(%from, %to, "moved the selection to a player that answers");
+                }
+                // The rows as well as the selection: whether each can be
+                // grouped with the selected player is worked out against it,
+                // and `after_selecting` draws only the highlight.
+                backend.publish();
+                backend.after_selecting(landed, landed != from);
                 continue;
             }
             Command::AddPlayer(text) => {
@@ -11484,6 +12326,13 @@ async fn run_commands(
                     }
                     Err(_) => say(&backend.ui, format!("{text:?} is not an address")),
                 }
+                continue;
+            }
+            // On the loop rather than off it, so it lands in order with a
+            // press on a card: forgetting the selected row and choosing
+            // another one straight after must end on the one chosen.
+            Command::Forget(id) => {
+                backend.forget(id);
                 continue;
             }
 
@@ -16733,6 +17582,179 @@ mod tests {
         a_question_does_not_select_a_half_typed_query(&ui);
         // And the one sum in the window that no other test can reach.
         the_picker_list_is_as_tall_as_the_cards_in_it(&ui);
+        // And the one button in the player list that only a dead row has.
+        // Last, because it opens the list, and an open popup takes every
+        // press made anywhere until it is closed.
+        a_player_that_is_not_responding_offers_to_be_forgotten(&ui, &mut rx);
+    }
+
+    /// The player list offers to forget a player that is not responding, on
+    /// its card and on no other, and the press names that player.
+    ///
+    /// The cards are drawn inside the players popup, which nothing else in
+    /// this test opens, and the button sits on a card that is itself a target:
+    /// pressed through the card, it would choose the dead player instead of
+    /// forgetting it. A player installing an update says "not responding" as
+    /// well, and must not be offered it — it is coming back.
+    fn a_player_that_is_not_responding_offers_to_be_forgotten(
+        ui: &AppWindow,
+        rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) {
+        let settle = |ms: u64| {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+        };
+        let labelled = |label: String| {
+            i_slint_backend_testing::ElementQuery::from_root(ui)
+                .match_descendants()
+                .match_predicate(move |e| e.accessible_label().is_some_and(|l| l == label))
+                .find_all()
+        };
+        let forget = || labelled("Forget this player".to_owned());
+        // A press and a release at one place in the window, hit-tested by the
+        // window as a pointer is.
+        let click = |position: slint::LogicalPosition| {
+            let button = slint::platform::PointerEventButton::Left;
+            for event in [
+                slint::platform::WindowEvent::PointerMoved { position },
+                slint::platform::WindowEvent::PointerPressed { position, button },
+                slint::platform::WindowEvent::PointerReleased { position, button },
+            ] {
+                ui.window().dispatch_event(event);
+            }
+        };
+
+        // TEST-NET-1 addresses, which nothing is sent to: the commands are
+        // read off the channel.
+        let gone = "192.0.2.8:11000";
+        ui.set_devices(ModelRc::new(VecModel::from(vec![
+            Device {
+                id: "192.0.2.7:11000".into(),
+                name: "Kitchen".into(),
+                reachable: true,
+                ..Default::default()
+            },
+            Device {
+                id: gone.into(),
+                name: UNNAMED.into(),
+                reachable: false,
+                ..Default::default()
+            },
+            Device {
+                id: "192.0.2.9:11000".into(),
+                name: "Den".into(),
+                reachable: false,
+                upgrading: true,
+                ..Default::default()
+            },
+        ])));
+        ui.set_selected(0);
+        settle(0);
+        while rx.try_recv().is_ok() {}
+        assert!(
+            forget().is_empty(),
+            "nothing offers it while the list is closed"
+        );
+
+        // Opened the way the pill beside the transport opens it.
+        labelled("Player: Kitchen".to_owned())
+            .first()
+            .expect("the player pill")
+            .invoke_accessible_default_action();
+        settle(0);
+
+        // Counted by where they are drawn rather than by how many the query
+        // returns: it reaches the popup's tree more than once and hands back
+        // the same button each time — eighteen of them, measured, all at one
+        // spot. Every card sits at a height of its own, so a button on any
+        // other card would be somewhere else.
+        let offered = forget();
+        let places: std::collections::BTreeSet<(i64, i64)> = offered
+            .iter()
+            .map(|button| {
+                let at = button.absolute_position();
+                (at.x.round() as i64, at.y.round() as i64)
+            })
+            .collect();
+        assert_eq!(
+            places.len(),
+            1,
+            "only the card that is not responding offers it — not the one answering, and not the \
+             one installing an update: {places:?}"
+        );
+        assert!(
+            !labelled(format!("{gone} · not responding")).is_empty(),
+            "and the card says which address it is, since every row that never answered has the \
+             same name"
+        );
+
+        // A click, hit-tested at the button's middle as the window hit-tests
+        // a pointer. The whole card is a touch area that chooses its player,
+        // and a button under it rather than over it would send that instead.
+        //
+        // Pressed by hand rather than with `mock_single_click`. An element in
+        // a popup reports its place in the popup, not in the window, and the
+        // testing backend of Slint 1.17 presses the window at that place —
+        // which is outside the list, so the list closes and nothing is pressed
+        // at all. The list's own place is added here, by the rule `players`
+        // places it by: 24px left of the pill it hangs off, and its own height
+        // and 10px more above it. Slint moves a popup that would leave the
+        // window, so the sum holds only where this one fits, which is checked.
+        let pill = labelled("Player: Kitchen".to_owned())
+            .first()
+            .expect("the player pill")
+            .absolute_position();
+        // The frame of the list: the one element drawn at the popup's corner
+        // as wide as the popup is.
+        let list = i_slint_backend_testing::ElementQuery::from_root(ui)
+            .match_descendants()
+            .match_predicate(|e| {
+                let at = e.absolute_position();
+                at.x.abs() < 0.5 && at.y.abs() < 0.5 && (e.size().width - 340.0).abs() < 0.5
+            })
+            .find_first()
+            .expect("the list's frame")
+            .size();
+        let corner = (pill.x - 24.0, pill.y - list.height - 10.0);
+        let window = ui.window().size().to_logical(ui.window().scale_factor());
+        assert!(
+            corner.0 >= 0.0
+                && corner.1 >= 0.0
+                && corner.0 + list.width <= window.width
+                && corner.1 + list.height <= window.height,
+            "the list fits where it hangs, so it is where the sum says: {corner:?} {list:?} in \
+             {window:?}"
+        );
+        let at = offered[0].absolute_position();
+        let size = offered[0].size();
+        click(slint::LogicalPosition::new(
+            corner.0 + at.x + size.width / 2.0,
+            corner.1 + at.y + size.height / 2.0,
+        ));
+        let mut sent = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            sent.push(command);
+        }
+        assert!(
+            matches!(&sent[..], [Command::Forget(id)] if id.to_string() == gone),
+            "a click names the player on its own card, and does not choose it: {sent:?}"
+        );
+        // And the way a screen reader presses it.
+        offered[0].invoke_accessible_default_action();
+        let sent = rx.try_recv();
+        assert!(
+            matches!(&sent, Ok(Command::Forget(id)) if id.to_string() == gone),
+            "got {sent:?}"
+        );
+
+        // Left as it was found: the list closed by a click outside it, which
+        // the popup takes and does not pass on, and no rows.
+        click(slint::LogicalPosition::new(6.0, 6.0));
+        settle(0);
+        assert!(forget().is_empty(), "the list is closed again");
+        ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new())));
+        ui.set_selected(0);
+        settle(0);
+        while rx.try_recv().is_ok() {}
     }
 
     /// The picker's list is told the height its cards come to.
@@ -17587,6 +18609,62 @@ mod tests {
         assert_eq!(badged_cards(&[card("Following Kitchen", false, false)]), 1);
     }
 
+    /// Every page that sends to one player is that player's, including the
+    /// three `Pane::owner` leaves out: forgetting the player has to take them
+    /// down with it, or they stay up sending to an address nobody tracks.
+    #[test]
+    fn a_page_belongs_to_the_player_it_sends_to() {
+        let mine = DeviceId::new(std::net::Ipv4Addr::new(192, 0, 2, 7), 11000);
+        let theirs = DeviceId::new(std::net::Ipv4Addr::new(192, 0, 2, 8), 11000);
+
+        let settings = Pane::Settings(mine, Vec::new());
+        let playlists = Pane::Playlists(Box::new(PlaylistPage {
+            device: mine,
+            opened: 1,
+            title: "Add to playlist".to_owned(),
+            options: Default::default(),
+            naming: false,
+        }));
+        let preset = Pane::EditPreset(Box::new(EditPresetPage {
+            device: mine,
+            slot: 3,
+            preset: Default::default(),
+        }));
+        let customise = |presets| {
+            Pane::Customise(CustomisePage {
+                screen: "presets".to_owned(),
+                title: "Presets".to_owned(),
+                rows: Vec::new(),
+                presets,
+            })
+        };
+        for pane in [&settings, &playlists, &preset, &customise(Some((mine, 1)))] {
+            assert!(pane.belongs_to(mine));
+            assert!(!pane.belongs_to(theirs), "and nobody else's");
+        }
+
+        // A screen's own order is this app's, whoever's screen it is.
+        assert!(!customise(None).belongs_to(mine));
+        // A Help page is facts. An offer on it names a player without being
+        // that player's page, and is retired on its own; see `forget`.
+        let help = Pane::HelpDetail(String::new(), Vec::new(), Whence::Help, Some(mine));
+        assert!(!help.belongs_to(mine));
+        assert!(!Pane::Browse.belongs_to(mine));
+    }
+
+    /// A row that has never answered is named for where it is.
+    ///
+    /// Every one of them is "BluOS player", and those are exactly the rows a
+    /// player is forgotten from: "Forgot BluOS player" with two of them on
+    /// screen does not say which one went.
+    #[test]
+    fn a_player_with_no_name_of_its_own_is_called_by_its_address() {
+        let id = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+        assert_eq!(called("Kitchen", id), "Kitchen");
+        assert_eq!(called(UNNAMED, id), "the player at 10.0.0.156:11000");
+        assert_eq!(called("", id), "the player at 10.0.0.156:11000");
+    }
+
     /// The highlight follows the player, including to a new address.
     ///
     /// The window's index used to be reconstructed from the window's own row,
@@ -17634,7 +18712,8 @@ mod tests {
              whoever sorts first"
         );
 
-        // Then the player is tracked at its new address and `Select` names it.
+        // Then the player is tracked at its new address, which the selection
+        // already names.
         // The window is still showing the neighbor it was left on, and that
         // stale row is exactly what used to win.
         let settled = rows(&[new, other]);
@@ -19265,6 +20344,7 @@ mod tests {
             Entry {
                 client: Client::with_http(id, http.clone()),
                 identity: None,
+                provenance: Provenance::Settled,
                 poll: Arc::default(),
                 writes: Arc::default(),
                 upgrading: None,
@@ -19382,6 +20462,7 @@ mod selection_tests {
             registry: Arc::new(Mutex::new(BTreeMap::new())),
             selected: Arc::new(Mutex::new(None)),
             selections: Arc::new(AtomicU64::new(0)),
+            chosen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commands,
             ui: slint::Weak::default(),
             artwork: Arc::new(Artwork::in_memory(http.clone(), Default::default())),
@@ -19424,10 +20505,41 @@ mod selection_tests {
             Entry {
                 client: Client::with_http(player.id(), http.clone()),
                 identity: None,
+                provenance: Provenance::Settled,
                 poll: Arc::default(),
                 writes: Arc::default(),
                 upgrading: None,
                 view: Device::default(),
+                status: None,
+                status_at: None,
+                queue: None,
+                sync: None,
+                cover_url: None,
+                card_cover: None,
+                card_cover_url: None,
+            },
+        );
+    }
+
+    /// A row at `id` drawn the way the window would draw it — with its own
+    /// address, and answering or not — with nothing behind it: no poll loop,
+    /// and no fake unless the caller has one there.
+    fn add_row(backend: &Backend, id: DeviceId, http: &reqwest::Client, reachable: bool) {
+        backend.registry.lock().unwrap().insert(
+            id,
+            Entry {
+                client: Client::with_http(id, http.clone()),
+                identity: None,
+                provenance: Provenance::Settled,
+                poll: Arc::default(),
+                writes: Arc::default(),
+                upgrading: None,
+                view: Device {
+                    id: id.to_string().into(),
+                    name: UNNAMED.into(),
+                    reachable,
+                    ..Default::default()
+                },
                 status: None,
                 status_at: None,
                 queue: None,
@@ -19640,6 +20752,7 @@ mod selection_tests {
         let entry = || Entry {
             client: Client::with_http(id, http.clone()),
             identity: None,
+            provenance: Provenance::Settled,
             poll: Arc::default(),
             writes: Arc::default(),
             upgrading: None,
@@ -23332,7 +24445,7 @@ mod selection_tests {
     /// The watch can be entered on a request the player never answered, and
     /// end at `UPGRADE_SILENCE` having never seen it answer anything. Clearing
     /// the upgrade then wrote `reachable = true` on a speaker that is
-    /// switched off: the row stopped saying "Not responding" and its transport
+    /// switched off: the row stopped saying "not responding" and its transport
     /// and volume came back live for a room nobody could reach, until the next
     /// failed poll — up to a backoff later — put it back. Every press made in
     /// that window did nothing.
@@ -23414,10 +24527,11 @@ mod selection_tests {
         // An announcement is an unauthenticated broadcast, and a move it
         // claims is undone by the next poll — where striking the address out
         // of the file is not undone by anything. It waits for the player to
-        // answer from the new address as itself.
+        // answer from the new address as itself — as the identity that
+        // claimed the move, which is what the evidence is checked against.
         assert_eq!(
-            backend.vacated.lock().unwrap().get(&now).copied(),
-            Some(was),
+            backend.vacated.lock().unwrap().get(&now).cloned(),
+            Some((was, identity.clone())),
             "the address it left has to wait for evidence, not go on a broadcast"
         );
 
@@ -23444,13 +24558,14 @@ mod selection_tests {
     /// to put right, that emptiness stood for as long as the loop took to
     /// drain the command, so a change of DHCP lease flashed an empty window.
     /// The id moves with the player; everything else choosing one means is
-    /// still `Select`'s.
+    /// left to the command that follows a move, `Command::Carried`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_move_carries_the_highlight_to_the_new_address() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::new();
         let player = Player::start().await;
-        // Nothing drains the channel in this harness, so `Select` stays in it:
+        // Nothing drains the channel in this harness, so nothing following
+        // the move up runs:
         // what is asserted below is the state a publish would read before the
         // loop has caught up, which is the whole of the window this is about.
         let (backend, _rx) = backend(&http);
@@ -23466,6 +24581,8 @@ mod selection_tests {
             .unwrap()
             .identity = Some(identity.clone());
         *backend.selected.lock().unwrap() = Some(was);
+        // Chosen by somebody, with a press on its card.
+        backend.chosen.store(true, Ordering::SeqCst);
         let chosen = backend.selections.load(Ordering::SeqCst);
 
         let now = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), was.port);
@@ -23482,6 +24599,10 @@ mod selection_tests {
             chosen,
             "and it is a new choice, so replies still out for the address that has gone are \
              stood down"
+        );
+        assert!(
+            backend.chosen.load(Ordering::SeqCst),
+            "but still the one somebody made: the same speaker, at another address"
         );
 
         // Which is what the publish carrying the new row then asks. Before
@@ -23605,6 +24726,7 @@ mod selection_tests {
             Entry {
                 client: Client::with_http(elsewhere, http.clone()),
                 identity: Some(identity.clone()),
+                provenance: Provenance::Settled,
                 poll: Arc::default(),
                 writes: Arc::default(),
                 upgrading: None,
@@ -23796,6 +24918,280 @@ mod selection_tests {
         );
     }
 
+    /// The MAC a fake answers `/SyncStatus` with, swapped for another, so one
+    /// address can be made to answer as somebody else.
+    fn answering_as(mac: &str) -> String {
+        fixtures::sync_status().replace("00:11:22:33:44:55", mac)
+    }
+
+    /// A player that took a new address while the app was closed is
+    /// recognized at the address it left.
+    ///
+    /// The players file used to list both addresses and nothing else. The old
+    /// one never answers, so nothing in the run ever said whose it was: when
+    /// the player announced from its new address, `moved_here` had nothing to
+    /// match, and the dead address stayed as a second row — the selected one,
+    /// since the file is oldest first — with no way to be rid of it.
+    /// Remembered with the MAC it last answered with, it is matched like any
+    /// other. And since the new address, tracked from the same file, has
+    /// already answered by the time the announcement arrives, the old one
+    /// leaves the file there and then: nothing asks the new address again
+    /// until its grouping changes, so waiting for another answer was waiting
+    /// all run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_remembered_at_the_address_it_left_is_retired_when_it_announces() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let live = Player::start().await;
+        // Held, as a real player holds a long poll. The first answer is what
+        // is watched here, and a fake answering every poll at once would be
+        // polled flat out for as long as the test runs.
+        live.delay("/Status", Duration::from_secs(600));
+        let (backend, _rx) = backend(&http);
+
+        // What the file holds after a lease moved the player: the address it
+        // had, the one it has now, and the same MAC against both.
+        let identity = identity_from_mac("00:11:22:33:44:55").unwrap();
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        let remembered = vec![
+            known::Remembered {
+                id: dead,
+                identity: Some(identity.clone()),
+            },
+            known::Remembered {
+                id: live.id(),
+                identity: Some(identity.clone()),
+            },
+        ];
+        *backend.known.lock().unwrap() = remembered.clone();
+        backend.track_remembered(remembered, &http);
+
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "the oldest address is tracked first, and selected with it"
+        );
+        assert_eq!(
+            backend.with_entry(dead, |e| (e.identity.clone(), e.provenance)),
+            Some((Some(identity.clone()), Provenance::Remembered)),
+            "and it carries who answered there, as a memory rather than an answer"
+        );
+        let poll = backend.with_entry(dead, |e| e.poll.clone()).unwrap();
+
+        // The new address answers before any announcement lands, as it does
+        // at startup, where the file is tried ahead of the sweep.
+        until("the new address to answer", || {
+            backend
+                .with_entry(live.id(), |e| e.sync.is_some())
+                .unwrap_or(false)
+        })
+        .await;
+
+        // Its announcement.
+        assert!(
+            backend.moved_here(&identity, live.id()),
+            "the selection was on the address it left, and has to be carried"
+        );
+        assert_eq!(*backend.selected.lock().unwrap(), Some(live.id()));
+        assert!(
+            backend.with_entry(dead, |_| ()).is_none(),
+            "the address it left is not a row any more"
+        );
+        assert!(poll.retired(), "and its poll is told to stop");
+
+        let known: Vec<DeviceId> = backend
+            .known
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|player| player.id)
+            .collect();
+        assert_eq!(
+            known,
+            vec![live.id()],
+            "nor is it a line in the file, to be probed and selected at the next start"
+        );
+        assert!(
+            backend.vacated.lock().unwrap().is_empty(),
+            "and nothing is left waiting on evidence that was already in"
+        );
+    }
+
+    /// What the file remembers about an address gives way to what the address
+    /// says now.
+    ///
+    /// A lease can go to another speaker while the app is closed, and the file
+    /// still names the one that had it. Held as firmly as an announced
+    /// identity, that memory would have the speaker answering here now retired
+    /// the moment the old one announced from anywhere else; and where the address
+    /// answers with no MAC that names anyone, the memory is not left standing
+    /// in place of the answer either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remembered_identity_gives_way_to_the_address_answering_for_itself() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let here = Player::start().await;
+        let blank = Player::start().await;
+        for player in [&here, &blank] {
+            // Held, as in the test above.
+            player.delay("/Status", Duration::from_secs(600));
+        }
+        here.serve("/SyncStatus", answering_as("aa:bb:cc:dd:ee:ff"));
+        blank.serve("/SyncStatus", answering_as("00:00:00:00:00:00"));
+        let (backend, _rx) = backend(&http);
+
+        let before = identity_from_mac("00:11:22:33:44:55").unwrap();
+        let now = identity_from_mac("aa:bb:cc:dd:ee:ff").unwrap();
+        let remembered: Vec<known::Remembered> = [&here, &blank]
+            .into_iter()
+            .map(|player| known::Remembered {
+                id: player.id(),
+                identity: Some(before.clone()),
+            })
+            .collect();
+        *backend.known.lock().unwrap() = remembered.clone();
+        backend.track_remembered(remembered, &http);
+
+        // The file's record is the last thing an answer changes.
+        let expected = vec![
+            known::Remembered {
+                id: here.id(),
+                identity: Some(now.clone()),
+            },
+            known::Remembered {
+                id: blank.id(),
+                identity: None,
+            },
+        ];
+        until("both addresses to answer for themselves", || {
+            *backend.known.lock().unwrap() == expected
+        })
+        .await;
+        assert_eq!(
+            backend.with_entry(here.id(), |e| (e.identity.clone(), e.provenance)),
+            Some((Some(now.clone()), Provenance::Settled)),
+            "the speaker answering here is who this address is now"
+        );
+        assert_eq!(
+            backend.with_entry(blank.id(), |e| e.identity.clone()),
+            Some(None),
+            "and an answer that names nobody leaves nobody, not the memory"
+        );
+
+        // The speaker that used to be here, announcing from wherever it went.
+        let elsewhere = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), here.id().port);
+        assert!(!backend.moved_here(&before, elsewhere));
+        assert_eq!(
+            backend.registry.lock().unwrap().len(),
+            2,
+            "neither player answering under the old name is the one that left"
+        );
+        assert!(backend.vacated.lock().unwrap().is_empty());
+    }
+
+    /// An address leaves the file only on the word of the player that claimed
+    /// to have left it.
+    ///
+    /// The evidence used to be the entry's own identity against the answer.
+    /// An entry nothing had named yet is filled in by that answer, and one the
+    /// file seeded is replaced by it, so either agrees with whoever answers: an
+    /// announcement claiming a sleeping player had moved onto a live speaker's
+    /// address — which anyone on the segment can broadcast — had the sleeping
+    /// player's real address struck out of the file as soon as the speaker
+    /// answered as itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_is_confirmed_only_by_the_player_that_claimed_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let speaker = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &speaker, &http);
+        let client = backend
+            .with_entry(speaker.id(), |e| e.client.clone())
+            .unwrap();
+
+        // A player remembered at another address, asleep, with what its
+        // decoder last named written down against that address.
+        let sleeping = identity_from_mac("aa:bb:cc:dd:ee:ff").unwrap();
+        let asleep = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), speaker.id().port);
+        let remembered = known::Remembered {
+            id: asleep,
+            identity: Some(sleeping.clone()),
+        };
+        *backend.known.lock().unwrap() = vec![
+            remembered.clone(),
+            known::Remembered {
+                id: speaker.id(),
+                identity: None,
+            },
+        ];
+        backend.track_remembered(vec![remembered], &http);
+        let mqa = bluos::Status {
+            quality: Some("mqaAuthored".to_owned()),
+            pid: Some(7),
+            song: Some(0),
+            title1: Some("A Song".to_owned()),
+            ..Default::default()
+        };
+        assert!(decoded::remember(
+            &mut backend.decoded.lock().unwrap(),
+            asleep,
+            &mqa
+        ));
+
+        // The claim, from the speaker's address, before the speaker has said
+        // anything.
+        backend.moved_here(&sleeping, speaker.id());
+        assert_eq!(
+            backend.vacated.lock().unwrap().get(&speaker.id()).cloned(),
+            Some((asleep, sleeping.clone()))
+        );
+
+        // And the speaker, answering as itself.
+        read_sync(&backend, speaker.id(), &client)
+            .await
+            .expect("the speaker answers");
+        assert!(
+            backend
+                .known
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|player| player.id == asleep),
+            "an answer from somebody else is not the claimed player's word"
+        );
+        assert!(
+            decoded::about(&backend.decoded.lock().unwrap(), asleep).is_some(),
+            "and what its decoder said stays where it was"
+        );
+        assert!(
+            backend.vacated.lock().unwrap().contains_key(&speaker.id()),
+            "the claim is still waiting for it"
+        );
+
+        // The claimed player, answering there after all.
+        speaker.serve("/SyncStatus", answering_as("aa:bb:cc:dd:ee:ff"));
+        read_sync(&backend, speaker.id(), &client)
+            .await
+            .expect("the player answers");
+        assert_eq!(
+            *backend.known.lock().unwrap(),
+            vec![known::Remembered {
+                id: speaker.id(),
+                identity: Some(sleeping.clone()),
+            }],
+            "the address it left goes, and who answers here now is written down"
+        );
+        let heard = backend.decoded.lock().unwrap();
+        assert!(decoded::about(&heard, asleep).is_none());
+        assert!(
+            decoded::about(&heard, speaker.id()).is_some(),
+            "its decoder's last word goes with it"
+        );
+        drop(heard);
+        assert!(backend.vacated.lock().unwrap().is_empty());
+    }
+
     /// A player that has just announced itself does not sit out a backoff
     /// meant for its silence.
     ///
@@ -23851,6 +25247,1513 @@ mod selection_tests {
             asked(&first, "/Delete"),
             1,
             "and the first player's write is still out, which is the point"
+        );
+    }
+
+    /// A row that is not responding can be got rid of.
+    ///
+    /// A player that took a new address while the app was closed left its
+    /// old one in the players file, and nothing in a run could take it out:
+    /// the address never answers, so nothing says whose it was, and a move
+    /// is only noticed when the same player announces from somewhere else.
+    /// The file is oldest first, so that dead row was the one tracked first
+    /// and selected at every start, with no way to be rid of it short of
+    /// editing the file by hand. Forgetting it takes everything kept against
+    /// it, and hands the selection to a player that answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_that_is_not_responding_can_be_forgotten() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let live = Player::start().await;
+        let (backend, rx) = backend(&http);
+
+        // A row that has never answered, first in the order the rows are
+        // drawn in: drawn as answering, since nothing has failed yet, but no
+        // more a player that works than the dead one is.
+        let quiet = DeviceId::new(std::net::Ipv4Addr::LOCALHOST, 1);
+        add_row(&backend, quiet, &http, true);
+        // A player that has answered.
+        add_row(&backend, live.id(), &http, true);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&live.id())
+            .unwrap()
+            .status = Some(bluos::Status::default());
+        // And the address a lease moved it away from, selected, as the oldest
+        // line of the file is at every start, with the browser on it — and
+        // chosen, pressed to find out what it was.
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, dead, &http, false);
+        let poll = backend.with_entry(dead, |e| e.poll.clone()).unwrap();
+        *backend.selected.lock().unwrap() = Some(dead);
+        backend.chosen.store(true, Ordering::SeqCst);
+        let chosen = backend.selections.load(Ordering::SeqCst);
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            browsing.device = Some(dead);
+            browsing.pane = Pane::EditPreset(Box::new(EditPresetPage {
+                device: dead,
+                slot: 1,
+                preset: Default::default(),
+            }));
+            browsing.light(dead, (0, 1));
+        }
+        backend.artwork.remember_player(dead.host);
+        let art = format!("http://{}/Artwork", dead.host);
+        assert!(backend.artwork.offered(&art).is_some());
+
+        // Everything else kept against it: its line in each file, a move it
+        // was waiting to confirm from either end — beside one about somebody
+        // else — and an update offered for it.
+        let identity = identity_from_mac("00:11:22:33:44:55").unwrap();
+        *backend.known.lock().unwrap() = vec![
+            known::Remembered {
+                id: dead,
+                identity: Some(identity.clone()),
+            },
+            known::Remembered {
+                id: live.id(),
+                identity: Some(identity.clone()),
+            },
+        ];
+        let mqa = bluos::Status {
+            quality: Some("mqaAuthored".to_owned()),
+            pid: Some(7),
+            song: Some(0),
+            title1: Some("A Song".to_owned()),
+            ..Default::default()
+        };
+        assert!(decoded::remember(
+            &mut backend.decoded.lock().unwrap(),
+            dead,
+            &mqa
+        ));
+        let elsewhere = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 3), 11000);
+        {
+            let mut vacated = backend.vacated.lock().unwrap();
+            vacated.insert(dead, (elsewhere, identity.clone()));
+            vacated.insert(live.id(), (dead, identity.clone()));
+            vacated.insert(quiet, (elsewhere, identity.clone()));
+        }
+        *backend.update_offer.lock().unwrap() = Some(dead);
+        backend.told_about_update.lock().unwrap().insert(dead);
+        backend.sent_players.store(0, Ordering::Relaxed);
+
+        // The press, through the loop, as the window sends it.
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+        let _ = backend.commands.send(Command::Forget(dead));
+
+        // What the backend does once the selection has moved, done for the
+        // player it moved to: the browser goes to its screens. Which also
+        // says the forget is over, since that comes after it on the loop.
+        until(
+            "the browser to follow the selection to the live player",
+            || device(&backend) == Some(live.id()),
+        )
+        .await;
+
+        assert!(
+            backend.with_entry(dead, |_| ()).is_none(),
+            "the row has gone"
+        );
+        assert!(poll.retired(), "and its poll is told to stop");
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(live.id()),
+            "the selection goes to a player that answers, not merely to the first row"
+        );
+        assert_ne!(
+            backend.selections.load(Ordering::SeqCst),
+            chosen,
+            "as a new choice, so replies still out for the forgotten one stand down"
+        );
+        assert!(
+            !backend.chosen.load(Ordering::SeqCst),
+            "and the backend's choice rather than the user's, whose choice was the row that \
+             has gone"
+        );
+        assert_ne!(
+            backend.sent_players.load(Ordering::Relaxed),
+            0,
+            "the rows are published without it: no announcement follows to do it"
+        );
+
+        let known: Vec<DeviceId> = backend
+            .known
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|player| player.id)
+            .collect();
+        assert_eq!(
+            known,
+            vec![live.id()],
+            "out of the players file, so it is not tried and selected at the next start"
+        );
+        assert!(decoded::about(&backend.decoded.lock().unwrap(), dead).is_none());
+        {
+            let vacated = backend.vacated.lock().unwrap();
+            assert!(
+                !vacated.contains_key(&dead) && vacated.values().all(|(old, _)| *old != dead),
+                "no move is left waiting on it from either end: {vacated:?}"
+            );
+            assert!(
+                vacated.contains_key(&quiet),
+                "while a move about other players still waits"
+            );
+        }
+        assert_eq!(*backend.update_offer.lock().unwrap(), None);
+        assert!(!backend.told_about_update.lock().unwrap().contains(&dead));
+        {
+            let browsing = backend.browsing.lock().unwrap();
+            assert!(
+                matches!(browsing.pane, Pane::Browse),
+                "a page of its own is not left up sending to nobody"
+            );
+            assert!(!browsing.highlighted.contains_key(&dead));
+        }
+        assert!(
+            backend.artwork.offered(&art).is_none(),
+            "an address no player is tracked at is not a player's own address"
+        );
+        assert!(
+            backend.with_entry(quiet, |_| ()).is_some()
+                && backend.with_entry(live.id(), |_| ()).is_some(),
+            "and nothing else is forgotten with it"
+        );
+    }
+
+    /// Only a row that says "not responding" can be forgotten, and not one
+    /// that says it while it installs an update.
+    ///
+    /// The window offers it on no other row, but the press is a command that
+    /// waits its turn on the loop, and the player can answer in the meantime.
+    /// One installing an update reads as not responding while it reboots and
+    /// is watched until it comes back; forgetting it would leave that watch
+    /// running for a row that has gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_that_answers_or_is_installing_is_not_forgotten() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+
+        let answering = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), 11000);
+        let installing = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 3), 11000);
+        add_row(&backend, answering, &http, true);
+        add_row(&backend, installing, &http, false);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&installing)
+            .unwrap()
+            .upgrading = Some(Upgrading {
+            name: "Kitchen".to_owned(),
+            stage: "Installing".to_owned(),
+            percent: 0.0,
+        });
+        *backend.selected.lock().unwrap() = Some(installing);
+        let chosen = backend.selections.load(Ordering::SeqCst);
+        let remembered: Vec<known::Remembered> = [answering, installing]
+            .into_iter()
+            .map(|id| known::Remembered { id, identity: None })
+            .collect();
+        *backend.known.lock().unwrap() = remembered.clone();
+        let polls: Vec<Arc<Poll>> = [answering, installing]
+            .into_iter()
+            .map(|id| backend.with_entry(id, |e| e.poll.clone()).unwrap())
+            .collect();
+
+        assert!(!backend.forget(answering), "it is answering");
+        assert!(!backend.forget(installing), "it is installing an update");
+        assert!(
+            !backend.forget(DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 4), 11000)),
+            "nothing is tracked there"
+        );
+
+        assert_eq!(backend.registry.lock().unwrap().len(), 2);
+        assert!(polls.iter().all(|poll| !poll.retired()));
+        assert_eq!(*backend.selected.lock().unwrap(), Some(installing));
+        assert_eq!(backend.selections.load(Ordering::SeqCst), chosen);
+        assert_eq!(*backend.known.lock().unwrap(), remembered);
+    }
+
+    /// Forgetting a row nobody has selected leaves the selection where it is,
+    /// and forgetting the last row leaves nothing selected rather than a
+    /// player with no row.
+    ///
+    /// And a Help page that offered an update for the row keeps its facts
+    /// but loses the offer, where a move repoints it: there is no other
+    /// address the player answers on, and Install there would be sent to
+    /// nobody. A page of the player's own goes altogether — rearranging its
+    /// presets here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_row_leaves_no_selection_on_nothing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+
+        let first = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), 11000);
+        let second = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 3), 11000);
+        add_row(&backend, first, &http, false);
+        add_row(&backend, second, &http, false);
+        *backend.selected.lock().unwrap() = Some(first);
+        let chosen = backend.selections.load(Ordering::SeqCst);
+        backend.browsing.lock().unwrap().pane = Pane::HelpDetail(
+            "Upgrade Check".to_owned(),
+            vec![("Firmware".to_owned(), "4.16.22".to_owned())],
+            Whence::Help,
+            Some(second),
+        );
+
+        assert!(backend.forget(second));
+        assert_eq!(*backend.selected.lock().unwrap(), Some(first));
+        assert_eq!(
+            backend.selections.load(Ordering::SeqCst),
+            chosen,
+            "a row nobody had chosen takes no choice with it"
+        );
+        assert!(
+            matches!(
+                backend.browsing.lock().unwrap().pane,
+                Pane::HelpDetail(_, _, _, None)
+            ),
+            "the facts stay up, and the offer goes"
+        );
+
+        backend.browsing.lock().unwrap().pane = Pane::Customise(CustomisePage {
+            screen: "presets".to_owned(),
+            title: "Presets".to_owned(),
+            rows: Vec::new(),
+            presets: Some((first, 7)),
+        });
+        assert!(backend.forget(first));
+        assert!(backend.registry.lock().unwrap().is_empty());
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            None,
+            "with no row left, nothing is selected — not a player the rows do not hold"
+        );
+        assert!(matches!(
+            backend.browsing.lock().unwrap().pane,
+            Pane::Browse
+        ));
+    }
+
+    /// An answer that lands after a player was forgotten does not put it back.
+    ///
+    /// `/SyncStatus` is read off the loop, and a reply can be on its way when
+    /// the row goes. It used to write the address back into the players file
+    /// regardless — which is the first place a forgotten player was meant to
+    /// leave — and ask it about firmware for a row that was not there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_landing_after_a_forget_does_not_bring_the_player_back() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add_row(&backend, player.id(), &http, true);
+        let client = backend
+            .with_entry(player.id(), |e| e.client.clone())
+            .unwrap();
+        let listed = |backend: &Backend| {
+            backend
+                .known
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|kept| kept.id == player.id())
+        };
+
+        // Tracked, an answer is what writes an address down.
+        read_sync(&backend, player.id(), &client)
+            .await
+            .expect("the player answers");
+        assert!(listed(&backend));
+
+        // Then it stops answering, and is forgotten.
+        backend.update(player.id(), |view| view.reachable = false);
+        assert!(backend.forget(player.id()));
+        assert!(!listed(&backend));
+
+        // And the reply that was still on its way.
+        assert!(
+            read_sync(&backend, player.id(), &client).await.is_none(),
+            "there is no row to fold it into"
+        );
+        assert_eq!(asked(&player, "/SyncStatus"), 2, "it did answer");
+        assert!(
+            !listed(&backend),
+            "and the answer does not write the address back into the file"
+        );
+        assert!(
+            !backend
+                .told_about_update
+                .lock()
+                .unwrap()
+                .contains(&player.id()),
+            "nor ask about firmware for a row that is not there"
+        );
+    }
+
+    /// A fake that answers `/SyncStatus` at once and holds its long poll, as
+    /// a player at rest does. Its first answer is what these tests watch, and
+    /// one answering every poll at once would be polled flat out for as long
+    /// as the test runs.
+    async fn holding_its_poll() -> Player {
+        let player = Player::start().await;
+        player.delay("/Status", Duration::from_secs(600));
+        player
+    }
+
+    /// Select `id` the way the first row tracked is selected: written down
+    /// and counted, and chosen by nobody.
+    fn select_unchosen(backend: &Backend, id: DeviceId) {
+        let mut selected = backend.selected.lock().unwrap();
+        *selected = Some(id);
+        backend.selections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A client with the app's own timeouts. The address nothing answers at
+    /// has to fail within them, here as on a machine that drops the
+    /// connection rather than refusing it; see [`until_within`].
+    fn timed_client() -> reqwest::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        bluos::client::http_client().expect("a client")
+    }
+
+    /// Two failed connections at the dead address before its row says so —
+    /// `/SyncStatus`, then the first poll — each as long as the connect
+    /// timeout where nothing refuses them, and room to spare after that.
+    const SEEN_FAILING: Duration = Duration::from_secs(20);
+
+    /// The selection a run starts with leaves an address that never answers
+    /// for a player that does.
+    ///
+    /// The players file is tracked oldest first, and after a lease has moved
+    /// a player the address it left is the oldest line, so that dead row was
+    /// the one selected at every start: no queue, a pane that never filled
+    /// and a transport that pressed nothing, beside a row for the same player
+    /// that answered, until somebody thought to press it. The file here is
+    /// the one that was found with — two bare addresses, the dead one first —
+    /// so nothing can tell the two were ever the same player, and nothing
+    /// retires the dead row; it only stops being the one selected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_address_nobody_chose_gives_way_to_a_player_that_answers() {
+        let http = timed_client();
+        let live = holding_its_poll().await;
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        backend.track_remembered(
+            [dead, live.id()]
+                .into_iter()
+                .map(|id| known::Remembered { id, identity: None })
+                .collect(),
+            &http,
+        );
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "the oldest address is tracked first, and selected with it"
+        );
+
+        until_within(
+            SEEN_FAILING,
+            "the selection to move to the player that answers",
+            || *backend.selected.lock().unwrap() == Some(live.id()),
+        )
+        .await;
+        assert!(
+            !backend.chosen.load(Ordering::SeqCst),
+            "and it is still nobody's choice"
+        );
+        assert_eq!(
+            backend.with_entry(dead, |e| e.view.reachable),
+            Some(false),
+            "the dead row stays, drawn as not responding, to be forgotten"
+        );
+
+        // And everything choosing a player means is done for it, as for a
+        // press: the browser goes to its screens.
+        until("the browser to follow the selection", || {
+            device(&backend) == Some(live.id())
+        })
+        .await;
+    }
+
+    /// Nothing moves before the selected row has failed, and the move is made
+    /// when it does.
+    ///
+    /// The order a start usually goes in: the live address answers in one
+    /// round trip, while the dead one takes two failed connections to be
+    /// drawn as not responding. Until then a row is drawn answering, and a
+    /// player that is slow to reply is not a dead one, so the first answer
+    /// elsewhere moves nothing; the failure, when it comes, does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selection_moves_when_its_row_is_seen_failing() {
+        let http = timed_client();
+        let live = holding_its_poll().await;
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        // Tracked first and selected, as at a start, but with its poll held
+        // back so that its failure can be made to come second.
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, dead, &http, true);
+        select_unchosen(&backend, dead);
+
+        backend.track(live.id(), &http, None, None);
+        until("the live player to answer", || {
+            backend
+                .with_entry(live.id(), Entry::answered)
+                .unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "a row that has not failed yet keeps the selection, however slow it is"
+        );
+
+        // Its poll, as `track_as` starts one.
+        tokio::spawn(follow(
+            backend.clone(),
+            dead,
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until_within(
+            SEEN_FAILING,
+            "the selection to leave the row once it fails",
+            || *backend.selected.lock().unwrap() == Some(live.id()),
+        )
+        .await;
+        assert_eq!(backend.with_entry(dead, |e| e.view.reachable), Some(false));
+    }
+
+    /// And where the selected row has already failed, the move is made when
+    /// another player first answers.
+    ///
+    /// The other order: a player switched on after the app, or found only by
+    /// the sweep, answers well after the dead row has given up. Nothing on
+    /// the dead row's side changes then — its poll is only backing off — so
+    /// the answer is the moment to move.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selection_moves_when_another_player_first_answers() {
+        let http = timed_client();
+        let live = holding_its_poll().await;
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        // Seen failing already, and with no poll of its own to fail again, so
+        // that only the other player's answer can move the selection.
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, dead, &http, false);
+        select_unchosen(&backend, dead);
+        backend.reconsider_selection();
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "with nowhere better to go, the selection stays"
+        );
+
+        backend.track(live.id(), &http, None, None);
+        until("the selection to move to the player that answered", || {
+            *backend.selected.lock().unwrap() == Some(live.id())
+        })
+        .await;
+        assert!(!backend.chosen.load(Ordering::SeqCst));
+    }
+
+    /// A player's first answer moves the selection when it comes by the poll
+    /// rather than by `/SyncStatus`, as well.
+    ///
+    /// The turn from silence to an answer is watched in the poll too, not only
+    /// at the `/SyncStatus` each player is asked for first: that one can fail
+    /// where the status does not, and a player that was down when the dead row
+    /// failed comes back by the poll, with its `/SyncStatus` long since read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selection_moves_when_another_player_first_answers_by_its_poll() {
+        let http = timed_client();
+        let live = Player::start().await;
+        // Nothing to say on `/SyncStatus`, and a status a moment later — then
+        // another every moment after that, which is a poll slow enough to
+        // leave be.
+        live.forget("/SyncStatus");
+        live.delay("/Status", SLOW);
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, dead, &http, false);
+        select_unchosen(&backend, dead);
+
+        backend.track(live.id(), &http, None, None);
+        until("the selection to move to the player that answered", || {
+            *backend.selected.lock().unwrap() == Some(live.id())
+        })
+        .await;
+        assert_eq!(
+            backend.with_entry(live.id(), |e| (e.sync.is_none(), e.status.is_some())),
+            Some((true, true)),
+            "on the strength of its status alone"
+        );
+    }
+
+    /// A row somebody chose keeps the selection, answering or not.
+    ///
+    /// Pressing a card that says "not responding" is a person asking about
+    /// that row — what it is, or whether it has come back — and moving them
+    /// off it a moment later would be the app overruling them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_address_somebody_chose_keeps_the_selection() {
+        let http = timed_client();
+        let live = holding_its_poll().await;
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        backend.track_remembered(
+            [dead, live.id()]
+                .into_iter()
+                .map(|id| known::Remembered { id, identity: None })
+                .collect(),
+            &http,
+        );
+        // The press, on the row already selected.
+        let _ = backend.commands.send(Command::Select(dead));
+
+        until_within(
+            SEEN_FAILING,
+            "the dead row to fail and the live one to answer",
+            || {
+                backend.with_entry(dead, |e| !e.view.reachable) == Some(true)
+                    && backend.with_entry(live.id(), Entry::answered) == Some(true)
+            },
+        )
+        .await;
+        // Both moments a move is weighed at have passed. Weighed once more,
+        // and offered outright as well, as a move decided a moment before the
+        // press would be.
+        backend.reconsider_selection();
+        let _ = backend.commands.send(Command::AutoSelect {
+            from: dead,
+            to: live.id(),
+        });
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "the row the user chose is the row selected"
+        );
+        assert!(backend.chosen.load(Ordering::SeqCst));
+    }
+
+    /// Two players that both answer leave the selection on the one tracked
+    /// first, whichever replies first.
+    ///
+    /// Moving on an answer alone — the selected player not having answered
+    /// yet, another having — would hand the selection to whichever of two
+    /// working players was quicker, and a slower speaker first in the file
+    /// would lose the highlight a moment after the window opened on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_players_that_answer_keep_the_first_tracked_selection() {
+        let http = timed_client();
+        let first = holding_its_poll().await;
+        let second = holding_its_poll().await;
+        // The first the slower of the two.
+        first.delay("/SyncStatus", SLOW);
+        let (backend, rx) = backend(&http);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        backend.track_remembered(
+            [first.id(), second.id()]
+                .into_iter()
+                .map(|id| known::Remembered { id, identity: None })
+                .collect(),
+            &http,
+        );
+        let selection = backend.selections.load(Ordering::SeqCst);
+
+        until("both players to answer", || {
+            [first.id(), second.id()]
+                .into_iter()
+                .all(|id| backend.with_entry(id, Entry::answered) == Some(true))
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(*backend.selected.lock().unwrap(), Some(first.id()));
+        assert_eq!(
+            backend.selections.load(Ordering::SeqCst),
+            selection,
+            "and it was never moved, not even away and back"
+        );
+    }
+
+    /// What a move is weighed on, one condition at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selection_moves_only_off_a_dead_row_nobody_chose() {
+        let http = reqwest::Client::new();
+        let (backend, mut rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        let edit = |id, f: &dyn Fn(&mut Entry)| {
+            f(backend.registry.lock().unwrap().get_mut(&id).unwrap());
+        };
+        let offered = |rx: &mut mpsc::UnboundedReceiver<Command>| {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+        };
+
+        // In the order the rows are drawn in: the dead row selected; one that
+        // has never answered, drawn answering because it has not failed yet;
+        // one installing an update, drawn answering because a status landed
+        // mid-install; and two players that work.
+        let (dead, quiet, installing, live, also) = (at(2), at(3), at(4), at(5), at(6));
+        add_row(&backend, dead, &http, false);
+        add_row(&backend, quiet, &http, true);
+        add_row(&backend, installing, &http, true);
+        add_row(&backend, live, &http, true);
+        add_row(&backend, also, &http, true);
+        edit(installing, &|e| {
+            e.status = Some(bluos::Status::default());
+            e.upgrading = Some(Upgrading {
+                name: "Kitchen".to_owned(),
+                stage: "Installing".to_owned(),
+                percent: 0.0,
+            });
+        });
+        for id in [live, also] {
+            edit(id, &|e| e.status = Some(bluos::Status::default()));
+        }
+        select_unchosen(&backend, dead);
+
+        backend.reconsider_selection();
+        assert!(
+            matches!(
+                &offered(&mut rx)[..],
+                [Command::AutoSelect { from, to }] if *from == dead && *to == live
+            ),
+            "the first row that works, past one that has never answered and one \
+             that is installing an update"
+        );
+
+        backend.chosen.store(true, Ordering::SeqCst);
+        backend.reconsider_selection();
+        assert!(offered(&mut rx).is_empty(), "a choice is not overruled");
+        backend.chosen.store(false, Ordering::SeqCst);
+
+        edit(dead, &|e| e.status = Some(bluos::Status::default()));
+        backend.reconsider_selection();
+        assert!(
+            offered(&mut rx).is_empty(),
+            "a player that has answered once keeps the selection through a failure"
+        );
+        edit(dead, &|e| e.status = None);
+
+        edit(dead, &|e| e.view.reachable = true);
+        backend.reconsider_selection();
+        assert!(
+            offered(&mut rx).is_empty(),
+            "nor is a row left before it has been seen failing"
+        );
+        edit(dead, &|e| e.view.reachable = false);
+
+        for id in [live, also] {
+            edit(id, &|e| e.view.reachable = false);
+        }
+        backend.reconsider_selection();
+        assert!(
+            offered(&mut rx).is_empty(),
+            "and a player that has stopped answering is nowhere to move to"
+        );
+    }
+
+    /// A move decided off the loop is dropped where what it was decided on
+    /// has changed by the time the loop reaches it.
+    ///
+    /// It is decided in a poll and made on the command loop, behind whatever
+    /// is already waiting there. The selection can have moved in between, the
+    /// player it was going to can have gone, and the one it was leaving can
+    /// have answered after all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_decided_on_old_facts_is_dropped() {
+        let http = reqwest::Client::new();
+        let (backend, rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        let (dead, quiet, live, other, gone) = (at(2), at(3), at(4), at(5), at(6));
+        // Two rows that have never answered and have failed, one of them
+        // selected; and two players that work.
+        add_row(&backend, dead, &http, false);
+        add_row(&backend, quiet, &http, false);
+        for id in [live, other] {
+            add_row(&backend, id, &http, true);
+            backend
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .status = Some(bluos::Status::default());
+        }
+        select_unchosen(&backend, dead);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        // The row it was leaving answered after the decision.
+        let answered = |status: Option<bluos::Status>| {
+            backend
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&dead)
+                .unwrap()
+                .status = status;
+        };
+        answered(Some(bluos::Status::default()));
+        let _ = backend.commands.send(Command::AutoSelect {
+            from: dead,
+            to: live,
+        });
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "a player that has answered is not left on a decision made before it did"
+        );
+        answered(None);
+
+        // A row that has gone, and a selection that is not where the move
+        // thought it was. Each is dropped, which is why the last can succeed:
+        // it moves the selection only from where it still is.
+        let selection = backend.selections.load(Ordering::SeqCst);
+        backend.sent_players.store(0, Ordering::Relaxed);
+        let _ = backend.commands.send(Command::AutoSelect {
+            from: dead,
+            to: gone,
+        });
+        let _ = backend.commands.send(Command::AutoSelect {
+            from: quiet,
+            to: other,
+        });
+        let _ = backend.commands.send(Command::AutoSelect {
+            from: dead,
+            to: live,
+        });
+        until("the move that still holds to be made", || {
+            *backend.selected.lock().unwrap() == Some(live)
+        })
+        .await;
+        assert_eq!(
+            backend.selections.load(Ordering::SeqCst),
+            selection + 1,
+            "counted once, as a new selection"
+        );
+        assert!(!backend.chosen.load(Ordering::SeqCst));
+        assert_ne!(
+            backend.sent_players.load(Ordering::Relaxed),
+            0,
+            "and the rows are drawn again, against the player now selected"
+        );
+    }
+
+    /// A move is nobody's choice, and a choice made while one is followed up
+    /// stands.
+    ///
+    /// `moved_here` writes the selection at once and leaves the rest of what
+    /// choosing a player means to a command, which waits its turn on the loop
+    /// behind anything already there. That command was a `Select` for the new
+    /// address: it marked the move as the user's own choice, and took back a
+    /// card pressed in the meantime from the person who pressed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_followed_up_takes_no_choice_back() {
+        let (backend, first, second) = two_players().await;
+
+        // A selection carried to `first`, and the command that follows it.
+        select_unchosen(&backend, first.id());
+        let _ = backend.commands.send(Command::Carried(first.id()));
+        until("the browser to follow the carried selection", || {
+            device(&backend) == Some(first.id())
+        })
+        .await;
+        assert!(
+            !backend.chosen.load(Ordering::SeqCst),
+            "the move is nobody's choice"
+        );
+
+        // Another carried to `second`, with a press on `first` ahead of its
+        // follow-up on the loop.
+        select_unchosen(&backend, second.id());
+        let _ = backend.commands.send(Command::Select(first.id()));
+        let _ = backend.commands.send(Command::Carried(second.id()));
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(first.id()),
+            "the press stands"
+        );
+        assert!(backend.chosen.load(Ordering::SeqCst));
+        assert_eq!(
+            asked(&second, "/Playlist"),
+            0,
+            "and nothing choosing a player means was done for the one not chosen"
+        );
+    }
+
+    /// Wait, without awaiting, for something another thread does — for a test
+    /// that is holding one of the backend's locks, which must not be held
+    /// across an await.
+    fn until_blocking(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A selection read back after it is written lands on a row: the one
+    /// asked for while it has one, or the first, or nothing where there are
+    /// none — and where somebody else has moved it since, it is theirs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selection_read_back_lands_on_a_row() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        let (gone, first, second) = (at(2), at(3), at(4));
+        add_row(&backend, first, &http, false);
+        add_row(&backend, second, &http, false);
+        let selected = || *backend.selected.lock().unwrap();
+
+        assert_eq!(
+            backend.keep_selection_on_a_row(None, None),
+            Some(first),
+            "nothing written, with a row there to select: the first row"
+        );
+        assert_eq!(selected(), Some(first));
+
+        select_unchosen(&backend, gone);
+        assert_eq!(
+            backend.keep_selection_on_a_row(Some(gone), Some(second)),
+            Some(second),
+            "a row that has gone gives way to the one asked for"
+        );
+        assert_eq!(selected(), Some(second));
+
+        select_unchosen(&backend, gone);
+        assert_eq!(
+            backend.keep_selection_on_a_row(Some(gone), Some(at(9))),
+            Some(first),
+            "or to the first row, where that has gone too"
+        );
+
+        select_unchosen(&backend, second);
+        let selection = backend.selections.load(Ordering::SeqCst);
+        assert_eq!(
+            backend.keep_selection_on_a_row(Some(gone), None),
+            None,
+            "a selection somebody else has moved since is not this path's to correct"
+        );
+        assert_eq!(
+            backend.keep_selection_on_a_row(Some(second), None),
+            Some(second),
+            "and one still on its row stands"
+        );
+        assert_eq!(selected(), Some(second));
+        assert_eq!(
+            backend.selections.load(Ordering::SeqCst),
+            selection,
+            "untouched, and not counted as a new selection"
+        );
+
+        backend.registry.lock().unwrap().clear();
+        select_unchosen(&backend, gone);
+        assert_eq!(backend.keep_selection_on_a_row(Some(gone), None), None);
+        assert_eq!(
+            selected(),
+            None,
+            "with no row left, nothing — not a player the rows do not hold"
+        );
+    }
+
+    /// A player tracked for the first time while the last row is forgotten
+    /// is selected.
+    ///
+    /// Forget chooses who takes the selection under the registry's guard and
+    /// writes it under the selection's, and `track_as` inserts a new entry
+    /// and then asks the selection whether anything is chosen. One that asked
+    /// in between found the row being forgotten still selected and left it,
+    /// and the forget then wrote the nobody it had chosen when it was alone:
+    /// a row on screen, nothing selected, no queue and no browser for it, and
+    /// nothing to put that right short of a press.
+    ///
+    /// Written as the ordering rather than as the race: the selection is
+    /// held, so the forget stops between its choice and its write, and the
+    /// adoption is made there. Where the forget has not reached the lock by
+    /// the time the adoption is made, it finds the new row in its choice and
+    /// this passes without the gap being exercised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_tracked_as_the_last_row_is_forgotten_is_selected() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        let (dead, found) = (at(2), at(3));
+        add_row(&backend, dead, &http, false);
+        select_unchosen(&backend, dead);
+
+        // In a block of its own, so the guard is gone before the await below.
+        let forgetting = {
+            let selected = backend.selected.lock().unwrap();
+            let forgetting = tokio::task::spawn_blocking({
+                let backend = backend.clone();
+                move || backend.forget(dead)
+            });
+            // Long enough for the blocking pool to pick it up, choose nobody
+            // and reach the lock.
+            std::thread::sleep(Duration::from_millis(250));
+            // The adoption: inserted, and then finding the selection on a
+            // row, so leaving it.
+            add_row(&backend, found, &http, true);
+            assert_eq!(*selected, Some(dead));
+            forgetting
+        };
+        assert!(
+            forgetting
+                .await
+                .expect("the forget finishes once the selection is free")
+        );
+
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(found),
+            "the row left is the one selected"
+        );
+        assert!(!backend.chosen.load(Ordering::SeqCst), "by nobody");
+    }
+
+    /// And a forget whose choice of who takes the selection moves away
+    /// before it is written leaves the selection on a row.
+    ///
+    /// A move retires the entry the player has left and then asks whether it
+    /// was the one selected; one that asked before the forget's write was
+    /// not carried, and the forget then wrote a player the rows no longer
+    /// held, drawn as no player at all. Written as the ordering, as above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forget_whose_choice_moves_away_meanwhile_lands_on_a_row() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        // The dead row selected; a player that works, which the forget hands
+        // the selection to; and a row that does not.
+        let (dead, moving, quiet) = (at(2), at(3), at(4));
+        add_row(&backend, dead, &http, false);
+        add_row(&backend, moving, &http, true);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&moving)
+            .unwrap()
+            .status = Some(bluos::Status::default());
+        add_row(&backend, quiet, &http, false);
+        select_unchosen(&backend, dead);
+
+        let forgetting = {
+            let selected = backend.selected.lock().unwrap();
+            let forgetting = tokio::task::spawn_blocking({
+                let backend = backend.clone();
+                move || backend.forget(dead)
+            });
+            std::thread::sleep(Duration::from_millis(250));
+            // The move: the entry it left retired, and the selection found on
+            // another row, so not carried.
+            backend.retire(&mut backend.registry.lock().unwrap(), moving);
+            assert_eq!(*selected, Some(dead));
+            forgetting
+        };
+        assert!(forgetting.await.expect("the forget finishes"));
+
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(quiet),
+            "the selection is on a row that is there"
+        );
+    }
+
+    /// A move off a dead row onto a player that moves away before it is
+    /// written goes back to the row it came from.
+    ///
+    /// `AutoSelect` asks the registry whether the player it goes to is still
+    /// there, then writes the selection under another guard. A move landing
+    /// between the two left the selection on a row that had gone — and since
+    /// a row the selection is not on is never asked about again, nothing
+    /// moved it off. Written as the ordering, as above: the loop is held at
+    /// the selection, past its check, while the player moves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_onto_a_player_that_moves_away_meanwhile_goes_back() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, rx) = backend(&http);
+        let at = |n| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), 11000);
+        let (dead, moving) = (at(2), at(3));
+        add_row(&backend, dead, &http, false);
+        add_row(&backend, moving, &http, true);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&moving)
+            .unwrap()
+            .status = Some(bluos::Status::default());
+        select_unchosen(&backend, dead);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http.clone()));
+
+        {
+            let selected = backend.selected.lock().unwrap();
+            let _ = backend.commands.send(Command::AutoSelect {
+                from: dead,
+                to: moving,
+            });
+            std::thread::sleep(Duration::from_millis(250));
+            backend.retire(&mut backend.registry.lock().unwrap(), moving);
+            assert_eq!(*selected, Some(dead));
+        }
+        tokio::time::sleep(SETTLED).await;
+
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(dead),
+            "the selection is back on the row it was taken from, which is there"
+        );
+        assert!(!backend.chosen.load(Ordering::SeqCst));
+    }
+
+    /// Run `read_sync` at `id`, and take the row away once the answer has
+    /// been folded into it and before anything is written down — the gap a
+    /// forget, or a move, can land in while a reply is on its way. The record
+    /// of having asked about firmware is held across it, which is what stops
+    /// the call there.
+    async fn read_sync_losing_its_row(backend: &Backend, id: DeviceId) -> Option<SyncStatus> {
+        let client = backend.with_entry(id, |e| e.client.clone()).unwrap();
+        let reading = {
+            let told = backend.told_about_update.lock().unwrap();
+            let reading = tokio::spawn({
+                let backend = backend.clone();
+                async move { read_sync(&backend, id, &client).await }
+            });
+            until_blocking("the answer to be folded in", || {
+                backend.with_entry(id, |e| e.sync.is_some()) == Some(true)
+            });
+            // Everything a forget does that can land in the gap: the row
+            // goes, and the record of having asked is cleared — it was not
+            // there yet.
+            backend.retire(&mut backend.registry.lock().unwrap(), id);
+            assert!(!told.contains(&id));
+            reading
+        };
+        reading.await.expect("the read finishes")
+    }
+
+    /// An answer that is folded in as its player is forgotten does not bring
+    /// it back.
+    ///
+    /// The check that the player is still tracked was made only as the
+    /// answer was folded in. A forget landing after it, and before the
+    /// address was written down, struck a line that was not there yet — and
+    /// the answer then wrote it in, to be tried again at the next start — and
+    /// cleared a record of having asked about firmware that was then written
+    /// back, so the player was not asked about again if it came back.
+    ///
+    /// An address a move has taken out of the registry is a different case:
+    /// it stays written down until the player confirms the move, and the
+    /// answer leaves it there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_folded_in_as_its_player_is_forgotten_is_taken_back_out() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        let id = player.id();
+        let listed = |backend: &Backend| backend.known.lock().unwrap().iter().any(|k| k.id == id);
+
+        add_row(&backend, id, &http, true);
+        assert!(
+            read_sync_losing_its_row(&backend, id).await.is_some(),
+            "the answer was folded in while the row was there"
+        );
+        assert!(
+            !listed(&backend),
+            "the address it wrote down is taken back out"
+        );
+        assert!(
+            !backend.told_about_update.lock().unwrap().contains(&id),
+            "and so is the record of having asked about firmware"
+        );
+
+        // An address a move has left, still written down.
+        add_row(&backend, id, &http, true);
+        *backend.known.lock().unwrap() = vec![known::Remembered {
+            id,
+            identity: identity_from_mac("00:11:22:33:44:55"),
+        }];
+        assert!(read_sync_losing_its_row(&backend, id).await.is_some());
+        assert!(
+            listed(&backend),
+            "a line this answer did not write is not this answer's to take back"
+        );
+    }
+
+    /// An answer takes its player off every other host the file has it at,
+    /// and leaves its other zones be.
+    ///
+    /// An address typed in by hand is written down with whoever answers at
+    /// it, and nothing tied it to a line for the address the player had left:
+    /// both named it. The next time it moved, its announcement then found two
+    /// entries on two hosts answering to it, and moved neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_takes_its_player_off_the_hosts_it_has_left() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add_row(&backend, player.id(), &http, true);
+        let client = backend
+            .with_entry(player.id(), |e| e.client.clone())
+            .unwrap();
+
+        let identity = identity_from_mac("00:11:22:33:44:55");
+        let left = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), player.id().port);
+        let zone = DeviceId::new(
+            player.id().host,
+            if player.id().port == 11010 {
+                11020
+            } else {
+                11010
+            },
+        );
+        *backend.known.lock().unwrap() = vec![
+            known::Remembered {
+                id: left,
+                identity: identity.clone(),
+            },
+            known::Remembered {
+                id: zone,
+                identity: identity.clone(),
+            },
+        ];
+
+        read_sync(&backend, player.id(), &client)
+            .await
+            .expect("the player answers");
+        assert_eq!(
+            *backend.known.lock().unwrap(),
+            vec![
+                known::Remembered {
+                    id: zone,
+                    identity: identity.clone(),
+                },
+                known::Remembered {
+                    id: player.id(),
+                    identity,
+                },
+            ],
+            "the host it left goes, and a second zone on the box answering stays"
+        );
+    }
+
+    /// The zones of a box that moved follow it, each on its own port.
+    ///
+    /// The box answers for every zone with one MAC, so after a lease moves
+    /// it, each zone's announcement finds all the zones left at the old host,
+    /// and two entries answering to one identity were never moved: the dead
+    /// rows stayed, and the bug a remembered identity is there to fix was
+    /// back for every multi-zone box. The port says which zone is which.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_zones_of_a_box_that_moved_follow_it_port_by_port() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _rx) = backend(&http);
+        let identity = identity_from_mac("00:11:22:33:44:55").unwrap();
+        let on = |n, port| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, n), port);
+        let remembered = |id| {
+            add_row(&backend, id, &http, false);
+            let mut registry = backend.registry.lock().unwrap();
+            let entry = registry.get_mut(&id).unwrap();
+            entry.identity = Some(identity.clone());
+            entry.provenance = Provenance::Remembered;
+        };
+        let tracked = |id| backend.with_entry(id, |_| ()).is_some();
+
+        let (zone, other) = (on(2, 11000), on(2, 11010));
+        remembered(zone);
+        remembered(other);
+        select_unchosen(&backend, zone);
+
+        assert!(!backend.moved_here(&identity, on(3, 11020)));
+        assert!(
+            tracked(zone) && tracked(other),
+            "a port with no zone of its own left behind moves none of them"
+        );
+
+        assert!(
+            backend.moved_here(&identity, on(3, 11000)),
+            "the zone on the port announcing has moved, and the selection with it"
+        );
+        assert!(!tracked(zone));
+        assert!(tracked(other), "and only that zone");
+        assert_eq!(*backend.selected.lock().unwrap(), Some(on(3, 11000)));
+
+        backend.moved_here(&identity, on(3, 11010));
+        assert!(!tracked(other), "the other follows on its own announcement");
+
+        // Entries on two hosts are still not told apart.
+        let (one, another) = (on(4, 11000), on(5, 11000));
+        remembered(one);
+        remembered(another);
+        assert!(!backend.moved_here(&identity, on(6, 11000)));
+        assert!(tracked(one) && tracked(another));
+
+        // And one alone on another port is another zone still, with nothing
+        // of its box at the new host to say so: a box whose `:11010` zone was
+        // the only one remembered, announcing first from `:11000`.
+        let lone = identity_from_mac("00:11:22:33:44:66").unwrap();
+        let behind = on(7, 11010);
+        add_row(&backend, behind, &http, false);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&behind)
+            .unwrap()
+            .identity = Some(lone.clone());
+        assert!(!backend.moved_here(&lone, on(8, 11000)));
+        assert!(tracked(behind), "a zone on another port is not this one");
+        backend.moved_here(&lone, on(8, 11010));
+        assert!(!tracked(behind), "it follows on its own announcement");
+    }
+
+    /// A zone that has followed its box does not take the one left behind.
+    ///
+    /// The zone that moved goes on announcing from its new address, and
+    /// while its sibling has still to announce, that sibling is the only
+    /// other entry answering to the box's MAC. Matched on that alone, it was
+    /// retired onto the announcing zone's address: the selection on it went
+    /// into the other room, the queue already read there was dropped, and —
+    /// the zone having answered as the box by then — the sibling's decoder
+    /// line was handed to it. The sibling's own announcement then found
+    /// nothing to move and turned up as a fresh row with none of that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zone_that_has_moved_does_not_take_the_one_left_behind() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        // The zone that moved, answering at its new address as the box.
+        let zone = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        let identity = identity_from_mac("00:11:22:33:44:55").unwrap();
+        let tracked = |id| backend.with_entry(id, |_| ()).is_some();
+
+        // Both zones remembered at the host the box left, and the one the
+        // user was looking at being the zone that has not announced yet.
+        let left = |port| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), port);
+        let (was, other) = (left(zone.id().port), left(zone.id().port + 10));
+        for id in [was, other] {
+            add_row(&backend, id, &http, false);
+            let mut registry = backend.registry.lock().unwrap();
+            let entry = registry.get_mut(&id).unwrap();
+            entry.identity = Some(identity.clone());
+            entry.provenance = Provenance::Remembered;
+        }
+        select_unchosen(&backend, other);
+        let mqa = bluos::Status {
+            quality: Some("mqaAuthored".to_owned()),
+            pid: Some(7),
+            song: Some(0),
+            title1: Some("A Song".to_owned()),
+            ..Default::default()
+        };
+        assert!(decoded::remember(
+            &mut backend.decoded.lock().unwrap(),
+            other,
+            &mqa
+        ));
+
+        // The zone's first announcement from the new host, the row `adopt`
+        // then tracks for it, and its answer there as the box, which
+        // confirms its own move.
+        assert!(!backend.moved_here(&identity, zone.id()));
+        assert!(!tracked(was) && tracked(other));
+        add(&backend, &zone, &http);
+        {
+            let mut registry = backend.registry.lock().unwrap();
+            let entry = registry.get_mut(&zone.id()).unwrap();
+            entry.identity = Some(identity.clone());
+            entry.queue = Some(bluos::Queue {
+                length: 3,
+                ..Default::default()
+            });
+        }
+        let client = backend.with_entry(zone.id(), |e| e.client.clone()).unwrap();
+        read_sync(&backend, zone.id(), &client)
+            .await
+            .expect("the zone answers");
+        assert!(backend.vacated.lock().unwrap().is_empty());
+
+        // Announcing again, as LSDP does, before its sibling has.
+        assert!(!backend.moved_here(&identity, zone.id()));
+        assert!(tracked(other), "the zone left behind is still its own row");
+        assert_eq!(
+            *backend.selected.lock().unwrap(),
+            Some(other),
+            "and the selection on it stays in its own room"
+        );
+        assert_eq!(
+            backend
+                .with_entry(zone.id(), |e| e.queue.as_ref().map(|q| q.length))
+                .flatten(),
+            Some(3),
+            "the zone announcing keeps the queue read from it"
+        );
+        assert!(backend.vacated.lock().unwrap().is_empty());
+        {
+            let heard = backend.decoded.lock().unwrap();
+            assert!(
+                decoded::about(&heard, other).is_some(),
+                "and the decoder line stays with the zone it was heard from"
+            );
+            assert!(decoded::about(&heard, zone.id()).is_none());
+        }
+
+        // The sibling's own announcement moves it, selection and all.
+        let there = DeviceId::new(zone.id().host, other.port);
+        assert!(backend.moved_here(&identity, there));
+        assert!(!tracked(other));
+        assert_eq!(*backend.selected.lock().unwrap(), Some(there));
+        assert_eq!(
+            backend.vacated.lock().unwrap().get(&there).cloned(),
+            Some((other, identity))
+        );
+    }
+
+    /// An answer that lands while a move is being written down still
+    /// confirms it.
+    ///
+    /// The move reads whether the new address has already answered as the
+    /// player, and if not, writes down a record for `read_sync` to spend;
+    /// `read_sync` writes the answer and then looks for the record. An answer
+    /// between the read and the record was seen by neither: the record
+    /// waited for an answer nothing would ask for again until the player's
+    /// grouping changed, and the address it left stayed in the file for
+    /// another run. Written as the ordering: the record is held while the
+    /// answer is written in, once the move is past its read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_landing_as_a_move_is_written_down_confirms_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let live = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        let identity = identity_from_mac("00:11:22:33:44:55").unwrap();
+        let old = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, old, &http, false);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&old)
+            .unwrap()
+            .identity = Some(identity.clone());
+        add_row(&backend, live.id(), &http, true);
+        *backend.known.lock().unwrap() = [old, live.id()]
+            .into_iter()
+            .map(|id| known::Remembered {
+                id,
+                identity: Some(identity.clone()),
+            })
+            .collect();
+        // The answer, read off the player and not yet written in.
+        let sync = backend
+            .with_entry(live.id(), |e| e.client.clone())
+            .unwrap()
+            .sync_status()
+            .await
+            .expect("the player answers");
+
+        let moving = {
+            let vacated = backend.vacated.lock().unwrap();
+            let moving = tokio::task::spawn_blocking({
+                let backend = backend.clone();
+                let identity = identity.clone();
+                let to = live.id();
+                move || backend.moved_here(&identity, to)
+            });
+            // Past its read: the address it left is out of the registry, and
+            // the new one was read without an answer in it.
+            until_blocking("the move to reach its record", || {
+                backend.with_entry(old, |_| ()).is_none()
+            });
+            // `read_sync`'s half: the answer written in, and no record to
+            // spend.
+            backend
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&live.id())
+                .unwrap()
+                .sync = Some(sync);
+            assert!(vacated.get(&live.id()).is_none());
+            moving
+        };
+        moving.await.expect("the move finishes");
+
+        assert_eq!(
+            backend
+                .known
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|player| player.id)
+                .collect::<Vec<_>>(),
+            vec![live.id()],
+            "the address it left is struck"
+        );
+        assert!(
+            backend.vacated.lock().unwrap().is_empty(),
+            "and nothing is left waiting for an answer that is already in"
+        );
+    }
+
+    /// A press on a row that has gone is dropped.
+    ///
+    /// A press names the row the window last drew, and the row can go before
+    /// the press is handled: a move retires it and carries the selection to
+    /// the new address, and the `Carried` that follows waits behind the press
+    /// on the loop. The press used to be written down anyway — a selection on
+    /// a row nobody holds, drawn as no player at all — and, being somebody's
+    /// choice, kept there: the `Carried` found the selection elsewhere and
+    /// did nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_press_on_a_row_that_has_gone_is_dropped() {
+        let (backend, first, second) = two_players().await;
+        select_unchosen(&backend, first.id());
+
+        // The move, from `first` to `second`'s address, with the press on
+        // `first` ahead of its follow-up.
+        backend.retire(&mut backend.registry.lock().unwrap(), first.id());
+        select_unchosen(&backend, second.id());
+        let _ = backend.commands.send(Command::Select(first.id()));
+        let _ = backend.commands.send(Command::Carried(second.id()));
+
+        until("the browser to follow the carried selection", || {
+            device(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(*backend.selected.lock().unwrap(), Some(second.id()));
+        assert!(
+            !backend.chosen.load(Ordering::SeqCst),
+            "the press on a row that had gone was nobody's choice of anything"
         );
     }
 }
