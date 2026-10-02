@@ -33,7 +33,7 @@ cask "azzurro" do
 
   # Matches LSMinimumSystemVersion in the bundle's Info.plist. Both slices of
   # the universal binary are built against 11.0.
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Azzurro.app"
 
