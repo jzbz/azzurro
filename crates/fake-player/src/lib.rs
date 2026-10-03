@@ -60,11 +60,14 @@ impl Request {
 /// A route that works its reply out from the request. `None` is a 404.
 type Handler = Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>;
 
-/// What a path answers: the same document every time, or whatever a handler
-/// makes of the request.
+/// What a path answers: the same document every time, whatever a handler
+/// makes of the request, or nothing at all.
 enum Route {
     Fixed(String),
     Answer(Handler),
+    /// No reply: the connection is closed once the request is in. See
+    /// [`Player::hang_up`].
+    HangUp,
 }
 
 /// What the player answers, by path.
@@ -191,6 +194,23 @@ impl Player {
         });
     }
 
+    /// Hang up on a path, from here on: the request is read and recorded, and
+    /// the connection is closed with nothing sent back, as a player that
+    /// drops it part-way does.
+    ///
+    /// The client sees no status at all — the same as a request that times
+    /// out, which is what the app has to tell from a player that answered and
+    /// said no, and without the ten seconds a timeout takes. A delay set on
+    /// the path is sat out first. `serve` or `handle` on the path answers it
+    /// again.
+    pub fn hang_up(&self, path: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .insert(path.to_owned(), Route::HangUp);
+    }
+
     /// Stop answering a path at all, so it 404s.
     pub fn forget(&self, path: &str) {
         self.state.lock().unwrap().routes.remove(path);
@@ -313,6 +333,7 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
         let route = match state.routes.get(&request.path) {
             Some(Route::Fixed(body)) => Route::Fixed(body.clone()),
             Some(Route::Answer(handler)) => Route::Answer(handler.clone()),
+            Some(Route::HangUp) => Route::HangUp,
             None => Route::Answer(Arc::new(|_| None)),
         };
         let delay = state.delays.get(&request.path).copied();
@@ -320,15 +341,23 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
     };
     // Outside the lock, so a handler that keeps state of its own cannot
     // deadlock against a test reading `asked()` at the same moment.
+    let hanging_up = matches!(route, Route::HangUp);
     let body = match route {
         Route::Fixed(body) => Some(body),
         Route::Answer(handler) => handler(&request),
+        Route::HangUp => None,
     };
 
     // Read which route to answer before waiting, and the body too: what a
     // player sends is what it had when it was asked.
     if let Some(delay) = delay {
         tokio::time::sleep(delay).await;
+    }
+
+    // The whole request has been read, so the close is an orderly one and
+    // not a reset; what the client misses is the reply.
+    if hanging_up {
+        return stream.shutdown().await;
     }
 
     let carried = match &context {
@@ -399,6 +428,30 @@ mod tests {
             "the head stops at the blank line: {:?}",
             player.heads()
         );
+    }
+
+    /// A path hung up on is asked and sends nothing back, until it is served
+    /// again.
+    #[tokio::test]
+    async fn a_path_hung_up_on_sends_nothing_until_it_is_served_again() {
+        let player = Player::with_routes(vec![("/ui/Home", "<screen/>".to_owned())]).await;
+        let ask = || async {
+            let mut stream = TcpStream::connect(player.address()).await.unwrap();
+            stream
+                .write_all(b"GET /ui/Home HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            reply
+        };
+
+        player.hang_up("/ui/Home");
+        assert_eq!(ask().await, "", "nothing at all, not even a status line");
+        assert_eq!(player.asked(), ["/ui/Home"], "though it was asked");
+
+        player.serve("/ui/Home", "<screen/>");
+        assert!(ask().await.starts_with("HTTP/1.1 200"));
     }
 
     #[test]

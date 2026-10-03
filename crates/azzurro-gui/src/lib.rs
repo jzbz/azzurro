@@ -239,6 +239,13 @@ enum Command {
     CycleRepeat(DeviceId),
     /// Show the browser's starting screen.
     BrowseHome,
+    /// `BrowseHome` for this player, heard answering while the pane stands in
+    /// for it, which nobody pressed for: its Home arrives as
+    /// [`Arrive::Recovered`], and leaves whatever pane is up where it is.
+    /// Nothing at all where the player is no longer selected or the pane no
+    /// longer stands in for it by the time this is handled. See
+    /// [`Backend::answering_again`].
+    BrowseRecover(DeviceId),
     /// Follow row `n` of the screen currently shown.
     BrowseActivate(usize),
     /// Open row `n`'s context menu.
@@ -423,6 +430,52 @@ struct Browsing {
     /// holds — the same shape as `searches`, which has guarded typing this
     /// way from the start.
     era: u64,
+    /// The Home on show, where it came by itself — see
+    /// [`Arrive::Recovered`] — under another pane, and neither the trail nor
+    /// the pane has moved since: the era it went up at, the selection it
+    /// landed under, and the `panes` count of the page it was kept under.
+    ///
+    /// A choice that asked for a player's Home and a recovery asking for it
+    /// again can both be out at once: the player chosen while its row said
+    /// it was not responding, and heard answering before the choice's reply
+    /// came. Whichever Home landed first was the one shown, and the other
+    /// found this player's trail up and stepped aside. So the choice took
+    /// the pane from a settings page left open when its own Home came first,
+    /// and left the page up when the recovery's did — the same press, two
+    /// outcomes, from the order of two replies. A Home pressed for that finds
+    /// this naming the trail on show takes the pane as it would have, and so
+    /// does its configuration when it finds the trail already up. See
+    /// [`Browsing::recovered_up`].
+    ///
+    /// Only while the page it was kept under is the one up. A recovered Home
+    /// that lands in the browse pane is in front of the user already, and
+    /// one kept under a page is in front of them once they leave it; either
+    /// way the press has had what it asked for, and a page opened after that
+    /// is the user's own. Held past that, the choice's late reply took the
+    /// pane for the Home and closed whatever had been opened over it — a
+    /// settings page, an alarm being edited — seconds after it went up. A
+    /// refresh re-reads the same Home under the same page, and carries this
+    /// across. So does a reply that restates that page as itself — the form
+    /// it was kept under filled in, the list read again — or takes the form
+    /// down onto the page it was opened from: nobody opened anything there.
+    /// See `panes`.
+    recovered: Option<(u64, u64, u64)>,
+    /// Bumped every time the pane is replaced by another page, or a level is
+    /// opened inside it, so that `recovered` can tell the page it was kept
+    /// under from one opened since. Put a new page up through
+    /// [`Browsing::show`], and count a level opened in place — an alarm's
+    /// editor, its picker, a settings page deeper, a field for a name — with
+    /// [`Browsing::opened_over`].
+    ///
+    /// Not for a page restated as itself: the same opening of a form filled
+    /// in by its reply, or a list read again. That is assigned to `pane`
+    /// directly. Counted, the scan answering under a WiFi placeholder ended
+    /// the claim with nothing opened at all, and the same press again took
+    /// the pane or left it up from which of two replies came first.
+    ///
+    /// `era` cannot tell them apart: it follows the trail, and opening Help or
+    /// Settings over the trail leaves it where it is.
+    panes: u64,
     /// Bumped every time a letter is jumped to.
     ///
     /// `era` is not enough. It marks a change of *screen*, and a jump stays on
@@ -519,10 +572,45 @@ struct Browsing {
     /// Which player `queue_uri` and the addresses beside it were read from.
     ///
     /// They are written when a player's configuration arrives, which is some
-    /// time after it is chosen and never for one that cannot answer. Until
-    /// then they are the last player's, and a queue document fetched from
-    /// them could be the wrong route entirely.
+    /// time after it is chosen. Until then they are the last player's, and a
+    /// queue document fetched from them could be the wrong route entirely.
+    /// For a player whose configuration does not come they are not left that
+    /// way: [`Backend::stand_in`] takes them down, and this goes to `None`.
     configured: Option<DeviceId>,
+    /// The selected player the pane is standing in for, because its screens —
+    /// or what sits beside them — did not come, and why they did not.
+    ///
+    /// Written by [`Backend::stand_in`], which also takes down whatever of
+    /// another player's was still up, so that this is the only thing left to
+    /// draw: `publish_browse` says why in place of a screen. Gone again when
+    /// something of the player's lands — its configuration in `BrowseHome`,
+    /// any screen in `open_screen` — and when it is forgotten. Read only
+    /// against the selection: where another player has been chosen since,
+    /// this names nobody on screen, and that player's own configuration is on
+    /// its way. The pane is drawn again at each of those moments, since what
+    /// it says goes with them.
+    ///
+    /// Also what brings the screens back by themselves: a player found
+    /// answering after a silence is asked for its Home again if this names
+    /// it, and so is one this calls silent at a status it answers while no
+    /// ask for it is out (see `stood_after`). See
+    /// [`Backend::answering_again`].
+    standing_in: Option<(DeviceId, Unshown)>,
+    /// The configuration ask whose failure wrote `standing_in`, where that
+    /// ask had come back by then: `None` for a stand-in written before any
+    /// reply — on the loop, for a row already drawn silent, while the ask it
+    /// made is still out — and for a Home that failed.
+    ///
+    /// What a status that is not a turn reads before asking again for a
+    /// player this calls silent: only while this is still the newest ask
+    /// (see `configurations`), so once for each stand-in and never while an
+    /// ask is on its way. That ask settles the stand-in itself, by answering
+    /// or by failing. Asked again at every status instead, each ask
+    /// superseded the one before it, so a failure slower than the statuses
+    /// never landed, the stand-in never became `Slow`, and a busy player was
+    /// sent a configuration request a status for as long as it was chosen.
+    /// See `follow`.
+    stood_after: Option<u64>,
     /// The search screen's own uri, from the same place.
     ///
     /// The player puts a search box on exactly one screen — measured on a
@@ -569,6 +657,12 @@ struct Browsing {
     /// could all be true at once, and a stale one routed a press to a pane that
     /// was not on screen: with the services list left set, every row of the
     /// settings page opened a music service's sign-in page instead.
+    ///
+    /// Replaced through [`Browsing::show`], which counts it in `panes`.
+    /// Changed in place it is still the same pane, and a level opened inside
+    /// it — a page deeper, an editor — is counted by
+    /// [`Browsing::opened_over`]; a field edited, or the page restated by a
+    /// reply, is not counted at all.
     pane: Pane,
     /// Text typed into a settings row and not sent to the player yet.
     ///
@@ -605,6 +699,56 @@ struct Browsing {
     /// was lit can: lit before this configuration was asked for, it is from
     /// before.
     configurations: u64,
+}
+
+/// Why the Browse pane is standing in for the selected player rather than
+/// showing its screens. See [`Browsing::standing_in`].
+///
+/// Three cases, because the pane says which. Telling somebody a player is not
+/// responding while its card shows it playing is a claim the window can see
+/// is false, and so is promising its screens the moment it answers when it
+/// is answering already and nothing is going to ask again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unshown {
+    /// Nothing came back from a player that is not answering anything else
+    /// either: the request timed out or was refused at the door while its
+    /// row said it was not responding, or the row already said so when it
+    /// was chosen. The one case asked again by itself, once the player is
+    /// heard answering; see [`Backend::answering_again`].
+    Silent,
+    /// Nothing came back, from a player that is answering: its row was drawn
+    /// answering when the request gave up, or what timed out was its Home,
+    /// asked for a moment after its configuration came. A player busy with
+    /// something else — indexing a library, a network stalling for longer
+    /// than one request waits — and nothing about its poll will change to
+    /// say it is ready, so it is asked again when it is chosen again.
+    ///
+    /// Unless the poll fails. Whether it was answering was read off its row,
+    /// and a row stays drawn answering for as long as a long poll to a
+    /// player switched off at the wall takes to give up — the better part of
+    /// two minutes — so a player that had gone was called slow and said to
+    /// be answering beside a card saying it was not. Once its poll is seen
+    /// failing it is silent after all, and is said to be; see `follow`.
+    Slow,
+    /// The player answered, and what it sent was not its screens: an error
+    /// status, or a document that could not be read.
+    Refused,
+}
+
+impl Unshown {
+    /// Which of the three a failed request for a player's screens was.
+    /// `answering` is whether the player is known to be answering all the
+    /// same — its row drawn answering, or an earlier request of the same
+    /// ask answered — which is what tells silence from slowness.
+    fn of(e: &bluos::Error, answering: bool) -> Self {
+        if !unanswered(e) {
+            Unshown::Refused
+        } else if answering {
+            Unshown::Slow
+        } else {
+            Unshown::Silent
+        }
+    }
 }
 
 impl Pane {
@@ -1006,8 +1150,12 @@ impl Browsing {
     /// showing.
     ///
     /// Not cleared when another player's configuration lands, only not drawn:
-    /// that player's Home may never come, and choosing the last player back
-    /// keeps its trail, which the entry it had lit still describes.
+    /// that player's Home can still be on its way, and choosing the last
+    /// player back before it lands keeps that player's trail, which the entry
+    /// it had lit still describes. Where the other player's screens do not
+    /// come at all, its stand-in takes the last player's trail down (see
+    /// [`Backend::stand_in`]), and the entry is dropped as a leftover when
+    /// that player's configuration next lands and its Home is fetched afresh.
     fn lit(&self) -> Option<(i32, i32)> {
         self.configured
             .and_then(|owner| self.highlighted.get(&owner))
@@ -1019,6 +1167,34 @@ impl Browsing {
     fn light(&mut self, id: DeviceId, entry: (i32, i32)) {
         let at = self.configurations;
         self.highlighted.insert(id, (entry, at));
+    }
+
+    /// Whether the trail on show is a Home that came by itself under
+    /// `selection`, with nothing moved since and the page it was kept under
+    /// still up over it: the case where a Home pressed for under that same
+    /// selection still owes the user the pane. See `recovered`.
+    fn recovered_up(&self, selection: u64) -> bool {
+        self.recovered == Some((self.era, selection, self.panes))
+            && !matches!(self.pane, Pane::Browse)
+    }
+
+    /// Put `pane` up in place of whatever is, counting it in `panes`.
+    fn show(&mut self, pane: Pane) {
+        self.pane = pane;
+        self.opened_over();
+    }
+
+    /// Count a level opened inside the pane on show as a page opened over
+    /// it: an alarm's editor or its picker, a settings page deeper, the
+    /// field a new playlist is named in, the stations' edit mode.
+    ///
+    /// Each holds what the user is putting in, and a press's late reply
+    /// owed the pane for a Home kept under the page took the whole pane for
+    /// it — the half-made alarm with it — where Help opened over the same
+    /// page was left alone. Not for Back within the pane, a reload, or a
+    /// field edited: none of those is a page opened. See `recovered`.
+    fn opened_over(&mut self) {
+        self.panes = self.panes.wrapping_add(1);
     }
 }
 
@@ -1064,6 +1240,18 @@ enum Arrive {
     /// lit, and one that finds this player's screens already up — the press
     /// answered before it did — is not shown at all.
     Home,
+    /// `Home`, asked for by itself when a player the pane stood in for is
+    /// heard answering again (see [`Backend::answering_again`]), and `Home` in
+    /// everything but the pane: nobody pressed for it, so like a `Refresh` it
+    /// does not take the pane from whatever is up. That can be minutes after
+    /// the player was chosen, by which time a page of another player's
+    /// settings, an alarm being edited or a Customize drag may be open, and
+    /// taking the pane threw them away. The screen is simply there when the
+    /// user goes back to browsing. Unless a press of the same choice is still
+    /// owed its Home, and lands after this one while the page this was kept
+    /// under is still up: that takes the pane as it would have. See
+    /// `Browsing::recovered`.
+    Recovered,
     /// A step deeper, which Back undoes.
     Deeper,
     /// A set of search results: pushed the first time, and thereafter in place
@@ -1079,6 +1267,14 @@ enum Arrive {
     /// it finds, so a refresh that lost that race deleted the level the user
     /// had just opened and put the old one back in its place.
     Refresh { query: Option<String>, was: String },
+}
+
+impl Arrive {
+    /// Whether this is a player's first screen, either way it comes: see
+    /// `Home` and `Recovered`.
+    fn home(&self) -> bool {
+        matches!(self, Arrive::Home | Arrive::Recovered)
+    }
 }
 
 impl Browsing {
@@ -1312,6 +1508,19 @@ impl Entry {
     /// [`Backend::reconsider_selection`].
     fn working(&self) -> bool {
         self.answered() && self.view.reachable && self.upgrading.is_none()
+    }
+
+    /// Whether this player can be sent a grouping request: `/AddSlave` and
+    /// `/RemoveSlave` as the selected player, or `/AddSlave` naming it as
+    /// the one to join. It answers, and it is not installing an update.
+    ///
+    /// `view.reachable` rather than [`Entry::working`], which also wants an
+    /// answer already in. The card says "not responding" from `reachable`,
+    /// and a freshly tracked row that has not been polled yet is drawn as
+    /// answering; refusing it here would be a refusal the card gave no reason
+    /// for.
+    fn takes_grouping(&self) -> bool {
+        self.view.reachable && self.upgrading.is_none()
     }
 
     /// Whether this address last answered `/SyncStatus` as `identity` — the
@@ -1560,6 +1769,16 @@ struct Backend {
     /// Which screen the window was last shown, so a new one can start at the
     /// top. See the note where it is read.
     sent_era: Arc<AtomicU64>,
+    /// What the sidebar was last sent, as its fingerprint.
+    ///
+    /// A record rather than a memo, unlike the ones above: the sidebar is
+    /// drawn at presses and landings, not at every status, so a send skipped
+    /// would save nothing worth the risk of one missed. What it is for is
+    /// telling what the window was last given, which the state behind it
+    /// cannot: an entry lit in [`Browsing`] is not an entry drawn lit, and a
+    /// Home that lit one under another pane once left the sidebar drawn as
+    /// it was before. See [`sidebar_fingerprint`].
+    sent_sidebar: Arc<AtomicU64>,
     /// How many times the queue has been read afresh.
     ///
     /// A re-read takes the next number, and every walk started before it stops
@@ -2175,13 +2394,160 @@ fn badged(row: &Device) -> bool {
 ///
 /// Counted rather than assumed. The list used to take the taller number for
 /// every row but one, on the reasoning that grouping is offered against every
-/// player except the selected one. That holds for `groupable` and for neither
-/// of the others: the selected player leads the group it is in, and it rewrites
-/// its own firmware, and it wears the badge for both. Two grouped players were
-/// then given 226px of the 260px they draw, and what fell off the bottom was
-/// the Ungroup button — the one control that undoes the grouping.
+/// player except the selected one. That held for `groupable` at the time and
+/// for neither of the others: the selected player leads the group it is in,
+/// and it rewrites its own firmware, and it wears the badge for both. Two
+/// grouped players were then given 226px of the 260px they draw, and what fell
+/// off the bottom was the Ungroup button — the one control that undoes the
+/// grouping. It no longer holds for `groupable` either, which a player that
+/// cannot take the request goes without: see [`offers_grouping`].
 fn badged_cards(rows: &[Device]) -> i32 {
     rows.iter().filter(|row| row.badged).count() as i32
+}
+
+/// Whether a card offers its Group button — under either of its two names —
+/// against the selected player.
+///
+/// `row` is the card as it is about to be drawn, with `in_group` already
+/// worked out, and `master_answers` is [`Entry::takes_grouping`] of the
+/// selected player. [`judge_grouping`] supplies both, and is the only caller
+/// outside the tests.
+///
+/// Both requests go to the selected player, which owns the group; the other
+/// player only finds out afterwards. So nothing is offered while the selected
+/// player is not answering or is installing an update: every card offered
+/// Group against a selected player that had stopped answering, and each press
+/// sat out a timeout against an address that was not going to reply. Group
+/// also needs the row itself to answer, because the selected player has to
+/// reach a player to sync it — a card reading "not responding" beside "Group
+/// with the selected player" was offering a press that could not work.
+/// Ungroup does not: `/RemoveSlave` goes to the selected player as well, and
+/// it is the only way a member that has stopped answering is ever taken out of
+/// a group that is still playing, so a member keeps it for as long as the
+/// selected player lists it. Nothing at all for a player installing an
+/// update, which the official controller keeps out of groups altogether.
+///
+/// Not folded into [`badged`], which reads the result. The badge's tests and
+/// the picker's height are written against `groupable` as published, and a
+/// condition repeated there would be a second definition to drift.
+fn offers_grouping(
+    selected: Option<DeviceId>,
+    id: DeviceId,
+    row: &Device,
+    master_answers: bool,
+) -> bool {
+    // Grouping is something done *to another* player, so the selected row
+    // does not offer it against itself.
+    selected.is_some_and(|sel| sel != id)
+        && master_answers
+        && !row.upgrading
+        && (row.reachable || row.in_group)
+}
+
+/// Work out a card's `in_group` and `groupable` against the selected player,
+/// onto `card`, a copy of `entry.view` for the player at `id`. `master` is the
+/// selected player's entry, read under the same registry guard as `entry`.
+///
+/// The one definition of both. [`Backend::publish`] draws the card with it,
+/// and `Command::ToggleGroup` asks it again when the press arrives, to decide
+/// whether anything is sent and whether that is `/RemoveSlave` or
+/// `/AddSlave`. Two definitions could disagree, and the disagreement would be
+/// a button labelled Ungroup that sent `/AddSlave`.
+///
+/// A row that is answering is in the group if its own `/SyncStatus` names the
+/// selected player as its leader, as it always was. A row that is not
+/// answering is in the group if the selected player still lists it. What the
+/// row itself last said is never cleared (see [`Entry::answered`]), so after
+/// an Ungroup worked, its own word still named the leader and the button stayed
+/// until the row answered again, which a player that has gone may never do.
+/// The leader's list is what moves when `/RemoveSlave` lands. A leader that
+/// lists the member at an address other than the one its row is tracked at
+/// leaves that row offering nothing, which is the safe way for this to fail.
+fn judge_grouping(
+    card: &mut Device,
+    id: DeviceId,
+    entry: &Entry,
+    selected: Option<DeviceId>,
+    master: Option<&Entry>,
+) {
+    card.in_group = selected.is_some()
+        && if card.reachable {
+            entry.sync.as_ref().and_then(SyncStatus::master_id) == selected
+        } else {
+            master
+                .and_then(|leader| leader.sync.as_ref())
+                .is_some_and(|sync| sync.slave_ids().any(|slave| slave == id))
+        };
+    card.groupable = offers_grouping(
+        selected,
+        id,
+        card,
+        master.is_some_and(Entry::takes_grouping),
+    );
+}
+
+/// What stands in the way of a grouping request involving `entry`, the player
+/// at `id`, in the words a toast says it with.
+///
+/// Asked only about a player [`Entry::takes_grouping`] or [`offers_grouping`]
+/// has just turned down, so it is one of two things. The update is named
+/// first: a player installing one is drawn as not answering as well, and the
+/// update is the reason that will end on its own.
+fn not_grouping(entry: &Entry, id: DeviceId) -> String {
+    let name = called(&entry.view.name, id);
+    if entry.upgrading.is_some() || entry.view.upgrading {
+        format!("{name} is installing an update")
+    } else {
+        format!("{name} is not responding")
+    }
+}
+
+/// What GROUP ALL does with `master`, the selected player: the client to ask
+/// it through and the players it is asked to take in, or, where it asks
+/// nobody, what the toast says instead. `None` where `master` has no row.
+///
+/// Every request goes to the selected player, so none goes while it cannot
+/// take them. And a player is asked to join only while it answers and is not
+/// installing an update, as its own card's Group is offered: the master has
+/// to reach a player to sync it, and with the requests going one at a time,
+/// one that could not be reached held up everybody after it while the master
+/// tried.
+///
+/// Where that leaves nobody, the toast says why in the same order
+/// [`not_grouping`] does, update first. A player downloading firmware goes
+/// on answering its poll, so its row is drawn answering while it is rightly
+/// left out, and calling it not responding contradicted its own card — and
+/// the refusal its card's Group gives, which names the update.
+fn grouping_all(
+    registry: &BTreeMap<DeviceId, Entry>,
+    master: DeviceId,
+) -> Option<Result<(Client, Vec<DeviceId>), String>> {
+    let leader = registry.get(&master)?;
+    let others = || registry.iter().filter(|(id, _)| **id != master);
+    let joining: Vec<DeviceId> = others()
+        .filter(|(_, entry)| entry.takes_grouping())
+        .map(|(id, _)| *id)
+        .collect();
+    Some(if !leader.takes_grouping() {
+        Err(format!("Not grouped: {}", not_grouping(leader, master)))
+    } else if !joining.is_empty() {
+        Ok((leader.client.clone(), joining))
+    } else if others().next().is_none() {
+        Err("No other players to group".to_owned())
+    } else {
+        let updating: Vec<String> = others()
+            .filter(|(_, entry)| entry.upgrading.is_some() || entry.view.upgrading)
+            .map(|(id, entry)| called(&entry.view.name, *id))
+            .collect();
+        Err(match updating.as_slice() {
+            [] => "No other players are responding".to_owned(),
+            [one] => format!("No other players to group: {one} is installing an update"),
+            many => format!(
+                "No other players to group: {} of them are installing updates",
+                many.len()
+            ),
+        })
+    })
 }
 
 /// Whether a row is the app's own furniture rather than something on the system.
@@ -2225,11 +2591,14 @@ async fn open_picker(
         // Said only while the picker it was asked from is still up: a list
         // nobody is waiting for any more has not failed anybody.
         match listed {
-            Ok(rows) => page.picking.push(PickerLevel {
-                title,
-                rows,
-                opened,
-            }),
+            Ok(rows) => {
+                page.picking.push(PickerLevel {
+                    title,
+                    rows,
+                    opened,
+                });
+                browsing.opened_over();
+            }
             Err(e) => {
                 drop(browsing);
                 say(&backend.ui, format!("could not read that list: {e}"));
@@ -3044,6 +3413,73 @@ fn browse_row_fingerprint(row: &BrowseData, hash: &mut impl std::hash::Hasher) {
     row.has_menu.hash(hash);
 }
 
+/// Everything the sidebar draws, as [`Backend::publish_sidebar`] hands it to
+/// the window: its rows, and how many of them are screens rather than the
+/// Sources screen's own. See `Backend::sent_sidebar`.
+fn sidebar_fingerprint(rows: &[BrowseData], screens: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    screens.hash(&mut hash);
+    for row in rows {
+        browse_row_fingerprint(row, &mut hash);
+    }
+    hash.finish()
+}
+
+/// Everything the browse pane draws, as [`Backend::send_browse`] is handed it
+/// and remembers having sent it.
+///
+/// Its own function so that a test can say what a publish should have sent
+/// and compare: the window is not there to ask.
+#[allow(clippy::too_many_arguments)]
+fn browse_fingerprint(
+    blocks: &[BlockData],
+    selector: &[BrowseData],
+    recent: &[String],
+    empty: Option<&(String, String, Option<Glyph>)>,
+    header: Option<&HeaderData>,
+    title: &str,
+    can_go_back: bool,
+    search: Option<&String>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut hash);
+    can_go_back.hash(&mut hash);
+    search.hash(&mut hash);
+    recent.hash(&mut hash);
+    empty.map(|(a, b, g)| (a, b, *g)).hash(&mut hash);
+    for row in selector {
+        browse_row_fingerprint(row, &mut hash);
+    }
+    for block in blocks {
+        block.kind.hash(&mut hash);
+        block.title.hash(&mut hash);
+        block.action.hash(&mut hash);
+        block.section.hash(&mut hash);
+        for row in &block.rows {
+            browse_row_fingerprint(row, &mut hash);
+        }
+    }
+    if let Some(header) = header {
+        header.title.hash(&mut hash);
+        header.subtitle.hash(&mut hash);
+        header.detail.hash(&mut hash);
+        header.cover.is_some().hash(&mut hash);
+        header.buttons.hash(&mut hash);
+    }
+    hash.finish()
+}
+
+/// The letters of the bar, as [`Backend::send_browse_index`] remembers having
+/// sent them; apart for the reason [`browse_fingerprint`] is.
+fn index_fingerprint(keys: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    keys.hash(&mut hash);
+    hash.finish()
+}
+
 /// Everything about a player's sidebar card that the window draws.
 ///
 /// `cover` is what that row's art is *of* — the address it was fetched from —
@@ -3813,6 +4249,7 @@ async fn run(
         sent_items: Arc::default(),
         sent_index: Arc::new(AtomicU64::new(0)),
         sent_era: Arc::new(AtomicU64::new(0)),
+        sent_sidebar: Arc::new(AtomicU64::new(0)),
         thumbnails: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
@@ -4024,6 +4461,58 @@ fn called(name: &str, id: DeviceId) -> String {
     } else {
         name.to_owned()
     }
+}
+
+/// What the Browse pane says in place of a screen while it stands in for the
+/// selected player — `name`, at `id` — and why: a headline, a line under it,
+/// and the player's glyph, for the empty state a player's own info panel is
+/// drawn with. See [`Backend::stand_in`].
+///
+/// An update is named first. A player rewriting its firmware is drawn as not
+/// answering as well, and the update is the reason that ends by itself. Then
+/// whether the player answered at all: one that answered with something other
+/// than its screens is not "not responding", and its card says it is there;
+/// nor is one that is answering and was too slow to send them, and only the
+/// silent one is promised its screens by itself. See [`Unshown`].
+fn standing_in_notice(
+    name: &str,
+    id: DeviceId,
+    upgrading: bool,
+    why: Unshown,
+) -> (String, String, Option<Glyph>) {
+    let name = called(name, id);
+    let (headline, detail) = if upgrading {
+        (
+            format!("{name} is installing an update"),
+            "Its screens will appear here once it has restarted — or choose another player.",
+        )
+    } else {
+        match why {
+            Unshown::Silent => (
+                format!("{name} is not responding"),
+                "Check that it is switched on and on this network. Its screens will appear \
+                 here as soon as it answers — or choose another player.",
+            ),
+            Unshown::Slow => (
+                format!("{name} did not send its screens in time"),
+                "It is answering, but they took too long. Choose it again to ask once more — or \
+                 choose another player.",
+            ),
+            Unshown::Refused => (
+                format!("Could not load {name}'s screens"),
+                "It answered, but without them. Choose it again to ask once more — or choose \
+                 another player.",
+            ),
+        }
+    };
+    // A headline starts with a capital, and a player with no name of its own
+    // is called "the player at …".
+    let mut letters = headline.chars();
+    let headline = letters
+        .next()
+        .map(|first| first.to_uppercase().chain(letters).collect())
+        .unwrap_or_default();
+    (headline, detail.to_owned(), Some(Glyph::Speaker))
 }
 
 impl Backend {
@@ -4267,7 +4756,7 @@ impl Backend {
             let mut browsing = self.browsing.lock().unwrap();
             let stranded = browsing.pane.owner() == Some(old);
             if stranded {
-                browsing.pane = Pane::Browse;
+                browsing.show(Pane::Browse);
             }
             let reoffered = match &mut browsing.pane {
                 Pane::HelpDetail(_, _, _, offer) if *offer == Some(old) => {
@@ -4611,12 +5100,15 @@ impl Backend {
         // other address this player is answering on. The page itself is facts
         // and stays. And the lit sidebar entry kept for it is dropped: nothing
         // will draw that player's sidebar again, and a player tracked at the
-        // same address later is a new one.
-        let (stranded, unoffered) = {
+        // same address later is a new one. So is the pane's standing in for
+        // it, for the same reason: a player tracked there later and selected
+        // would be drawn as not responding until its Home landed, on the
+        // strength of this one's silence.
+        let (stranded, unoffered, unstood) = {
             let mut browsing = self.browsing.lock().unwrap();
             let stranded = browsing.pane.belongs_to(id);
             if stranded {
-                browsing.pane = Pane::Browse;
+                browsing.show(Pane::Browse);
             }
             let unoffered = match &mut browsing.pane {
                 Pane::HelpDetail(_, _, _, offer) if *offer == Some(id) => {
@@ -4626,7 +5118,11 @@ impl Backend {
                 _ => false,
             };
             browsing.highlighted.remove(&id);
-            (stranded, unoffered)
+            let unstood = browsing.standing_in.is_some_and(|(at, _)| at == id);
+            if unstood {
+                browsing.standing_in = None;
+            }
+            (stranded, unoffered, unstood)
         };
 
         // A move this address was waiting to confirm, from either end. Where
@@ -4682,6 +5178,14 @@ impl Backend {
 
         if stranded {
             self.publish_pane();
+        } else if unstood {
+            // The pane saying the forgotten player is not responding has to
+            // be drawn again to stop saying it: nothing that follows does.
+            // The player the selection goes to has its Home asked for, and
+            // drawing nothing until that lands, the pane went on naming a
+            // player with no row for the length of a round trip or two.
+            // Only the browse pane, the one that says it; see `stand_in`.
+            self.publish_browse();
         }
         // After the selection, which is what decides whether Install is drawn;
         // see `publish_help`.
@@ -4789,6 +5293,27 @@ impl Backend {
         {
             self.publish_pane();
         }
+        // And a pane standing in for the player chosen before, for the same
+        // reason: it is drawn for the selection, and nothing else draws it
+        // again on a choice. Left alone, it went on saying that player was
+        // not responding under this one's highlight until this one's
+        // configuration came back or gave up — a round trip from a player
+        // that answers, up to ten seconds from one that is slow to. Drawn
+        // now, it is the plain pane,
+        // since the stand-in names somebody no longer selected; see
+        // `publish_browse`. The browse pane alone, which is the only one that
+        // says it: another pane is not drawn again for a choice it does not
+        // follow.
+        if changed
+            && self
+                .browsing
+                .lock()
+                .unwrap()
+                .standing_in
+                .is_some_and(|(at, _)| at != id)
+        {
+            self.publish_browse();
+        }
         // The card the window highlights, which is also the one every
         // transport press names. A press puts it there already; a selection
         // the backend moved has nobody to put it there but this.
@@ -4811,6 +5336,104 @@ impl Backend {
         if changed || self.with_entry(id, |e| e.queue.is_none()).unwrap_or(false) {
             tokio::spawn(fetch_queue(self.clone(), id));
         }
+    }
+
+    /// Take whatever of another player's is still in the Browse pane down,
+    /// for `id`, the selected player, whose screens did not come.
+    ///
+    /// Choosing a player leaves the last one's screens up until the new one's
+    /// Home lands, which is right for the moment that takes and wrong for a
+    /// player that never answers. The last player's Home and sidebar stayed
+    /// up under a pill naming the new one for as long as it was chosen, while
+    /// the queue beside them said to pick a player that was responding. Every
+    /// press on them was refused — see [`Backend::browsing_selected`] — so
+    /// nothing reached either player, and nothing on screen said why.
+    /// So the pane moves to `id` with an empty trail, the sidebar and the
+    /// addresses beside it go where they were another player's, and why is
+    /// recorded in [`Browsing::standing_in`], which `publish_browse` draws in
+    /// place of a screen.
+    ///
+    /// `selection` is the selection the screens were asked for under, and
+    /// nothing happens where another has been made since: that player's own
+    /// screens are on their way, and this would take them down. `asked` is
+    /// the number the configuration was asked for under, where that is what
+    /// failed and the failure has come back (see `Browsing::configurations`):
+    /// a failure landing after a newer ask for the same player has been
+    /// answered must not undo the answer. Both are checked under the one
+    /// guard the writes are made under, as the success path checks the
+    /// selection. `None` for a stand-in written on the loop before the ask
+    /// it made has come back, which nothing can have been asked after, and
+    /// for a Home; it is recorded either way, in `Browsing::stood_after`.
+    ///
+    /// A trail that is already `id`'s own stays where it is: a re-ask that
+    /// failed says nothing about screens that came. And where the sidebar
+    /// beside that trail is `id`'s too, nothing is stood in for at all: a
+    /// press made while the ask was out has brought everything of the
+    /// player's up, and a stand-in under it is drawn nowhere, but went on
+    /// sending a recovery at every status the player answered, for screens
+    /// that were already showing. Pages a player owns — its settings, its
+    /// alarms, a form — keep their own rules, as they do when another player
+    /// is chosen. What is lit is left alone too: it is read through
+    /// `configured`, which names nobody here, so nothing is drawn lit, and an
+    /// entry left from before is dropped when a configuration next lands.
+    fn stand_in(&self, id: DeviceId, selection: u64, asked: Option<u64>, why: Unshown) {
+        let left = {
+            let mut browsing = self.browsing.lock().unwrap();
+            if !self.still_selected(selection)
+                || asked.is_some_and(|asked| browsing.configurations != asked)
+            {
+                return;
+            }
+            if browsing.device == Some(id)
+                && browsing.configured == Some(id)
+                && !browsing.trail.is_empty()
+            {
+                return;
+            }
+            // Another player's trail, or none at all. Everything worked out
+            // from it goes with it, and the era moves on, so a page or a letter
+            // still out for it lands nowhere.
+            let left = browsing.device != Some(id);
+            if left {
+                browsing.device = Some(id);
+                browsing.trail.clear();
+                browsing.derived.clear();
+                browsing.cycling = None;
+                browsing.moved_on();
+            }
+            // And the sidebar and the addresses beside it, where they were
+            // read from somebody else. Every user of an address already asks
+            // `configured` first, so `None` sends each of them to its default
+            // on the selected player, and the search key, the one way left to
+            // reach a screen of this player's, asks for its configuration
+            // again.
+            if browsing.configured != Some(id) {
+                browsing.configured = None;
+                browsing.screens.clear();
+                browsing.sources = None;
+                browsing.queue_uri = None;
+                browsing.search_uri = None;
+                browsing.queue_menu_uri = None;
+                browsing.now_playing_menu = None;
+            }
+            browsing.standing_in = Some((id, why));
+            browsing.stood_after = asked;
+            left
+        };
+        if left {
+            // After the guard, as Back does: see `stop_browse_walks`.
+            self.stop_browse_walks();
+        }
+        self.publish_sidebar();
+        // The browse pane, not whichever pane is up. Nothing here changes
+        // which pane that is, and the browse pane is the only one that says
+        // anything about this. This lands seconds after the press, from the
+        // network, as `open_screen`'s refresh does, and drawing the whole
+        // pane here rebuilt the rows of whatever was up by then: the caret
+        // went out of a station's name being typed, and a Customize drag was
+        // dropped. The browse rows nobody can see are drawn when the pane
+        // goes back to them.
+        self.publish_browse();
     }
 
     /// Move a selection nobody chose off a player that has never answered,
@@ -4868,6 +5491,59 @@ impl Backend {
         };
         if let Some(to) = to {
             let _ = self.commands.send(Command::AutoSelect { from, to });
+        }
+    }
+
+    /// What `id` answering after not answering — its first answer of the run
+    /// included — brings with it: the selection weighed again, as
+    /// [`Backend::reconsider_selection`] says, and the pane's screens asked
+    /// for where it was standing in for this player.
+    ///
+    /// Choosing a player is the one thing that asks for its screens, so a
+    /// player chosen while it was silent was stood in for (see
+    /// [`Backend::stand_in`]) and then left that way: when it came back, the
+    /// pane went on saying it was not answering beside a card that said it
+    /// was, until somebody pressed the card again. Its Home is asked for now
+    /// instead, and its queue where none is held — that was asked for when it
+    /// was chosen and failed with everything else, and the first status after
+    /// a silence is not counted as a new queue.
+    ///
+    /// Also called at a status from a player the pane calls silent, and not
+    /// only at the turn: a stand-in written after the turn had passed — its
+    /// configuration out while the poll came back, and failing a moment
+    /// later — would otherwise wait for a silence and another turn that need
+    /// not come, while the pane promised its screens as soon as it answered.
+    /// Once for each such stand-in, and not while an ask is out; see `follow`
+    /// and `Browsing::stood_after`.
+    ///
+    /// Only where the pane is standing in for it, and it is still selected.
+    /// The first answer of a normal start finds the Home already asked for by
+    /// the selection that start made, and a player whose screens are up has
+    /// nothing to ask for; a second ask would only be a second request in
+    /// flight. One lock at a time: the selection, then the pane, then the
+    /// registry.
+    ///
+    /// As [`Command::BrowseRecover`] rather than `BrowseHome`, because nobody
+    /// pressed for it: it can come minutes after the choice, and the Home it
+    /// brings must not take the pane from whatever the user has open by then.
+    /// See [`Arrive::Recovered`].
+    fn answering_again(&self, id: DeviceId) {
+        self.reconsider_selection();
+        if !self.is_selected(id) {
+            return;
+        }
+        let stood_in = self
+            .browsing
+            .lock()
+            .unwrap()
+            .standing_in
+            .is_some_and(|(at, _)| at == id);
+        if !stood_in {
+            return;
+        }
+        let _ = self.commands.send(Command::BrowseRecover(id));
+        if self.with_entry(id, |e| e.queue.is_none()).unwrap_or(false) {
+            tokio::spawn(fetch_queue(self.clone(), id));
         }
     }
 
@@ -5054,11 +5730,14 @@ impl Backend {
     ///
     /// `selection` is read before `browsing` is taken, and `browsing` is what
     /// is passed in. A press on the browse pane runs on `device`, and `device`
-    /// stays the last player's until the next one's Home lands — and for as
-    /// long as that player is chosen, when it cannot say what screens it has.
-    /// A row pressed in between is the last player's row, and it played there
-    /// while the window showed another player as the one being controlled.
-    /// So every press there asks this first and does nothing on `None`.
+    /// stays the last player's until the next one's Home lands, or until its
+    /// stand-in takes the last player's screens down where that Home does not
+    /// come (see [`Backend::stand_in`]). A row pressed in between is the last
+    /// player's row, and it played there while the window showed another
+    /// player as the one being controlled. So every press there asks this
+    /// first and does nothing on `None` — paging, letters and the ends of a
+    /// long list included, which only read, but read the last player's list
+    /// into a pane that is about to belong to another.
     fn browsing_selected(
         &self,
         browsing: &Browsing,
@@ -5107,17 +5786,16 @@ impl Backend {
         self.publish();
     }
 
-    /// Replace the window's device model wholesale.
+    /// The rows [`Backend::publish`] hands the window, one per tracked player
+    /// in registry order and judged against `selected`, with each card's cover
+    /// and the address that cover was fetched from.
     ///
-    /// Fine while a row is a dozen scalars and a household has a handful of
-    /// players. Once rows carry decoded artwork this wants to become a
-    /// `VecModel` held across calls with `row_changed` on the one row that
-    /// moved, so that a volume nudge does not re-upload every cover on screen.
-    fn publish(&self) {
-        // Selection first, then the registry: two locks, always in that order,
-        // everywhere.
-        let selected = *self.selected.lock().unwrap();
-
+    /// Apart from `publish` so that a test can read the rows the window would
+    /// be given: `publish` sends them to an event loop and nowhere else.
+    fn player_rows(
+        &self,
+        selected: Option<DeviceId>,
+    ) -> (Vec<Device>, Vec<Option<Pixels>>, Vec<Option<String>>) {
         // Gathered beside the rows rather than inside them: `Device` is held
         // in the registry and travels between threads, and `slint::Image` is
         // not `Send`, so the picture cannot live in the struct. The two are
@@ -5138,6 +5816,10 @@ impl Backend {
                 .iter()
                 .map(|(id, entry)| (*id, entry.view.name.to_string()))
                 .collect();
+            // And whether a card offers grouping depends on the player it
+            // would be grouped with, read under this same guard so that every
+            // row is judged against the one reading of it.
+            let selected_entry = selected.and_then(|sel| guard.get(&sel));
 
             guard
                 .iter()
@@ -5169,11 +5851,7 @@ impl Backend {
                         _ => Default::default(),
                     };
 
-                    view.in_group =
-                        selected.is_some() && sync.and_then(|sync| sync.master_id()) == selected;
-                    // Grouping is something you do *to another* player, so the
-                    // selected row does not offer it against itself.
-                    view.groupable = selected.is_some_and(|sel| sel != *id);
+                    judge_grouping(&mut view, *id, entry, selected, selected_entry);
                     // Last, because it is a statement about the three above.
                     // Published rather than worked out again in the card, so
                     // the count below and what the card draws cannot disagree.
@@ -5182,6 +5860,21 @@ impl Backend {
                 })
                 .collect()
         };
+
+        (rows, covers, cover_ids)
+    }
+
+    /// Replace the window's device model wholesale.
+    ///
+    /// Fine while a row is a dozen scalars and a household has a handful of
+    /// players. Once rows carry decoded artwork this wants to become a
+    /// `VecModel` held across calls with `row_changed` on the one row that
+    /// moved, so that a volume nudge does not re-upload every cover on screen.
+    fn publish(&self) {
+        // Selection first, then the registry: two locks, always in that order,
+        // everywhere.
+        let selected = *self.selected.lock().unwrap();
+        let (rows, covers, cover_ids) = self.player_rows(selected);
 
         let line = match rows.len() {
             0 => "no players found yet".to_owned(),
@@ -6407,6 +7100,8 @@ impl Backend {
         // for it, so it is recovered from whether a heading precedes: simpler
         // to carry it explicitly.
         let screens = self.browsing.lock().unwrap().screens.len();
+        self.sent_sidebar
+            .store(sidebar_fingerprint(&rows, screens), Ordering::Relaxed);
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -7294,9 +7989,21 @@ impl Backend {
     }
 
     fn publish_browse(&self) {
-        // Which player's screens these are, then everything about that player,
-        // then the screens themselves — three steps rather than two, so that no
-        // two of these locks are ever held at once. See the note on `Backend`.
+        // The selected player, and what to call it if the pane turns out to be
+        // standing in for it; then which player's screens these are, then
+        // everything about that player, then the screens themselves. One step
+        // at a time, so that no two of these locks are ever held at once. See
+        // the note on `Backend`.
+        let selected = *self.selected.lock().unwrap();
+        let chosen = selected.and_then(|id| {
+            self.with_entry(id, |e| {
+                (
+                    id,
+                    e.view.name.to_string(),
+                    e.upgrading.is_some() || e.view.upgrading,
+                )
+            })
+        });
         let device = self.browsing.lock().unwrap().device;
         let status = device
             .and_then(|id| self.with_entry(id, |e| e.status.clone()))
@@ -7316,16 +8023,33 @@ impl Backend {
             let browsing = self.browsing.lock().unwrap();
 
             let Some(screen) = browsing.current() else {
-                return self.send_browse(
+                // No screen. Where that is because the pane is standing in for
+                // the player selected, the pane says so, in the empty state a
+                // player's own info panel is drawn with. Anywhere else —
+                // another player chosen since, its screens on their way — it
+                // is the plain pane it always was.
+                let notice = browsing
+                    .standing_in
+                    .zip(chosen)
+                    .filter(|((at, _), (id, _, _))| at == id)
+                    .map(|((_, why), (id, name, upgrading))| {
+                        standing_in_notice(&name, id, upgrading, why)
+                    });
+                drop(browsing);
+                self.send_browse(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    None,
+                    notice,
                     None,
                     "Browse".into(),
                     false,
                     None,
                 );
+                // And no letters. The bar is built from the screen, so with no
+                // screen it went on offering the last list's, beside nothing.
+                self.send_browse_index();
+                return;
             };
 
             // The block at the top of an album's page. Its artwork is the one
@@ -7668,12 +8392,7 @@ impl Backend {
             }
         };
 
-        if already_sent(&self.sent_index, {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            keys.hash(&mut hash);
-            hash.finish()
-        }) {
+        if already_sent(&self.sent_index, index_fingerprint(&keys)) {
             return;
         }
 
@@ -7738,35 +8457,19 @@ impl Backend {
         // — the same rule the queue's memo follows, for the same reason: a
         // decoded cover is more expensive to compare than the redraw it would
         // save, and its arrival is the only thing about it that changes.
-        if already_sent(&self.sent_browse, {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            title.hash(&mut hash);
-            can_go_back.hash(&mut hash);
-            search.hash(&mut hash);
-            recent.hash(&mut hash);
-            empty.as_ref().map(|(a, b, g)| (a, b, *g)).hash(&mut hash);
-            for row in &selector {
-                browse_row_fingerprint(row, &mut hash);
-            }
-            for block in &blocks {
-                block.kind.hash(&mut hash);
-                block.title.hash(&mut hash);
-                block.action.hash(&mut hash);
-                block.section.hash(&mut hash);
-                for row in &block.rows {
-                    browse_row_fingerprint(row, &mut hash);
-                }
-            }
-            if let Some(header) = &header {
-                header.title.hash(&mut hash);
-                header.subtitle.hash(&mut hash);
-                header.detail.hash(&mut hash);
-                header.cover.is_some().hash(&mut hash);
-                header.buttons.hash(&mut hash);
-            }
-            hash.finish()
-        }) {
+        if already_sent(
+            &self.sent_browse,
+            browse_fingerprint(
+                &blocks,
+                &selector,
+                &recent,
+                empty.as_ref(),
+                header.as_ref(),
+                &title,
+                can_go_back,
+                search.as_ref(),
+            ),
+        ) {
             // The rows on screen are already these — but the title and the
             // back arrow may not be, and this memo cannot see that. It compares
             // against what *browse* last sent, and another pane can overwrite
@@ -8747,10 +9450,22 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 // the ones showing — see `BrowseHome` — so finding them up now
                 // means one the user pressed for landed first. That screen is
                 // what was asked for last, and Home would replace it.
-                if arrive == Arrive::Home
-                    && browsing.device == Some(id)
-                    && !browsing.trail.is_empty()
-                {
+                //
+                // Or a Home of the same player's that came by itself first,
+                // for this same choice: the screen is the one this would have
+                // put up, but it left the pane where it was, and a Home
+                // pressed for takes the pane. Taken here, as it would have
+                // been had this landed first. See `Browsing::recovered`.
+                if arrive.home() && browsing.device == Some(id) && !browsing.trail.is_empty() {
+                    let owed = arrive == Arrive::Home && browsing.recovered_up(selection);
+                    if owed {
+                        browsing.show(Pane::Browse);
+                        browsing.recovered = None;
+                    }
+                    drop(browsing);
+                    if owed {
+                        backend.publish_pane();
+                    }
                     return;
                 }
 
@@ -8766,9 +9481,10 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                 // the middle of it. The crumb underneath is replaced either
                 // way, and `publish_browse` draws nothing while another pane
                 // has the screen, so the new screen is simply there when they
-                // come back to it.
-                if !matches!(&arrive, Arrive::Refresh { .. }) {
-                    browsing.pane = Pane::Browse;
+                // come back to it. A Home brought back by the player answering
+                // again is the other: see `Arrive::Recovered`.
+                if !matches!(&arrive, Arrive::Refresh { .. } | Arrive::Recovered) {
+                    browsing.show(Pane::Browse);
                 }
                 kept_pane = !matches!(browsing.pane, Pane::Browse);
                 // Browsing follows the selection: a screen only means anything
@@ -8777,6 +9493,10 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                     browsing.trail.clear();
                 }
                 browsing.device = Some(id);
+                // A screen of the selected player's is going up, so the pane
+                // is no longer standing in for anybody; see
+                // `Browsing::standing_in`.
+                browsing.standing_in = None;
                 let query = match &arrive {
                     // Still the screen it was started for; checked above.
                     Arrive::Refresh { query, .. } => {
@@ -8787,7 +9507,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                         browsing.trail.clear();
                         None
                     }
-                    Arrive::Home => {
+                    Arrive::Home | Arrive::Recovered => {
                         browsing.trail.clear();
                         // An entry of this player's lit since its Home was
                         // asked for is a press still on its way, or an input
@@ -8822,7 +9542,22 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
                     query,
                     page,
                 });
+                let was_era = browsing.era;
                 browsing.moved_on();
+                // Which Home this is, for a press of the same choice landing
+                // after it; see `Browsing::recovered`. Only one kept under
+                // another pane: in the browse pane it is in front of the user
+                // already, and nothing is owed.
+                //
+                // And the same Home again, where a refresh re-read it under
+                // the page it was kept under: the screen is the one the
+                // recovery put up, the pane has not moved, and the press is
+                // owed the pane as much as before. Dropped there, a preset
+                // saved while the reply was out left the page up after all.
+                let refreshed = matches!(arrive, Arrive::Refresh { .. })
+                    && browsing.recovered == Some((was_era, selection, browsing.panes));
+                let owed = (arrive == Arrive::Recovered && kept_pane) || refreshed;
+                browsing.recovered = owed.then_some((browsing.era, selection, browsing.panes));
             }
             // The whole pane, not only the browse rows. Opening a screen is
             // also leaving whichever pane was covering them, and the window
@@ -8836,13 +9571,35 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             // rows nobody can see are drawn when the pane goes back to them.
             if !kept_pane {
                 backend.publish_pane();
-                if arrive == Arrive::Home {
-                    backend.publish_sidebar();
-                }
+            }
+            // The sidebar either way, for the entry Home lights: it is beside
+            // every pane rather than one of them, and a Home brought back
+            // under another pane lights it as much as one pressed for.
+            if arrive.home() {
+                backend.publish_sidebar();
             }
             backend.walk_browse(id, Walk::Whole);
         }
-        Err(e) => tracing::warn!(%id, "could not read {uri}: {e}"),
+        Err(e) => {
+            tracing::warn!(%id, "could not read {uri}: {e}");
+            // The player said what screens it has and then could not show the
+            // first of them. Left there, the last player's screens stayed up
+            // under this one's sidebar for as long as it was chosen, with
+            // every press on them refused. Stood in for, as a configuration
+            // that fails is, and never in the words for a player that is
+            // silent: its configuration answered a moment ago. A Home that did
+            // not come in time is a player answering slowly, and calling it
+            // not responding promised its screens the moment it answered,
+            // which waited on a poll that had never stopped answering. Its
+            // own sidebar stays, since that came, and so does a trail that is
+            // its own already — a press of the user's that landed first. See
+            // [`Backend::stand_in`] and [`Unshown`]. Only Home, the one screen
+            // asked for on the player's behalf rather than by a press: a press
+            // that fails leaves showing whatever it was pressed on.
+            if arrive.home() {
+                backend.stand_in(id, selection, None, Unshown::of(&e, true));
+            }
+        }
     }
 }
 
@@ -9138,6 +9895,10 @@ fn refuse_other_players_screen(backend: &Backend) {
 /// and put a Recently Played tile that plays under the pointer. Whatever
 /// replaced the form in the meantime, another of this player's forms included,
 /// is not the reply's to close.
+///
+/// A Home kept under the form for a press still on its way is kept under the
+/// page put back, and still owed to that press: a reply put the page back,
+/// not the user, and nothing was opened. See `Browsing::recovered`.
 fn close_form(backend: &Backend, device: DeviceId, opened: u64) -> bool {
     let mut browsing = backend.browsing.lock().unwrap();
     let Pane::Form(page) = &mut browsing.pane else {
@@ -9147,7 +9908,14 @@ fn close_form(backend: &Backend, device: DeviceId, opened: u64) -> bool {
         return false;
     }
     let from = page.from.take();
-    browsing.pane = from.map_or(Pane::Browse, |pane| *pane);
+    let panes = browsing.panes;
+    let owed = browsing
+        .recovered
+        .filter(|&(_, _, at)| at == panes && from.is_some());
+    browsing.show(from.map_or(Pane::Browse, |pane| *pane));
+    if let Some((era, selection, _)) = owed {
+        browsing.recovered = Some((era, selection, browsing.panes));
+    }
     true
 }
 
@@ -9228,7 +9996,7 @@ fn show_form(
             Pane::Form(page) => page.from,
             _ => None,
         };
-        browsing.pane = Pane::Form(Box::new(FormPage {
+        let page = Pane::Form(Box::new(FormPage {
             device,
             opened,
             title,
@@ -9237,6 +10005,15 @@ fn show_form(
             note,
             from,
         }));
+        // The same opening answered — its placeholder filled in, or its
+        // submit's next step — is the form restated, not a page opened over
+        // it: put up without counting, or a Home kept under the placeholder
+        // stopped being owed to its press when the scan landed. See
+        // `Browsing::panes`.
+        match replacing {
+            Replacing::Form(_) => browsing.pane = page,
+            Replacing::Page => browsing.show(page),
+        }
         opened
     };
     // Through `publish_pane`, not `publish_form`. Every caller of this reaches
@@ -9591,7 +10368,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                                 Pane::NowPlaying => Whence::NowPlaying,
                                 _ => Whence::Browse,
                             };
-                            browsing.pane = Pane::HelpDetail(title, facts, whence, None);
+                            browsing.show(Pane::HelpDetail(title, facts, whence, None));
                             drop(browsing);
                             backend.publish_pane();
                         }
@@ -9620,13 +10397,13 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                             if !selection.is_some_and(|n| backend.still_selected(n)) {
                                 return;
                             }
-                            browsing.pane = Pane::Playlists(Box::new(PlaylistPage {
+                            browsing.show(Pane::Playlists(Box::new(PlaylistPage {
                                 device: id,
                                 opened: backend.openings.fetch_add(1, Ordering::Relaxed) + 1,
                                 title,
                                 options,
                                 naming: false,
-                            }));
+                            })));
                         }
                         backend.publish_pane();
                     }
@@ -9755,7 +10532,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 match page {
                     // Fewer than two and there is nothing to arrange.
                     Some(page) if page.rows.len() > 1 => {
-                        backend.browsing.lock().unwrap().pane = Pane::Customise(page);
+                        backend.browsing.lock().unwrap().show(Pane::Customise(page));
                         backend.publish_pane();
                     }
                     _ => say(&backend.ui, "Nothing on this screen can be moved"),
@@ -9827,11 +10604,11 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                         if !selection.is_some_and(|n| backend.still_selected(n)) {
                             return;
                         }
-                        browsing.pane = Pane::EditPreset(Box::new(EditPresetPage {
+                        browsing.show(Pane::EditPreset(Box::new(EditPresetPage {
                             device: id,
                             slot,
                             preset,
-                        }));
+                        })));
                     }
                     // Through publish_pane, so every "this pane is showing"
                     // flag is answered.
@@ -9875,7 +10652,7 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                     match page {
                         // Fewer than two and there is nothing to arrange.
                         Some(page) if page.rows.len() > 1 => {
-                            browsing.pane = Pane::Customise(page);
+                            browsing.show(Pane::Customise(page));
                             true
                         }
                         _ => false,
@@ -11769,14 +12546,16 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
         .unwrap_or_default();
     // Whether the last request this loop made was answered. The turn from
     // silence to an answer, the first answer of the run included, is one of
-    // the two moments a selection left on a dead row can move to this player;
-    // see [`Backend::reconsider_selection`]. Kept here so that it is asked at
-    // the turn rather than at every status.
+    // the two moments a selection left on a dead row can move to this player,
+    // and the moment a pane standing in for this player can have its screens;
+    // see [`Backend::answering_again`]. Kept here so that it is asked at the
+    // turn rather than at every status — but for a pane still calling this
+    // player silent after the turn, which is asked once more; see below.
     let mut answering = false;
     if let Some(sync) = read_sync(&backend, id, &client).await {
         name = sync.name.clone();
         answering = true;
-        backend.reconsider_selection();
+        backend.answering_again(id);
     }
 
     // Deliberately not exported yet. An address that never answers — one typed
@@ -11853,10 +12632,33 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 });
 
                 // After the row is drawn answering, not before: a selection
-                // is only moved to a row that is. See [`Entry::working`].
-                if !answering {
+                // is only moved to a row that is (see [`Entry::working`]), and
+                // a Home asked for here must not find the row still drawn
+                // silent and be stood in for at once.
+                //
+                // At the turn, and also at a status while the pane says this
+                // player is not responding. That can be written after the
+                // turn has passed — a configuration out while the poll came
+                // back, failing a moment later — and the poll then answers on
+                // without another turn, while the pane promises the screens
+                // as soon as it answers.
+                //
+                // Once for each such stand-in, and only where the failure
+                // that wrote it is still the newest ask: an ask on its way
+                // settles the stand-in itself. Asked at every status instead,
+                // each ask superseded the last, so a failure slower than the
+                // statuses never landed and the asks never stopped; see
+                // `Browsing::stood_after`. A re-ask that fails again on a row
+                // drawn answering stands in as slow, which waits to be chosen
+                // again. See [`Unshown`].
+                let said_silent = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    browsing.standing_in == Some((id, Unshown::Silent))
+                        && browsing.stood_after == Some(browsing.configurations)
+                };
+                if !answering || said_silent {
                     answering = true;
-                    backend.reconsider_selection();
+                    backend.answering_again(id);
                 }
 
                 // `syncStat` mirrors /SyncStatus's own etag, so a change in it
@@ -12002,6 +12804,27 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                 } else {
                     unreadable = 0;
                     backend.update(id, |view| view.reachable = false);
+                    // A pane calling this player slow says it is answering,
+                    // which was read off a row that is now drawn not
+                    // responding: the long poll of a player switched off
+                    // holds the row answering for up to two minutes, and a
+                    // request that failed against it in that time was called
+                    // slow. Silent now, and drawn so — nothing else draws the
+                    // pane again here — so the pane says what the card says,
+                    // and the turn back asks for the screens. At every
+                    // failure, not only the first, since a slow stand-in can
+                    // be written just after this has looked. See [`Unshown`].
+                    let unslowed = {
+                        let mut browsing = backend.browsing.lock().unwrap();
+                        let slow = browsing.standing_in == Some((id, Unshown::Slow));
+                        if slow {
+                            browsing.standing_in = Some((id, Unshown::Silent));
+                        }
+                        slow
+                    };
+                    if unslowed {
+                        backend.publish_browse();
+                    }
                     // The other moment: where this is the selected row and it
                     // has never answered, it has now been seen failing.
                     answering = false;
@@ -12255,6 +13078,15 @@ async fn run_commands(
                     backend.chosen.store(true, Ordering::SeqCst);
                     already
                 };
+                // The rows as well as the selection, as `AutoSelect` does:
+                // whether each card offers grouping is worked out against the
+                // selected player, and `after_selecting` draws only the
+                // highlight. Without this the cards went on offering Group
+                // against the player chosen before — or not offering it,
+                // where that one had stopped answering — until the next status
+                // from anybody, which from a player sitting idle is a long
+                // poll away.
+                backend.publish();
                 backend.after_selecting(id, !already);
                 continue;
             }
@@ -12336,9 +13168,32 @@ async fn run_commands(
                 continue;
             }
 
-            Command::BrowseHome => {
+            command @ (Command::BrowseHome | Command::BrowseRecover(_)) => {
                 let Some((id, selection)) = backend.selection() else {
                     continue;
+                };
+                // A Home nobody pressed for, sent by a player heard answering
+                // while the pane stood in for it, and weighed again here,
+                // where it lands in order with the presses: chosen away
+                // since, or its screens brought back by a press meanwhile,
+                // there is nothing left for it to do. It is never taken for
+                // a Home of whoever is selected now, which would then arrive
+                // under the flag that keeps it off the pane.
+                let recovering = match command {
+                    Command::BrowseRecover(answered) => {
+                        let still = answered == id
+                            && backend
+                                .browsing
+                                .lock()
+                                .unwrap()
+                                .standing_in
+                                .is_some_and(|(at, _)| at == id);
+                        if !still {
+                            continue;
+                        }
+                        true
+                    }
+                    _ => false,
                 };
                 // Already showing this player's screens, with its sidebar and
                 // addresses beside them: leave the trail where the user left
@@ -12355,14 +13210,53 @@ async fn run_commands(
                         && !browsing.trail.is_empty()
                     {
                         drop(browsing);
-                        backend.publish_pane();
+                        // Drawn for a press, and not for a recovery, which
+                        // nobody is looking for and which would rebuild
+                        // whatever pane is up.
+                        if !recovering {
+                            backend.publish_pane();
+                        }
                         continue;
                     }
                 }
 
-                let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+                // And whether its row already says it is not answering, read
+                // with the client under the one guard.
+                let Some((client, silent)) =
+                    backend.with_entry(id, |e| (e.client.clone(), !e.view.reachable))
+                else {
                     continue;
                 };
+
+                // Numbered as it is asked, for the note on
+                // `Browsing::configurations`. On the loop rather than in the
+                // task below, so that the number is in hand before anything
+                // can fail under it: a failure stands in for this player only
+                // where no ask has been made since, and a newer one may
+                // already have been answered.
+                let asked = {
+                    let mut browsing = backend.browsing.lock().unwrap();
+                    browsing.configurations += 1;
+                    browsing.configurations
+                };
+
+                // A row that already says the player is not responding is
+                // believed now, rather than once its configuration has timed
+                // out: that wait is five to ten seconds of the last player's
+                // screens under this one's name, for an answer the row has
+                // given already. The configuration is still asked for below,
+                // and if it comes the screens come with it. A player
+                // installing an update is drawn as not answering too, and is
+                // stood in for the same way; the pane says which it is.
+                //
+                // With no ask number. Nothing can have been asked since on
+                // this loop, and the ask just made is still out, which is
+                // what `Browsing::stood_after` has to know: it settles this
+                // stand-in itself, and a status asking again over it would
+                // only supersede it.
+                if silent {
+                    backend.stand_in(id, selection, None, Unshown::Silent);
+                }
 
                 // Off the loop from here. Two round trips follow, and awaiting
                 // them here stopped the loop reading its channel at all: on a
@@ -12377,26 +13271,41 @@ async fn run_commands(
                     // The player says which screens it has; the app does not have a
                     // list of its own.
                     //
-                    // And without that answer there is nothing to write. This
-                    // used to carry on with an empty one, which replaced the
-                    // sidebar and the queue and search addresses with nothing
-                    // while the last player's screens stayed up — and nothing
-                    // put them back, because choosing that player again finds
-                    // its trail still showing and fetches nothing. Leaving it
-                    // all as it was keeps a consistent window, and this player
-                    // is asked again the next time it is chosen.
-                    //
-                    // Numbered as it is asked, for the note on
-                    // `Browsing::configurations`.
-                    let asked = {
-                        let mut browsing = backend.browsing.lock().unwrap();
-                        browsing.configurations += 1;
-                        browsing.configurations
-                    };
+                    // And without that answer there is nothing of this player's
+                    // to write, and nothing of the last player's may stay. This
+                    // once carried on with an empty configuration, which
+                    // emptied the sidebar and the addresses while the last
+                    // player's screens stayed up — and choosing that player
+                    // again found its trail still showing and fetched nothing,
+                    // so nothing put them back. Leaving everything as it was
+                    // came next, and kept the last player's Home and sidebar up
+                    // under this one's name for as long as it was chosen. Now a
+                    // failure stands in for this player instead: the last
+                    // player's screens and sidebar go, the pane says why, and
+                    // choosing the last player again fetches its own afresh.
+                    // See [`Backend::stand_in`]. This player is asked again
+                    // when it is chosen again, when the search key is pressed,
+                    // and by itself once it is heard answering where the pane
+                    // calls it silent or it has been silent since; see
+                    // [`Backend::answering_again`].
                     let config = match client.ui_configuration().await {
                         Ok(config) => config,
                         Err(e) => {
                             tracing::warn!(%id, "could not read its configuration: {e}");
+                            // Silent, or only slow: a request that went
+                            // unanswered from a player whose row is drawn
+                            // answering is a player busy with something else,
+                            // and its poll has nothing to say when it is done.
+                            // Read before the stand-in takes its own lock.
+                            let answering = backend
+                                .with_entry(id, |entry| entry.view.reachable)
+                                .unwrap_or(false);
+                            backend.stand_in(
+                                id,
+                                selection,
+                                Some(asked),
+                                Unshown::of(&e, answering),
+                            );
                             return;
                         }
                     };
@@ -12412,7 +13321,7 @@ async fn run_commands(
                     let sources_uri = config.uri("sources").unwrap_or("/ui/Sources").to_owned();
                     let sources = client.screen(&sources_uri).await.ok();
 
-                    let keeping_trail = {
+                    let (keeping_trail, stood_down, takes_pane) = {
                         let mut browsing = backend.browsing.lock().unwrap();
                         // Another player chosen while these were on their way:
                         // this is its sidebar and its addresses now, whether or
@@ -12437,6 +13346,13 @@ async fn run_commands(
                         browsing.search_uri = config.uri("search").map(str::to_owned);
                         browsing.screens = screens;
                         browsing.sources = sources;
+                        // It has answered, so the pane is no longer standing
+                        // in for it — nor for anybody, since only the selected
+                        // player is ever drawn that way. Where its trail is not
+                        // the one showing, its Home is asked for below, and a
+                        // Home that fails stands in for it again, in the words
+                        // for a player that answered.
+                        let stood_down = browsing.standing_in.take().is_some();
                         // What is lit is left alone: it describes the trail
                         // showing, and that is still this player's or still
                         // the last one's, which `Browsing::lit` keeps off
@@ -12463,15 +13379,45 @@ async fn run_commands(
                         if !keeping_trail && left_over {
                             browsing.highlighted.remove(&id);
                         }
-                        keeping_trail
+                        // A press, finding its player's Home already up
+                        // because a recovery of the same choice brought it
+                        // first: the pane the press would have taken with
+                        // its own Home, it takes now. See
+                        // `Browsing::recovered`.
+                        let takes_pane =
+                            !recovering && keeping_trail && browsing.recovered_up(selection);
+                        if takes_pane {
+                            browsing.show(Pane::Browse);
+                            browsing.recovered = None;
+                        }
+                        (keeping_trail, stood_down, takes_pane)
                     };
                     backend.publish_sidebar();
+                    // And the pane, which was saying this player had not
+                    // answered and has just been answered by it. Drawn plain
+                    // for the round trip to its Home, rather than still saying
+                    // so. The browse pane alone, for the reason on
+                    // `stand_in`: another pane up now was not opened over the
+                    // notice by this, and rebuilding it would cost whatever
+                    // is being typed or dragged there. Except where the press
+                    // has just taken the pane, which is then the browse pane
+                    // and is drawn whole.
+                    if takes_pane {
+                        backend.publish_pane();
+                    } else if stood_down {
+                        backend.publish_browse();
+                    }
                     // The queue's buttons are read from the address just
                     // written, and a queue that arrived before it had none to
                     // read them from.
                     tokio::spawn(fetch_queue_buttons(backend.clone(), id));
                     if !keeping_trail {
-                        open_screen(backend.clone(), id, root, Arrive::Home).await;
+                        let arrive = if recovering {
+                            Arrive::Recovered
+                        } else {
+                            Arrive::Home
+                        };
+                        open_screen(backend.clone(), id, root, arrive).await;
                     }
                 });
                 continue;
@@ -12504,7 +13450,7 @@ async fn run_commands(
                             true
                         }
                         Pane::Alarms(_) => {
-                            browsing.pane = Pane::Browse;
+                            browsing.show(Pane::Browse);
                             true
                         }
                         // One level: out of editing before out of the page,
@@ -12516,19 +13462,20 @@ async fn run_commands(
                             true
                         }
                         Pane::Stations(_) => {
-                            browsing.pane = Pane::Browse;
+                            browsing.show(Pane::Browse);
                             true
                         }
                         Pane::EditPreset(_) => {
-                            browsing.pane = Pane::Browse;
+                            browsing.show(Pane::Browse);
                             true
                         }
                         Pane::HelpDetail(_, _, whence, _) => {
-                            browsing.pane = match whence {
+                            let back = match whence {
                                 Whence::Help => Pane::Help,
                                 Whence::Browse => Pane::Browse,
                                 Whence::NowPlaying => Pane::NowPlaying,
                             };
+                            browsing.show(back);
                             true
                         }
                         Pane::Settings(_, trail) if trail.len() > 1 => {
@@ -12543,7 +13490,7 @@ async fn run_commands(
                         Pane::Form(page) if page.from.is_some() => {
                             let from = page.from.take();
                             if let Some(pane) = from {
-                                browsing.pane = *pane;
+                                browsing.show(*pane);
                             }
                             true
                         }
@@ -12554,7 +13501,7 @@ async fn run_commands(
                         | Pane::Customise(_)
                         | Pane::Playlists(_)
                         | Pane::NowPlaying => {
-                            browsing.pane = Pane::Browse;
+                            browsing.show(Pane::Browse);
                             true
                         }
                         // Already browsing, so back means the screen before.
@@ -12690,6 +13637,7 @@ async fn run_commands(
                         // than acting, because a new playlist needs a name.
                         Some((_, None)) => {
                             page.naming = true;
+                            browsing.opened_over();
                             None
                         }
                         Some((service, Some(playlist))) => Some((
@@ -12791,7 +13739,7 @@ async fn run_commands(
                                     Pane::Playlists(page) if page.opened == opened
                                 );
                                 if own {
-                                    browsing.pane = Pane::Browse;
+                                    browsing.show(Pane::Browse);
                                 }
                                 own
                             };
@@ -12826,13 +13774,13 @@ async fn run_commands(
                                 if !backend.may_open_for(&browsing, id, selection) {
                                     return;
                                 }
-                                browsing.pane = Pane::Alarms(Box::new(AlarmsPage {
+                                browsing.show(Pane::Alarms(Box::new(AlarmsPage {
                                     device: id,
                                     list,
                                     editing: None,
                                     opened: 0,
                                     picking: Vec::new(),
-                                }));
+                                })));
                                 browsing.highlighted.clear();
                             }
                             backend.publish_sidebar();
@@ -12901,6 +13849,9 @@ async fn run_commands(
                     };
                     page.editing = Some(found.clone());
                     page.opened = backend.openings.fetch_add(1, Ordering::Relaxed) + 1;
+                    // A page over the list, as Back has it; see
+                    // `Browsing::opened_over`.
+                    browsing.opened_over();
                 }
                 backend.publish_pane();
                 continue;
@@ -12939,6 +13890,8 @@ async fn run_commands(
                         }
                         fresh
                     });
+                    // As for `AlarmOpen`.
+                    browsing.opened_over();
                 }
                 backend.publish_pane();
                 continue;
@@ -13336,7 +14289,12 @@ async fn run_commands(
                                 (Pane::Settings(owner, trail), Step::Deeper(from))
                                     if *owner == from =>
                                 {
-                                    trail.push(page)
+                                    trail.push(page);
+                                    // A page over the one it was opened from,
+                                    // as Back has it; see
+                                    // `Browsing::opened_over`. A reload below
+                                    // restates the top and counts nothing.
+                                    browsing.opened_over();
                                 }
                                 (Pane::Settings(owner, trail), Step::Reload(from))
                                     if *owner == from && !trail.is_empty() =>
@@ -13370,7 +14328,7 @@ async fn run_commands(
                                 (_, Step::Root) if !backend.still_selected(selection) => {
                                     return;
                                 }
-                                (_, Step::Root) => browsing.pane = Pane::Settings(id, vec![page]),
+                                (_, Step::Root) => browsing.show(Pane::Settings(id, vec![page])),
                             }
                             // Settings and Help are rows of their own below the
                             // list, so nothing in the list is where you are any
@@ -13407,10 +14365,10 @@ async fn run_commands(
             Command::OpenStations => {
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.pane = Pane::Stations(Box::new(StationsPage {
+                    browsing.show(Pane::Stations(Box::new(StationsPage {
                         stations: custom::load(),
                         editing: false,
-                    }));
+                    })));
                 }
                 // Through publish_pane, never the specific publisher: it is
                 // what answers every "this pane is showing" flag, and a pane
@@ -13481,6 +14439,12 @@ async fn run_commands(
                     let mut browsing = backend.browsing.lock().unwrap();
                     if let Pane::Stations(page) = &mut browsing.pane {
                         page.editing = !page.editing;
+                        // Into edit mode is a level opened, as Back has it,
+                        // and a rename may be typed there. Out of it is
+                        // Back. See `Browsing::opened_over`.
+                        if page.editing {
+                            browsing.opened_over();
+                        }
                     }
                 }
                 // Done is one of the ways a rename ends, and the field it ends
@@ -13661,7 +14625,7 @@ async fn run_commands(
                     continue;
                 };
 
-                backend.browsing.lock().unwrap().pane = Pane::Browse;
+                backend.browsing.lock().unwrap().show(Pane::Browse);
                 backend.publish_pane();
                 let backend = backend.clone();
                 tokio::spawn(async move {
@@ -13833,7 +14797,7 @@ async fn run_commands(
             Command::OpenHelp => {
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.pane = Pane::Help;
+                    browsing.show(Pane::Help);
                     browsing.highlighted.clear();
                 }
                 backend.publish_sidebar();
@@ -13906,12 +14870,12 @@ async fn run_commands(
                                         {
                                             return;
                                         }
-                                        browsing.pane = Pane::HelpDetail(
+                                        browsing.show(Pane::HelpDetail(
                                             "Diagnostics".to_owned(),
                                             facts,
                                             Whence::Help,
                                             None,
-                                        );
+                                        ));
                                     }
                                     // As above: asking the player takes as
                                     // long as it takes, and the sidebar is
@@ -14021,12 +14985,12 @@ async fn run_commands(
                                 // The offer goes up as part of the page and
                                 // names the player checked, so it cannot
                                 // outlive this page or be read for another.
-                                browsing.pane = Pane::HelpDetail(
+                                browsing.show(Pane::HelpDetail(
                                     "Upgrade Check".to_owned(),
                                     facts,
                                     Whence::Help,
                                     selected.filter(|_| offer),
-                                );
+                                ));
                             }
                             // And this one waits on two round trips.
                             backend.publish_pane();
@@ -14466,8 +15430,8 @@ async fn run_commands(
                 // Every entry below is read out of the player's configuration
                 // — the screens it lists, the rows of its Sources screen — and
                 // run on `id`. Those are the last player's until this one's
-                // configuration arrives, and for as long as it is chosen when
-                // it cannot give one: pressing an input there sent the other
+                // configuration arrives or fails, when the pane stands in for
+                // it and they go: pressing an input there sent the other
                 // player's capture path to this speaker and stopped it.
                 //
                 // Refused, and the configuration asked for again. A player
@@ -14492,7 +15456,7 @@ async fn run_commands(
                         let mut browsing = backend.browsing.lock().unwrap();
                         let covered = !matches!(browsing.pane, Pane::Browse);
                         if covered {
-                            browsing.pane = Pane::Browse;
+                            browsing.show(Pane::Browse);
                         }
                         covered
                     };
@@ -14750,7 +15714,14 @@ async fn run_commands(
                             if !may {
                                 return;
                             }
-                            browsing.pane = Pane::Web(id, WebPage::Services(services));
+                            // A reload is the list restated as itself, and
+                            // counts as no page opened; see `Browsing::panes`.
+                            let list = Pane::Web(id, WebPage::Services(services));
+                            if reload {
+                                browsing.pane = list;
+                            } else {
+                                browsing.show(list);
+                            }
                             browsing.highlighted.clear();
                             drop(browsing);
                             backend.publish_sidebar();
@@ -14821,7 +15792,13 @@ async fn run_commands(
                             if !may {
                                 return;
                             }
-                            browsing.pane = Pane::Web(id, WebPage::Shares { action, shares });
+                            // As for the services page above.
+                            let list = Pane::Web(id, WebPage::Shares { action, shares });
+                            if reload {
+                                browsing.pane = list;
+                            } else {
+                                browsing.show(list);
+                            }
                             browsing.highlighted.clear();
                             drop(browsing);
                             backend.publish_sidebar();
@@ -15031,8 +16008,16 @@ async fn run_commands(
                 // aimed at the last window instead of a letter's. A list held
                 // whole never gets here: the window scrolls itself, because it
                 // is the only one that knows how tall the pane is.
+                //
+                // Only on a list of the selected player's, as every press on
+                // the pane is; see [`Backend::browsing_selected`]. Read before
+                // the pane is taken, as everywhere.
+                let selection = backend.selection();
                 let target = {
                     let mut browsing = backend.browsing.lock().unwrap();
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        continue;
+                    };
                     let offset = browsing
                         .trail
                         .last()
@@ -15043,11 +16028,10 @@ async fn run_commands(
                             let era = browsing.era;
                             browsing.jumps += 1;
                             let jump = browsing.jumps;
-                            browsing.trail.last().and_then(|crumb| {
-                                browsing
-                                    .device
-                                    .map(|id| (id, crumb.uri.clone(), offset, era, jump))
-                            })
+                            browsing
+                                .trail
+                                .last()
+                                .map(|crumb| (id, crumb.uri.clone(), offset, era, jump))
                         }
                     }
                 };
@@ -15100,8 +16084,8 @@ async fn run_commands(
                     // Lit for and opened on `id`, the player whose address
                     // this is, as a sidebar press is — not on the player whose
                     // screens are showing. The two differ from the moment one
-                    // player's configuration lands until its Home does, and
-                    // for good if that Home never comes: lighting the last
+                    // player's configuration lands until its Home does, or
+                    // fails and the pane stands in for it: lighting the last
                     // player's entry with this one's position lit Search over
                     // that player's Home once it was chosen back, and opening
                     // on it was declined, so the key did nothing at all.
@@ -15128,10 +16112,21 @@ async fn run_commands(
             }
 
             Command::BrowseJump(key) => {
+                // Only on a list of the selected player's, as every press on
+                // the pane is; see [`Backend::browsing_selected`]. The last
+                // player's list is still up from the moment another is chosen
+                // until that one's Home lands or is stood in for, and a letter
+                // pressed there fetched a window of it from the last player.
+                // Asked again below, with the pane taken a second time.
+                let selection = backend.selection();
+
                 // A list held whole scrolls to the letter; nothing is asked
                 // for, because there is nothing that is not already here.
                 let scrolled = {
                     let mut browsing = backend.browsing.lock().unwrap();
+                    if backend.browsing_selected(&browsing, selection).is_none() {
+                        continue;
+                    }
                     let stops = stops_derived(&browsing.derived, &key);
                     browsing.next_stop(&key, stops.len()).map(|at| stops[at])
                 };
@@ -15144,6 +16139,9 @@ async fn run_commands(
                 // screen; the window only ever sent the letter.
                 let target = {
                     let mut browsing = backend.browsing.lock().unwrap();
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        continue;
+                    };
                     let stops = browsing
                         .trail
                         .last()
@@ -15162,11 +16160,10 @@ async fn run_commands(
                             browsing.jumps += 1;
                             let jump = browsing.jumps;
                             let offset = stops[at];
-                            browsing.trail.last().and_then(|crumb| {
-                                browsing
-                                    .device
-                                    .map(|id| (id, crumb.uri.clone(), offset, era, jump))
-                            })
+                            browsing
+                                .trail
+                                .last()
+                                .map(|crumb| (id, crumb.uri.clone(), offset, era, jump))
                         }
                     }
                 };
@@ -15189,8 +16186,16 @@ async fn run_commands(
             }
 
             Command::BrowseMore => {
+                // Only on a list of the selected player's, as every press on
+                // the pane is; see [`Backend::browsing_selected`]. Refused
+                // before the flags below are touched: the ask is not wanted
+                // later either, since the list it was for is on its way out.
+                let selection = backend.selection();
                 let asking = {
                     let mut browsing = backend.browsing.lock().unwrap();
+                    let Some(id) = backend.browsing_selected(&browsing, selection) else {
+                        continue;
+                    };
                     if browsing.fetching_more {
                         // Kept rather than queued: the page out may be the one
                         // this ask wants, and then nothing more is needed. See
@@ -15204,8 +16209,7 @@ async fn run_commands(
                     let next = browsing
                         .current()
                         .and_then(|screen| screen.next.clone())
-                        .zip(browsing.device)
-                        .map(|(next, id)| (next, id, era, jump));
+                        .map(|next| (next, id, era, jump));
                     if next.is_some() {
                         browsing.fetching_more = true;
                     }
@@ -15374,10 +16378,11 @@ async fn run_commands(
             Command::ToggleNowPlaying => {
                 {
                     let mut browsing = backend.browsing.lock().unwrap();
-                    browsing.pane = match browsing.pane {
+                    let next = match browsing.pane {
                         Pane::NowPlaying => Pane::Browse,
                         _ => Pane::NowPlaying,
                     };
+                    browsing.show(next);
                 }
                 backend.publish_pane();
                 continue;
@@ -15498,18 +16503,52 @@ async fn run_commands(
                 if master == target {
                     continue;
                 }
-                let Some(client) = backend.with_entry(master, |e| e.client.clone()) else {
-                    continue;
+
+                // The card's own rule, asked again now that the press is here:
+                // the same function, both players read under one registry
+                // guard. The card can be behind what is known. The poll that
+                // finds a player gone publishes through the event loop, where
+                // a click can already be waiting ahead of it, so whether
+                // anything is sent at all, and whether it is `/RemoveSlave` or
+                // `/AddSlave`, is decided here rather than taken from the
+                // button.
+                let judged = {
+                    let registry = backend.registry.lock().unwrap();
+                    let (Some(leader), Some(entry)) =
+                        (registry.get(&master), registry.get(&target))
+                    else {
+                        continue;
+                    };
+                    let mut card = entry.view.clone();
+                    judge_grouping(&mut card, target, entry, Some(master), Some(leader));
+                    if card.groupable {
+                        Ok((leader.client.clone(), card.in_group))
+                    } else if !leader.takes_grouping() {
+                        Err((card.in_group, not_grouping(leader, master)))
+                    } else {
+                        Err((card.in_group, not_grouping(entry, target)))
+                    }
+                };
+                let (client, joined) = match judged {
+                    Ok(judged) => judged,
+                    // Said rather than dropped. A press that does nothing at
+                    // all reads as a button that is broken, and what it would
+                    // have sent was a request to an address that is not
+                    // answering, or one asking a player that is to reach one
+                    // that is not.
+                    Err((joined, why)) => {
+                        let stands = if joined {
+                            "Still grouped"
+                        } else {
+                            "Not grouped"
+                        };
+                        say(&backend.ui, format!("{stands}: {why}"));
+                        continue;
+                    }
                 };
 
                 // Both calls go to the master: it owns the group, and the
                 // slave only learns about it afterwards.
-                let joined = backend
-                    .with_entry(target, |e| {
-                        e.sync.as_ref().and_then(|s| s.master_id()) == Some(master)
-                    })
-                    .unwrap_or(false);
-
                 tokio::spawn(async move {
                     let result = if joined {
                         client.remove_slave(target).await
@@ -15573,7 +16612,7 @@ async fn run_commands(
                         continue;
                     };
 
-                    backend.browsing.lock().unwrap().pane = Pane::Browse;
+                    backend.browsing.lock().unwrap().show(Pane::Browse);
                     backend.publish_pane();
                     let backend = backend.clone();
                     tokio::spawn(async move {
@@ -15603,7 +16642,7 @@ async fn run_commands(
                 // reliably arrives.
                 order::save(&saved);
 
-                backend.browsing.lock().unwrap().pane = Pane::Browse;
+                backend.browsing.lock().unwrap().show(Pane::Browse);
                 backend.publish_pane();
                 // Section ids come from the player, and one carrying this
                 // file's own structure cannot be written down. Saying it was
@@ -15625,22 +16664,18 @@ async fn run_commands(
                 let Some(master) = *backend.selected.lock().unwrap() else {
                     continue;
                 };
-                let Some(client) = backend.with_entry(master, |e| e.client.clone()) else {
+                // Who is asked, read under one guard with the player doing the
+                // asking; see `grouping_all` for who that is.
+                let Some(read) = grouping_all(&backend.registry.lock().unwrap(), master) else {
                     continue;
                 };
-                let others: Vec<DeviceId> = backend
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .copied()
-                    .filter(|id| *id != master)
-                    .collect();
-
-                if others.is_empty() {
-                    say(&backend.ui, "No other players to group");
-                    continue;
-                }
+                let (client, others) = match read {
+                    Ok(read) => read,
+                    Err(refused) => {
+                        say(&backend.ui, refused);
+                        continue;
+                    }
+                };
 
                 tokio::spawn(async move {
                     // One at a time: the master rebuilds the group on each
@@ -18609,6 +19644,75 @@ mod tests {
         assert_eq!(badged_cards(&[card("Following Kitchen", false, false)]), 1);
     }
 
+    /// Group is offered only where both players answer; Ungroup wherever the
+    /// selected player answers and the card is in its group, answering or
+    /// not; and neither against a player installing an update, or while the
+    /// selected player cannot take the request.
+    ///
+    /// A card reading "not responding" used to offer "Group with the selected
+    /// player", and every card offered it against a selected player that had
+    /// stopped answering: presses that could only time out.
+    #[test]
+    fn grouping_is_offered_only_where_the_request_can_work() {
+        let selected = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 1), 11000);
+        let other = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 2), 11000);
+        let card = |reachable: bool, in_group: bool, upgrading: bool| Device {
+            reachable,
+            in_group,
+            upgrading,
+            ..Default::default()
+        };
+        let offered = |row: Device, master_answers: bool| {
+            offers_grouping(Some(selected), other, &row, master_answers)
+        };
+
+        // Both answering: Group, or Ungroup for a member.
+        assert!(offered(card(true, false, false), true));
+        assert!(offered(card(true, true, false), true));
+
+        // Nothing selected, or the selected player's own card.
+        assert!(!offers_grouping(
+            None,
+            other,
+            &card(true, false, false),
+            true
+        ));
+        assert!(!offers_grouping(
+            Some(other),
+            other,
+            &card(true, false, false),
+            true
+        ));
+
+        // A card that is not answering cannot be asked to join...
+        assert!(!offered(card(false, false, false), true));
+        // ...but a member of the group that has stopped answering can still
+        // be taken out of it, by the selected player, which is the one asked.
+        assert!(offered(card(false, true, false), true));
+
+        // A selected player that cannot take the request offers nothing on
+        // anybody's card, Group or Ungroup.
+        assert!(!offered(card(true, false, false), false));
+        assert!(!offered(card(true, true, false), false));
+        assert!(!offered(card(false, true, false), false));
+
+        // A player installing an update is offered neither, member or not.
+        assert!(!offered(card(false, false, true), true));
+        assert!(!offered(card(false, true, true), true));
+        assert!(!offered(card(true, true, true), true));
+
+        // And the card that is offered nothing goes without its badge row
+        // where nothing else puts one there: the shorter of the two cards,
+        // and one fewer counted towards the picker's height.
+        let mut dead = card(false, false, false);
+        dead.groupable = offered(dead.clone(), true);
+        dead.badged = badged(&dead);
+        let mut live = card(true, false, false);
+        live.groupable = offered(live.clone(), true);
+        live.badged = badged(&live);
+        assert_eq!(badged_cards(&[dead, live]), 1);
+    }
+
     /// Every page that sends to one player is that player's, including the
     /// three `Pane::owner` leaves out: forgetting the player has to take them
     /// down with it, or they stay up sending to an address nobody tracks.
@@ -20489,6 +21593,7 @@ mod selection_tests {
             sent_items: Arc::default(),
             sent_index: Arc::new(AtomicU64::new(0)),
             sent_era: Arc::new(AtomicU64::new(0)),
+            sent_sidebar: Arc::new(AtomicU64::new(0)),
             thumbnails: Arc::new(AtomicU64::new(0)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orders: Arc::new(Mutex::new(order::Orders::new())),
@@ -20499,6 +21604,11 @@ mod selection_tests {
 
     /// Put a player in the registry the way `track` would, without the
     /// long-poll and the remembered-players file that come with it.
+    ///
+    /// Drawn answering, as `track` draws a row until its first poll fails.
+    /// A fake is a player that answers, and a row drawn silent is one that
+    /// `BrowseHome` stands in for at once; see [`Backend::stand_in`]. A test
+    /// about a silent row says so with `update` or [`add_row`].
     pub(super) fn add(backend: &Backend, player: &Player, http: &reqwest::Client) {
         backend.registry.lock().unwrap().insert(
             player.id(),
@@ -20509,7 +21619,10 @@ mod selection_tests {
                 poll: Arc::default(),
                 writes: Arc::default(),
                 upgrading: None,
-                view: Device::default(),
+                view: Device {
+                    reachable: true,
+                    ..Default::default()
+                },
                 status: None,
                 status_at: None,
                 queue: None,
@@ -20986,40 +22099,106 @@ mod selection_tests {
         );
     }
 
+    /// The player chosen answers, and not with what it offers: the last
+    /// player's screens and sidebar stay up only until that answer, and then
+    /// go, and the pane says why.
+    ///
+    /// They used to stay for as long as the player was chosen — the first
+    /// player's Home and sidebar under a pill naming the second, every press
+    /// on them refused, and nothing on screen saying why.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_player_that_cannot_say_what_it_offers_leaves_the_last_one_showing() {
+    async fn a_player_that_cannot_say_what_it_offers_takes_the_last_ones_screens_down() {
         let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+
+        // Slowly, from a row drawn answering, which is believed until the
+        // answer comes: the first player's screens are up meanwhile.
         second.forget("/ui/Configuration");
-
-        let _ = backend.commands.send(Command::Select(first.id()));
-        until("the first player's Home", || {
-            device(&backend) == Some(first.id())
-        })
-        .await;
-
+        second.delay("/ui/Configuration", SLOW);
         let _ = backend.commands.send(Command::Select(second.id()));
         until("the second player to be asked", || {
             second.asked_for("/ui/Configuration")
         })
         .await;
-        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            showing(&backend),
+            Some(first.id()),
+            "nothing is taken down before the answer"
+        );
+        assert_eq!(standing_in(&backend), None);
 
-        {
-            let browsing = backend.browsing.lock().unwrap();
-            assert_eq!(browsing.screens.len(), 3, "the sidebar is not emptied");
-            assert_eq!(browsing.queue_uri.as_deref(), Some("/ui/playQueue"));
-            assert_eq!(browsing.search_uri.as_deref(), Some("/ui/Search"));
-            assert_eq!(browsing.device, Some(first.id()));
-        }
+        // A 404 is an answer, so not "not responding".
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Refused))
+        })
+        .await;
+        assert_stood_in_bare(&backend, second.id());
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Refused);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
 
-        // And it is asked again the next time it is chosen.
+        // It is asked again the next time it is chosen, and its screens come.
         second.serve("/ui/Configuration", fixtures::configuration());
+        second.delay("/ui/Configuration", Duration::ZERO);
         let _ = backend.commands.send(Command::Select(first.id()));
         let _ = backend.commands.send(Command::Select(second.id()));
         until("the second player's Home", || {
-            device(&backend) == Some(second.id())
+            showing(&backend) == Some(second.id())
         })
         .await;
+        assert_eq!(standing_in(&backend), None);
+    }
+
+    /// Whose screens are up, if any are.
+    fn showing(backend: &Backend) -> Option<DeviceId> {
+        let browsing = backend.browsing.lock().unwrap();
+        browsing.device.filter(|_| !browsing.trail.is_empty())
+    }
+
+    fn standing_in(backend: &Backend) -> Option<(DeviceId, Unshown)> {
+        backend.browsing.lock().unwrap().standing_in
+    }
+
+    /// What the browse pane was last sent, as its fingerprint.
+    fn sent_browse(backend: &Backend) -> u64 {
+        backend.sent_browse.load(Ordering::Relaxed)
+    }
+
+    /// The pane with no screen, and `notice` in its place.
+    fn bare_pane(notice: Option<(String, String, Option<Glyph>)>) -> u64 {
+        browse_fingerprint(&[], &[], &[], notice.as_ref(), None, "Browse", false, None)
+    }
+
+    /// The pane standing in for `id`, as its row reads now.
+    fn stood_in_pane(backend: &Backend, id: DeviceId, why: Unshown) -> u64 {
+        let (name, upgrading) = backend
+            .with_entry(id, |e| {
+                (
+                    e.view.name.to_string(),
+                    e.upgrading.is_some() || e.view.upgrading,
+                )
+            })
+            .expect("a row");
+        bare_pane(Some(standing_in_notice(&name, id, upgrading, why)))
+    }
+
+    /// Nothing of anybody's is left in the pane but `id`'s name: no trail,
+    /// and no sidebar or addresses read from another player.
+    fn assert_stood_in_bare(backend: &Backend, id: DeviceId) {
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(browsing.device, Some(id), "the pane is the player's");
+        assert!(
+            browsing.trail.is_empty(),
+            "the last player's screens are down"
+        );
+        assert!(browsing.derived.is_empty(), "and their letters");
+        assert_eq!(browsing.configured, None);
+        assert!(browsing.screens.is_empty(), "and its sidebar");
+        assert!(browsing.sources.is_none());
+        assert_eq!(browsing.queue_uri, None, "and its addresses");
+        assert_eq!(browsing.search_uri, None);
+        assert_eq!(browsing.queue_menu_uri, None);
+        assert_eq!(browsing.now_playing_menu, None);
+        assert_eq!(browsing.lit(), None, "and nothing is lit");
     }
 
     /// Choose a player and wait for its Home to be the screen showing.
@@ -21036,13 +22215,18 @@ mod selection_tests {
     /// A Home arriving takes the pane back to browsing, so this is how a pane
     /// read from one player stays up with another selected: the state every
     /// test below is about. A player that cannot say what screens it has
-    /// leaves the window exactly like this for as long as it is chosen, and
-    /// any player leaves it like this until its Home lands.
+    /// leaves the window like this for as long as it is chosen, and any player
+    /// leaves it like this until its Home lands. What it no longer leaves up
+    /// is the last player's browse screens and sidebar, which its stand-in
+    /// takes down (see [`Backend::stand_in`]); pages a player owns, and the
+    /// queue's buttons, are not the pane's to take and stay where they were.
     async fn choose_without_home(backend: &Backend, player: &Player) {
         player.forget("/ui/Configuration");
         let _ = backend.commands.send(Command::Select(player.id()));
-        until("the player to be selected and asked", || {
-            backend.is_selected(player.id()) && player.asked_for("/ui/Configuration")
+        until("the player to be selected, asked, and stood in for", || {
+            backend.is_selected(player.id())
+                && player.asked_for("/ui/Configuration")
+                && standing_in(backend).is_some_and(|(at, _)| at == player.id())
         })
         .await;
         tokio::time::sleep(SETTLED).await;
@@ -22845,8 +24029,7 @@ mod selection_tests {
         .await;
         // Its sidebar is up and its Home is not. The first player's Favourites
         // is second in its list and Search is second in this one, so an index
-        // carried across would light Search. The same holds for good when
-        // that Home never comes.
+        // carried across would light Search.
         {
             let browsing = backend.browsing.lock().unwrap();
             assert_eq!(browsing.screens.len(), 2);
@@ -22893,11 +24076,23 @@ mod selection_tests {
         );
     }
 
+    /// A row of the last player's screen, pressed while the player chosen
+    /// since is still being asked what it offers.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_row_of_the_last_players_screen_does_not_play_on_it() {
         let (backend, first, second) = two_players().await;
         choose(&backend, &first).await;
-        choose_without_home(&backend, &second).await;
+        // Slower than the wait below, so the first player's Home is still the
+        // screen showing when the row is pressed. A configuration that does
+        // not come at all takes that screen down; see
+        // `a_player_that_cannot_say_what_it_offers_takes_the_last_ones_screens_down`.
+        second.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player to be asked", || {
+            second.asked_for("/ui/Configuration")
+        })
+        .await;
+        assert_eq!(showing(&backend), Some(first.id()));
 
         // "A Song", the first row of the first player's Home, still showing.
         let _ = backend.commands.send(Command::BrowseActivate(0));
@@ -23083,7 +24278,7 @@ mod selection_tests {
     }
 
     /// The search key, with a player chosen that has not said what it offers,
-    /// while the last player's Home is still showing.
+    /// where the last player's Home was showing until its stand-in.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_search_key_lights_nothing_for_a_player_that_is_not_configured() {
         let (backend, first, second) = two_players().await;
@@ -23100,10 +24295,12 @@ mod selection_tests {
         })
         .await;
         tokio::time::sleep(SETTLED).await;
+        // Nothing at all: the last player's Home and sidebar went with the
+        // stand-in, and nothing of this player's has come to light.
         assert_eq!(
             lit(&backend),
-            Some((0, 0)),
-            "the last player's Search is not lit over its Home"
+            None,
+            "the last player's Search is not lit, nor anything else"
         );
         assert!(!first.asked_for("/ui/Search"));
         assert!(!second.asked_for("/ui/Search"));
@@ -23164,8 +24361,10 @@ mod selection_tests {
         assert_eq!(lit(&backend), Some((0, 0)));
     }
 
-    /// As above, with a Home that never comes: the last player's screens stay
-    /// up for as long as this one is chosen, and choosing it back keeps them.
+    /// As above, with a Home that never comes: the last player's screens go
+    /// once it has failed (see [`Backend::stand_in`]), the search key still
+    /// searches the player it was asked of, and choosing the last player back
+    /// reads its Home again with Home lit.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_search_key_lights_no_search_over_the_last_players_home() {
         let (backend, first, second) = two_players().await;
@@ -23197,7 +24396,11 @@ mod selection_tests {
         })
         .await;
         tokio::time::sleep(SETTLED).await;
-        assert_eq!(device(&backend), Some(first.id()), "its trail is kept");
+        assert_eq!(
+            showing(&backend),
+            Some(first.id()),
+            "its Home is read again"
+        );
         assert_eq!(
             lit(&backend),
             Some((0, 0)),
@@ -23408,7 +24611,13 @@ mod selection_tests {
     }
 
     /// The addresses held are the last configured player's until this one's
-    /// configuration lands, which here it never does.
+    /// configuration lands, and the presses here are made while it is still
+    /// on its way.
+    ///
+    /// Not after it has failed: a failure stands in for the player and takes
+    /// the last one's addresses down with everything else of its, so a press
+    /// made then finds nothing to misuse and says nothing about the guard on
+    /// each address. See [`Backend::stand_in`].
     #[tokio::test(flavor = "multi_thread")]
     async fn menus_on_a_player_not_yet_configured_are_not_asked_for_at_anothers_address() {
         let (backend, first, second) = two_players().await;
@@ -23419,7 +24628,17 @@ mod selection_tests {
                 .replace("/ui/nowPlayingCM", "/ui/firstNowCM"),
         );
         choose(&backend, &first).await;
-        choose_without_home(&backend, &second).await;
+        second.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the second player to be asked what it offers", || {
+            asked(&second, "/ui/Configuration") == 1
+        })
+        .await;
+        assert_eq!(
+            configured(&backend),
+            Some(first.id()),
+            "the first player's addresses are the ones held"
+        );
 
         let _ = backend.commands.send(Command::QueueMenu(0));
         let _ = backend.commands.send(Command::NowPlayingInfo);
@@ -23740,6 +24959,12 @@ mod selection_tests {
         assert!(!upgrade_started(&first));
 
         // With the player it checked selected again, it does run, there.
+        //
+        // Pressed while that player's Home is on its way. Its trail went with
+        // the other player's stand-in, so choosing it reads Home again, and a
+        // Home landing takes the pane back to browsing, as any Home does; the
+        // page is up until then.
+        first.delay("/ui/Home", Duration::from_secs(5));
         let _ = backend.commands.send(Command::Select(first.id()));
         until("the first player to be selected", || {
             backend.is_selected(first.id())
@@ -24039,9 +25264,11 @@ mod selection_tests {
         })
         .await;
         // Another chosen before either lands, so both are dropped, and then
-        // this one again. It is still the player configured.
+        // this one again. Its configuration was taken down by the other's
+        // stand-in, so it is asked for again, and the press made under the
+        // first ask is from before the second.
         choose_without_home(&backend, &second).await;
-        assert_eq!(configured(&backend), Some(first.id()));
+        assert_eq!(configured(&backend), None);
         first.delay("/ui/Home", Duration::ZERO);
         choose(&backend, &first).await;
         tokio::time::sleep(SETTLED).await;
@@ -25205,6 +26432,9 @@ mod selection_tests {
         let player = Player::start().await;
         let (backend, _rx) = backend(&http);
         add(&backend, &player, &http);
+        // Seen failing, which is what puts the loop in a wait at all, and the
+        // only kind of row an announcement cuts a wait short for.
+        backend.update(player.id(), |view| view.reachable = false);
         let poll = backend.with_entry(player.id(), |e| e.poll.clone()).unwrap();
 
         // The wait the loop is in after half a minute of nothing.
@@ -26755,6 +27985,2019 @@ mod selection_tests {
             !backend.chosen.load(Ordering::SeqCst),
             "the press on a row that had gone was nobody's choice of anything"
         );
+    }
+
+    /// `body` as `player`'s `/SyncStatus`, read back through the client's own
+    /// parser. The player goes on answering it.
+    async fn sync_reading(player: &Player, http: &reqwest::Client, body: String) -> SyncStatus {
+        player.serve("/SyncStatus", body);
+        Client::with_http(player.id(), http.clone())
+            .sync_status()
+            .await
+            .expect("the player answers")
+    }
+
+    /// The `/SyncStatus` of the player at `id`, leading `members`.
+    fn leading(id: DeviceId, members: &[DeviceId]) -> String {
+        let members: String = members
+            .iter()
+            .map(|member| format!(r#"<slave id="{}" port="{}"/>"#, member.host, member.port))
+            .collect();
+        format!(
+            r#"<SyncStatus etag="g1" id="{id}" name="Kitchen" model="T100">{members}</SyncStatus>"#
+        )
+    }
+
+    /// The `/SyncStatus` of the player at `id`, following the one at `leader`.
+    fn following(id: DeviceId, leader: DeviceId) -> String {
+        format!(
+            r#"<SyncStatus etag="f1" id="{id}" name="Den" model="T100"><master port="{}">{}</master></SyncStatus>"#,
+            leader.port, leader.host
+        )
+    }
+
+    /// The card for `id` as the window would be handed it now.
+    fn drawn(backend: &Backend, id: DeviceId) -> Device {
+        let selected = *backend.selected.lock().unwrap();
+        backend
+            .player_rows(selected)
+            .0
+            .into_iter()
+            .find(|row| row.id == id.to_string())
+            .expect("a card for every row")
+    }
+
+    /// Whether `player` was asked `path` about the player at `id`.
+    fn asked_about(player: &Player, path: &str, id: DeviceId) -> bool {
+        player.asked_for(&format!("{path}?slave={}&port={}", id.host, id.port))
+    }
+
+    fn installing() -> Upgrading {
+        Upgrading {
+            name: "Den".to_owned(),
+            stage: "Installing".to_owned(),
+            percent: 0.0,
+        }
+    }
+
+    /// The cards offer grouping only where the request can work, judged as
+    /// `publish` judges them.
+    ///
+    /// A card reading "not responding" offered "Group with the selected
+    /// player", and every card offered it while the selected player was the
+    /// one not answering. Ungroup stays on a member that has stopped
+    /// answering, since the selected player is the one asked to let it go —
+    /// but only while that player still lists it, whatever the member last
+    /// said about itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_offers_grouping_only_where_the_request_can_work() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let master = Player::start().await;
+        let live = Player::start().await;
+        let (backend, _commands) = backend(&http);
+
+        // Four rows that answer nothing: a member of the selected player's
+        // group; a player that was never in it; one whose own last word was
+        // that it follows the selected player, which no longer lists it; and
+        // a member installing an update.
+        let at = |last| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, last), master.id().port);
+        let (member, stranger, stale, upgrading) = (at(2), at(3), at(4), at(5));
+        add_row(&backend, master.id(), &http, true);
+        add_row(&backend, live.id(), &http, true);
+        for id in [member, stranger, stale, upgrading] {
+            add_row(&backend, id, &http, false);
+        }
+        let follower = sync_reading(&master, &http, following(stale, master.id())).await;
+        let leader = sync_reading(&master, &http, leading(master.id(), &[member, upgrading])).await;
+        {
+            let mut registry = backend.registry.lock().unwrap();
+            registry.get_mut(&master.id()).unwrap().sync = Some(leader);
+            registry.get_mut(&stale).unwrap().sync = Some(follower);
+            let entry = registry.get_mut(&upgrading).unwrap();
+            entry.upgrading = Some(installing());
+            entry.view.upgrading = true;
+        }
+        *backend.selected.lock().unwrap() = Some(master.id());
+
+        let card = drawn(&backend, live.id());
+        assert!(
+            card.groupable && !card.in_group,
+            "a player that answers is offered Group"
+        );
+        let card = drawn(&backend, member);
+        assert!(
+            card.groupable && card.in_group,
+            "a member that has stopped answering is offered Ungroup"
+        );
+        let card = drawn(&backend, stranger);
+        assert!(
+            !card.groupable,
+            "a player that is not answering is not offered Group"
+        );
+        assert!(
+            !card.badged,
+            "and with nothing else to show, its card is the shorter one"
+        );
+        let card = drawn(&backend, stale);
+        assert!(
+            !card.in_group && !card.groupable,
+            "a player not answering is in the group only while the selected player lists it"
+        );
+        assert!(
+            !drawn(&backend, upgrading).groupable,
+            "a member installing an update is offered nothing"
+        );
+        assert!(
+            !drawn(&backend, master.id()).groupable,
+            "and the selected player nothing against itself"
+        );
+
+        // The selected player stops answering, and then answers but is
+        // installing an update — set here with the row still drawn as
+        // answering, so it is the update that is being asked about. Every
+        // request would go to it, so nobody's card offers anything.
+        for answering_but_installing in [false, true] {
+            {
+                let mut registry = backend.registry.lock().unwrap();
+                let entry = registry.get_mut(&master.id()).unwrap();
+                entry.view.reachable = answering_but_installing;
+                entry.upgrading = answering_but_installing.then(installing);
+            }
+            for id in [live.id(), member] {
+                assert!(
+                    !drawn(&backend, id).groupable,
+                    "{id} is offered nothing while the selected player cannot be asked \
+                     (answering but installing: {answering_but_installing})"
+                );
+            }
+        }
+        {
+            let mut registry = backend.registry.lock().unwrap();
+            let entry = registry.get_mut(&master.id()).unwrap();
+            entry.view.reachable = true;
+            entry.upgrading = None;
+        }
+        assert!(drawn(&backend, member).groupable, "and back once it can");
+
+        // The selected player lets the member go. Its own word still says
+        // otherwise, and it is not answering to say anything new: the
+        // selected player's list is what has moved, and the card follows it.
+        let leader = sync_reading(&master, &http, leading(master.id(), &[upgrading])).await;
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&master.id())
+            .unwrap()
+            .sync = Some(leader);
+        let card = drawn(&backend, member);
+        assert!(
+            !card.in_group && !card.groupable,
+            "Ungroup goes once the selected player has let the member go"
+        );
+    }
+
+    /// A press on Group asks the selected player to take in only a player that
+    /// answers.
+    ///
+    /// The press is judged again when it is handled, because the card can be
+    /// behind: a card drawn before its player was seen failing still offers
+    /// Group, and the handler used to send `/AddSlave` for whatever it was
+    /// given. What it says instead goes to the toast, which has no window to
+    /// reach here; that nothing is sent is what can be seen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_press_on_group_asks_nothing_about_a_player_that_cannot_answer() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let master = Player::start().await;
+        let live = Player::start().await;
+        let (backend, rx) = backend(&http);
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, master.id(), &http, true);
+        add_row(&backend, live.id(), &http, true);
+        add_row(&backend, dead, &http, false);
+        *backend.selected.lock().unwrap() = Some(master.id());
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+
+        let _ = backend.commands.send(Command::ToggleGroup(dead));
+        let _ = backend.commands.send(Command::ToggleGroup(live.id()));
+
+        // The second press reaching the selected player says the first was
+        // handled; the wait after it is for a request of the first's that
+        // was spawned and is still on its way.
+        until("the player that answers to be asked to join", || {
+            asked_about(&master, "/AddSlave", live.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !master.asked_for(&format!("slave={}", dead.host)),
+            "nothing about the player that is not answering: {:?}",
+            master.asked()
+        );
+    }
+
+    /// Nothing is sent while the selected player is not answering: every
+    /// grouping request goes to it, and each would only sit out a timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selected_player_that_is_not_answering_is_asked_nothing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        // Answering on the loopback, but drawn as not answering, so whatever
+        // the app would have sent it is seen.
+        let master = Player::start().await;
+        let live = Player::start().await;
+        let (backend, rx) = backend(&http);
+        add_row(&backend, master.id(), &http, false);
+        add_row(&backend, live.id(), &http, true);
+        *backend.selected.lock().unwrap() = Some(master.id());
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+
+        let _ = backend.commands.send(Command::ToggleGroup(live.id()));
+        let _ = backend.commands.send(Command::GroupAll);
+        // Handled in order, so once this has landed the two before it have
+        // been dealt with.
+        let _ = backend.commands.send(Command::Select(live.id()));
+        until("the press after them to be handled", || {
+            *backend.selected.lock().unwrap() == Some(live.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+
+        assert!(
+            !master.asked_for("Slave"),
+            "nothing was sent to the player that is not answering: {:?}",
+            master.asked()
+        );
+    }
+
+    /// Ungroup on a member that has stopped answering asks the selected player
+    /// to let it go, and only while the selected player still lists it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_that_has_stopped_answering_can_still_be_ungrouped() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let master = Player::start().await;
+        let (backend, rx) = backend(&http);
+        let at = |last| DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, last), master.id().port);
+        let (member, stranger) = (at(2), at(3));
+        add_row(&backend, master.id(), &http, true);
+        add_row(&backend, member, &http, false);
+        add_row(&backend, stranger, &http, false);
+        let leader = sync_reading(&master, &http, leading(master.id(), &[member])).await;
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&master.id())
+            .unwrap()
+            .sync = Some(leader);
+        *backend.selected.lock().unwrap() = Some(master.id());
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+
+        let _ = backend.commands.send(Command::ToggleGroup(stranger));
+        let _ = backend.commands.send(Command::ToggleGroup(member));
+
+        until(
+            "the selected player to be asked to let the member go",
+            || asked_about(&master, "/RemoveSlave", member),
+        )
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !master.asked_for(&format!("slave={}", stranger.host)),
+            "nothing about a player it does not list and that cannot be reached to join: {:?}",
+            master.asked()
+        );
+        assert!(
+            !master.asked_for("/AddSlave"),
+            "and the member is not asked back in: {:?}",
+            master.asked()
+        );
+    }
+
+    /// GROUP ALL asks the selected player to take in the players that answer
+    /// and are not installing an update, and nobody else.
+    ///
+    /// The requests go one at a time, so one for a player that cannot be
+    /// reached held up everyone after it while the selected player tried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_all_leaves_out_players_that_cannot_join() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let master = Player::start().await;
+        let live = Player::start().await;
+        let busy = Player::start().await;
+        let (backend, rx) = backend(&http);
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), live.id().port);
+        add_row(&backend, master.id(), &http, true);
+        add_row(&backend, live.id(), &http, true);
+        add_row(&backend, dead, &http, false);
+        // Drawn as answering with its install already marked, which is the
+        // moment between the two that `show_upgrade` passes through — so it
+        // is the update this is left out for.
+        add_row(&backend, busy.id(), &http, true);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&busy.id())
+            .unwrap()
+            .upgrading = Some(installing());
+        *backend.selected.lock().unwrap() = Some(master.id());
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+
+        let _ = backend.commands.send(Command::GroupAll);
+        until("the player that answers to be asked to join", || {
+            asked_about(&master, "/AddSlave", live.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !asked_about(&master, "/AddSlave", dead),
+            "not the player that is not answering: {:?}",
+            master.asked()
+        );
+        assert!(
+            !asked_about(&master, "/AddSlave", busy.id()),
+            "nor the one installing an update: {:?}",
+            master.asked()
+        );
+
+        // And with nobody left who can join, nothing is asked at all.
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&live.id())
+            .unwrap()
+            .view
+            .reachable = false;
+        let _ = backend.commands.send(Command::GroupAll);
+        let _ = backend.commands.send(Command::Select(live.id()));
+        until("the press after it to be handled", || {
+            *backend.selected.lock().unwrap() == Some(live.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            asked(&master, "/AddSlave"),
+            1,
+            "only the one request, from the first press: {:?}",
+            master.asked()
+        );
+    }
+
+    /// Choosing a player publishes the cards again, judged against it.
+    ///
+    /// Whether a card offers grouping depends on which player is selected, and
+    /// a press on a card used to draw only the highlight: the cards went on
+    /// offering Group against the player chosen before until the next status
+    /// from anybody.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn choosing_a_player_judges_the_cards_against_it() {
+        let (backend, first, second) = two_players().await;
+        // Drawn as the window draws a player that answers, and with its own
+        // address, which is what the cards are told apart by.
+        for id in [first.id(), second.id()] {
+            let mut registry = backend.registry.lock().unwrap();
+            let view = &mut registry.get_mut(&id).unwrap().view;
+            view.id = id.to_string().into();
+            view.reachable = true;
+        }
+        select_unchosen(&backend, first.id());
+        backend.publish();
+        let against_first = backend.sent_players.load(Ordering::Relaxed);
+        assert_ne!(against_first, 0);
+        assert!(drawn(&backend, second.id()).groupable);
+
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until(
+            "the cards to be published against the player chosen",
+            || backend.sent_players.load(Ordering::Relaxed) != against_first,
+        )
+        .await;
+        assert!(drawn(&backend, first.id()).groupable);
+        assert!(!drawn(&backend, second.id()).groupable);
+    }
+
+    /// The quirk as it was found, up to the stand-in: a player whose Home has
+    /// loaded, and then a player whose row already says it is not responding
+    /// chosen after it.
+    async fn stood_in_for_a_dead_player() -> (Backend, Player, DeviceId) {
+        let http = timed_client();
+        let first = Player::start().await;
+        let (backend, rx) = backend(&http);
+        add(&backend, &first, &http);
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), first.id().port);
+        add_row(&backend, dead, &http, false);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+        choose(&backend, &first).await;
+        assert_eq!(showing(&backend), Some(first.id()));
+
+        let _ = backend.commands.send(Command::Select(dead));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((dead, Unshown::Silent))
+        })
+        .await;
+        (backend, first, dead)
+    }
+
+    /// A player that does not answer, chosen after one whose Home had loaded,
+    /// left that Home and sidebar up under its own name, with the queue beside
+    /// them saying to pick a player that was responding. They go, the pane
+    /// says the player is not responding, and nothing pressed there reaches
+    /// the player whose screens they were.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_that_does_not_answer_takes_the_last_players_screens_down() {
+        let (backend, first, dead) = stood_in_for_a_dead_player().await;
+        assert_stood_in_bare(&backend, dead);
+        let pane = stood_in_pane(&backend, dead, Unshown::Silent);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        // Every way the pane has of reaching a player: a row, its menu, the
+        // header's buttons, a section's, paging, a letter, the ends of a list,
+        // the search key and typing, a screen and an input off the sidebar.
+        // Whatever choosing the first player started has finished first, so
+        // anything it is asked from here is a press reaching it.
+        tokio::time::sleep(SETTLED).await;
+        let before = first.asked().len();
+        for press in [
+            Command::BrowseActivate(0),
+            Command::BrowseMenu(0),
+            Command::BrowseHeader(0),
+            Command::BrowseSection(0),
+            Command::BrowseMore,
+            Command::BrowseJump("A".to_owned()),
+            Command::BrowseEnds(true),
+            Command::OpenSearch,
+            Command::Sidebar(0, 1),
+            Command::Sidebar(1, 0),
+            Command::BrowseSearch("x".to_owned()),
+        ] {
+            let _ = backend.commands.send(press);
+        }
+        tokio::time::sleep(SEARCH_SETTLE + SETTLED).await;
+        assert_eq!(
+            first.asked()[before..],
+            [] as [String; 0],
+            "nothing of any kind is asked of the player whose screens they were"
+        );
+    }
+
+    /// Choosing the last player back, after one that did not answer took its
+    /// screens down, reads its configuration and its Home afresh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn choosing_the_last_player_back_after_one_that_does_not_answer_reads_its_home_again() {
+        let (backend, first, _dead) = stood_in_for_a_dead_player().await;
+        let configurations = asked(&first, "/ui/Configuration");
+        let homes = asked(&first, "/ui/Home");
+
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until("the first player's Home", || {
+            showing(&backend) == Some(first.id()) && configured(&backend) == Some(first.id())
+        })
+        .await;
+        assert_eq!(asked(&first, "/ui/Configuration"), configurations + 1);
+        assert_eq!(asked(&first, "/ui/Home"), homes + 1);
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(browsing.screens.len(), 3, "its own sidebar is back");
+        assert_eq!(browsing.standing_in, None);
+    }
+
+    /// A player chosen while it was not answering loads its Home by itself
+    /// once it answers again, and its queue with it.
+    ///
+    /// Choosing it was the only thing that ever asked for its screens, so the
+    /// pane went on saying it was not responding beside a card that said it
+    /// was, until somebody pressed the card again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chosen_player_that_answers_again_loads_its_home_by_itself() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        // Silent everywhere the app looks. A 404 is not a status document, so
+        // the poll takes it for no answer at all.
+        for path in ["/SyncStatus", "/Status", "/ui/Configuration", "/Playlist"] {
+            second.forget(path);
+        }
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend).is_some_and(|(at, _)| at == second.id())
+        })
+        .await;
+
+        // Its poll, as `track_as` starts one.
+        tokio::spawn(follow(
+            backend.clone(),
+            second.id(),
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until("its row to be seen failing", || {
+            backend.with_entry(second.id(), |e| !e.view.reachable) == Some(true)
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        let (configurations, queues) = (
+            asked(&second, "/ui/Configuration"),
+            asked(&second, "/Playlist"),
+        );
+
+        // Back, and nothing pressed: the poll's next try, a backoff of a
+        // second away, is what finds it.
+        second.serve("/Status", fixtures::status_stopped());
+        second.serve("/ui/Configuration", fixtures::configuration());
+        second.serve("/Playlist", fixtures::queue());
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        assert!(asked(&second, "/ui/Configuration") > configurations);
+        assert_eq!(standing_in(&backend), None);
+        until("its queue", || asked(&second, "/Playlist") > queues).await;
+    }
+
+    /// What the pane says in place of a screen while it stands in, and that
+    /// it says it only for the player selected and only with no screen up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pane_says_why_it_stands_in_and_only_for_the_player_selected() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _commands) = backend(&http);
+        let kitchen = DeviceId::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 11000);
+        let nameless = DeviceId::new(std::net::Ipv4Addr::new(192, 0, 2, 2), 11000);
+
+        // The words.
+        let said = |name: &str, id, upgrading, why| standing_in_notice(name, id, upgrading, why);
+        let (headline, detail, glyph) = said("Kitchen", kitchen, false, Unshown::Silent);
+        assert_eq!(headline, "Kitchen is not responding");
+        assert!(detail.contains("as soon as it answers") && detail.contains("another player"));
+        assert_eq!(
+            glyph,
+            Some(Glyph::Speaker),
+            "drawn with the player's own glyph"
+        );
+        assert_eq!(
+            said("Kitchen", kitchen, false, Unshown::Refused).0,
+            "Could not load Kitchen's screens",
+            "a player that answered is not said to be silent"
+        );
+        let (headline, detail, _) = said("Kitchen", kitchen, false, Unshown::Slow);
+        assert_eq!(
+            headline, "Kitchen did not send its screens in time",
+            "nor one that is answering, slowly"
+        );
+        assert!(
+            detail.contains("Choose it again") && !detail.contains("as soon as it answers"),
+            "and only the silent one is promised its screens by itself: {detail}"
+        );
+        assert_eq!(
+            said("Kitchen", kitchen, true, Unshown::Slow).0,
+            "Kitchen is installing an update"
+        );
+        assert_eq!(
+            said("Kitchen", kitchen, true, Unshown::Silent).0,
+            "Kitchen is installing an update",
+            "and an update is named before either"
+        );
+        assert_eq!(
+            said("Kitchen", kitchen, true, Unshown::Refused).0,
+            "Kitchen is installing an update"
+        );
+        assert_eq!(
+            said(UNNAMED, nameless, false, Unshown::Silent).0,
+            "The player at 192.0.2.2:11000 is not responding",
+            "a row with no name of its own goes by its address, with a capital"
+        );
+
+        // Drawn by the pane only where it is standing in for the player
+        // selected and there is no screen up.
+        add_row(&backend, kitchen, &http, false);
+        add_row(&backend, nameless, &http, true);
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&kitchen)
+            .unwrap()
+            .view
+            .name = "Kitchen".into();
+        select_unchosen(&backend, kitchen);
+        backend.browsing.lock().unwrap().standing_in = Some((kitchen, Unshown::Silent));
+        backend.publish_browse();
+        assert_eq!(
+            sent_browse(&backend),
+            bare_pane(Some(said("Kitchen", kitchen, false, Unshown::Silent))),
+            "the pane says the player selected is not responding"
+        );
+
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&kitchen)
+            .unwrap()
+            .upgrading = Some(installing());
+        backend.publish_browse();
+        assert_eq!(
+            sent_browse(&backend),
+            bare_pane(Some(said("Kitchen", kitchen, true, Unshown::Silent))),
+            "or that it is installing an update"
+        );
+
+        // Another player chosen since: the stand-in names nobody on screen,
+        // and the pane is the plain one it always was while that player's
+        // screens are on their way.
+        select_unchosen(&backend, nameless);
+        backend.publish_browse();
+        assert_eq!(sent_browse(&backend), bare_pane(None));
+
+        // And a screen up is drawn as the screen, whatever the stand-in says.
+        select_unchosen(&backend, kitchen);
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            browsing.device = Some(kitchen);
+            browsing.trail.push(Crumb {
+                uri: "/ui/Home".to_owned(),
+                screen: bluos::screen::parse(fixtures::home()).expect("a screen"),
+                query: None,
+                page: 0,
+            });
+        }
+        backend.publish_browse();
+        assert_ne!(
+            sent_browse(&backend),
+            bare_pane(Some(said("Kitchen", kitchen, true, Unshown::Silent)))
+        );
+        assert_ne!(sent_browse(&backend), bare_pane(None));
+    }
+
+    /// A configuration that fails after a newer ask for the same player has
+    /// been answered leaves that answer alone.
+    ///
+    /// Both asks are made under the one selection, so it is the count of asks
+    /// that tells them apart: the search key asks again for a player that has
+    /// not said what it offers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_configuration_failure_does_not_take_down_a_home_asked_for_since() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.forget("/ui/Configuration");
+        second.delay("/ui/Configuration", SLOW * 2);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the first ask", || second.asked_for("/ui/Configuration")).await;
+        let failing = Instant::now() + SLOW * 2;
+
+        // Answered at once from here on.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        second.delay("/ui/Configuration", Duration::ZERO);
+        let _ = backend.commands.send(Command::OpenSearch);
+        until("the second ask's Home", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+
+        // The first ask fails now, behind it.
+        tokio::time::sleep((failing + SETTLED).saturating_duration_since(Instant::now())).await;
+        assert_eq!(showing(&backend), Some(second.id()), "its Home stays");
+        assert_eq!(configured(&backend), Some(second.id()), "and its sidebar");
+        assert_eq!(
+            standing_in(&backend),
+            None,
+            "and the pane is not standing in for a player that has answered"
+        );
+    }
+
+    /// A player whose row already says it is not responding is stood in for
+    /// the moment it is chosen, rather than after its configuration has had
+    /// five to ten seconds to fail. The configuration is asked for all the
+    /// same, and if it comes the screens come with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_already_not_responding_is_stood_in_for_at_once() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        // Drawn silent, and slower to answer than the wait for the stand-in.
+        backend.update(second.id(), |view| view.reachable = false);
+        second.delay("/ui/Configuration", SLOW * 3);
+        second.delay("/ui/Home", SLOW * 3);
+
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until_within(SLOW, "the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Silent))
+        })
+        .await;
+        assert_stood_in_bare(&backend, second.id());
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Silent);
+        until_within(SLOW, "the pane to say so", || sent_browse(&backend) == pane).await;
+        assert!(
+            second.asked_for("/ui/Configuration"),
+            "and it is asked anyway"
+        );
+
+        // It answers after all. The pane stops saying otherwise the moment it
+        // has, and its Home follows.
+        until("its configuration", || {
+            configured(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(standing_in(&backend), None);
+        until("the pane to stop saying so", || {
+            sent_browse(&backend) == bare_pane(None)
+        })
+        .await;
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+    }
+
+    /// Scrolling, a letter and the ends of the last player's long list ask
+    /// that player for nothing once another is chosen — in the moment before
+    /// the other's Home lands or its stand-in takes the list down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_players_list_is_not_paged_once_another_is_chosen() {
+        let (backend, first, second) = two_players().await;
+        first.handle("/ui/songs", |request| {
+            let at = request
+                .param("listContinuation")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Some(songs_window(at))
+        });
+        choose(&backend, &first).await;
+        open_screen(
+            backend.clone(),
+            first.id(),
+            "/ui/songs".to_owned(),
+            Arrive::Deeper,
+        )
+        .await;
+        assert_eq!(asked(&first, "/ui/songs"), 1);
+
+        // Slow to say what it offers, so the list stays up meanwhile.
+        second.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        let _ = backend.commands.send(Command::BrowseMore);
+        let _ = backend.commands.send(Command::BrowseJump("S".to_owned()));
+        let _ = backend.commands.send(Command::BrowseEnds(true));
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(showing(&backend), Some(first.id()), "the list is still up");
+        assert_eq!(
+            asked(&first, "/ui/songs"),
+            1,
+            "and no more of it is asked for: {:?}",
+            first.asked()
+        );
+    }
+
+    /// The letters beside the last player's long list go with its screens:
+    /// the bar is built from the screen, and with no screen it went on
+    /// offering the last list's letters beside nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_letters_of_the_last_players_list_go_with_its_screens() {
+        let (backend, first, second) = two_players().await;
+        first.handle("/ui/songs", |request| {
+            let at = request
+                .param("listContinuation")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Some(songs_window(at))
+        });
+        choose(&backend, &first).await;
+        open_screen(
+            backend.clone(),
+            first.id(),
+            "/ui/songs".to_owned(),
+            Arrive::Deeper,
+        )
+        .await;
+        let none = index_fingerprint(&[]);
+        assert_ne!(
+            backend.sent_index.load(Ordering::Relaxed),
+            none,
+            "the list has letters"
+        );
+
+        // Drawn silent, and slow enough to answer that the stand-in is there
+        // to be seen.
+        backend.update(second.id(), |view| view.reachable = false);
+        second.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend).is_some_and(|(at, _)| at == second.id())
+        })
+        .await;
+        // Well before its Home could land and clear them on its own account.
+        until_within(SLOW, "the letters to go", || {
+            backend.sent_index.load(Ordering::Relaxed) == none
+        })
+        .await;
+        assert_eq!(showing(&backend), None);
+    }
+
+    /// A player that says what it offers and then cannot show its Home is
+    /// stood in for as well, in the words for a player that answered, with
+    /// its own sidebar kept. A screen of its own pressed there ends it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_fails_after_the_configuration_answered_stands_in_too() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.forget("/ui/Home");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Refused))
+        })
+        .await;
+        {
+            let browsing = backend.browsing.lock().unwrap();
+            assert_eq!(browsing.device, Some(second.id()));
+            assert!(
+                browsing.trail.is_empty(),
+                "the first player's screens are down"
+            );
+            assert_eq!(
+                browsing.configured,
+                Some(second.id()),
+                "and its own sidebar is up"
+            );
+            assert_eq!(browsing.screens.len(), 3);
+        }
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Refused);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        // Home pressed in its own sidebar, and answered this time.
+        second.serve("/ui/Home", fixtures::home());
+        let _ = backend.commands.send(Command::Sidebar(0, 0));
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        assert_eq!(
+            standing_in(&backend),
+            None,
+            "a screen of its own ends the stand-in"
+        );
+    }
+
+    /// Forgetting the player the pane is standing in for ends the stand-in,
+    /// and the pane stops saying it at once.
+    ///
+    /// It used to go on naming the forgotten player, which no longer had a
+    /// row, until the Home of the player the selection went to landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_the_player_stood_in_for_ends_the_stand_in() {
+        let (backend, first, dead) = stood_in_for_a_dead_player().await;
+        let pane = stood_in_pane(&backend, dead, Unshown::Silent);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        // Slow, so that the Home of the player the selection is handed to is
+        // not what ends it.
+        first.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Forget(dead));
+        until_within(SLOW, "the stand-in to end", || {
+            standing_in(&backend).is_none()
+        })
+        .await;
+        until_within(SLOW, "the pane to stop saying so", || {
+            sent_browse(&backend) == bare_pane(None)
+        })
+        .await;
+        assert!(backend.is_selected(first.id()));
+        assert_eq!(showing(&backend), None, "its Home has not landed");
+        assert_ne!(
+            configured(&backend),
+            Some(first.id()),
+            "nor its configuration"
+        );
+    }
+
+    /// Choosing another player takes the pane's word about the last one down
+    /// at once.
+    ///
+    /// The pane is drawn for the selection, and nothing drew it again on a
+    /// choice: it went on saying the last player was not responding under the
+    /// new one's highlight until the new one's configuration came back — up
+    /// to ten seconds from a player slow to answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn choosing_another_player_takes_the_stand_in_notice_down_at_once() {
+        let (backend, first, dead) = stood_in_for_a_dead_player().await;
+        let pane = stood_in_pane(&backend, dead, Unshown::Silent);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        first.delay("/ui/Configuration", SLOW * 3);
+        let _ = backend.commands.send(Command::Select(first.id()));
+        until_within(SLOW, "the plain pane", || {
+            sent_browse(&backend) == bare_pane(None)
+        })
+        .await;
+        assert_ne!(
+            configured(&backend),
+            Some(first.id()),
+            "before anything of the player chosen has come back"
+        );
+        until("its Home", || showing(&backend) == Some(first.id())).await;
+    }
+
+    /// A stand-in draws the browse pane and no other.
+    ///
+    /// It lands from the network, as long as ten seconds after the press, and
+    /// it drew whichever pane was up by then: the rows of a settings page, the
+    /// stations list or a Customize list were rebuilt under whatever was
+    /// being typed or dragged there. A settings page drawn again shows as its
+    /// rows being sent again, which nothing else here does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stand_in_draws_no_pane_but_the_browse_one() {
+        let http = timed_client();
+        let first = Player::start().await;
+        first.serve("/Settings", ONE_SWITCH);
+        let (backend, rx) = backend(&http);
+        add(&backend, &first, &http);
+        let dead = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), first.id().port);
+        add_row(&backend, dead, &http, false);
+        tokio::spawn(run_commands(rx, backend.clone(), None, http));
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        backend.sent_settings.store(0, Ordering::Relaxed);
+
+        // At once, for a row already drawn silent, and again when its
+        // configuration fails.
+        let _ = backend.commands.send(Command::Select(dead));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((dead, Unshown::Silent))
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "the page stays up"
+        );
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            0,
+            "and is not drawn again"
+        );
+    }
+
+    /// A Home brought back by the player answering again leaves the pane the
+    /// user has open where it is, and draws none of it again.
+    ///
+    /// Nobody pressed for it, and it can come minutes after the choice: by
+    /// then another player's settings page may be open, and taking the pane
+    /// closed it and dropped whatever had been typed into it, as a refresh
+    /// once did. The Home is there when the user goes back to browsing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_brought_back_by_itself_leaves_the_pane_the_user_has_open() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        second.forget("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend).is_some_and(|(at, _)| at == second.id())
+        })
+        .await;
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+
+        // Back, and heard answering.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        tokio::time::sleep(SETTLED).await;
+        backend.sent_settings.store(0, Ordering::Relaxed);
+        backend.sent_sidebar.store(0, Ordering::Relaxed);
+        backend.answering_again(second.id());
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(standing_in(&backend), None);
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "the settings page is still up"
+        );
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            0,
+            "and was not drawn again"
+        );
+        assert_eq!(
+            backend.browsing.lock().unwrap().lit(),
+            Some((0, 0)),
+            "its sidebar lights its Home"
+        );
+        // And draws it lit: the sidebar last sent is the sidebar as it now
+        // stands. Its configuration drew it a round trip before Home lit
+        // anything, and a Home that kept the pane once drew nothing after.
+        let drawn = backend.sent_sidebar.load(Ordering::Relaxed);
+        assert_ne!(drawn, 0, "a sidebar was drawn");
+        backend.publish_sidebar();
+        assert_eq!(
+            backend.sent_sidebar.load(Ordering::Relaxed),
+            drawn,
+            "and it was the one with Home lit"
+        );
+
+        let _ = backend.commands.send(Command::BrowseBack);
+        until("the browse pane", || {
+            matches!(backend.browsing.lock().unwrap().pane, Pane::Browse)
+        })
+        .await;
+        assert_eq!(showing(&backend), Some(second.id()), "where its Home is");
+    }
+
+    /// A recovery handled once the choice has moved on, or once the pane has
+    /// stopped standing in, asks nobody for anything: it is a Home of one
+    /// player's, for a pane that was saying that player had not answered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovery_that_finds_nothing_to_recover_asks_nothing() {
+        let (backend, first, second) = two_players().await;
+        select_unchosen(&backend, first.id());
+
+        // The first player's own, with nothing standing in for it: its
+        // screens came by some other way since it was sent.
+        let _ = backend.commands.send(Command::BrowseRecover(first.id()));
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !first.asked_for("/ui/Configuration"),
+            "nothing is asked of the player with nothing to recover: {:?}",
+            first.asked()
+        );
+
+        // The second player's, landing after the first was selected and
+        // stood in for: not taken for a recovery of the first. Only the
+        // selected player is ever asked by a recovery, so that is the one
+        // that could have been.
+        backend.browsing.lock().unwrap().standing_in = Some((first.id(), Unshown::Silent));
+        let _ = backend.commands.send(Command::BrowseRecover(second.id()));
+        tokio::time::sleep(SETTLED).await;
+        assert!(
+            !first.asked_for("/ui/Configuration"),
+            "nothing is asked of the player selected: {:?}",
+            first.asked()
+        );
+    }
+
+    /// A pane calling the selected player not responding while that player's
+    /// poll is answering asks for its screens again at the poll's next
+    /// answer, and not only at a turn from silence that has already passed.
+    ///
+    /// A stand-in written after the turn — the configuration out while the
+    /// poll came back, failing a moment later — waited for a silence and a
+    /// second turn that need not come, under a promise to show the screens
+    /// as soon as the player answered. A refusal is not asked again this way:
+    /// the player answered it, and it waits to be chosen again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_the_pane_calls_silent_is_asked_again_at_its_next_answer() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        // Its poll, answering throughout, at a pace that can be watched.
+        second.delay("/Status", SLOW / 4);
+        tokio::spawn(follow(
+            backend.clone(),
+            second.id(),
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until("its poll to be answering", || asked(&second, "/Status") > 0).await;
+
+        second.forget("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Refused))
+        })
+        .await;
+        let statuses = asked(&second, "/Status");
+        until("a few more statuses", || {
+            asked(&second, "/Status") > statuses + 2
+        })
+        .await;
+        assert_eq!(
+            asked(&second, "/ui/Configuration"),
+            1,
+            "a refusal is not asked again by itself"
+        );
+
+        // Now said to be silent by the newest ask's failure, come back after
+        // the turn — as one that read the row a moment before the poll's
+        // answer redrew it leaves the pane — and its configuration served
+        // again.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        let (_, selection) = backend.selection().expect("a selection");
+        let newest = backend.browsing.lock().unwrap().configurations;
+        backend.stand_in(second.id(), selection, Some(newest), Unshown::Silent);
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        assert_eq!(standing_in(&backend), None);
+    }
+
+    /// A configuration that goes unanswered from a player whose row is drawn
+    /// answering is not called silent: the pane says it was too slow, and
+    /// to choose it again, since nothing about a poll that has never stopped
+    /// answering will say it is ready.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configuration_unanswered_by_a_player_drawn_answering_is_called_slow() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.hang_up("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend).is_some_and(|(at, _)| at == second.id())
+        })
+        .await;
+        assert_eq!(standing_in(&backend), Some((second.id(), Unshown::Slow)));
+        assert_stood_in_bare(&backend, second.id());
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Slow);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+    }
+
+    /// A Home that goes unanswered after the configuration answered is not
+    /// called silent either: the player has just answered. Choosing it again
+    /// asks once more, as the pane says.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_unanswered_after_the_configuration_came_is_not_called_silent() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.hang_up("/ui/Home");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend).is_some_and(|(at, _)| at == second.id())
+        })
+        .await;
+        assert_eq!(standing_in(&backend), Some((second.id(), Unshown::Slow)));
+        assert_eq!(
+            configured(&backend),
+            Some(second.id()),
+            "its configuration came"
+        );
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Slow);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        second.serve("/ui/Home", fixtures::home());
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        assert_eq!(standing_in(&backend), None);
+    }
+
+    /// A player the pane calls silent, heard answering while the ask that
+    /// settles that is still out, is asked once and then waited for: the
+    /// statuses that come in between ask nothing more, and a failure slower
+    /// than they are lands, as slow.
+    ///
+    /// Asked again at every status, each ask superseded the one before it.
+    /// From a busy player — answering its poll, slow to send its screens — no
+    /// failure was ever the newest ask by the time it came back, so the pane
+    /// never stopped calling it silent, and it was sent a configuration
+    /// request a status for as long as it was chosen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_player_heard_answering_is_asked_once_while_its_ask_is_out() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        // Chosen while its row says it is not responding, and giving up on
+        // its configuration only after longer than a status takes to come.
+        let giving_up = SLOW * 5;
+        second.delay("/ui/Configuration", giving_up);
+        second.hang_up("/ui/Configuration");
+        backend.update(second.id(), |view| view.reachable = false);
+        let _ = backend.commands.send(Command::Select(second.id()));
+        tokio::time::sleep(giving_up + SETTLED).await;
+        assert_eq!(standing_in(&backend), Some((second.id(), Unshown::Silent)));
+        assert_eq!(asked(&second, "/ui/Configuration"), 1);
+
+        // Its poll, as `track_as` starts one: answering from here on, about
+        // a status a second.
+        tokio::spawn(follow(
+            backend.clone(),
+            second.id(),
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until_within(
+            giving_up * 3,
+            "the ask made at the turn to fail, as slow",
+            || standing_in(&backend) == Some((second.id(), Unshown::Slow)),
+        )
+        .await;
+        assert_eq!(
+            asked(&second, "/ui/Configuration"),
+            2,
+            "once when chosen, and once when heard answering"
+        );
+        let statuses = asked(&second, "/Status");
+        until("two more statuses", || {
+            asked(&second, "/Status") >= statuses + 2
+        })
+        .await;
+        assert_eq!(
+            asked(&second, "/ui/Configuration"),
+            2,
+            "and nothing at the statuses after"
+        );
+    }
+
+    /// A player chosen while its poll answers, whose configuration goes
+    /// unanswered, so that the pane calls it slow — with its poll running, as
+    /// `track_as` starts one, at a pace that can be watched.
+    async fn stood_in_as_slow_with_its_poll_running() -> (Backend, Player, Player) {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.delay("/Status", SLOW / 4);
+        tokio::spawn(follow(
+            backend.clone(),
+            second.id(),
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until("its poll to be answering", || asked(&second, "/Status") > 0).await;
+        second.hang_up("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Slow))
+        })
+        .await;
+        (backend, first, second)
+    }
+
+    /// A player the pane calls slow is not asked again at its statuses: it
+    /// waits to be chosen again, as the pane says. Widening the re-ask in
+    /// `follow` to slow would send a busy player a configuration request a
+    /// status, each able to hold a connection for ten seconds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_the_pane_calls_slow_is_not_asked_again_at_its_statuses() {
+        let (backend, _first, second) = stood_in_as_slow_with_its_poll_running().await;
+        let statuses = asked(&second, "/Status");
+        until("a few more statuses", || {
+            asked(&second, "/Status") > statuses + 2
+        })
+        .await;
+        assert_eq!(asked(&second, "/ui/Configuration"), 1);
+        assert_eq!(standing_in(&backend), Some((second.id(), Unshown::Slow)));
+    }
+
+    /// A player the pane calls slow whose poll then fails is called silent:
+    /// the pane stops saying it is answering beside a card saying it is not,
+    /// and the turn back brings its screens.
+    ///
+    /// Slow was read off the row, and a row stays drawn answering for as long
+    /// as the long poll to a player switched off at the wall takes to give
+    /// up; nothing drew the pane again when it did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_player_the_pane_calls_slow_is_called_silent_once_its_poll_fails() {
+        let (backend, _first, second) = stood_in_as_slow_with_its_poll_running().await;
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Slow);
+        until("the pane to say it is slow", || {
+            sent_browse(&backend) == pane
+        })
+        .await;
+
+        // Gone. A 404 is not a status document, so the poll takes it for no
+        // answer at all.
+        second.forget("/Status");
+        until("its row to be seen failing", || {
+            backend.with_entry(second.id(), |e| !e.view.reachable) == Some(true)
+        })
+        .await;
+        until("the stand-in to call it silent", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Silent))
+        })
+        .await;
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Silent);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+
+        // And back: the turn asks for its screens, and they come.
+        second.serve("/Status", fixtures::status_stopped());
+        second.serve("/ui/Configuration", fixtures::configuration());
+        until("its Home", || showing(&backend) == Some(second.id())).await;
+        assert_eq!(standing_in(&backend), None);
+    }
+
+    /// A player chosen while its row says it is not responding, over the
+    /// first player's settings page, and heard answering a moment later: the
+    /// choice's ask and a recovery's both out at once. `chose` and `heard`
+    /// are how long each one's configuration is sat on, and `home` how long
+    /// the first Home asked for is.
+    async fn chosen_and_heard_at_once(
+        chose: Duration,
+        heard: Duration,
+        home: Duration,
+    ) -> (Backend, Player, Player) {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+        choose_and_hear(&backend, &second, chose, heard, home).await;
+        (backend, first, second)
+    }
+
+    /// The choice and the recovery of `chosen_and_heard_at_once`, over
+    /// whatever pane is up.
+    async fn choose_and_hear(
+        backend: &Backend,
+        player: &Player,
+        chose: Duration,
+        heard: Duration,
+        home: Duration,
+    ) {
+        backend.update(player.id(), |view| view.reachable = false);
+        player.delay("/ui/Configuration", chose);
+        player.delay("/ui/Home", home);
+        let _ = backend.commands.send(Command::Select(player.id()));
+        until("the choice's ask, and its stand-in", || {
+            asked(player, "/ui/Configuration") == 1
+                && standing_in(backend) == Some((player.id(), Unshown::Silent))
+        })
+        .await;
+
+        // Heard answering, as the turn of its poll says it.
+        player.delay("/ui/Configuration", heard);
+        backend.update(player.id(), |view| view.reachable = true);
+        backend.answering_again(player.id());
+        until("the recovery's ask", || {
+            asked(player, "/ui/Configuration") == 2
+        })
+        .await;
+    }
+
+    /// Wait for the choice's own configuration, sat on since the player was
+    /// chosen, to land and be dealt with. Every configuration that answers
+    /// reads the player's Sources next, and the recovery's has read them once.
+    async fn the_choice_lands(player: &Player) {
+        until("the choice's configuration", || {
+            asked(player, "/ui/Sources") == 2
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+    }
+
+    fn help_up(backend: &Backend) -> bool {
+        matches!(backend.browsing.lock().unwrap().pane, Pane::Help)
+    }
+
+    fn browsing_pane_up(backend: &Backend) -> bool {
+        matches!(backend.browsing.lock().unwrap().pane, Pane::Browse)
+    }
+
+    /// A choice whose Home lands after a recovery's Home of the same choice
+    /// takes the pane all the same, as it does when it lands first.
+    ///
+    /// Whichever Home landed first was the one shown and the other stepped
+    /// aside, so the settings page open when the player was chosen was closed
+    /// by the choice's Home and left up by the recovery's: one press, two
+    /// outcomes, decided by which reply came back first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_pressed_for_takes_the_pane_from_one_that_came_by_itself_first() {
+        let (backend, first, second) = chosen_and_heard_at_once(SLOW, SLOW * 3, SLOW * 6).await;
+        // The choice's configuration first, and its Home slow; the
+        // recovery's Home, asked for after, not.
+        until("the choice's Home to be asked for", || {
+            asked(&second, "/ui/Home") == 1
+        })
+        .await;
+        second.delay("/ui/Home", Duration::ZERO);
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "which leaves the settings page where it is"
+        );
+        until("the Home pressed for to take the pane", || {
+            browsing_pane_up(&backend)
+        })
+        .await;
+        assert_eq!(showing(&backend), Some(second.id()));
+        assert_eq!(asked(&second, "/ui/Home"), 2);
+    }
+
+    /// The same, where the choice's configuration is what comes back after
+    /// the recovery's Home: it finds the trail up and asks for no Home of its
+    /// own, and takes the pane that Home would have.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configuration_pressed_for_takes_the_pane_from_a_home_that_came_by_itself_first() {
+        let (backend, first, second) =
+            chosen_and_heard_at_once(SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "which leaves the settings page where it is"
+        );
+        until("the choice's configuration to take the pane", || {
+            browsing_pane_up(&backend)
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(showing(&backend), Some(second.id()));
+        assert_eq!(
+            asked(&second, "/ui/Home"),
+            1,
+            "with the Home already up, not asked for again"
+        );
+    }
+
+    /// A Home that came by itself into the browse pane owes a press nothing:
+    /// it is in front of the user already. A page opened over it is the
+    /// user's own, and the choice's reply, landing after, leaves it up.
+    ///
+    /// Recorded all the same, that reply found the Home it would have asked
+    /// for up and took the pane for it, closing the page seconds after it was
+    /// opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_came_by_itself_in_view_owes_a_late_press_no_pane() {
+        let (backend, first, second) = two_players().await;
+        second.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &first).await;
+        choose_and_hear(&backend, &second, SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself, in view", || {
+            showing(&backend) == Some(second.id()) && browsing_pane_up(&backend)
+        })
+        .await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("its settings, opened over it", || {
+            settings_owner(&backend) == Some(second.id())
+        })
+        .await;
+
+        the_choice_lands(&second).await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(second.id()),
+            "the page opened over the Home stays"
+        );
+        // Opening the page would end it anyway, as any change of pane does;
+        // a Home in view is not recorded at all.
+        assert_eq!(
+            backend.browsing.lock().unwrap().recovered,
+            None,
+            "nothing was owed"
+        );
+    }
+
+    /// The recovery and the choice of `chosen_and_heard_at_once`, the
+    /// recovery's Home kept under the first player's settings, and Help then
+    /// opened: from the browse pane, gone back to first, or straight over the
+    /// settings page.
+    async fn help_opened_after_a_home_came_by_itself(back_first: bool) -> (Backend, Player) {
+        let (backend, first, second) =
+            chosen_and_heard_at_once(SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "kept under the settings page"
+        );
+        if back_first {
+            let _ = backend.commands.send(Command::BrowseBack);
+            until("the Home in view", || browsing_pane_up(&backend)).await;
+        }
+        let _ = backend.commands.send(Command::OpenHelp);
+        until("Help", || help_up(&backend)).await;
+        (backend, second)
+    }
+
+    /// A Home that came by itself under a page owes the press its pane only
+    /// while that page is up. Back from the page shows the Home, which is
+    /// what the press asked for, and a page opened after that is the user's
+    /// own: the choice's reply, landing after, leaves it up.
+    ///
+    /// Nothing marked the page going, so the reply found the Home still owed
+    /// and closed whatever had been opened since.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_opened_after_going_back_to_a_home_that_came_by_itself_stays() {
+        let (backend, second) = help_opened_after_a_home_came_by_itself(true).await;
+        the_choice_lands(&second).await;
+        assert!(help_up(&backend), "the page opened since stays");
+    }
+
+    /// The same for a page opened straight over the one the Home was kept
+    /// under, without going back to browsing between. The page the press
+    /// found up is gone, and the one up now was opened after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_opened_over_the_one_a_home_came_by_itself_under_stays() {
+        let (backend, second) = help_opened_after_a_home_came_by_itself(false).await;
+        the_choice_lands(&second).await;
+        assert!(help_up(&backend), "the page opened since stays");
+    }
+
+    /// A Home that came by itself and is then refreshed under the page it
+    /// was kept under is still owed to the press: it is the same screen,
+    /// under the same page, and the choice's reply takes the pane for it.
+    ///
+    /// The refresh is the player saying its Home is stale, which a preset
+    /// saved anywhere does. Re-read, the Home stopped counting as the one
+    /// that came by itself, and the page stayed up — the outcome that
+    /// differed from the reply landing first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_came_by_itself_is_still_owed_once_refreshed() {
+        let (backend, first, second) =
+            chosen_and_heard_at_once(SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        refresh_current(backend.clone()).await;
+        assert_eq!(asked(&second, "/ui/Home"), 2, "the Home, read again");
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "under the settings page"
+        );
+
+        until("the choice's configuration to take the pane", || {
+            browsing_pane_up(&backend)
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(showing(&backend), Some(second.id()));
+        assert_eq!(
+            asked(&second, "/ui/Home"),
+            2,
+            "with the Home already up, not asked for again"
+        );
+    }
+
+    fn form_owner(backend: &Backend) -> Option<DeviceId> {
+        backend
+            .browsing
+            .lock()
+            .unwrap()
+            .pane
+            .form()
+            .map(|page| page.device)
+    }
+
+    /// The recovery and the choice of `chosen_and_heard_at_once`, with a form
+    /// opened over the first player's settings and its page still being
+    /// read: the placeholder `OpenForm` puts up, under which the recovery's
+    /// Home is kept. The opening the placeholder went up as.
+    async fn a_home_came_by_itself_under_a_placeholder() -> (Backend, Player, Player, u64) {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &first).await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("the first player's settings", || {
+            settings_owner(&backend) == Some(first.id())
+        })
+        .await;
+        let wifi = show_form(
+            &backend,
+            first.id(),
+            Replacing::Page,
+            "WiFi".to_owned(),
+            bluos::forms::Form::default(),
+            "Reading the page…".to_owned(),
+        )
+        .expect("over its own settings page");
+
+        choose_and_hear(&backend, &second, SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            form_owner(&backend),
+            Some(first.id()),
+            "kept under the placeholder"
+        );
+        (backend, first, second, wifi)
+    }
+
+    /// A Home that came by itself under a form's placeholder is still owed
+    /// to the press once the form's page is read and fills the placeholder
+    /// in: that is the same form restated, with nothing opened over it, and
+    /// the choice's reply takes the pane for the Home.
+    ///
+    /// Counted as a page opened, the fill ended the claim, and the form
+    /// stayed up over the Home; landing after the choice's reply, it found
+    /// the placeholder gone and put nothing up. One press, two outcomes, from
+    /// which reply came first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_came_by_itself_under_a_form_is_still_owed_once_it_fills_in() {
+        let (backend, first, second, wifi) = a_home_came_by_itself_under_a_placeholder().await;
+        // The scan's reply: the same opening, filled in.
+        assert_eq!(
+            show_form(
+                &backend,
+                first.id(),
+                Replacing::Form(wifi),
+                "WiFi".to_owned(),
+                bluos::forms::Form::default(),
+                String::new(),
+            ),
+            Some(wifi)
+        );
+
+        the_choice_lands(&second).await;
+        assert!(
+            browsing_pane_up(&backend),
+            "the choice's configuration takes the pane for its Home"
+        );
+        assert_eq!(showing(&backend), Some(second.id()));
+        assert_eq!(
+            asked(&second, "/ui/Home"),
+            1,
+            "with the Home already up, not asked for again"
+        );
+    }
+
+    /// The same where the form's own reply takes it down onto the page it
+    /// was opened from — a page that cannot be read, or a submit with no next
+    /// step. The page put back is the one the press found up, put back by a
+    /// reply rather than the user, and the Home under it is still owed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_came_by_itself_under_a_form_is_still_owed_once_it_comes_down() {
+        let (backend, first, second, wifi) = a_home_came_by_itself_under_a_placeholder().await;
+        assert!(close_form(&backend, first.id(), wifi));
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "back on the settings page it was opened from"
+        );
+
+        the_choice_lands(&second).await;
+        assert!(
+            browsing_pane_up(&backend),
+            "the choice's configuration takes the pane for its Home"
+        );
+        assert_eq!(showing(&backend), Some(second.id()));
+    }
+
+    /// A services list with `names` on it, as the player's page draws one.
+    fn services_page(names: &[&str]) -> String {
+        names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"<li id="{name}"><a href="/{name}">{name}<span class="bs-list-logo"></span></a></li>"#
+                )
+            })
+            .collect()
+    }
+
+    fn services_listed(backend: &Backend, owner: DeviceId) -> Option<usize> {
+        match &backend.browsing.lock().unwrap().pane {
+            Pane::Web(at, WebPage::Services(list)) if *at == owner => Some(list.len()),
+            _ => None,
+        }
+    }
+
+    /// A Home that came by itself under a services list is still owed to the
+    /// press once the list is read again, as a sign-in answered with no next
+    /// step reads it: the same list restated, with nothing opened over it.
+    ///
+    /// Counted as a page opened, the reload ended the claim, and the list
+    /// stayed up over the Home or not from which reply came first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_that_came_by_itself_under_a_list_is_still_owed_once_it_is_read_again() {
+        let (backend, first, second) = two_players().await;
+        first.serve("/redirectToCp", services_page(&["Tidal"]));
+        choose(&backend, &first).await;
+        let _ = backend.commands.send(Command::OpenServices {
+            device: first.id(),
+            reload: false,
+        });
+        until("the first player's services", || {
+            services_listed(&backend, first.id()) == Some(1)
+        })
+        .await;
+
+        choose_and_hear(&backend, &second, SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            services_listed(&backend, first.id()),
+            Some(1),
+            "kept under the services list"
+        );
+        first.serve("/redirectToCp", services_page(&["Tidal", "Qobuz"]));
+        let _ = backend.commands.send(Command::OpenServices {
+            device: first.id(),
+            reload: true,
+        });
+        until("the list read again", || {
+            services_listed(&backend, first.id()) == Some(2)
+        })
+        .await;
+
+        the_choice_lands(&second).await;
+        assert!(
+            browsing_pane_up(&backend),
+            "the choice's configuration takes the pane for its Home"
+        );
+        assert_eq!(showing(&backend), Some(second.id()));
+    }
+
+    fn alarm_editor_up(backend: &Backend, owner: DeviceId) -> bool {
+        matches!(
+            &backend.browsing.lock().unwrap().pane,
+            Pane::Alarms(page) if page.device == owner && page.editing.is_some()
+        )
+    }
+
+    /// The recovery and the choice of `chosen_and_heard_at_once`, the
+    /// recovery's Home kept under the first player's alarms list, and the
+    /// editor then opened over the list by `open`. Whether the editor is
+    /// still up once the choice's reply has landed.
+    async fn an_alarm_editor_opened_after_a_home_came_by_itself(open: Command) -> bool {
+        let (backend, first, second) = two_players().await;
+        first.serve("/Alarms", fixtures::one_alarm());
+        choose(&backend, &first).await;
+        let _ = backend.commands.send(Command::OpenAlarms(first.id()));
+        until("the first player's alarms", || {
+            alarms_owner(&backend) == Some(first.id())
+        })
+        .await;
+
+        choose_and_hear(&backend, &second, SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            alarms_owner(&backend),
+            Some(first.id()),
+            "kept under the alarms list"
+        );
+        let _ = backend.commands.send(open);
+        until("the editor", || alarm_editor_up(&backend, first.id())).await;
+
+        the_choice_lands(&second).await;
+        alarm_editor_up(&backend, first.id())
+    }
+
+    /// An alarm editor opened over the alarms list a Home came by itself
+    /// under is the user's own, as Help opened over it is, and the choice's
+    /// reply, landing after, leaves it up with the alarm being made.
+    ///
+    /// The editor opens inside the alarms pane rather than replacing it, and
+    /// only a replaced pane was counted, so the reply found the Home still
+    /// owed and took the whole pane for it, half-made alarm and all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_alarm_opened_over_the_list_a_home_came_by_itself_under_stays() {
+        assert!(
+            an_alarm_editor_opened_after_a_home_came_by_itself(Command::AlarmNew {
+                schedule: false
+            })
+            .await,
+            "the alarm being made stays"
+        );
+    }
+
+    /// The same for an alarm of the list's opened to be edited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alarm_opened_over_the_list_a_home_came_by_itself_under_stays() {
+        assert!(
+            an_alarm_editor_opened_after_a_home_came_by_itself(Command::AlarmOpen(1)).await,
+            "the alarm being edited stays"
+        );
+    }
+
+    /// The same for a settings page opened deeper than the one a Home came by
+    /// itself under: a page over it, as Back has it, and the user's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_page_opened_deeper_than_the_one_a_home_came_by_itself_under_stays() {
+        let (backend, first, second) =
+            chosen_and_heard_at_once(SLOW * 4, Duration::ZERO, Duration::ZERO).await;
+        until("the Home that came by itself", || {
+            showing(&backend) == Some(second.id())
+        })
+        .await;
+        assert_eq!(
+            settings_owner(&backend),
+            Some(first.id()),
+            "kept under the settings page"
+        );
+        let _ = backend.commands.send(Command::OpenSettings(
+            Some("audio".to_owned()),
+            Step::Deeper(first.id()),
+        ));
+        until("the page deeper", || settings_depth(&backend) == 2).await;
+
+        the_choice_lands(&second).await;
+        assert_eq!(settings_owner(&backend), Some(first.id()));
+        assert_eq!(settings_depth(&backend), 2, "the page opened deeper stays");
+    }
+
+    /// A Home brought back by itself that lands after a press made while it
+    /// was on its way leaves the pressed screen showing, as a Home pressed
+    /// for does: the press is what was asked for last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_brought_back_by_itself_leaves_a_screen_pressed_for_meanwhile() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.forget("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Refused))
+        })
+        .await;
+
+        // Back, with its Home slow to come.
+        second.serve("/ui/Configuration", fixtures::configuration());
+        second.serve("/ui/Favourites", fixtures::home());
+        second.delay("/ui/Home", SLOW * 2);
+        backend.answering_again(second.id());
+        until("its configuration, and its Home asked for", || {
+            configured(&backend) == Some(second.id()) && asked(&second, "/ui/Home") == 1
+        })
+        .await;
+        let _ = backend.commands.send(Command::Sidebar(0, 1));
+        until("the screen pressed for", || {
+            backend
+                .browsing
+                .lock()
+                .unwrap()
+                .trail
+                .last()
+                .is_some_and(|crumb| crumb.uri == "/ui/Favourites")
+        })
+        .await;
+
+        tokio::time::sleep(SLOW * 2 + SETTLED).await;
+        let browsing = backend.browsing.lock().unwrap();
+        assert_eq!(browsing.trail.len(), 1);
+        assert_eq!(
+            browsing.trail[0].uri, "/ui/Favourites",
+            "the Home landed and stepped aside"
+        );
+        assert_eq!(browsing.lit(), Some((0, 1)));
+    }
+
+    /// A recovery that finds its player's screens and sidebar up already —
+    /// handled just as they land, after it has read the pane as standing in
+    /// for the player — draws nothing. The pane up is the user's, and a
+    /// recovery is not a press: drawn whole, a settings page open there was
+    /// rebuilt under whatever was being typed into it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovery_that_finds_the_screens_up_draws_nothing() {
+        let (backend, _first, second) = two_players().await;
+        second.serve("/Settings", ONE_SWITCH);
+        choose(&backend, &second).await;
+        until("its Home and its sidebar", || {
+            showing(&backend) == Some(second.id()) && configured(&backend) == Some(second.id())
+        })
+        .await;
+        let _ = backend
+            .commands
+            .send(Command::OpenSettings(None, Step::Root));
+        until("its settings", || {
+            settings_owner(&backend) == Some(second.id())
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        backend.sent_settings.store(0, Ordering::Relaxed);
+        let configurations = asked(&second, "/ui/Configuration");
+
+        // Still read as standing in, as it was a moment before the screens
+        // landed; they are up by the time the recovery looks for them.
+        backend.browsing.lock().unwrap().standing_in = Some((second.id(), Unshown::Silent));
+        let _ = backend.commands.send(Command::BrowseRecover(second.id()));
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(
+            backend.sent_settings.load(Ordering::Relaxed),
+            0,
+            "the settings page is not drawn again"
+        );
+        assert_eq!(
+            asked(&second, "/ui/Configuration"),
+            configurations,
+            "and nothing is asked"
+        );
+    }
+
+    /// A Home brought back by itself that then fails stands in again, as a
+    /// Home pressed for does. The configuration that came had taken the
+    /// stand-in down, and without another the pane was left bare, saying
+    /// nothing, with nothing left to ask for the screens again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_home_brought_back_by_itself_that_fails_stands_in_again() {
+        let (backend, first, second) = two_players().await;
+        choose(&backend, &first).await;
+        second.forget("/ui/Configuration");
+        let _ = backend.commands.send(Command::Select(second.id()));
+        until("the stand-in", || {
+            standing_in(&backend) == Some((second.id(), Unshown::Refused))
+        })
+        .await;
+
+        second.serve("/ui/Configuration", fixtures::configuration());
+        second.forget("/ui/Home");
+        backend.answering_again(second.id());
+        until("its configuration, and its Home asked for", || {
+            configured(&backend) == Some(second.id()) && asked(&second, "/ui/Home") == 1
+        })
+        .await;
+        tokio::time::sleep(SETTLED).await;
+        assert_eq!(standing_in(&backend), Some((second.id(), Unshown::Refused)));
+        let pane = stood_in_pane(&backend, second.id(), Unshown::Refused);
+        until("the pane to say so", || sent_browse(&backend) == pane).await;
+    }
+
+    /// A failure that lands under the player's own screens and sidebar — a
+    /// press of the user's brought them up while the ask was out — stands
+    /// in for nothing. Drawn nowhere, the stand-in went on sending a
+    /// recovery at every status the player answered, each finding the
+    /// screens up and doing nothing, until some screen was opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_landing_under_the_players_own_screens_stands_in_for_nothing() {
+        let (backend, _first, second) = two_players().await;
+        choose(&backend, &second).await;
+        until("its Home and its sidebar", || {
+            showing(&backend) == Some(second.id()) && configured(&backend) == Some(second.id())
+        })
+        .await;
+        let (_, selection) = backend.selection().expect("a selection");
+        let newest = backend.browsing.lock().unwrap().configurations;
+        backend.stand_in(second.id(), selection, Some(newest), Unshown::Silent);
+        assert_eq!(standing_in(&backend), None);
+        assert_eq!(showing(&backend), Some(second.id()), "its screens stay");
+        assert_eq!(configured(&backend), Some(second.id()), "and its sidebar");
+    }
+
+    /// GROUP ALL says why nobody is left to group in the order a card's own
+    /// refusal does, the update first: a player downloading firmware goes on
+    /// answering, and is drawn answering while it is left out.
+    #[tokio::test]
+    async fn group_all_names_the_update_that_leaves_nobody_to_group() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let (backend, _commands) = backend(&http);
+        let at = |last| DeviceId::new(std::net::Ipv4Addr::new(192, 0, 2, last), 11000);
+        let (kitchen, den, loft) = (at(1), at(2), at(3));
+        for (id, name) in [(kitchen, "Kitchen"), (den, "Den"), (loft, "Loft")] {
+            add_row(&backend, id, &http, true);
+            backend
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .view
+                .name = name.into();
+        }
+        let set = |id, reachable: bool, upgrading: bool| {
+            let mut registry = backend.registry.lock().unwrap();
+            let entry = registry.get_mut(&id).unwrap();
+            entry.view.reachable = reachable;
+            entry.upgrading = upgrading.then(installing);
+        };
+        let said = || match grouping_all(&backend.registry.lock().unwrap(), kitchen) {
+            Some(Err(said)) => said,
+            Some(Ok((_, joining))) => panic!("asked {joining:?} to join"),
+            None => panic!("no row for the selected player"),
+        };
+
+        // Den answering and installing, Loft not answering.
+        set(den, true, true);
+        set(loft, false, false);
+        assert_eq!(
+            said(),
+            "No other players to group: Den is installing an update"
+        );
+        set(loft, true, true);
+        assert_eq!(
+            said(),
+            "No other players to group: 2 of them are installing updates"
+        );
+        set(den, false, false);
+        set(loft, false, false);
+        assert_eq!(said(), "No other players are responding");
+
+        // And the cases around it, as they were.
+        set(loft, true, false);
+        assert!(matches!(
+            grouping_all(&backend.registry.lock().unwrap(), kitchen),
+            Some(Ok((_, joining))) if joining == [loft]
+        ));
+        set(kitchen, false, false);
+        assert_eq!(said(), "Not grouped: Kitchen is not responding");
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .retain(|id, _| *id == kitchen);
+        set(kitchen, true, false);
+        assert_eq!(said(), "No other players to group");
+        assert!(grouping_all(&backend.registry.lock().unwrap(), den).is_none());
     }
 }
 
