@@ -2538,16 +2538,16 @@ mod tests {
     const QUEUE_ITEM_MENU: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <contextMenu image="/Artwork?service=LocalMusic&amp;artist=21+Savage&amp;album=Gang+Shit" subTitle="21 Savage • Gang Shit" title="Gang Shit" version="1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="screen.xsd">
   <item icon="/images/ui/cm_favourite_add.png" text="Favourite">
-    <action type="player-link" URI="/ui/prf?cgsc=1&amp;u=%2FAddFavourite%3Ffn%3D%252Fvar%252Fmnt%252F10.0.0.100-mediamusic%252Fplaylist%252F21%2BSavage%2B-%2BGang%2BShit.flac%26service%3DLocalMusic" refreshScreen="true" haptic="true" notification="Added to favourites" notificationIcon="/images/ui/cm_favourite_add.png"></action>
+    <action type="player-link" URI="/ui/prf?cgsc=1&amp;u=%2FAddFavourite%3Ffn%3D%252Fvar%252Fmnt%252F192.168.1.100-mediamusic%252Fplaylist%252F21%2BSavage%2B-%2BGang%2BShit.flac%26service%3DLocalMusic" refreshScreen="true" haptic="true" notification="Added to favourites" notificationIcon="/images/ui/cm_favourite_add.png"></action>
   </item>
   <item icon="/images/ui/cm_addtoplaylist.png" text="Add to playlist…">
-    <action type="browse" URI="/AddToPlaylistOptions?service=LocalMusic&amp;songid=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac" resultType="AddToPlaylistOptions" title="Add to playlist…" service="LocalMusic"></action>
+    <action type="browse" URI="/AddToPlaylistOptions?service=LocalMusic&amp;songid=%2Fvar%2Fmnt%2F192.168.1.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac" resultType="AddToPlaylistOptions" title="Add to playlist…" service="LocalMusic"></action>
   </item>
   <item icon="/images/ui/cm_info.png" text="Info">
     <action type="browse" URI="/Info?album=Gang+Shit&amp;artist=21+Savage&amp;service=LocalMusic&amp;title=Gang+Shit" resultType="Info" title="Info" service="LocalMusic"></action>
   </item>
   <item icon="/images/ui/cm_info.png" text="Technical info">
-    <action type="browse" URI="/Info?category=technical&amp;filename=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac&amp;service=LocalMusic" resultType="BriefInfo" title="Technical info" service="LocalMusic"></action>
+    <action type="browse" URI="/Info?category=technical&amp;filename=%2Fvar%2Fmnt%2F192.168.1.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac&amp;service=LocalMusic" resultType="BriefInfo" title="Technical info" service="LocalMusic"></action>
   </item>
   <item icon="/images/ui/cm_delete.png" text="Delete from play queue">
     <action type="player-link" URI="/Delete?id=0" refreshScreen="true" haptic="true" notification="Deleted &#34;Gang Shit&#34;"></action>

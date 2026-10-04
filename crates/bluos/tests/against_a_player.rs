@@ -485,7 +485,7 @@ async fn a_stream_that_would_replace_the_queue_asks_first() {
 async fn a_member_is_upgraded_through_its_leader() {
     let player = Player::start().await;
     let client = client_for(&player).await;
-    let member = bluos::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+    let member = bluos::DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 156), 11000);
 
     player.serve(
         "/upgrade",
@@ -508,7 +508,7 @@ async fn a_member_is_upgraded_through_its_leader() {
         .expect("starts");
 
     assert!(
-        player.asked_for("slave=10.0.0.156"),
+        player.asked_for("slave=192.168.1.156"),
         "the request names the member"
     );
     assert!(player.asked_for("port=11000"), "and the port it answers on");
@@ -526,7 +526,7 @@ async fn a_member_is_upgraded_through_its_leader() {
         .find(|seen| seen.contains("upgrade=check"))
         .expect("it checked first");
     assert!(
-        checked.contains("slave=10.0.0.156"),
+        checked.contains("slave=192.168.1.156"),
         "the check must be about the member too, not about its leader: {checked}"
     );
 }

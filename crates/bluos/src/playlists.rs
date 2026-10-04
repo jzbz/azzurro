@@ -274,7 +274,7 @@ mod tests {
 <addToPlaylistOptions service="LocalMusic">
   <urlPath>/AddToPlaylist</urlPath>
   <requestParameter>sourceService=LocalMusic</requestParameter>
-  <requestParameter>songid=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac</requestParameter>
+  <requestParameter>songid=%2Fvar%2Fmnt%2F192.168.1.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac</requestParameter>
   <playlists service="LocalMusic" serviceName="BluOS" serviceIcon="/images/BluOSIcon.png" create="1"></playlists>
 </addToPlaylistOptions>"#;
 
@@ -337,7 +337,8 @@ mod tests {
                 ("sourceService".to_owned(), "LocalMusic".to_owned()),
                 (
                     "songid".to_owned(),
-                    "/var/mnt/10.0.0.100-mediamusic/playlist/21 Savage - Gang Shit.flac".to_owned()
+                    "/var/mnt/192.168.1.100-mediamusic/playlist/21 Savage - Gang Shit.flac"
+                        .to_owned()
                 ),
             ]
         );
@@ -359,7 +360,7 @@ mod tests {
 <addToPlaylistOptions service="LocalMusic">
   <urlPath>/AddToPlaylist</urlPath>
   <requestParameter>sourceService=LocalMusic</requestParameter>
-  <requestParameter>songid=%2Fvar%2Fmnt%2F10.0.0.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac</requestParameter>
+  <requestParameter>songid=%2Fvar%2Fmnt%2F192.168.1.100-mediamusic%2Fplaylist%2F21+Savage+-+Gang+Shit.flac</requestParameter>
   <playlists service="LocalMusic" create="1" serviceName="BluOS" serviceIcon="/images/BluOSIcon.png">
     <name image="/Artwork?service=LocalMusic&amp;fn=%2Fvar%2Fmnt%2Fx.flac">Azzurro test</name>
   </playlists>

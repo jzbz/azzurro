@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 /// How a player is addressed and identified.
 ///
 /// BluOS itself uses `host:port` as a device's identity — `/SyncStatus`
-/// reports `id="10.0.0.155:11000"` — so this crate does too, rather than
+/// reports `id="192.168.1.155:11000"` — so this crate does too, rather than
 /// inventing a key the device would not recognize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId {
@@ -72,11 +72,11 @@ mod tests {
 
     #[test]
     fn parses_both_forms_and_round_trips() {
-        let with_port: DeviceId = "10.0.0.155:11000".parse().unwrap();
-        let bare: DeviceId = "10.0.0.155".parse().unwrap();
+        let with_port: DeviceId = "192.168.1.155:11000".parse().unwrap();
+        let bare: DeviceId = "192.168.1.155".parse().unwrap();
         assert_eq!(with_port, bare);
-        assert_eq!(with_port.to_string(), "10.0.0.155:11000");
-        assert_eq!(with_port.base_url(), "http://10.0.0.155:11000");
+        assert_eq!(with_port.to_string(), "192.168.1.155:11000");
+        assert_eq!(with_port.base_url(), "http://192.168.1.155:11000");
         assert!("not-an-address".parse::<DeviceId>().is_err());
     }
 

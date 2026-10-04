@@ -683,8 +683,8 @@ impl Artwork {
     /// players is a flood rather than a house.
     pub fn remember_player(&self, host: std::net::IpAddr) {
         // Canonical for the same reason [`literal_address`] is: the two are
-        // compared, and a player discovered as `::ffff:10.0.0.155` is the
-        // player whose art is at `10.0.0.155`.
+        // compared, and a player discovered as `::ffff:192.168.1.155` is the
+        // player whose art is at `192.168.1.155`.
         let host = host.to_canonical();
         let mut players = self.players.lock().unwrap();
         if players.len() >= MAX_ART_HOSTS && !players.contains(&host) {
@@ -1362,7 +1362,7 @@ mod tests {
         assert!(!allow("http://127.0.0.1:8080/probe"));
         assert!(!allow("http://[::1]/probe"), "IPv6 loopback is bracketed");
         assert!(!allow("http://192.168.1.1/cgi-bin/reboot"));
-        assert!(!allow("http://10.0.0.155:11000/Artwork"));
+        assert!(!allow("http://192.168.1.155:11000/Artwork"));
         assert!(!allow("http://169.254.169.254/latest/meta-data/"));
         assert!(!allow("http://[fe80::1]/probe"), "IPv6 link-local");
         assert!(!allow("http://[fd00::1]/probe"), "IPv6 unique-local");
@@ -1418,12 +1418,12 @@ mod tests {
         assert!(art.may_fetch("http://100.101.102.103:11004/library/v1/Artwork"));
         assert!(!art.may_fetch("http://100.101.102.104/"), "only that one");
 
-        art.remember_player("::ffff:10.0.0.155".parse().expect("an address"));
+        art.remember_player("::ffff:192.168.1.155".parse().expect("an address"));
         assert!(
-            art.may_fetch("http://10.0.0.155:11000/Artwork"),
+            art.may_fetch("http://192.168.1.155:11000/Artwork"),
             "found as mapped IPv6, fetched as IPv4"
         );
-        assert!(art.may_fetch("http://[::ffff:10.0.0.155]:11000/Artwork"));
+        assert!(art.may_fetch("http://[::ffff:192.168.1.155]:11000/Artwork"));
     }
 
     /// The desktop shell fetches `mpris:artUrl` itself, with none of this
@@ -1439,7 +1439,7 @@ mod tests {
             disk: Some(dir.clone()),
             ..Artwork::in_memory(reqwest::Client::new(), Players::default())
         };
-        let own = "http://10.0.0.155:11000/Artwork?service=LocalMusic&album=A";
+        let own = "http://192.168.1.155:11000/Artwork?service=LocalMusic&album=A";
 
         // Not cached, not adopted: this app would not fetch it, so neither is
         // the shell told of it.
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(art.for_desktop(cdn).await.as_deref(), Some(cdn));
 
         // Once adopted, the player's own URL is what this would fetch.
-        art.remember_player("10.0.0.155".parse().expect("an address"));
+        art.remember_player("192.168.1.155".parse().expect("an address"));
         assert_eq!(art.for_desktop(own).await.as_deref(), Some(own));
 
         // A reply that is not an image is not a cover, even on disk.
@@ -1480,18 +1480,18 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let art = Artwork::new(reqwest::Client::new(), Players::default());
-        let own = "http://10.0.0.155:11000/Artwork?service=LocalMusic";
+        let own = "http://192.168.1.155:11000/Artwork?service=LocalMusic";
 
         assert!(
             !art.may_fetch(own),
             "before adoption it is just another address on the subnet"
         );
 
-        art.remember_player("10.0.0.155".parse().expect("an address"));
+        art.remember_player("192.168.1.155".parse().expect("an address"));
 
         assert!(art.may_fetch(own), "its own art is the point of the app");
         assert!(
-            !art.may_fetch("http://10.0.0.156:11000/Artwork"),
+            !art.may_fetch("http://192.168.1.156:11000/Artwork"),
             "adopting one player does not open the rest of the subnet"
         );
         assert!(
@@ -1505,7 +1505,7 @@ mod tests {
         // first request, so a rule that knew only the public-address test
         // stopped every cover the player served.
         assert!(
-            art.may_fetch("http://10.0.0.155:11004/library/v1/Artwork?album=x"),
+            art.may_fetch("http://192.168.1.155:11004/library/v1/Artwork?album=x"),
             "a player's other ports are the same player"
         );
     }
@@ -2055,11 +2055,11 @@ mod tests {
 
     #[test]
     fn file_names_are_stable_and_distinct() {
-        let a = file_name("http://10.0.0.155:11000/Artwork?service=LocalMusic&album=A");
-        let b = file_name("http://10.0.0.155:11000/Artwork?service=LocalMusic&album=B");
+        let a = file_name("http://192.168.1.155:11000/Artwork?service=LocalMusic&album=A");
+        let b = file_name("http://192.168.1.155:11000/Artwork?service=LocalMusic&album=B");
         assert_eq!(
             a,
-            file_name("http://10.0.0.155:11000/Artwork?service=LocalMusic&album=A")
+            file_name("http://192.168.1.155:11000/Artwork?service=LocalMusic&album=A")
         );
         assert_ne!(a, b);
         assert_eq!(a.len(), 16);

@@ -296,8 +296,9 @@ mod tests {
 
     #[test]
     fn an_ordinary_sync_status_is_not_an_upgrade() {
-        let ordinary = in_sync_status(r#"<SyncStatus etag="x" id="10.0.0.155" name="Powernode"/>"#)
-            .expect("parses");
+        let ordinary =
+            in_sync_status(r#"<SyncStatus etag="x" id="192.168.1.155" name="Powernode"/>"#)
+                .expect("parses");
         assert_eq!(ordinary, None);
     }
 

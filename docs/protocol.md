@@ -346,10 +346,10 @@ two sides do not look alike:
 
 ```xml
 <!-- on the master -->
-<slave id="10.0.0.9" port="11000"></slave>
+<slave id="192.168.1.9" port="11000"></slave>
 
 <!-- on the slave: the address is the element's TEXT, not an attribute -->
-<master port="11000" reconnecting="false">10.0.0.155</master>
+<master port="11000" reconnecting="false">192.168.1.155</master>
 ```
 
 Note that `id` on a `<slave>` is a bare host, whereas `id` on `<SyncStatus>`

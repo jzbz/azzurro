@@ -77,7 +77,7 @@ pub enum Sync {
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// Everything a form field may not carry raw. A share's name is a UNC path —
-/// `\\10.0.0.100\media\music` — so the backslashes matter as much as the
+/// `\\192.168.1.100\media\music` — so the backslashes matter as much as the
 /// ampersands.
 const FORM_FIELD: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
@@ -367,8 +367,8 @@ impl Client {
     /// Every path here comes out of a document the player wrote — a screen's
     /// action URI, a setting's target, a form's `action` — and concatenating
     /// it onto a base is not the same as resolving it. `@evil.example/x`
-    /// concatenated gives `http://10.0.0.155:11000@evil.example/x`, which
-    /// parses with `10.0.0.155:11000` as *userinfo* and `evil.example` as the
+    /// concatenated gives `http://192.168.1.155:11000@evil.example/x`, which
+    /// parses with `192.168.1.155:11000` as *userinfo* and `evil.example` as the
     /// host: the request leaves for a machine of the player's choosing, from
     /// this desktop's position on the network, which is somewhere the player
     /// itself may not be able to reach. `//evil.example/x` and an outright
@@ -2344,12 +2344,12 @@ mod tests {
 
     #[test]
     fn a_member_is_addressed_by_host_and_port() {
-        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 156), 11000);
         assert_eq!(
             upgrade_query("this", Some(member)),
             vec![
                 ("upgrade", "this".to_owned()),
-                ("slave", "10.0.0.156".to_owned()),
+                ("slave", "192.168.1.156".to_owned()),
                 ("port", "11000".to_owned()),
             ]
         );
@@ -2359,7 +2359,7 @@ mod tests {
     fn a_member_on_a_non_standard_port_keeps_it() {
         // The port is part of what identifies a player, so a member is not
         // assumed to be on 11000 just because most are.
-        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 157), 11010);
+        let member = crate::DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 157), 11010);
         let query = upgrade_query("check", Some(member));
         assert_eq!(query[2], ("port", "11010".to_owned()));
     }

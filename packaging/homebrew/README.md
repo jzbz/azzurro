@@ -41,10 +41,10 @@ or in one step, without tapping first:
 ## Per release
 
 After the release is published, the notarized zip is attached and SHA256SUMS
-is signed:
+is signed, from this repository's root with the tap checked out beside it:
 
-    cd ~/zx/dev/azzurro && ./packaging/homebrew/update-cask.sh v0.1.0 ~/zx/dev/homebrew-tap/Casks/azzurro.rb &&
-      cd ~/zx/dev/homebrew-tap && git commit -S -m "azzurro 0.1.0" Casks/azzurro.rb && git push
+    ./packaging/homebrew/update-cask.sh v0.1.0 ../homebrew-tap/Casks/azzurro.rb &&
+      cd ../homebrew-tap && git commit -S -m "azzurro 0.1.0" Casks/azzurro.rb && git push
 
 One command, chained with `&&`, and the script is handed the path rather than
 redirected into it. A `>` empties the cask before the script has even started,

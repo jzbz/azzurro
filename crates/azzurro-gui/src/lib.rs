@@ -16843,11 +16843,11 @@ mod web_page_tests {
     fn only_a_web_page_goes_to_the_browser() {
         // Off the player is fine: sign-in pages live on the service's site.
         assert!(web_page("https://accounts.example.com/signin").is_some());
-        assert!(web_page("http://10.0.0.155/sharecfg?noheader=1").is_some());
+        assert!(web_page("http://192.168.1.155/sharecfg?noheader=1").is_some());
 
         for url in [
             "file:///etc/passwd",
-            "smb://10.0.0.155/share",
+            "smb://192.168.1.155/share",
             "ms-settings:network",
             "javascript:alert(1)",
             "/sharecfg?noheader=1",
@@ -19654,8 +19654,8 @@ mod tests {
     /// stopped answering: presses that could only time out.
     #[test]
     fn grouping_is_offered_only_where_the_request_can_work() {
-        let selected = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 1), 11000);
-        let other = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 2), 11000);
+        let selected = DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 1), 11000);
+        let other = DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 2), 11000);
         let card = |reachable: bool, in_group: bool, upgrading: bool| Device {
             reachable,
             in_group,
@@ -19763,10 +19763,10 @@ mod tests {
     /// screen does not say which one went.
     #[test]
     fn a_player_with_no_name_of_its_own_is_called_by_its_address() {
-        let id = DeviceId::new(std::net::Ipv4Addr::new(10, 0, 0, 156), 11000);
+        let id = DeviceId::new(std::net::Ipv4Addr::new(192, 168, 1, 156), 11000);
         assert_eq!(called("Kitchen", id), "Kitchen");
-        assert_eq!(called(UNNAMED, id), "the player at 10.0.0.156:11000");
-        assert_eq!(called("", id), "the player at 10.0.0.156:11000");
+        assert_eq!(called(UNNAMED, id), "the player at 192.168.1.156:11000");
+        assert_eq!(called("", id), "the player at 192.168.1.156:11000");
     }
 
     /// The highlight follows the player, including to a new address.
@@ -19784,9 +19784,9 @@ mod tests {
             id: id.into(),
             ..Default::default()
         };
-        let old: DeviceId = "10.0.0.10:11000".parse().unwrap();
-        let new: DeviceId = "10.0.0.20:11000".parse().unwrap();
-        let other: DeviceId = "10.0.0.30:11000".parse().unwrap();
+        let old: DeviceId = "192.168.1.10:11000".parse().unwrap();
+        let new: DeviceId = "192.168.1.20:11000".parse().unwrap();
+        let other: DeviceId = "192.168.1.30:11000".parse().unwrap();
         let rows = |ids: &[DeviceId]| {
             ids.iter()
                 .map(|id| row(&id.to_string()))
@@ -19797,7 +19797,11 @@ mod tests {
         // a player appearing above the selected one moves every index by one
         // and must not move the highlight.
         assert_eq!(
-            highlighted_row(&rows(&[old, other]), Some("10.0.0.30:11000"), Some(other)),
+            highlighted_row(
+                &rows(&[old, other]),
+                Some("192.168.1.30:11000"),
+                Some(other)
+            ),
             Some(1)
         );
 
@@ -19810,7 +19814,7 @@ mod tests {
         // rather than row zero.
         let carried = rows(&[other]);
         assert_eq!(
-            highlighted_row(&carried, Some("10.0.0.10:11000"), Some(old)),
+            highlighted_row(&carried, Some("192.168.1.10:11000"), Some(old)),
             None,
             "a player the list does not hold must not lend its highlight to \
              whoever sorts first"
@@ -19822,7 +19826,7 @@ mod tests {
         // stale row is exactly what used to win.
         let settled = rows(&[new, other]);
         assert_eq!(
-            highlighted_row(&settled, Some("10.0.0.30:11000"), Some(new)),
+            highlighted_row(&settled, Some("192.168.1.30:11000"), Some(new)),
             Some(0),
             "the highlight belongs on the player the backend has selected, \
              not on the row the window was left holding"
@@ -19833,7 +19837,7 @@ mod tests {
         // it, and answering zero there would drag the highlight back off the
         // card that was just pressed.
         assert_eq!(
-            highlighted_row(&settled, Some("10.0.0.30:11000"), None),
+            highlighted_row(&settled, Some("192.168.1.30:11000"), None),
             Some(1)
         );
         assert_eq!(highlighted_row(&settled, None, None), Some(0));
@@ -20177,7 +20181,7 @@ mod tests {
             quality: "FLAC".to_owned(),
             action: "Manage".to_owned(),
             cover: None,
-            art: Some("http://10.0.0.2:11000/Artwork?id=1".to_owned()),
+            art: Some("http://192.168.1.2:11000/Artwork?id=1".to_owned()),
             glyph: None,
             heading: false,
             actionable: true,
@@ -20249,7 +20253,7 @@ mod tests {
             (
                 "art",
                 BrowseData {
-                    art: Some("http://10.0.0.2:11000/Artwork?id=2".to_owned()),
+                    art: Some("http://192.168.1.2:11000/Artwork?id=2".to_owned()),
                     ..base.clone()
                 },
             ),
@@ -20314,7 +20318,7 @@ mod tests {
         };
 
         let base = Device {
-            id: "10.0.0.2:11000".into(),
+            id: "192.168.1.2:11000".into(),
             name: "Kitchen".into(),
             model: "Powernode".into(),
             volume: 30,
@@ -20333,14 +20337,14 @@ mod tests {
             upgrade_line: "".into(),
             badged: false,
         };
-        let art = Some("http://10.0.0.2:11000/Artwork?service=LocalMusic&id=1");
+        let art = Some("http://192.168.1.2:11000/Artwork?service=LocalMusic&id=1");
         let baseline = print(&base, art);
 
         let variants: Vec<(&str, Device)> = vec![
             (
                 "id",
                 Device {
-                    id: "10.0.0.3:11000".into(),
+                    id: "192.168.1.3:11000".into(),
                     ..base.clone()
                 },
             ),
@@ -20492,7 +20496,7 @@ mod tests {
         assert_ne!(
             print(
                 &base,
-                Some("http://10.0.0.2:11000/Artwork?service=LocalMusic&id=2")
+                Some("http://192.168.1.2:11000/Artwork?service=LocalMusic&id=2")
             ),
             baseline,
             "a different sleeve on the same row has to be published"
@@ -30144,9 +30148,10 @@ mod thumbnail_tests {
         // new record on every track change: watching a count of decodes for
         // the whole process put all of that on the queue's bill, at around one
         // rebuild a second for as long as the browsing lasted.
-        backend
-            .artwork
-            .note_arrival("http://10.0.0.1/Artwork?album=somewhere-else", THUMB_SIZE);
+        backend.artwork.note_arrival(
+            "http://192.168.1.1/Artwork?album=somewhere-else",
+            THUMB_SIZE,
+        );
         backend.publish_queue();
         assert_eq!(
             backend.artwork.peeks(),

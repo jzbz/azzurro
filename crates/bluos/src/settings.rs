@@ -537,8 +537,8 @@ mod tests {
 	<setting id="alarms" displayName="Alarms" class="alarms" count="0" enabled="0"></setting>
 	<menuGroup id="player" displayName="Player" icon="/images/players/N225_nt.png"></menuGroup>
 	<menuGroup id="library" displayName="Music library">
-		<setting id="sharecfg" displayName="Network shares" description="//10.0.0.100/media/music" helpUrl="https://support.bluos.net/hc/en-us/articles/360000469948">
-			<webview url="http://10.0.0.155:80/sharecfg?noheader=1"></webview>
+		<setting id="sharecfg" displayName="Network shares" description="//192.168.1.100/media/music" helpUrl="https://support.bluos.net/hc/en-us/articles/360000469948">
+			<webview url="http://192.168.1.155:80/sharecfg?noheader=1"></webview>
 		</setting>
 		<setting id="reindex" name="reindex" displayName="Reindex music collection" url="/Reindex" class="button"></setting>
 	</menuGroup>
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(shares.kind, Kind::Other);
         assert_eq!(
             shares.webview.as_deref(),
-            Some("http://10.0.0.155:80/sharecfg?noheader=1")
+            Some("http://192.168.1.155:80/sharecfg?noheader=1")
         );
         assert!(shares.help_url.is_some());
 

@@ -85,7 +85,7 @@ cargo run --bin bluosctl -- discover
 ```
 
 ```bash
-cargo run --bin bluosctl -- status 10.0.0.155
+cargo run --bin bluosctl -- status 192.168.1.155
 ```
 
 `bluosctl watch <player>` prints a block every time a player changes and is the

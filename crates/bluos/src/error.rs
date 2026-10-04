@@ -19,7 +19,7 @@ pub enum Error {
     /// The cause is in the message and not behind `source()`. Nothing that
     /// shows these walks a chain — a toast, the poll's log line — so a cause
     /// kept only there reached nobody, and every network failure read "request
-    /// to 10.0.0.5:11000 failed" and stopped. Keeping it in both would print it
+    /// to 192.168.1.5:11000 failed" and stopped. Keeping it in both would print it
     /// twice wherever something does walk the chain, as the CLI's does.
     ///
     /// The path goes in too, which reqwest's own message used to carry: with

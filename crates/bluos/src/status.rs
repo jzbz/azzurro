@@ -147,7 +147,7 @@ impl SyncStatus {
     }
 }
 
-/// `<master port="11000" reconnecting="false">10.0.0.7</master>` — the address
+/// `<master port="11000" reconnecting="false">192.168.1.7</master>` — the address
 /// is the element's text, not an attribute.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Master {
@@ -175,7 +175,7 @@ impl Master {
     }
 }
 
-/// `<slave id="10.0.0.9" port="11000"/>`. Note that `id` is a bare host here,
+/// `<slave id="192.168.1.9" port="11000"/>`. Note that `id` is a bare host here,
 /// unlike the `id` on `<SyncStatus>` itself, which may carry a port.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Slave {
@@ -862,7 +862,7 @@ mod tests {
         .expect("reads");
         assert_eq!(sync.port, None);
         assert_eq!(sync.volume, None);
-        let reached_at = "10.0.0.1:11000".parse().unwrap();
+        let reached_at = "192.168.1.1:11000".parse().unwrap();
         assert_eq!(sync.device_id(reached_at).to_string(), "192.0.2.9:11000");
     }
 
@@ -874,15 +874,18 @@ mod tests {
             r#"<SyncStatus etag="1" id="127.0.0.1:11000" name="Odd" model="X"></SyncStatus>"#,
         )
         .unwrap();
-        let reached_at = "10.0.0.155:11000".parse().unwrap();
+        let reached_at = "192.168.1.155:11000".parse().unwrap();
         assert_eq!(s.device_id(reached_at), reached_at);
 
         // A sensible address is taken at its word.
         let ordinary: SyncStatus = quick_xml::de::from_str(
-            r#"<SyncStatus etag="1" id="10.0.0.7:11000" name="Fine" model="X"></SyncStatus>"#,
+            r#"<SyncStatus etag="1" id="192.168.1.7:11000" name="Fine" model="X"></SyncStatus>"#,
         )
         .unwrap();
-        assert_eq!(ordinary.device_id(reached_at).to_string(), "10.0.0.7:11000");
+        assert_eq!(
+            ordinary.device_id(reached_at).to_string(),
+            "192.168.1.7:11000"
+        );
     }
 
     #[test]

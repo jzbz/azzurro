@@ -1,7 +1,7 @@
 #!/bin/sh
 # Write the cask for a published release, with the real hash filled in.
 #
-#   ./packaging/homebrew/update-cask.sh v0.1.0 ~/zx/dev/homebrew-tap/Casks/azzurro.rb
+#   ./packaging/homebrew/update-cask.sh v0.1.0 ../homebrew-tap/Casks/azzurro.rb
 #
 # Run after the release is published, the notarized macOS zip is attached and
 # SHA256SUMS is signed — the hash has to be of the artifact users will actually
@@ -26,7 +26,7 @@ FPR=252B901C88853CF9F9392559249738C8641C3359
 TAG="${1:-}"
 OUT="${2:-}"
 [ -n "$TAG" ] && [ -n "$OUT" ] || {
-    echo "usage: $0 <tag> <cask>   e.g. $0 v0.1.0 ~/zx/dev/homebrew-tap/Casks/azzurro.rb" >&2
+    echo "usage: $0 <tag> <cask>   e.g. $0 v0.1.0 ../homebrew-tap/Casks/azzurro.rb" >&2
     exit 1
 }
 case "$TAG" in v*) ;; *) echo "error: tag should start with v, got '$TAG'" >&2; exit 1 ;; esac

@@ -9,7 +9,7 @@
 //!
 //! The file is one player per line under `~/.config/azzurro/players`: the
 //! `host:port`, then after a space the MAC that address last answered
-//! `/SyncStatus` with, as `10.0.0.155:11000 90:56:82:80:34:7a`. Deliberately
+//! `/SyncStatus` with, as `192.168.1.155:11000 00:00:5e:00:53:01`. Deliberately
 //! plain text so an address can be pinned by hand on a machine that cannot
 //! discover it at all, and the MAC can be left off — it is written in once the
 //! address answers. Addresses added that way survive, because the set is
@@ -307,12 +307,12 @@ mod tests {
     #[test]
     fn one_address_cannot_fill_the_whole_file() {
         let mut players = Vec::new();
-        let mine: DeviceId = "10.0.0.155:11000".parse().expect("an address");
+        let mine: DeviceId = "192.168.1.155:11000".parse().expect("an address");
         assert!(remember(&mut players, mine));
 
         let flood: Vec<DeviceId> = (0..MAX_REMEMBERED + 16)
             .map(|n| {
-                format!("10.0.0.99:{}", 11000 + n)
+                format!("192.168.1.99:{}", 11000 + n)
                     .parse()
                     .expect("an address")
             })
@@ -329,21 +329,21 @@ mod tests {
         );
 
         // A genuinely different address is unaffected by the cap.
-        let other: DeviceId = "10.0.0.42:11000".parse().expect("an address");
+        let other: DeviceId = "192.168.1.42:11000".parse().expect("an address");
         assert!(remember(&mut players, other), "other hosts still fit");
     }
 
     #[test]
     fn round_trips_through_the_file_format() {
         // The parsing half, without touching the real config directory.
-        let text = "# a comment\n\n10.0.0.155:11000\n  10.0.0.9:11000  \nnonsense\n";
+        let text = "# a comment\n\n192.168.1.155:11000\n  192.168.1.9:11000  \nnonsense\n";
         let parsed = read(text);
 
         assert_eq!(parsed.len(), 2, "the comment, the blank and the rubbish go");
-        assert_eq!(parsed[0], at("10.0.0.155:11000", None));
+        assert_eq!(parsed[0], at("192.168.1.155:11000", None));
         assert_eq!(
             parsed[1],
-            at("10.0.0.9", None),
+            at("192.168.1.9", None),
             "bare host means the default port"
         );
         assert_eq!(read(&body(&parsed)), parsed, "and back out again unchanged");
@@ -355,17 +355,17 @@ mod tests {
     #[test]
     fn who_answered_where_round_trips_through_the_file() {
         let players = vec![
-            at("10.0.0.156:11000", Some("90568280347a")),
-            at("10.0.0.7:11000", None),
+            at("192.168.1.156:11000", Some("00005e005301")),
+            at("192.168.1.7:11000", None),
             at("[fe80::1]:11000", Some("aabbccddeeff")),
         ];
 
         let text = body(&players);
         assert!(
-            text.contains("10.0.0.156:11000 90:56:82:80:34:7a\n"),
+            text.contains("192.168.1.156:11000 00:00:5e:00:53:01\n"),
             "written the way the player writes its own MAC: {text:?}"
         );
-        assert!(text.contains("10.0.0.7:11000\n"));
+        assert!(text.contains("192.168.1.7:11000\n"));
         assert_eq!(read(&text), players);
     }
 
@@ -374,24 +374,24 @@ mod tests {
     #[test]
     fn a_mac_that_cannot_be_read_costs_only_itself() {
         let text = "\
-            10.0.0.1:11000 90-56-82-80-34-7A\n\
-            10.0.0.2:11000 90568280347a\n\
-            10.0.0.3:11000 not-a-mac\n\
-            10.0.0.4:11000 00:00:00:00:00:00\n\
-            10.0.0.5:11000 90:56:82:80:34:7a and a note\n\
-            10.0.0.1:11000 aa:bb:cc:dd:ee:ff\n";
+            192.168.1.1:11000 00-00-5E-00-53-01\n\
+            192.168.1.2:11000 00005e005301\n\
+            192.168.1.3:11000 not-a-mac\n\
+            192.168.1.4:11000 00:00:00:00:00:00\n\
+            192.168.1.5:11000 00:00:5e:00:53:01 and a note\n\
+            192.168.1.1:11000 aa:bb:cc:dd:ee:ff\n";
         let parsed = read(text);
 
         assert_eq!(
             parsed,
             vec![
-                at("10.0.0.1:11000", Some("90568280347a")),
-                at("10.0.0.2:11000", Some("90568280347a")),
-                at("10.0.0.3:11000", None),
+                at("192.168.1.1:11000", Some("00005e005301")),
+                at("192.168.1.2:11000", Some("00005e005301")),
+                at("192.168.1.3:11000", None),
                 // The value a player whose MAC was never written reports: a
                 // name every such player shares, so no name at all.
-                at("10.0.0.4:11000", None),
-                at("10.0.0.5:11000", None),
+                at("192.168.1.4:11000", None),
+                at("192.168.1.5:11000", None),
             ],
             "every address is kept, the first of a duplicate wins, and only \
              a MAC that names one player comes with it"
@@ -400,14 +400,20 @@ mod tests {
 
     #[test]
     fn an_address_already_written_down_is_not_written_down_again() {
-        let mut players = vec![at("10.0.0.1", Some("90568280347a")), at("10.0.0.2", None)];
-        assert!(!remember(&mut players, id("10.0.0.1")));
+        let mut players = vec![
+            at("192.168.1.1", Some("00005e005301")),
+            at("192.168.1.2", None),
+        ];
+        assert!(!remember(&mut players, id("192.168.1.1")));
         assert_eq!(
             players,
-            vec![at("10.0.0.1", Some("90568280347a")), at("10.0.0.2", None)],
+            vec![
+                at("192.168.1.1", Some("00005e005301")),
+                at("192.168.1.2", None)
+            ],
             "nor is who answered there lost by trying"
         );
-        assert!(remember(&mut players, id("10.0.0.3")));
+        assert!(remember(&mut players, id("192.168.1.3")));
         assert_eq!(players.len(), 3, "and a new one goes on the end");
     }
 
@@ -415,28 +421,38 @@ mod tests {
     /// then — which is every status that re-reads `/SyncStatus` otherwise.
     #[test]
     fn who_answered_is_written_down_only_when_it_changes() {
-        let mut players = vec![at("10.0.0.1", None), at("10.0.0.2", Some("aabbccddeeff"))];
+        let mut players = vec![
+            at("192.168.1.1", None),
+            at("192.168.1.2", Some("aabbccddeeff")),
+        ];
 
-        assert!(identify(&mut players, id("10.0.0.1"), Some("90568280347a")));
+        assert!(identify(
+            &mut players,
+            id("192.168.1.1"),
+            Some("00005e005301")
+        ));
         assert!(
-            !identify(&mut players, id("10.0.0.1"), Some("90568280347a")),
+            !identify(&mut players, id("192.168.1.1"), Some("00005e005301")),
             "the same answer twice is nothing to write"
         );
         assert!(
-            identify(&mut players, id("10.0.0.2"), Some("90568280347a")),
+            identify(&mut players, id("192.168.1.2"), Some("00005e005301")),
             "a lease that went to another speaker is"
         );
         assert!(
-            identify(&mut players, id("10.0.0.2"), None),
+            identify(&mut players, id("192.168.1.2"), None),
             "and so is an answer that names nobody"
         );
         assert!(
-            !identify(&mut players, id("10.0.0.9"), Some("90568280347a")),
+            !identify(&mut players, id("192.168.1.9"), Some("00005e005301")),
             "an address that is not listed is not listed by this"
         );
         assert_eq!(
             players,
-            vec![at("10.0.0.1", Some("90568280347a")), at("10.0.0.2", None)]
+            vec![
+                at("192.168.1.1", Some("00005e005301")),
+                at("192.168.1.2", None)
+            ]
         );
     }
 
@@ -444,19 +460,22 @@ mod tests {
     /// back carrying an identity it no longer has any evidence for.
     #[test]
     fn a_forgotten_address_takes_its_identity_with_it() {
-        let mut players = vec![at("10.0.0.1", Some("90568280347a")), at("10.0.0.2", None)];
+        let mut players = vec![
+            at("192.168.1.1", Some("00005e005301")),
+            at("192.168.1.2", None),
+        ];
 
-        assert!(forget(&mut players, id("10.0.0.1")));
+        assert!(forget(&mut players, id("192.168.1.1")));
         assert!(
-            !forget(&mut players, id("10.0.0.1")),
+            !forget(&mut players, id("192.168.1.1")),
             "nothing left to drop"
         );
-        assert_eq!(ids(&players), vec![id("10.0.0.2")]);
+        assert_eq!(ids(&players), vec![id("192.168.1.2")]);
 
-        assert!(remember(&mut players, id("10.0.0.1")));
+        assert!(remember(&mut players, id("192.168.1.1")));
         assert_eq!(
             players.last(),
-            Some(&at("10.0.0.1", None)),
+            Some(&at("192.168.1.1", None)),
             "back as an address nobody has answered at yet"
         );
     }
@@ -468,32 +487,36 @@ mod tests {
         let mut players = vec![
             // Where it was before two leases, and before one, the second
             // typed in by hand and so never matched to the first.
-            at("10.0.0.155:11000", Some("90568280347a")),
-            at("10.0.0.157:11000", Some("90568280347a")),
+            at("192.168.1.155:11000", Some("00005e005301")),
+            at("192.168.1.157:11000", Some("00005e005301")),
             // Another player, and an address nobody has answered at.
-            at("10.0.0.7:11000", Some("aabbccddeeff")),
-            at("10.0.0.8:11000", None),
+            at("192.168.1.7:11000", Some("aabbccddeeff")),
+            at("192.168.1.8:11000", None),
             // And the other zone of the box answering now, beside it.
-            at("10.0.0.160:11010", Some("90568280347a")),
+            at("192.168.1.160:11010", Some("00005e005301")),
         ];
 
-        assert!(claim(&mut players, id("10.0.0.160:11000"), "90568280347a"));
+        assert!(claim(
+            &mut players,
+            id("192.168.1.160:11000"),
+            "00005e005301"
+        ));
         assert_eq!(
             players,
             vec![
-                at("10.0.0.7:11000", Some("aabbccddeeff")),
-                at("10.0.0.8:11000", None),
-                at("10.0.0.160:11010", Some("90568280347a")),
+                at("192.168.1.7:11000", Some("aabbccddeeff")),
+                at("192.168.1.8:11000", None),
+                at("192.168.1.160:11010", Some("00005e005301")),
             ],
             "both addresses it left go; another player, an address with nobody \
              on it, and a second zone on the same box stay"
         );
         assert!(
-            !claim(&mut players, id("10.0.0.160:11000"), "90568280347a"),
+            !claim(&mut players, id("192.168.1.160:11000"), "00005e005301"),
             "nothing left to take"
         );
         assert!(
-            !claim(&mut players, id("10.0.0.9:11000"), "001122334455"),
+            !claim(&mut players, id("192.168.1.9:11000"), "001122334455"),
             "and a player written down nowhere else takes nothing"
         );
     }

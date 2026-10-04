@@ -284,8 +284,8 @@ mod tests {
     const SHARES: &str = r#"<form id="configshareform" method="POST" action="/findremoveshares?noheader=1" data-ajax="false">
         <fieldset data-role="controlgroup" data-type="vertical">
             <legend>Current music shares:</legend>
-            <input name="\\10.0.0.100\media\music" id="checkbox1" type="checkbox" />
-            <label for="checkbox1">media\music on 10.0.0.100 (\\10.0.0.100\media\music)</label>
+            <input name="\\192.168.1.100\media\music" id="checkbox1" type="checkbox" />
+            <label for="checkbox1">media\music on 192.168.1.100 (\\192.168.1.100\media\music)</label>
         </fieldset>
         <input type="submit" value="Remove selected shares" name="remove">
         <input type="submit" value="Add shares" name="doaddshares" data-inline="true">
@@ -314,10 +314,10 @@ mod tests {
 
         assert_eq!(action.as_deref(), Some("/findremoveshares?noheader=1"));
         assert_eq!(found.len(), 1, "the submit buttons are not shares");
-        assert_eq!(found[0].field, r"\\10.0.0.100\media\music");
+        assert_eq!(found[0].field, r"\\192.168.1.100\media\music");
         assert_eq!(
             found[0].label,
-            r"media\music on 10.0.0.100 (\\10.0.0.100\media\music)"
+            r"media\music on 192.168.1.100 (\\192.168.1.100\media\music)"
         );
     }
 
