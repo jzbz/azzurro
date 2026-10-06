@@ -47,46 +47,17 @@ except by hand.
 
 ## The first submission
 
-0.1.0's portable manifest went to winget-pkgs as microsoft/winget-pkgs#427198,
-which, as of 2026-10-02, is open and waiting for a moderator's manual review, so
-no one has a winget install of Azzurro yet. That pull request is not closed, and
-0.1.0 is not left to merge as it stands. Once a release carrying the setup exe
-is published and its `SHA256SUMS` signed, the pull request's branch
-(`jzbz:Azzurro.Azzurro-0.1.0`) gets one commit that removes
-`manifests/a/Azzurro/Azzurro/0.1.0/` and adds that release's installer-only
-manifests in a directory of their own, written by hand as below, and the pull
-request is retitled for that version. Validation runs again on the new commit.
-The pull request keeps its history, and the first Azzurro anyone installs
-through winget is the installer.
-
-If a moderator merges 0.1.0 before then, there is no open branch left to swap,
-and the first installer version goes to winget-pkgs as a new pull request of
-its own. Its manifests are written by hand as below, or written by a Komac
-that can read the setup exe, run with `--output <dir>`, corrected there and
-sent with `komac submit <dir>`. Not by 2.16.0's `komac update`, which besides
-not reading Inno Setup 7 keeps the previous manifest's `InstallerType` when
-that was `portable`, and so would file the setup exe as a portable package.
-Expect the bot to give that pull request the `Manifest-Metadata-Consistency`
-label for the change of installer type, for a moderator to clear.
-
-Whoever installed 0.1.0 then meets the one thing winget will not do: upgrade a
-portable install to an installer. `winget upgrade Azzurro.Azzurro` refuses,
-saying the install technology is different and the package has to be
-uninstalled and installed again, and neither `--force` nor
-`--uninstall-previous` gets past that. So, by hand, once, with Azzurro closed,
-since a running azzurro.exe cannot be deleted:
-
-    winget uninstall Azzurro.Azzurro
-    winget install Azzurro.Azzurro
-
-Nothing is lost. Uninstalling the portable package removes the exe winget
-copied, the `azzurro` command and winget's own entry for it, and nothing else:
-the settings live in `%APPDATA%\azzurro` and the artwork cache in
-`%LOCALAPPDATA%\azzurro`, outside anything winget or the installer owns, and the
-Azzurro that the second command installs finds them as they were. Running the
-setup exe by hand on top of a winget portable install is the one thing not to
-do: it leaves two copies, with the Start Menu pointing at one, the `azzurro`
-command at the other, and winget still tracking the old one.
+0.1.0's portable manifest went to winget-pkgs as microsoft/winget-pkgs#427198
+and waited there for a moderator's manual review. It was never merged, so no
+one has a winget install of 0.1.0, and it was not left to merge as it stood.
+0.2.0 is the first release carrying the setup exe, and once it was published
+and its `SHA256SUMS` signed, the pull request's branch
+(`jzbz:Azzurro.Azzurro-0.1.0`) got one commit that removes
+`manifests/a/Azzurro/Azzurro/0.1.0/` and adds 0.2.0's installer-only manifests
+in `manifests/a/Azzurro/Azzurro/0.2.0/`, written by hand as below, and the pull
+request was retitled for 0.2.0. Validation runs again on the new commit. The
+pull request keeps its history, and the first Azzurro anyone installs through
+winget is the installer, so nobody has a portable install to move off.
 
 ## The identifier
 
@@ -177,12 +148,12 @@ exe's line is the one that matters to winget. The installed azzurro.exe is the
 bare exe's bytes exactly, which release.yml checks by installing the setup on
 its runner, so the bare exe's line vouches for what ends up on disk as well.
 
-`manifest/` here holds what was actually submitted, for review before it is sent
-and as the starting point for the next version. Until the swap that is 0.1.0's
-portable manifest, which is what the open pull request still carries; replace
-it with what goes in. Keep `InstallerSha256` in step with the release's signed
-`SHA256SUMS` rather than recomputing it: pinning the hash that signature covers
-is the only thread connecting a winget install back to the key.
+`manifest/` here holds what was actually submitted, for review before it is
+sent and as the starting point for the next version. Since the swap that is
+0.2.0's installer manifest, the one the pull request carries. Keep
+`InstallerSha256` in step with the release's signed `SHA256SUMS` rather than
+recomputing it: pinning the hash that signature covers is the only thread
+connecting a winget install back to the key.
 
 ## Why there is no workflow for this
 
