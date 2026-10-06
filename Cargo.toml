@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/bluos", "crates/bluos-cli", "crates/azzurro-gui", "crates/fake-player"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -12,7 +12,7 @@ repository = "https://github.com/jzbz/azzurro"
 [workspace.dependencies]
 # Versioned as well as pathed so `bluos` can be published on its own: the
 # protocol is the part other people need, and it should outlive this GUI.
-bluos = { path = "crates/bluos", version = "0.1.0" }
+bluos = { path = "crates/bluos", version = "0.2.0" }
 
 # net for UDP and TCP, time for the long-poll backoff, sync for the channels
 # that carry player events to the UI thread. "macros" only for #[tokio::main]

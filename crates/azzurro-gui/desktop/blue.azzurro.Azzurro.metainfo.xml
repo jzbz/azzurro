@@ -95,6 +95,20 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.2.0" date="2026-10-05">
+      <description>
+        <p>Players that move, stop answering or come back are handled as they should be.</p>
+        <ul>
+          <li>A player that takes a new address while the app is closed is recognized and followed, instead of being left behind as a second row that never answers.</li>
+          <li>A player that has stopped responding can be forgotten from the player list, and the window no longer starts on one that does not answer.</li>
+          <li>Choosing a player that is not responding says so instead of showing another player's screens, and its screens appear once it answers again.</li>
+          <li>Grouping is offered only between players that can take part in it.</li>
+          <li>Every control has a name and a role for screen readers, keys go to the pane in front, and text being typed is kept.</li>
+          <li>The quality badge says what the player's decoder found, MQA included, and keeps it through a pause and across a restart.</li>
+          <li>Windows gets an installer with a Start Menu entry, and the Flatpak moves to the 26.08 runtime.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-21">
       <description>
         <p>First release.</p>

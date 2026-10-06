@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "azzurro-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bluos",
  "dirs",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "bluos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fake-player",
  "iana-time-zone",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "bluos-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bluos",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "fake-player"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bluos",
  "tokio",
