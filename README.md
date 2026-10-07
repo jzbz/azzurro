@@ -138,7 +138,12 @@ On Linux every player is also exported on D-Bus as its own MPRIS media player,
 named after the speaker rather than after the app — two speakers playing two
 different things are two things the desktop should be able to see and drive.
 Media keys, the GNOME shell menu, the KDE applet and a lock screen all reach a
-player through the same command channel the window's own buttons use.
+player through the same command channel the window's own buttons use. The bus
+names are the app's rather than the speakers' — one per player, each
+`org.mpris.MediaPlayer2.blue.azzurro.Azzurro.instance…` — so
+`playerctl -p blue.azzurro.Azzurro` picks out the app's players (`-a` reaches
+every one of them), and the Flatpak needs no permission to claim them, since they
+sit under the app's own id.
 
 Browsing is server-driven. `/ui/Configuration` lists the screens a player
 offers, each one arrives as XML describing rows and items, and every `browse`

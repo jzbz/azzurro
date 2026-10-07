@@ -31,17 +31,17 @@ finish-args:
   # player at all, and can only reach ones added by address.
   - --share=network
 
-  # One MPRIS object per player, so the desktop's media controls and the media
-  # keys reach each speaker separately. The suffix carries the process id and a
-  # per-player index, hence the wildcard.
-  - --own-name=org.mpris.MediaPlayer2.azzurro.*
-
   # Note what is *not* here: no --filesystem grants at all. The remembered
   # player list and the cover-art cache both live in the app's own directories
   # under ~/.var/app/blue.azzurro.Azzurro, and nothing else is read or
   # written. Signing into a music service and the players' own settings pages
   # are web pages, opened through the desktop's OpenURI portal rather than by
   # this app.
+  #
+  # No --own-name either, though each player is exported over MPRIS under a bus
+  # name of its own. Those names sit under the app id, as
+  # org.mpris.MediaPlayer2.blue.azzurro.Azzurro.instance..., and Flatpak lets
+  # every app own that subtree without being granted it.
 
 modules:
   - name: azzurro

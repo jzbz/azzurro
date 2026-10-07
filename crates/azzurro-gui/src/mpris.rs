@@ -93,12 +93,7 @@ impl Bridge {
         commands: mpsc::UnboundedSender<Command>,
         artwork: Arc<Artwork>,
     ) -> Attach {
-        // `org.mpris.MediaPlayer2.azzurro.instance<pid>_<n>`. The spec wants a
-        // unique suffix and suggests a process id; the index disambiguates the
-        // several players one process exports. Each dot-separated element has
-        // to start with a non-digit, which is what `instance` is doing here
-        // besides matching what every other player does.
-        let suffix = format!("azzurro.instance{}_{index}", std::process::id());
+        let suffix = bus_suffix(index);
 
         let exported = Exported {
             id,
@@ -182,6 +177,27 @@ impl Bridge {
             tracing::debug!("MPRIS offline announcement failed: {e}");
         }
     }
+}
+
+/// The part of a player's bus name after `org.mpris.MediaPlayer2.`.
+///
+/// `blue.azzurro.Azzurro.instance<pid>_<n>`. The spec wants a unique suffix
+/// and suggests a process id; the index disambiguates the several players one
+/// process exports. Each dot-separated element has to start with a non-digit,
+/// which is what `instance` is doing here besides matching what every other
+/// player does.
+///
+/// The application id comes first because of what a Flatpak sandbox allows.
+/// Its bus proxy lets an app own `org.mpris.MediaPlayer2.<app id>` and every
+/// name below it without being granted anything, and refuses any other name
+/// the manifest has not asked for with `--own-name`. Under the app id, the
+/// manifest asks for nothing on the session bus, and a store reading its
+/// permissions has no unexplained bus name to warn about. A name that is
+/// refused is not a missing bus: it comes back as [`Attach::Failed`], so the
+/// player would go without media controls and the export would be tried again
+/// on every status.
+fn bus_suffix(index: usize) -> String {
+    format!("{}.instance{}_{index}", crate::APP_ID, std::process::id())
 }
 
 /// One status as the bus sees it, at the moment it arrived.
@@ -1036,6 +1052,33 @@ mod tests {
         assert!(!no_session_bus(&zbus::Error::InputOutput(Arc::new(
             Error::from(ErrorKind::Interrupted)
         ))));
+    }
+
+    /// Flatpak lets an app own the names under `org.mpris.MediaPlayer2.<app
+    /// id>` and refuses the rest, and the manifest grants nothing more. A name
+    /// outside that subtree works when the binary is run directly and is
+    /// refused inside the sandbox, so nothing short of this would catch it
+    /// before somebody's media keys did.
+    #[test]
+    fn the_bus_name_sits_under_the_application_id() {
+        let granted = format!("org.mpris.MediaPlayer2.{}.", crate::APP_ID);
+        let first = format!("org.mpris.MediaPlayer2.{}", bus_suffix(0));
+        let second = format!("org.mpris.MediaPlayer2.{}", bus_suffix(1));
+
+        assert!(
+            first.starts_with(&granted),
+            "{first} is not under {granted}"
+        );
+        assert_ne!(first, second, "two players of one process would collide");
+
+        // And it is a name the bus accepts at all: no element may start with
+        // a digit, which a process id would without `instance` in front of it.
+        for name in [&first, &second] {
+            assert!(
+                zbus::names::WellKnownName::try_from(name.as_str()).is_ok(),
+                "{name} is not a valid bus name"
+            );
+        }
     }
 
     #[test]
