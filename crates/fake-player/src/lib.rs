@@ -5,6 +5,8 @@
 //! network, in a known state, answering the same way twice. So this answers
 //! instead. It binds a port on the loopback, serves documents in the shapes a
 //! real player uses, and lets a test say what those documents contain.
+//! [`Player::bind`] can place it at another address, for a demonstration that
+//! has to be found in the same place on every run.
 //!
 //! ```no_run
 //! # async fn go() {
@@ -60,11 +62,17 @@ impl Request {
 /// A route that works its reply out from the request. `None` is a 404.
 type Handler = Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>;
 
+/// The same for a reply that is not XML: a content type and raw bytes.
+/// Cover art is the case: a player serves JPEG or PNG from `/Artwork`.
+type BytesHandler = Arc<dyn Fn(&Request) -> Option<(String, Vec<u8>)> + Send + Sync>;
+
 /// What a path answers: the same document every time, whatever a handler
 /// makes of the request, or nothing at all.
 enum Route {
     Fixed(String),
     Answer(Handler),
+    /// Bytes with a content type of their own. See [`Player::handle_bytes`].
+    Bytes(BytesHandler),
     /// No reply: the connection is closed once the request is in. See
     /// [`Player::hang_up`].
     HangUp,
@@ -100,9 +108,10 @@ struct State {
     delays: HashMap<String, Duration>,
 }
 
-/// A player on the loopback.
+/// A player on the loopback, on a port of the kernel's choosing unless
+/// [`Player::bind`] put it somewhere in particular.
 pub struct Player {
-    port: u16,
+    bound: SocketAddr,
     state: Arc<Mutex<State>>,
 }
 
@@ -114,6 +123,19 @@ impl Player {
 
     /// Start one with exactly these routes and nothing else.
     pub async fn with_routes(routes: Vec<(&str, String)>) -> Self {
+        // Port zero: the kernel picks a free one, so tests can run at the same
+        // time as each other and as a real player.
+        Self::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), routes)
+            .await
+            .expect("a loopback port")
+    }
+
+    /// Start one at a chosen address, for something that has to be found in
+    /// the same place every time — a demonstration rather than a test.
+    ///
+    /// An error rather than a panic where the address cannot be had: taken
+    /// already, or not one this machine has. Port zero still means any port.
+    pub async fn bind(at: SocketAddr, routes: Vec<(&str, String)>) -> std::io::Result<Self> {
         let state = Arc::new(Mutex::new(State {
             routes: routes
                 .into_iter()
@@ -122,12 +144,8 @@ impl Player {
             ..State::default()
         }));
 
-        // Port zero: the kernel picks a free one, so tests can run at the same
-        // time as each other and as a real player.
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("a loopback port");
-        let port = listener.local_addr().expect("bound").port();
+        let listener = TcpListener::bind(at).await?;
+        let bound = listener.local_addr()?;
 
         let serving = state.clone();
         tokio::spawn(async move {
@@ -139,16 +157,16 @@ impl Player {
             }
         });
 
-        Self { port, state }
+        Ok(Self { bound, state })
     }
 
     /// Where it is, in the form the rest of the crate uses.
     pub fn id(&self) -> bluos::DeviceId {
-        bluos::DeviceId::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port)
+        bluos::DeviceId::new(self.bound.ip(), self.bound.port())
     }
 
     pub fn address(&self) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port)
+        self.bound
     }
 
     /// Change what a path answers, from here on.
@@ -176,6 +194,23 @@ impl Player {
             .insert(path.to_owned(), Route::Answer(Arc::new(answer)));
     }
 
+    /// Answer a path with bytes the handler chooses, and the content type it
+    /// names, from here on.
+    ///
+    /// The handler runs outside the fake's lock, so it may keep state of its
+    /// own behind one.
+    pub fn handle_bytes(
+        &self,
+        path: &str,
+        answer: impl Fn(&Request) -> Option<(String, Vec<u8>)> + Send + Sync + 'static,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .routes
+            .insert(path.to_owned(), Route::Bytes(Arc::new(answer)));
+    }
+
     /// Hold a queue of `length` songs and answer `/Playlist` from it the way a
     /// player does: the whole queue with no window asked for, and with
     /// `start=` and `end=` only the songs between them, **both ends included**.
@@ -201,8 +236,8 @@ impl Player {
     /// The client sees no status at all — the same as a request that times
     /// out, which is what the app has to tell from a player that answered and
     /// said no, and without the ten seconds a timeout takes. A delay set on
-    /// the path is sat out first. `serve` or `handle` on the path answers it
-    /// again.
+    /// the path is sat out first. `serve`, `handle` or `handle_bytes` on the
+    /// path answers it again.
     pub fn hang_up(&self, path: &str) {
         self.state
             .lock()
@@ -333,6 +368,7 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
         let route = match state.routes.get(&request.path) {
             Some(Route::Fixed(body)) => Route::Fixed(body.clone()),
             Some(Route::Answer(handler)) => Route::Answer(handler.clone()),
+            Some(Route::Bytes(handler)) => Route::Bytes(handler.clone()),
             Some(Route::HangUp) => Route::HangUp,
             None => Route::Answer(Arc::new(|_| None)),
         };
@@ -342,9 +378,11 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
     // Outside the lock, so a handler that keeps state of its own cannot
     // deadlock against a test reading `asked()` at the same moment.
     let hanging_up = matches!(route, Route::HangUp);
+    let xml = "application/xml".to_owned();
     let body = match route {
-        Route::Fixed(body) => Some(body),
-        Route::Answer(handler) => handler(&request),
+        Route::Fixed(body) => Some((xml, body.into_bytes())),
+        Route::Answer(handler) => handler(&request).map(|body| (xml, body.into_bytes())),
+        Route::Bytes(handler) => handler(&request),
         Route::HangUp => None,
     };
 
@@ -366,20 +404,25 @@ async fn answer(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Res
     };
 
     let reply = match body {
-        Some(body) => format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/xml\r\n\
-             {carried}\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            body.len()
-        ),
+        Some((kind, body)) => {
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: {kind}\r\n\
+                 {carried}\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(&body);
+            reply
+        }
         None => {
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
         }
     };
 
-    stream.write_all(reply.as_bytes()).await?;
+    stream.write_all(&reply).await?;
     stream.flush().await?;
     // Close the writing half deliberately rather than letting the drop do it,
     // so the client sees an orderly end to the body.
@@ -452,6 +495,75 @@ mod tests {
 
         player.serve("/ui/Home", "<screen/>");
         assert!(ask().await.starts_with("HTTP/1.1 200"));
+    }
+
+    /// Bytes go out as they are, under the content type the handler named and
+    /// with their own length, while a document keeps answering as XML.
+    #[tokio::test]
+    async fn bytes_are_served_under_their_own_content_type() {
+        let player = Player::with_routes(vec![("/Status", "<status/>".to_owned())]).await;
+        // Not UTF-8, which is the point: a cover is no string.
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+        let served = png.clone();
+        player.handle_bytes("/Artwork", move |request| {
+            (request.param("album") == Some("1")).then(|| ("image/png".to_owned(), served.clone()))
+        });
+        let ask = |target: &'static str| {
+            let address = player.address();
+            async move {
+                let mut stream = TcpStream::connect(address).await.unwrap();
+                let head = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+                stream.write_all(head.as_bytes()).await.unwrap();
+                let mut reply = Vec::new();
+                stream.read_to_end(&mut reply).await.unwrap();
+                let split = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let body = reply.split_off(split);
+                (String::from_utf8(reply).unwrap(), body)
+            }
+        };
+
+        let (head, body) = ask("/Artwork?album=1").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Content-Type: image/png\r\n"), "{head}");
+        assert!(
+            head.contains(&format!("Content-Length: {}\r\n", png.len())),
+            "{head}"
+        );
+        assert_eq!(body, png);
+
+        let (head, _) = ask("/Artwork?album=2").await;
+        assert!(
+            head.starts_with("HTTP/1.1 404"),
+            "no bytes is no cover: {head}"
+        );
+
+        let (head, body) = ask("/Status").await;
+        assert!(head.contains("Content-Type: application/xml\r\n"), "{head}");
+        assert_eq!(body, b"<status/>");
+    }
+
+    /// A player bound to an address is found there, and an address already
+    /// taken is an error to handle rather than a panic.
+    #[tokio::test]
+    async fn a_player_is_where_it_was_bound() {
+        let at = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let player = Player::bind(at, Vec::new()).await.unwrap();
+        let address = player.address();
+        assert_eq!(address.ip(), at.ip());
+        assert_ne!(
+            address.port(),
+            0,
+            "the port the kernel chose, not the zero asked for"
+        );
+        assert_eq!(
+            player.id(),
+            bluos::DeviceId::new(address.ip(), address.port())
+        );
+
+        assert!(
+            Player::bind(address, Vec::new()).await.is_err(),
+            "the same address twice"
+        );
     }
 
     #[test]
