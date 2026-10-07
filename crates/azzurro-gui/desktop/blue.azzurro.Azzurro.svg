@@ -8,28 +8,39 @@
     
     The glyph is placed by transform rather than by rewriting its coordinates,
     so it stays a verbatim copy of the upstream paths and can be replaced by
-    pasting a newer version in. Lucide's own 1:2 stroke-to-gap ratio is
-    preserved by scaling the 2px stroke with everything else: at this size that
-    is a 15px stroke, which is still four pixels when the desktop draws the
-    icon at 64.
+    pasting a newer version in. Lucide's own proportion, a stroke as wide as
+    the gap beside it, is kept by scaling the 2px stroke with everything else:
+    at this size that is a 14px stroke, which is still three and a half pixels
+    when the desktop draws the icon at 64.
 
     A ground rather than a bare glyph, because an icon is composited onto a
     panel of unknown color and a thin stroke on transparency disappears there.
-    The blue is the light-theme accent, fixed: the app follows the system
-    theme, but nothing asks an icon to redraw when the theme changes.
+    The blues are fixed: the app follows the system theme, but nothing asks an
+    icon to redraw when the theme changes.
   -->
   <defs>
     <!--
       Diagonal rather than straight down, and through three stops rather than
       two: a vertical two-stop ramp reads as a flat card with a shadow on it,
       while running light-to-deep across the corner gives the tile a direction
-      the eye follows. Sky at the top left, azure through the middle, indigo in
-      the far corner — all blue, so it still reads as one color at 32px.
+      the eye follows. Sky at the top left, azure through the middle, a deep
+      blue in the far corner — all blue, so it still reads as one color at
+      32px.
+
+      Deep, but not dark. The far corner is where the tile meets whatever it
+      sits on, and on a dark panel a dark edge is no edge at all: the indigo
+      this used to end in, #1e3a8a, is 1.5:1 against libadwaita's dark window
+      background, #222226, and the tile looked as though its bottom right had
+      been bitten off. Flathub's icon guidelines single out dark colors at the
+      edges for that reason. #2563eb is 3:1 against the same background, the
+      contrast WCAG asks of a graphic that has to be seen, and the edge itself
+      comes out a little lighter still, because the rounded corner stops short
+      of the end of the ramp. White on it is still better than 5:1.
     -->
     <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#7dd3fc"/>
       <stop offset="0.45" stop-color="#0ea5e9"/>
-      <stop offset="1" stop-color="#1e3a8a"/>
+      <stop offset="1" stop-color="#2563eb"/>
     </linearGradient>
 
     <!-- A soft highlight where the light would fall, for a little depth. -->
@@ -40,10 +51,25 @@
     </radialGradient>
   </defs>
 
-  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#ground)"/>
-  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#sheen)"/>
+  <!--
+    208 of the 256, from 24 to 232, which is the square on Flathub's icon grid:
+    its template draws that square as a 2px line whose outer edge runs from 24
+    to 232, and the store holds icons to it before featuring them. A tile that fills more of the
+    canvas than that sits larger than every other icon in a row of them. 24
+    rather than 25 keeps the straight edges on whole pixels at 32, 64, 128 and
+    256, where an edge halfway across a pixel is drawn as a soft line; at 16, 24
+    and 48 they fall part way across one either way.
 
-  <g transform="translate(36.8 36.8) scale(7.6)"
+    The corner radius and the glyph shrink with the tile, so the icon is the
+    one it was, only smaller: the radius goes from 52 to 48, and the glyph from
+    7.6 pixels per Lucide unit to 7, which makes its 24-unit box 168 across and
+    puts it at 44 to stay centered. Exactly in proportion would be 7.06; the
+    round number is less than a pixel a side away from it.
+  -->
+  <rect x="24" y="24" width="208" height="208" rx="48" fill="url(#ground)"/>
+  <rect x="24" y="24" width="208" height="208" rx="48" fill="url(#sheen)"/>
+
+  <g transform="translate(44 44) scale(7)"
      fill="none" stroke="#ffffff" stroke-width="2"
      stroke-linecap="round" stroke-linejoin="round">
     <path d="M2 10v3"/>
