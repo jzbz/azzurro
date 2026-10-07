@@ -7396,7 +7396,8 @@ impl Backend {
             // prose does.
             label: "© 2026 Jonathan Zeppettini · MIT License".to_owned(),
             detail: "Not affiliated with, endorsed by, or supported by Lenbrook \
-                     Industries. BluOS, Bluesound and NAD are their trademarks."
+                     Industries. BluOS, Bluesound, NAD, PSB and MQA are their \
+                     trademarks."
                 .to_owned(),
             glyph: Some(Glyph::Details),
             control: "none",

@@ -270,4 +270,4 @@ so no player can be reached at all, not even one added by address.
 MIT. See `LICENSE`.
 
 Not affiliated with, endorsed by, or supported by Lenbrook Industries. BluOS,
-Bluesound and NAD are their trademarks.
+Bluesound, Powernode, NAD, PSB and MQA are their trademarks.

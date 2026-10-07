@@ -16,15 +16,14 @@
   <description>
     <p>
       Azzurro is a controller for BluOS players — Bluesound, NAD and PSB. It
-      finds the players on your network, shows what each one is doing, and
-      drives them: transport, volume, the play queue, and browsing every source
-      the player offers.
+      finds the players on your network and talks to them directly, with no
+      cloud service in between and no account of its own. Music services stay
+      signed in on the player.
     </p>
     <p>
-      Browsing is not built from a list of music services. Each player
-      describes its own screens, and Azzurro renders what it is given, so a
-      service added to BluOS after this was written browses and plays without
-      an update here.
+      Each player describes its own browse screens, and Azzurro draws what it
+      is given, so a music service that BluOS adds later can be browsed and
+      played without an update to the app.
     </p>
     <p>Features:</p>
     <ul>
@@ -40,12 +39,8 @@
       so the media keys work</li>
     </ul>
     <p>
-      Written in Rust throughout, with Slint for the interface. No webview, no
-      Electron, and no accounts.
-    </p>
-    <p>
       Not affiliated with, endorsed by, or supported by Lenbrook Industries.
-      BluOS, Bluesound and NAD are their trademarks.
+      BluOS, Bluesound, NAD, PSB and MQA are their trademarks.
     </p>
   </description>
 
@@ -69,13 +64,18 @@
     <category>Player</category>
   </categories>
 
+  <!-- In a software center these replace the desktop file's Keywords rather
+       than adding to them, so the list repeats that one and goes further. -->
   <keywords>
     <keyword>BluOS</keyword>
     <keyword>Bluesound</keyword>
     <keyword>NAD</keyword>
     <keyword>PSB</keyword>
+    <keyword>music</keyword>
     <keyword>multiroom</keyword>
+    <keyword>speaker</keyword>
     <keyword>streaming</keyword>
+    <keyword>remote</keyword>
   </keywords>
 
   <supports>
@@ -87,9 +87,12 @@
     <display_length compare="ge">768</display_length>
   </requires>
 
+  <!-- A store draws the icon on these. They stay blue, as the name is, but
+       outside the tile's own range, from sky to a deep blue: a pale periwinkle
+       lighter than all of it for light, a navy darker than all of it for dark. -->
   <branding>
-    <color type="primary" scheme_preference="light">#0284c7</color>
-    <color type="primary" scheme_preference="dark">#38bdf8</color>
+    <color type="primary" scheme_preference="light">#c7d2fe</color>
+    <color type="primary" scheme_preference="dark">#2a2f6b</color>
   </branding>
 
   <content_rating type="oars-1.1"/>
@@ -109,7 +112,7 @@
         </ul>
       </description>
     </release>
-    <release version="0.1.0" date="2026-08-21">
+    <release version="0.1.0" date="2026-09-01">
       <description>
         <p>First release.</p>
       </description>
