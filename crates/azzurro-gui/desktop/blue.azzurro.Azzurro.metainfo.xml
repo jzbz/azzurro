@@ -46,13 +46,40 @@
 
   <launchable type="desktop-id">blue.azzurro.Azzurro.desktop</launchable>
 
-  <!--
-    No <screenshots> yet. Flathub requires at least one, and every screenshot
-    of a controller necessarily shows somebody's music library and the
-    addresses on their network, so these have to be taken deliberately against
-    content that is fine to publish rather than grabbed from a running session.
-    This must be added before submitting to Flathub.
-  -->
+  <!-- Each URL names the commit that last changed the screenshots, not a
+       branch, as Flathub asks: a later retake cannot then change what an
+       older release shows. Retaking them means pointing every URL at the
+       new commit. -->
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/01-now-playing.png</image>
+      <caption>Now Playing with large cover art, track details and the stream's audio format</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/02-home.png</image>
+      <caption>Recently played and recently added albums on Home, shown by their cover art</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/03-album.png</image>
+      <caption>Open an album to see its track list, then play it all or shuffle it</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/04-rooms.png</image>
+      <caption>Choose a room, set each player's volume and group rooms to play in sync</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/05-search.png</image>
+      <caption>Search for music and get matching albums and songs together</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/06-queue.png</image>
+      <caption>The play queue sits beside Home, with save, edit and clear at hand</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/azzurro/b1208bb17d424c329ea5da22e763ae0beab630fe/packaging/screenshots/07-now-playing-light.png</image>
+      <caption>Now Playing in the light style</caption>
+    </screenshot>
+  </screenshots>
 
   <url type="homepage">https://azzurro.blue/</url>
   <url type="bugtracker">https://github.com/jzbz/azzurro/issues</url>
