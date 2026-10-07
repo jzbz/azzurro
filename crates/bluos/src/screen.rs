@@ -310,6 +310,50 @@ impl Item {
         self.action.is_some() || self.play_action.is_some()
     }
 
+    /// Whether the player presents this item as one of the things its library
+    /// and services hold — a song, an album, an artist, a station, a playlist —
+    /// rather than as an entry in one of its own menus or a thing to do.
+    ///
+    /// Nothing in an item's title can say which. "Shuffle" is the button at
+    /// the top of an album's page and also a song somebody wrote; "Radio" is a
+    /// service and also the name of a record. What can is everything the
+    /// player attaches to a thing and, in every document captured here, never
+    /// to a menu entry: the kind of object it names, its place on a record,
+    /// how long it plays, how it is encoded, a play button beside the way in,
+    /// and a menu of what can be done with it. Any one of those is the player
+    /// saying the row is something rather than somewhere. An album's tracks
+    /// carry their number and their format, which is what its page draws
+    /// beside each of them, and a row of the play queue carries its length,
+    /// its format and its menu.
+    ///
+    /// Not every thing carries one. An artist on a library's Artists page
+    /// comes with a menu or without one, and no genre row has been captured to
+    /// say what a genre carries. This answers `false` for a row with none of
+    /// the marks, whatever the row is.
+    ///
+    /// Only an `<item>`, a cover tile or a teaser can be one. A `<source>`, an
+    /// `<input>` or a `<service>` is the player naming the row as a place to
+    /// browse or a way to make sound, whatever else it carries.
+    ///
+    /// What a row does is deliberately not part of the answer, and neither is
+    /// whether it can be the one playing. An input starts playing when it is
+    /// pressed and says when it is the one playing, exactly as a track does,
+    /// and "Play now" in a menu plays too. None of that says what the row is.
+    pub fn is_object(&self) -> bool {
+        // An attribute written empty says nothing, and is read as absent.
+        let says = |value: Option<&String>| value.is_some_and(|value| !value.is_empty());
+
+        matches!(
+            self.kind,
+            ItemKind::Item | ItemKind::Thumbnail | ItemKind::Teaser
+        ) && (says(self.object_type.as_ref())
+            || says(self.extra.get("track"))
+            || says(self.duration.as_ref())
+            || says(self.quality.as_ref())
+            || self.play_action.is_some()
+            || self.context_menu.is_some())
+    }
+
     /// Placeholder text for a search box — "Search..." — as distinct from its
     /// label, which is what [`Item::label`] returns.
     pub fn prompt(&self) -> Option<&str> {
@@ -2304,6 +2348,71 @@ mod tests {
             tracks[1].now_playing_match,
             Some(("song".to_owned(), "1".to_owned()))
         );
+    }
+
+    /// A thing is known by what the player attaches to it, and any one of
+    /// those marks is enough. The titles are chosen to be the player's own
+    /// words, because the title is exactly what this does not go by.
+    #[test]
+    fn a_thing_is_known_by_what_the_player_attaches_to_it() {
+        // Captured: every track in the queue has its length, its format and
+        // its menu.
+        let queue = parse(QUEUE).unwrap();
+        assert!(queue.items().all(Item::is_object));
+
+        let marked = parse(
+            r#"<screen><list>
+                 <item title="Barometer Song" track="4"><action type="player-link" URI="/Add?playnow=1&amp;file=4.flac"/></item>
+                 <item title="Shuffle" duration="3:12"/>
+                 <item title="Save Me" quality="cd"/>
+                 <item title="Radio" objectType="Album"><action type="browse" URI="/ui/album"/></item>
+                 <item title="Home"><action type="browse" URI="/ui/album"/><playAction type="player-link" URI="/Add?playnow=1&amp;album=1"/></item>
+                 <item title="Clear"><contextMenu type="browse" URI="/ui/rowCM" resultType="contextMenu"/></item>
+               </list>
+               <row><largeThumbnail title="Info" objectType="Album"/></row></screen>"#,
+        )
+        .unwrap();
+        assert_eq!(marked.items().count(), 7);
+        for item in marked.items() {
+            assert!(item.is_object(), "{:?} is a thing", item.label());
+        }
+    }
+
+    /// And a menu entry or a verb carries none of those marks, whatever it
+    /// does when it is pressed.
+    #[test]
+    fn a_menu_entry_or_a_verb_is_not_a_thing() {
+        // Captured. The inputs start playing and say when they are the one
+        // playing, which a track does too; that is not what makes a thing.
+        let sources = parse(SOURCES_SCREEN).unwrap();
+        assert!(sources.items().all(|item| !item.is_object()));
+        // Captured: a context menu is verbs, "Favourite" and "Go to artist".
+        let menu = parse(CONTEXT_MENU).unwrap();
+        assert!(menu.items().all(|item| !item.is_object()));
+        // Captured: a service picker, and the panel standing in for a list.
+        let favourites = parse(FAVOURITES).unwrap();
+        assert!(favourites.items().all(|item| !item.is_object()));
+
+        let library = parse(
+            r#"<screen><list>
+                 <item title="Albums"><action type="browse" URI="/ui/browseGrouped?service=LocalMusic&amp;type=Album"/></item>
+                 <item title="Songs" track="" objectType=""><action type="browse" URI="/ui/browseGrouped?service=LocalMusic&amp;type=Song"/></item>
+               </list></screen>"#,
+        )
+        .unwrap();
+        assert!(
+            library.items().all(|item| !item.is_object()),
+            "a library's own menu, and a mark written empty says nothing"
+        );
+
+        // A source is a source, whatever else it is given.
+        let source = parse(
+            r#"<screen><row><source title="Radio" objectType="Album" duration="3:12">
+                 <contextMenu type="browse" URI="/ui/rowCM" resultType="contextMenu"/>
+               </source></row></screen>"#,
+        )
+        .unwrap();
+        assert!(source.items().all(|item| !item.is_object()));
     }
 
     /// A library's Artists page: an alphabet to jump by, then the names. Both

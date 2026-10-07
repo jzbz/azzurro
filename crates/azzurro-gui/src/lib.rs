@@ -8135,6 +8135,8 @@ impl Backend {
                                 american(
                                     item.extra.get("subText").map(String::as_str).unwrap_or(""),
                                 ),
+                                // The screen's heading, which is not always
+                                // the player's own word; see `glyph_for`.
                                 glyphs::glyph_for(screen.heading().unwrap_or_default(), None),
                             ));
                             continue;
@@ -8148,36 +8150,11 @@ impl Backend {
                         .or(item.icon.as_deref())
                         .filter(|src| !src.is_empty());
 
-                    // What the row is called, for the purpose of choosing an
-                    // icon for it.
-                    //
-                    // Not always the item's own label: Home's Most Used shelf
-                    // writes Radio Paradise and TuneIn as `<source>` elements
-                    // with no title at all, and the name comes from the action
-                    // instead — which is where the caption gets it too. With
-                    // only the label to go on there was nothing to match and
-                    // both kept their logos.
-                    let named = item.label().unwrap_or_else(|| {
-                        item.action
-                            .as_ref()
-                            .and_then(|a| a.title.as_deref())
-                            .unwrap_or_default()
-                    });
-
-                    // A service picker is a row of names in the app's own
-                    // chrome, so it gets the app's own icons; everywhere else
-                    // the player's picture wins when it is content.
-                    let glyph = if kind == 2 {
-                        Some(glyphs::service_glyph(named))
-                    } else if item
-                        .action
-                        .as_ref()
-                        .is_some_and(bluos::Action::is_browse_menu)
-                    {
-                        Some(glyphs::menu_glyph(named))
-                    } else {
-                        glyphs::glyph_for(named, source)
-                    };
+                    // The same call the cover walk makes to decide what to
+                    // fetch, so the two cannot disagree about a row. It is
+                    // also where a song's title is kept away from the words
+                    // the player's menus are read by.
+                    let glyph = glyphs::row_glyph(section.kind, item);
                     // A glyph makes the picture beside it redundant, and not
                     // fetching it saves a request the player would have served.
                     //
@@ -11615,26 +11592,26 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left
                     // so the two want different fetches. Walking sections rather than
                     // items is what makes that distinction available here.
                     .flat_map(|section| {
-                        let size = if section.kind == SectionKind::Row {
+                        let kind = section.kind;
+                        let size = if kind == SectionKind::Row {
                             TILE_SIZE
                         } else {
                             THUMB_SIZE
                         };
-                        section.items.iter().map(move |item| (item, size))
+                        section.items.iter().map(move |item| (item, kind, size))
                     })
                     // Before the filter, so it counts items and not pictures:
                     // the caller knows how many items it had, not how many of
                     // them turned out to want one.
                     .skip(done)
-                    .filter_map(|(item, size)| {
-                        // A menu row is drawn as a glyph whatever picture came with it,
-                        // so fetching TuneIn's logo for "Sports" would be a request for
-                        // something that never reaches the screen.
-                        if item
-                            .action
-                            .as_ref()
-                            .is_some_and(bluos::Action::is_browse_menu)
-                        {
+                    .filter_map(|(item, kind, size)| {
+                        // Drawn as a glyph, so there is nothing to fetch: a
+                        // menu row is drawn as one whatever picture came with
+                        // it, and fetching TuneIn's logo for "Sports" would be
+                        // a request for something that never reaches the
+                        // screen. Asked of the call the publisher draws by, so
+                        // a row this skips is never one drawn as a picture.
+                        if glyphs::row_glyph(kind, item).is_some() {
                             return None;
                         }
                         let source = item
@@ -11642,10 +11619,7 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left
                             .as_deref()
                             .or(item.icon.as_deref())
                             .filter(|src| !src.is_empty())?;
-                        // Drawn as a glyph, so there is nothing to fetch.
-                        glyphs::glyph_for(item.label().unwrap_or_default(), Some(source))
-                            .is_none()
-                            .then_some((source, size))
+                        Some((source, size))
                     })
                     .map(|(src, size)| (client.image_url(src), size)),
             )
@@ -31890,6 +31864,182 @@ mod thumbnail_tests {
             backend.browsing.lock().unwrap().trail.len(),
             1,
             "and Back did leave the screen"
+        );
+    }
+
+    /// A screen whose rows are drawn by what they are and not by what they
+    /// are called, for the two tests below: a service picker's chip for a
+    /// service with no glyph of its own, a song called "Shuffle", and the verb
+    /// of the same name.
+    ///
+    /// Made up for these tests. The chip is the captured Favourites picker's
+    /// with another service in it, the verb is shaped like a row of a context
+    /// menu with the album header's own Shuffle behind it, and the song
+    /// carries its number and its format. The song's picture and the verb's
+    /// are under neither of the paths that hold content and are named nothing
+    /// a glyph is chosen by, so what each row is drawn with turns on the row.
+    const NAMED_LIKE_A_BUTTON: &str = r#"<screen>
+  <selectorMenu menuTitle="Select Service" replaceScreen="true">
+    <item icon="/Sources/images/QobuzIcon.png?style=Default" text="Qobuz"><action type="browse" URI="/ui/Favourites?service=Qobuz"/></item>
+  </selectorMenu>
+  <list>
+    <item title="Shuffle" track="3" quality="cd" image="/images/x9271.png"><action type="player-link" URI="/Add?playnow=1&amp;file=3.flac"/></item>
+    <item text="Shuffle" icon="/images/ui/cm_x9272.png"><action type="player-link" URI="/Add?playnow=1&amp;shuffle=1&amp;album=1"/></item>
+  </list>
+</screen>"#;
+
+    /// That screen, open on `player` as the only one on the trail.
+    fn open_named_like_a_button(backend: &Backend, player: &Player) {
+        let mut browsing = backend.browsing.lock().unwrap();
+        browsing.device = Some(player.id());
+        browsing.trail.push(Crumb {
+            uri: "/ui/Favourites?service=Qobuz".to_owned(),
+            screen: bluos::screen::parse(NAMED_LIKE_A_BUTTON).expect("parses"),
+            query: None,
+            page: 0,
+        });
+    }
+
+    /// The cover walk fetches the picture of a song whatever the song is
+    /// called, and never the icon of a row drawn as a glyph.
+    ///
+    /// It used to decide for itself, from the item's label alone. That
+    /// fetched the icon of a picker's chip that the publisher draws as a
+    /// glyph, and it read a song's title for the player's words, so a song
+    /// called "Shuffle" was skipped as a glyph. Once the publisher stopped
+    /// reading a song's title, that song would have been drawn by a picture
+    /// nothing had fetched. The walk asks the publisher's own question now,
+    /// and this holds it to the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_walk_fetches_a_things_picture_whatever_it_is_called() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        open_named_like_a_button(&backend, &player);
+
+        // Waited out to the end rather than until the song's picture is asked
+        // for: the walk fetches several at once and they arrive in no
+        // particular order, so a fetch of the chip's icon could still be on
+        // its way when the song's has landed.
+        backend.walk_browse(player.id(), Walk::Whole);
+        let walk = backend.browse_walk.lock().unwrap().running[0].stop.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !walk.is_finished() {
+            assert!(Instant::now() < deadline, "the walk never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let asked = player.asked();
+        assert!(
+            player.asked_for("/images/x9271.png"),
+            "the song called Shuffle is drawn by its picture, and the picture \
+             was never fetched: {asked:?}"
+        );
+        assert!(
+            !player.asked_for("QobuzIcon"),
+            "the picker's chip is drawn as a glyph, and its icon was fetched \
+             anyway: {asked:?}"
+        );
+        assert!(
+            !player.asked_for("cm_x9272"),
+            "the verb is drawn with the glyph of its name, and its icon was \
+             fetched anyway: {asked:?}"
+        );
+    }
+
+    /// And the publisher draws that screen the way the walk fetched it: the
+    /// chip and the verb as glyphs, and the song by its picture, at the
+    /// address the walk asked the player for.
+    ///
+    /// The publisher hands the window nothing a test can read but the
+    /// fingerprints its memos keep, so the rows are written out in full and
+    /// compared by theirs, as `bare_pane` does for a pane with no screen. One
+    /// row at a time first, so a failure says which.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_publisher_draws_a_thing_by_its_picture_whatever_it_is_called() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        open_named_like_a_button(&backend, &player);
+
+        backend.publish_browse();
+
+        let picture = backend
+            .with_entry(player.id(), |entry| {
+                entry.client.image_url("/images/x9271.png")
+            })
+            .expect("the player is in the registry");
+        let chip = BrowseData {
+            glyph: Some(Glyph::Service),
+            ..super::index_tests::row_of("Qobuz")
+        };
+        let song = BrowseData {
+            index: 1,
+            plays: true,
+            track: "3".to_owned(),
+            quality: "CD".to_owned(),
+            art: Some(picture),
+            ..super::index_tests::row_of("Shuffle")
+        };
+        let verb = BrowseData {
+            index: 2,
+            plays: true,
+            glyph: Some(Glyph::Shuffle),
+            ..super::index_tests::row_of("Shuffle")
+        };
+
+        // A plain list's rows are an item apiece, under no heading.
+        let item = |row: &BrowseData| {
+            item_fingerprint(&ItemData {
+                kind: 0,
+                title: String::new(),
+                action: String::new(),
+                section: 1,
+                rows: vec![row.clone()],
+            })
+        };
+        let sent = backend.sent_items.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "the list is two rows");
+        assert_eq!(
+            sent[0],
+            item(&song),
+            "the song called Shuffle is drawn by its picture, not the glyph of its name"
+        );
+        assert_eq!(
+            sent[1],
+            item(&verb),
+            "the verb called Shuffle is drawn with the glyph of its name"
+        );
+
+        // The chip sits beside the title rather than in the list, so only the
+        // pane's fingerprint has it.
+        let pane = browse_fingerprint(
+            &[BlockData {
+                kind: 0,
+                title: String::new(),
+                action: String::new(),
+                section: 1,
+                rows: vec![song, verb],
+            }],
+            &[chip],
+            &[],
+            None,
+            None,
+            "Browse",
+            false,
+            None,
+        );
+        assert_eq!(
+            backend.sent_browse.load(Ordering::Relaxed),
+            pane,
+            "the picker's chip is drawn with the glyph for a service"
         );
     }
 }

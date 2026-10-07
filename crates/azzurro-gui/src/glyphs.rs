@@ -12,6 +12,18 @@
 //! where the player keeps them, which is consistent across every document
 //! captured from a real player: service artwork lives under `/Sources/images/`
 //! or `/images/ui/Source/`, and the rest of `/images/` is chrome.
+//!
+//! The same split runs through the words. The vocabulary in [`reading`] is the
+//! player's names for its own menus, inputs and verbs — "Shuffle", "Add to
+//! playlist…", "Library", "HDMI ARC" — and it is only ever right about rows
+//! that are those things. A row the player presents as a song, an album, an
+//! artist or a station has a title somebody else wrote, and reading that
+//! against the same words drew one track of an album, "Barometer Song", with
+//! the track glyph in a column of tracks drawn with the plain note.
+//! [`row_glyph`] tells the two kinds of row apart by what the player says
+//! about the row, never by what the row is called.
+
+use bluos::screen::{Action, Item, SectionKind};
 
 /// A Lucide glyph to draw instead of the player's own picture.
 ///
@@ -120,7 +132,8 @@ fn is_content(source: &str) -> bool {
 /// category — TuneIn ships a colored logo for "Sports" and another for
 /// "Trending" — and beside a column of Lucide strokes those read as somebody
 /// else's icons pasted in. The rows that carry real artwork are the ones that
-/// play something, and they go through [`glyph_for`] as before.
+/// play something, and they go through [`row_glyph`], which reads a thing by
+/// its picture and never by its title.
 ///
 /// The fallback is a station, because a category in a radio service leads to
 /// stations however it is named — and some of them, like the listener's own
@@ -145,8 +158,86 @@ pub fn service_glyph(title: &str) -> Glyph {
 /// The title is matched before the path, because the title is what the reader
 /// is looking at: a row called "Albums" should get the album glyph whichever
 /// PNG happens to sit beside it.
+///
+/// Meant for a row whose title is the player's own word: a menu entry, an
+/// input, a button. A row of a browse screen goes through [`row_glyph`], which
+/// keeps the titles of songs and records away from here. The one caller that
+/// does not hold to that is the empty state, which reads the screen's heading:
+/// on Favourites that is the player's word, but on a screen named for a thing
+/// — a playlist's page, were one to come back empty — it would be the thing's
+/// name, and a playlist called "Save Me" would be drawn with the save glyph.
 pub fn glyph_for(title: &str, source: Option<&str>) -> Option<Glyph> {
     reading(title, source, false)
+}
+
+/// The glyph for a row of a browse screen, or `None` to draw the player's own
+/// picture — or, where it sent none, the note a row shows while its cover is
+/// still on its way.
+///
+/// One answer for the two places that need it: the publisher draws what this
+/// returns, and the walk that fetches covers skips every row it returns a
+/// glyph for. Worked out in each place separately, the two had already come
+/// apart — a picker's chip for a service with no glyph of its own, and the
+/// sources on Home's Most Used shelf that name themselves only on their
+/// action, were fetched for pictures that were never drawn — and reading a
+/// song's title on one side and not the other would have left a row waiting
+/// for a cover nothing had asked for.
+pub fn row_glyph(section: SectionKind, item: &Item) -> Option<Glyph> {
+    let source = item
+        .image
+        .as_deref()
+        .or(item.icon.as_deref())
+        .filter(|src| !src.is_empty());
+
+    // What the row is called, for the purpose of choosing an icon for it.
+    //
+    // Not always the item's own label: Home's Most Used shelf writes Radio
+    // Paradise and TuneIn as `<source>` elements with no title at all, and the
+    // name comes from the action instead — which is where the caption gets it
+    // too. With only the label to go on there was nothing to match and both
+    // kept their logos.
+    let named = item.label().unwrap_or_else(|| {
+        item.action
+            .as_ref()
+            .and_then(|a| a.title.as_deref())
+            .unwrap_or_default()
+    });
+
+    // A service picker is a row of names in the app's own chrome, so it gets
+    // the app's own icons, and a service's own menu is drawn in glyphs
+    // whatever its rows carry, for the reason `menu_glyph` gives. Both are
+    // settled before what the row is, so neither turns on the answer.
+    if section == SectionKind::SelectorMenu {
+        Some(service_glyph(named))
+    } else if item.action.as_ref().is_some_and(Action::is_browse_menu) {
+        Some(menu_glyph(named))
+    } else if item.is_object() {
+        object_glyph(source)
+    } else {
+        glyph_for(named, source)
+    }
+}
+
+/// The glyph for a row the player presents as a thing — a song, an album, an
+/// artist, a station, a playlist — or `None` to use whatever the player sent.
+///
+/// [`glyph_for`] with the title left out. A thing's title was written by
+/// whoever made the record or runs the station, and the vocabulary is the
+/// player's names for its own menus and verbs: read against it, "Barometer
+/// Song" came out drawn as a track in a list of tracks drawn with the plain
+/// note, and a song called "Shuffle" or "Save Me" would have been drawn with
+/// the glyph of the button it shares a name with. Which rows are things is the
+/// player's to say; see [`Item::is_object`].
+///
+/// The picture's file name is still read, because it is the player's own word
+/// rather than the title's: furniture whose file name says what it is — a
+/// playlist drawn with the player's stack of paper — is replaced on a thing as
+/// it is anywhere. Any other picture is drawn as it came, and that includes a
+/// service's brand mark. Elsewhere a brand mark gives way to the glyph the
+/// row's name earns, which is why [`is_content`] does not keep it; a thing's
+/// name is not read, so on a thing the mark is what is drawn.
+fn object_glyph(source: Option<&str>) -> Option<Glyph> {
+    by_path(source.filter(|source| !is_content(source))?)
 }
 
 /// The glyph for a row on one of the player's own settings pages, which always
@@ -347,8 +438,13 @@ fn reading(title: &str, source: Option<&str>, settings: bool) -> Option<Glyph> {
     }
 
     // Nothing in the title, so fall back to what the player named the file.
-    // Only a few of these are stable enough to rely on.
-    let source = source?.to_lowercase();
+    by_path(source?)
+}
+
+/// What the player named a picture, read for the few names stable enough to
+/// rely on.
+fn by_path(source: &str) -> Option<Glyph> {
+    let source = source.to_lowercase();
     if source.contains("bluetooth") {
         Some(Glyph::Bluetooth)
     } else if source.contains("ic_tv") {
@@ -539,5 +635,190 @@ mod tests {
         assert_eq!(glyph_for("Artists", None), Some(Glyph::Artist));
         assert_eq!(glyph_for("Genres", None), Some(Glyph::Genre));
         assert_eq!(glyph_for("Recently Played", None), Some(Glyph::Recent));
+    }
+
+    /// Every row of a screen, by its label, with what [`row_glyph`] draws it
+    /// with.
+    fn drawn(xml: &str) -> Vec<(String, Option<Glyph>)> {
+        let screen = bluos::screen::parse(xml).expect("parses");
+        screen
+            .sections
+            .iter()
+            .flat_map(|section| {
+                section.items.iter().map(|item| {
+                    (
+                        item.label().unwrap_or_default().to_owned(),
+                        row_glyph(section.kind, item),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// An album's page, made up for these tests in the shape the album page is
+    /// drawn from: the cover and what can be done with the whole record in the
+    /// header, then a row for each track with its number, its length and its
+    /// format, and no picture of its own, the cover being the header's.
+    const LOW_PRESSURE: &str = r#"<screen screenTitle="Low Pressure Systems" service="LocalMusic">
+  <header image="/Artwork?service=LocalMusic&amp;album=Low+Pressure+Systems" title="Low Pressure Systems" subTitle="Cirrus Fold">
+    <button text="Play all"><action type="player-link" URI="/Add?playnow=1&amp;album=1"/></button>
+    <button text="Shuffle"><action type="player-link" URI="/Add?playnow=1&amp;shuffle=1&amp;album=1"/></button>
+  </header>
+  <list>
+    <item title="Isobar" track="1" duration="4:12" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=1.flac"/></item>
+    <item title="Cold Front" track="2" duration="5:03" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=2.flac"/></item>
+    <item title="Dew Point" track="3" duration="3:47" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=3.flac"/></item>
+    <item title="Barometer Song" track="4" duration="4:31" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=4.flac"/></item>
+    <item title="Altostratus" track="5" duration="6:02" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=5.flac"/></item>
+    <item title="Rain Shadow" track="6" duration="4:18" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=6.flac"/></item>
+    <item title="Clearing" track="7" duration="5:26" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=7.flac"/></item>
+    <item title="High Pressure (Reprise)" track="8" duration="2:54" quality="hd"><action type="player-link" URI="/Add?playnow=1&amp;file=8.flac"/></item>
+  </list>
+</screen>"#;
+
+    #[test]
+    fn every_track_on_an_album_is_drawn_alike() {
+        let rows = drawn(LOW_PRESSURE);
+        assert_eq!(rows.len(), 8);
+        // "Barometer Song" was drawn with the track glyph, for the word in its
+        // name, and was the one row in the list that had a glyph at all.
+        let first = rows[0].1;
+        for (title, glyph) in &rows {
+            assert_eq!(*glyph, first, "{title:?} is drawn as its neighbors are");
+        }
+        assert_eq!(
+            first, None,
+            "and that is the note a track with no cover of its own is drawn with"
+        );
+
+        // The header's buttons are the player's own words, and keep theirs.
+        let screen = bluos::screen::parse(LOW_PRESSURE).expect("parses");
+        let verbs: Vec<_> = screen
+            .header
+            .expect("an album's page has a header")
+            .buttons
+            .iter()
+            .map(|button| glyph_for(button.text.as_deref().unwrap_or_default(), None))
+            .collect();
+        assert_eq!(verbs, [Some(Glyph::Play), Some(Glyph::Shuffle)]);
+    }
+
+    /// Titles of songs and records that are also the player's own words. On a
+    /// thing, each is drawn as any other thing is; on a menu entry, each is
+    /// still read for its word, as it was before.
+    #[test]
+    fn a_things_title_is_not_read_for_the_players_words() {
+        for (title, as_an_entry) in [
+            ("Shuffle", Some(Glyph::Shuffle)),
+            ("Save Me", Some(Glyph::Save)),
+            ("Edit", Some(Glyph::Edit)),
+            ("Info", Some(Glyph::Info)),
+            ("Home", Some(Glyph::Home)),
+            ("News", Some(Glyph::News)),
+            ("Clear", Some(Glyph::Clear)),
+            ("Radio Song", Some(Glyph::Track)),
+            // A word off the settings pages, which only a settings row is read
+            // for, so even as an entry this one has none.
+            ("Greatest Hits Volume 2", None),
+        ] {
+            // A track on an album's page, which has no cover of its own.
+            let track = format!(
+                r#"<screen><list><item title="{title}" track="3" duration="3:30" quality="cd"><action type="player-link" URI="/Add?playnow=1&amp;file=3.flac"/></item></list></screen>"#
+            );
+            // An album in a list that says what it is, with no cover to hand.
+            let album = format!(
+                r#"<screen><list><item title="{title}" subTitle="Cirrus Fold" objectType="Album"><action type="browse" URI="/ui/browseContext?service=LocalMusic&amp;type=Album"/></item></list></screen>"#
+            );
+            // And one on a shelf, known only by its play button and its menu.
+            let tile = format!(
+                r#"<screen><row title="Recently Added"><item title="{title}" subTitle="Cirrus Fold"><action type="browse" URI="/ui/browseContext?service=LocalMusic&amp;type=Album"/><playAction type="player-link" URI="/Add?playnow=1&amp;album=1"/><contextMenu type="browse" URI="/ui/albumCM" resultType="contextMenu"/></item></row></screen>"#
+            );
+            for (what, xml) in [("a track", track), ("an album", album), ("a tile", tile)] {
+                assert_eq!(
+                    drawn(&xml),
+                    [(title.to_owned(), None)],
+                    "{title:?} as {what}"
+                );
+            }
+
+            let entry = format!(
+                r#"<screen><list><item title="{title}"><action type="browse" URI="/ui/menu"/></item></list></screen>"#
+            );
+            assert_eq!(
+                drawn(&entry),
+                [(title.to_owned(), as_an_entry)],
+                "{title:?} as a menu entry"
+            );
+        }
+    }
+
+    /// Leaving a thing's title alone leaves its picture to the rules every
+    /// picture goes by: a cover is kept, and furniture is replaced where its
+    /// file name says what it is.
+    #[test]
+    fn a_things_picture_is_still_read_by_its_file_name() {
+        let rows = drawn(
+            r#"<screen><list>
+                 <item title="Radio Song Mix" icon="/images/ci_myplaylists.png"><action type="browse" URI="/ui/playlist?id=1"/><contextMenu type="browse" URI="/ui/playlistCM" resultType="contextMenu"/></item>
+                 <item title="Shuffle" image="/Artwork?service=LocalMusic&amp;album=Shuffle" objectType="Album"><action type="browse" URI="/ui/album"/></item>
+                 <item title="Save Me" image="/images/x9271.png" objectType="Song"/>
+               </list></screen>"#,
+        );
+        assert_eq!(
+            rows,
+            [
+                // Not a track or a radio for its name: the player's stack of
+                // paper, and so a playlist.
+                ("Radio Song Mix".to_owned(), Some(Glyph::Playlist)),
+                // A cover, kept.
+                ("Shuffle".to_owned(), None),
+                // Nothing in the file name to go on, so the player's picture
+                // stands, as it does for any row.
+                ("Save Me".to_owned(), None),
+            ]
+        );
+    }
+
+    /// The rows that are not things are drawn through [`row_glyph`] exactly as
+    /// they were drawn before it. All but the last three are rows from
+    /// captured screens, trimmed.
+    #[test]
+    fn a_menu_row_is_drawn_as_it_always_was() {
+        let rows = drawn(
+            r##"<screen>
+  <selectorMenu menuTitle="Select Service" replaceScreen="true">
+    <item icon="/images/LibraryIcon.png?style=Default" text="Library" selected="true"><action type="browse" URI="/ui/Favourites?service=LocalMusic"/></item>
+    <item icon="/Sources/images/TuneInIcon.png?style=Default" text="TuneIn"><action type="browse" URI="/ui/Favourites?service=TuneIn"/></item>
+  </selectorMenu>
+  <row id="inputs" title="Inputs">
+    <input title="HDMI ARC" icon="/images/capture/ic_tv.png"><action type="player-link" URI="/Play?url=Capture%3Ahw%3Aimxspdif&amp;title=HDMI+ARC"/><nowPlayingMatch key="inputId" value="input4"/></input>
+  </row>
+  <row id="services" title="Music Services"><list>
+    <service icon="/images/ui/Source/RadioParadiseSourceIcon.png" title="Radio Paradise"><action type="browse" URI="/ui/browseMenuGroup?service=RadioParadise"/></service>
+  </list></row>
+  <row id="mostUsed" title="Most Used">
+    <source icon="/images/ui/Source/TuneInLogo.png"><action type="browse" URI="/ui/browseMenuGroup?service=TuneIn" title="TuneIn"/></source>
+  </row>
+  <list>
+    <item title="Sports" image="https://cdn.example.com/sports.png"><action type="browse" URI="/ui/BrowseObjects?service=TuneIn&amp;type=BrowseMenu&amp;url=%2FSports"/></item>
+    <item title="Albums"><action type="browse" URI="/ui/browseGrouped?service=LocalMusic&amp;type=Album"/></item>
+    <item title="Playlists" icon="/images/ci_myplaylists.png"><action type="browse" URI="/ui/playlists"/></item>
+  </list>
+</screen>"##,
+        );
+        let expected = [
+            ("Library", Some(Glyph::Library)),
+            ("TuneIn", Some(Glyph::Broadcast)),
+            ("HDMI ARC", Some(Glyph::Tv)),
+            ("Radio Paradise", Some(Glyph::Headphones)),
+            // Named only on its action, which is what the glyph is chosen by.
+            ("", Some(Glyph::Broadcast)),
+            // A service's own menu, whose picture is its branding.
+            ("Sports", Some(Glyph::Sport)),
+            ("Albums", Some(Glyph::Album)),
+            ("Playlists", Some(Glyph::Playlist)),
+        ]
+        .map(|(title, glyph)| (title.to_owned(), glyph));
+        assert_eq!(rows, expected);
     }
 }
