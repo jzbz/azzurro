@@ -12,3 +12,8 @@ publish = false
 [dependencies]
 bluos.workspace = true
 tokio.workspace = true
+
+# Only for examples/demo-player.rs, which paints its own cover art. Already in
+# Cargo.lock by way of azzurro-gui, so nothing new is downloaded.
+[dev-dependencies]
+image.workspace = true
