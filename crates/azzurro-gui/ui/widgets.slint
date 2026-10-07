@@ -508,6 +508,17 @@ export component EmptyState inherits VerticalLayout {
             // A measure, so a long sentence sets as a paragraph rather than
             // running the width of the pane.
             max-width: 360px;
+            // Not the no-op it looks. Slint, as of 1.17, measures how tall a
+            // block under an `if` is at the width the block would like, not the
+            // width it was given, and this row would like the whole 360px
+            // measure. Anywhere narrower the words were set to the narrower
+            // width but drawn in the height of the lines they make at 360, so a
+            // line that wrapped onto the end was simply not there: the browse
+            // pane beside the queue in a 1000px window leaves this 306px, and
+            // "No players found" stopped at "add one by address from the".
+            // Stated outright, the height is the text's own at the width it was
+            // actually given.
+            height: self.preferred-height;
         }
     }
 }

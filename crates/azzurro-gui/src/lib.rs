@@ -18618,6 +18618,8 @@ mod tests {
         a_question_does_not_select_a_half_typed_query(&ui);
         // And the one sum in the window that no other test can reach.
         the_picker_list_is_as_tall_as_the_cards_in_it(&ui);
+        // And the pane in a window the size Flathub asks screenshots to be.
+        the_browse_pane_fits_a_1000px_window(&ui);
         // And the one button in the player list that only a dead row has.
         // Last, because it opens the list, and an open popup takes every
         // press made anywhere until it is closed.
@@ -18870,6 +18872,129 @@ mod tests {
         // model left behind is a surprise for whatever runs next.
         ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new())));
         ui.set_badged_players(0);
+    }
+
+    /// The browse pane in a window the size Flathub suggests for screenshots.
+    ///
+    /// 1000x700 with a title bar leaves a client area of about 1000x672, and
+    /// with the queue shown the browse pane is what is left of 1000 after the
+    /// 268px sidebar and the 330px queue column: 402px. Two things did not fit
+    /// in it and nothing said so, because the pane clips. The last line of the
+    /// "No players found" explanation was cut off, and so was the end of an
+    /// album's Shuffle button. Neither shows in the 1440px window the app
+    /// opens at, which is why this asks for the smaller one.
+    fn the_browse_pane_fits_a_1000px_window(ui: &AppWindow) {
+        let settle = |ms: u64| {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+        };
+        let labelled = |wanted: fn(&str) -> bool| {
+            i_slint_backend_testing::ElementQuery::from_root(ui)
+                .match_descendants()
+                .match_predicate(move |e| e.accessible_label().is_some_and(|l| wanted(&l)))
+                .find_first()
+        };
+        let was = ui.window().size().to_logical(ui.window().scale_factor());
+        let queue_was = ui.get_queue_shown();
+        let roomy = slint::LogicalSize::new(1440.0, 920.0);
+        let small = slint::LogicalSize::new(1000.0, 672.0);
+        // The column slides in, so it is given the time to finish.
+        ui.set_queue_shown(true);
+        settle(600);
+
+        // The explanation is set to a 360px measure, which the pane in the
+        // roomy window has to spare and the small one does not: 402 less the
+        // empty state's two 48px margins is 306. Set narrower, this sentence
+        // takes a fourth line. It used to be drawn in the height of the three
+        // it takes at 360, because Slint measures an element under an `if` at
+        // the width it would like rather than the width it is given, and the
+        // fourth line was simply not there. Asked as a comparison rather than
+        // in pixels, so the font's metrics stay the font's business.
+        ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new())));
+        ui.set_looking_for_players(false);
+        let explanation = || {
+            labelled(|l| l.starts_with("Nothing answered on this network"))
+                .expect("the explanation under \"No players found\"")
+                .size()
+                .height
+        };
+        ui.window().set_size(roomy);
+        settle(0);
+        let at_the_measure = explanation();
+        ui.window().set_size(small);
+        settle(0);
+        let narrower = explanation();
+        assert!(
+            narrower > at_the_measure,
+            "set 54px narrower than its measure, the explanation is drawn taller to hold the line \
+             that wraps: {narrower} against {at_the_measure} at the full measure"
+        );
+
+        // An album, with the two buttons the player puts on one. Their
+        // glyphs are part of how wide they are, so they are the real ones.
+        let icons = Icons::get(ui);
+        ui.set_devices(ModelRc::new(VecModel::from(vec![Device {
+            id: "192.0.2.7:11000".into(),
+            name: "Kitchen".into(),
+            reachable: true,
+            ..Default::default()
+        }])));
+        ui.set_selected(0);
+        ui.set_browse_header_title("An Album".into());
+        ui.set_browse_header_subtitle("A Band".into());
+        ui.set_browse_header_detail("2011 • Rock • 12 Tracks".into());
+        ui.set_browse_header_buttons(ModelRc::new(VecModel::from(vec![
+            ActionButton {
+                index: 0,
+                label: "Play all".into(),
+                glyph: icons.get_play(),
+                primary: true,
+            },
+            ActionButton {
+                index: 1,
+                label: "Shuffle".into(),
+                glyph: icons.get_shuffle(),
+                primary: false,
+            },
+        ])));
+
+        // With the room, the cover is the 160px square it always was, so the
+        // column of words starts where it always did: past the sidebar, the
+        // pane's padding, the cover and the room beside it.
+        let theme = Theme::get(ui);
+        ui.window().set_size(roomy);
+        settle(0);
+        let play = labelled(|l| l == "Play all").expect("the album's Play all button");
+        let column = 268.0 + theme.get_pad() + 160.0 + theme.get_room();
+        assert_eq!(
+            play.absolute_position().x,
+            column,
+            "in a pane with the room for both, the cover keeps all 160px"
+        );
+
+        // Without it, the cover gives way and the buttons do not. Named
+        // "Shuffle" and nothing else: the transport's own button says whether
+        // shuffle is on as well.
+        ui.window().set_size(small);
+        settle(0);
+        let shuffle = labelled(|l| l == "Shuffle").expect("the album's Shuffle button");
+        let right = shuffle.absolute_position().x + shuffle.size().width;
+        let pane = small.width - 330.0 - theme.get_pad();
+        assert!(
+            right <= pane,
+            "Shuffle ends inside the browse pane's padding, which stops at {pane}, short of \
+             the queue column: it ends at {right}"
+        );
+
+        // Left as it was found.
+        ui.set_browse_header_title("".into());
+        ui.set_browse_header_subtitle("".into());
+        ui.set_browse_header_detail("".into());
+        ui.set_browse_header_buttons(ModelRc::new(VecModel::<ActionButton>::from(Vec::new())));
+        ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new())));
+        ui.set_selected(0);
+        ui.set_queue_shown(queue_was);
+        ui.window().set_size(was);
+        settle(0);
     }
 
     /// Rows whose shape has not moved are seated into the model on screen.

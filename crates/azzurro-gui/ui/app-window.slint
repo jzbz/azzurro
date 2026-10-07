@@ -3729,19 +3729,53 @@ export component AppWindow inherits Window {
                         spacing: Theme.room;
                         vertical-stretch: 0;
 
+                        // As wide as it can be up to 160, and square.
+                        //
+                        // A fixed 160 left the column beside it 200px of the
+                        // 402px the browse pane has beside the queue in a
+                        // 1000px window, and Play all and Shuffle take nearly
+                        // 240: Shuffle ran on under the queue column, and the
+                        // pane cut the end of it off. The cover is the one
+                        // thing in this row that can give without losing
+                        // anything you need, so it gives, and only as far as
+                        // the buttons need it to — see the column's
+                        // `preferred-width`. In a pane with the room it is the
+                        // 160px square it always was.
+                        //
+                        // Its height is read from its width, which is not a
+                        // loop: nothing in this row takes its width from a
+                        // height.
                         Artwork {
                             source: root.browse-header-cover;
                             fallback: Icons.album;
                             corner: 10px;
-                            width: 160px;
-                            height: 160px;
+                            preferred-width: 160px;
+                            max-width: 160px;
+                            height: self.width;
                         }
 
                         VerticalLayout {
                             alignment: center;
                             spacing: Theme.tight;
                             horizontal-stretch: 1;
-                            min-width: 0px;
+                            // No more than its minimum, which is its row of
+                            // buttons: the three lines of text in it elide, so
+                            // they ask for next to nothing. That is what has
+                            // the cover give way to the buttons and to nothing
+                            // else. Asking for the width of a long title would
+                            // shrink the cover for the title too, which is what
+                            // eliding is for. Whatever room is left over still
+                            // comes here, by the stretch.
+                            //
+                            // This said `min-width: 0px`, which let the column
+                            // be squeezed narrower than its buttons while the
+                            // cover kept all 160px. The minimum it has now is
+                            // real, and it reaches the window: the buttons, the
+                            // room beside the cover and the padding come to
+                            // about 280px, inside the 350 that the transport
+                            // bar's own minimum already leaves this pane beside
+                            // the queue.
+                            preferred-width: 0px;
 
                             Text {
                                 text: root.browse-header-title;
