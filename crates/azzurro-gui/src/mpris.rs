@@ -181,11 +181,14 @@ impl Bridge {
 
 /// The part of a player's bus name after `org.mpris.MediaPlayer2.`.
 ///
-/// `blue.azzurro.Azzurro.instance<pid>_<n>`. The spec wants a unique suffix
-/// and suggests a process id; the index disambiguates the several players one
-/// process exports. Each dot-separated element has to start with a non-digit,
-/// which is what `instance` is doing here besides matching what every other
-/// player does.
+/// `blue.azzurro.Azzurro.instance<pid>_<token>_<n>`. The spec wants a unique
+/// suffix and suggests a process id, which is not unique inside a sandbox:
+/// every copy of the Flatpak is process 2, so a second window would ask for
+/// exactly the names the first one holds and be refused all of them. The
+/// token from [`crate::instance`] is what keeps the two apart, and the index
+/// disambiguates the several players one process exports. Each dot-separated
+/// element has to start with a non-digit, which is what `instance` is doing
+/// here besides matching what every other player does.
 ///
 /// The application id comes first because of what a Flatpak sandbox allows.
 /// Its bus proxy lets an app own `org.mpris.MediaPlayer2.<app id>` and every
@@ -197,7 +200,12 @@ impl Bridge {
 /// player would go without media controls and the export would be tried again
 /// on every status.
 fn bus_suffix(index: usize) -> String {
-    format!("{}.instance{}_{index}", crate::APP_ID, std::process::id())
+    format!(
+        "{}.instance{}_{:x}_{index}",
+        crate::APP_ID,
+        std::process::id(),
+        crate::instance::token()
+    )
 }
 
 /// One status as the bus sees it, at the moment it arrived.
@@ -1070,6 +1078,15 @@ mod tests {
             "{first} is not under {granted}"
         );
         assert_ne!(first, second, "two players of one process would collide");
+
+        // Nor two copies of the app. Inside the Flatpak each of them is
+        // process 2, so the id alone would hand a second window exactly the
+        // names the first one already holds.
+        let token = format!("_{:x}_", crate::instance::token());
+        assert!(
+            first.contains(&token),
+            "{first} would be the same in a second copy of the app"
+        );
 
         // And it is a name the bus accepts at all: no element may start with
         // a digit, which a process id would without `instance` in front of it.

@@ -1089,15 +1089,23 @@ impl Artwork {
 /// each then renamed whatever was in it onto the cover. Both write the same
 /// bytes, so the result was usually right and occasionally a short file that
 /// every later read accepted as an image. A counter makes the collision
-/// impossible rather than unlikely, and the process id keeps a second instance
-/// out of this one's way.
+/// impossible rather than unlikely within one process, and the process id and
+/// [`crate::instance::token`] keep a second instance out of this one's way.
+/// The id would not manage that alone in a Flatpak: every copy there is
+/// process 2, both counters start at zero, and the cache directory is the
+/// one they share, so two windows fetching the same cover would be back to
+/// writing one `.part`.
 ///
 /// Pruning sweeps up anything a crash leaves behind, the way it does the
 /// covers themselves.
 fn temp_name(path: &std::path::Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_extension(format!("{}-{n}.part", std::process::id()))
+    path.with_extension(format!(
+        "{}-{:x}-{n}.part",
+        std::process::id(),
+        crate::instance::token()
+    ))
 }
 
 /// Decode and scale to fit a `size` box.
@@ -2050,6 +2058,14 @@ mod tests {
         assert!(
             first.to_string_lossy().ends_with(".part"),
             "still recognizable as a part file: {first:?}"
+        );
+
+        // Not only the process id either: a second copy of the Flatpak is
+        // process 2 as well, with a counter that starts where this one did.
+        let this_run = format!(".{}-{:x}-", std::process::id(), crate::instance::token());
+        assert!(
+            first.to_string_lossy().contains(&this_run),
+            "a second copy of the app would write the same file: {first:?}"
         );
     }
 

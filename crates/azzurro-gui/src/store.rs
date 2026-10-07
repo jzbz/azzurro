@@ -350,8 +350,17 @@ impl Store {
 /// one inode: each `create` truncates what the other is part-way through
 /// writing, and the rename publishes the mixture — for the stations file, a
 /// list with lines from two writes in it, which is a hand-typed station gone.
+///
+/// [`crate::instance::token`] is in it too, because the id is not enough in a
+/// Flatpak. Every copy of the app there is process 2 to itself, and all of
+/// them write the one config directory under `~/.var/app`, so two windows
+/// would be back to sharing a temp name.
 fn temp_name(path: &Path) -> PathBuf {
-    path.with_extension(format!("{}.new", std::process::id()))
+    path.with_extension(format!(
+        "{}-{:x}.new",
+        std::process::id(),
+        crate::instance::token()
+    ))
 }
 
 #[cfg(test)]
@@ -506,11 +515,16 @@ mod tests {
         // Two windows of this app on one account write the same file, and
         // nothing stops them. Sharing a temp name meant sharing an inode:
         // each truncated what the other was part-way through writing, and the
-        // rename published the mixture.
+        // rename published the mixture. The token is there beside the id
+        // because in a Flatpak both windows are process 2.
         let name = temp_name(Path::new("/tmp/azzurro/stations"));
         assert_eq!(
             name,
-            PathBuf::from(format!("/tmp/azzurro/stations.{}.new", std::process::id()))
+            PathBuf::from(format!(
+                "/tmp/azzurro/stations.{}-{:x}.new",
+                std::process::id(),
+                crate::instance::token()
+            ))
         );
     }
 

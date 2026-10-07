@@ -14,6 +14,7 @@ mod artwork;
 mod custom;
 mod decoded;
 mod glyphs;
+mod instance;
 mod known;
 mod lane;
 #[cfg(target_os = "linux")]
