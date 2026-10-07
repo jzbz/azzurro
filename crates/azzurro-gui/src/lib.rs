@@ -11012,11 +11012,22 @@ impl Drop for Refreshing {
 /// every transport press also need. Claiming the interval under one lock makes
 /// it once per `every` however many walks are asking.
 ///
-/// What this cannot do is notice while every fetch is still outstanding: the
-/// check sits between completions, so a walk whose player accepts connections
-/// and then says nothing holds its share of the artwork permits until one of
-/// them times out. That is what [`start_walk`] is for — a superseded walk is
-/// aborted from outside rather than left to find out.
+/// What this cannot do is notice that it is no longer wanted while every fetch
+/// is still outstanding: `still_wanted` is asked between completions, so a
+/// walk whose player accepts connections and then says nothing holds its share
+/// of the artwork permits until one of them times out. That is what
+/// [`start_walk`] is for — a superseded walk is aborted from outside rather
+/// than left to find out.
+///
+/// The list's ceiling is the one thing a walk does attend to in that stretch.
+/// A walk that could not apply it when it listed its rows — see [`trim_walks`]
+/// for how that happens — waits on [`Walks::listings`] beside its fetches, so
+/// it comes back to the trim as soon as another walk on the list has listed
+/// its own, rather than after its next completed fetch. Against the player the
+/// ceiling exists for, one whose covers are slow, that next fetch can be a
+/// whole `artwork::FETCH_TIMEOUT` away, and a burst of pages stayed over the
+/// ceiling for all of it. Only while the trim is owed, though: a walk on a
+/// list at its ceiling waits on its fetches and nothing else.
 async fn walk_covers(
     artwork: Arc<Artwork>,
     urls: Vec<(String, u32)>,
@@ -11056,7 +11067,37 @@ async fn walk_covers(
     // finds nothing it is allowed to stop. Asked again below rather than left
     // at that, because every walk in such a burst is in the same position and
     // a ceiling nobody applies is no ceiling at all.
-    let mut owed_a_trim = trim_walks(&mut list.lock().unwrap(), &left);
+    //
+    // Then announced, because this walk having listed is exactly what any walk
+    // below it that is owed a trim is waiting for. The trim and the
+    // announcement share one guard, and a walk it wakes has to take that lock
+    // before it can trim, so either order leaves the woken walk finding the
+    // list as this trim left it. The order that matters is the next one: it
+    // subscribes after announcing, so its own news does not wake it.
+    //
+    // All three under the one `list` guard, which is what makes a listing
+    // impossible to miss. A walk sets `listed` before it takes this lock to
+    // announce, so its announcement lands either before this guard, and the
+    // trim here saw it listed, or after the subscription, and `changed` below
+    // answers for it. See [`Walks::listings`].
+    let (mut owed_a_trim, mut listings) = {
+        let mut walks = list.lock().unwrap();
+        let owed = trim_walks(&mut walks, &left);
+        walks
+            .listings
+            .send_modify(|listed| *listed = listed.wrapping_add(1));
+        (owed, walks.listings.subscribe())
+    };
+
+    // Another look at the ceiling, for a walk that is owed one. The receiver
+    // is brought up to date under the guard the trim runs under, for the
+    // reason above: whatever is announced after that is a listing this trim
+    // may not have seen, and the next `changed` is still there to say so.
+    let retrim = |listings: &mut tokio::sync::watch::Receiver<u64>| {
+        let mut walks = list.lock().unwrap();
+        listings.mark_unchanged();
+        trim_walks(&mut walks, &left)
+    };
 
     // The next row to issue, and where it sits in `left` so its fetch can
     // strike it off. Never held across an await.
@@ -11099,7 +11140,27 @@ async fn walk_covers(
             });
         }
 
-        while let Some(done) = fetches.join_next().await {
+        loop {
+            // A fetch coming back, or, while a trim is owed, another walk on
+            // the list announcing that it has listed. The second is the only
+            // thing that can give a walk owed a trim something it may stop,
+            // and waiting for it here rather than for the next completed
+            // fetch is the difference between a burst of pages that settles
+            // to the ceiling as the runtime reaches it and one that stays
+            // over it until a cover of its own comes back. Both are safe
+            // to drop when the other wins: `join_next` takes no task out of
+            // the set unless it returns one, and `changed` takes nothing at
+            // all.
+            let done = tokio::select! {
+                done = fetches.join_next() => done,
+                Ok(()) = listings.changed(), if owed_a_trim => {
+                    owed_a_trim = retrim(&mut listings);
+                    continue;
+                }
+            };
+            let Some(done) = done else {
+                break;
+            };
             fetched = true;
             if let Ok(row) = done {
                 // By index, which holds however this walk ends: a walk stopped
@@ -11120,12 +11181,14 @@ async fn walk_covers(
                     row
                 });
             }
-            // A fetch is long enough for the runtime to have reached the walks
-            // that were still unpolled when this one listed, so this is the
-            // cheapest place to find out. Only while the ceiling is actually
-            // owed, so a list at its ceiling pays nothing.
+            // And between fetches, as well as on an announcement. The wake
+            // above is what the ceiling relies on, and it relies in turn on
+            // every walk that sets `listed` announcing it; this is what still
+            // holds the list to its ceiling, if more slowly, should one ever
+            // not. Only while the ceiling is actually owed, so a list at its
+            // ceiling pays nothing.
             if owed_a_trim {
-                owed_a_trim = trim_walks(&mut list.lock().unwrap(), &left);
+                owed_a_trim = retrim(&mut listings);
             }
             if claim(false) {
                 publish();
@@ -11280,10 +11343,11 @@ struct Walking {
 ///
 /// One value per list rather than per walk, because all of these are
 /// properties of the list: how many walks are allowed over it at once, how
-/// often it is redrawn, and which of its rows are owed a cover. A page starts
-/// a walk of its own and leaves the walk above it running — see [`Walk`] — so
-/// "per walk" quietly meant "per page in flight" for the first two, and a list
-/// being scrolled had no ceiling on either.
+/// often it is redrawn, which of its rows are owed a cover, and when a walk
+/// waiting to apply the ceiling should look again. A page starts a walk of its
+/// own and leaves the walk above it running — see [`Walk`] — so "per walk"
+/// quietly meant "per page in flight" for the first two, and a list being
+/// scrolled had no ceiling on either.
 struct Walks {
     /// The walks still going, oldest first.
     running: Vec<Walking>,
@@ -11301,6 +11365,25 @@ struct Walks {
     /// reads and claims this, so the redraw rate is the list's and not each
     /// walk's.
     drawn: Instant,
+    /// How many walks have listed their rows: a signal rather than a number
+    /// anybody reads.
+    ///
+    /// Each walk bumps it once it has listed and applied the ceiling, and a
+    /// walk [`trim_walks`] has told to come back waits on it beside its
+    /// fetches, because another walk listing is the only thing that can give
+    /// that walk something it may stop. Without it the only way back was a
+    /// fetch of its own completing, and against a player whose covers are slow
+    /// that left a burst of pages over the ceiling for as long as the covers
+    /// took — up to a whole `artwork::FETCH_TIMEOUT` where the player takes the
+    /// request and says nothing.
+    ///
+    /// A `watch` rather than a `Notify`, because a receiver remembers which
+    /// value it last saw: a bump that lands while the walk is between its trim
+    /// and its next wait is not lost, it is waiting there when the walk
+    /// arrives. [`walk_covers`] bumps under the `list` lock and marks its
+    /// receiver up to date under the same guard it trims under, and those two
+    /// together are what make an announcement impossible to miss.
+    listings: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for Walks {
@@ -11309,6 +11392,7 @@ impl Default for Walks {
             running: Vec::new(),
             carried: Vec::new(),
             drawn: Instant::now(),
+            listings: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -11453,9 +11537,29 @@ where
 /// below it then lists and finds only unlisted elders too, and so on down to
 /// the oldest, whose slice of elders is empty. Each walk had its one go and
 /// the ceiling was never applied, so the list stayed at however many pages the
-/// scroll chained, which is the starvation the ceiling is for. Asked again
-/// after each fetch, the walk that could not trim finds its elders listed the
-/// moment they wake up and the list settles where it should.
+/// scroll chained, which is the starvation the ceiling is for.
+///
+/// When it is asked again matters as much as that it is. Asked only after one
+/// of its own fetches completed, a walk that could not trim came back to it
+/// when its player next answered, and the player the ceiling is for is the one
+/// whose covers are slow — long enough to matter, and a whole
+/// `artwork::FETCH_TIMEOUT` where it takes the request and says nothing. The
+/// burst stayed over the ceiling for all of that, and whether the ceiling was
+/// applied in time came down to the order the runtime happened to poll the
+/// pages in. What gives a waiting walk something to stop is another walk
+/// listing, so that is what wakes it: every walk announces on
+/// [`Walks::listings`] once it has listed and trimmed, and a walk this has
+/// answered `true` waits on that beside its fetches. The burst settles as the
+/// runtime reaches the last of its pages, however long the covers take.
+///
+/// Woken like that, a walk stops whichever of its elders have listed, oldest
+/// of those first — and in a burst polled strictly newest first, the elder
+/// that has just listed is the page above its own, not the top of the list. So
+/// the pages kept are not always the newest ones a later trim would have kept,
+/// but no row is thrown away: the list is still held to its ceiling, and the
+/// stopped pages' rows join [`Walks::carried`] in the order they were stopped,
+/// which puts the page just above the newest first in line for the next walk
+/// to run out of its own rows.
 ///
 /// The oldest walk is the one exception, and is told no rather than asked
 /// back: nothing is ever in front of it, so there is nothing it may yet stop
@@ -11491,9 +11595,10 @@ fn trim_walks(walks: &mut Walks, mine: &Rows) -> bool {
             // above and the trim below — can only lower an index, never raise
             // one, so a walk at the head stays at the head. Answering `true`
             // had the longest-lived walk on a paged list re-run this after
-            // every completed fetch for the rest of its life, taking the slot
-            // lock each time — the same lock every publish and every
-            // `start_walk` takes — to be told again that there is nothing it
+            // every completed fetch for the rest of its life — and would have
+            // it do so again every time a page beside it listed — taking the
+            // slot lock each time, the same lock every publish and every
+            // `start_walk` takes, to be told again that there is nothing it
             // may stop.
             return age > 0;
         };
@@ -31569,6 +31674,12 @@ mod thumbnail_tests {
     /// its rows, so its one trim can stop nothing. What has to happen is that
     /// it comes back to it as its elders wake up, rather than fetching on to
     /// the end of its own page with the list still four walks over.
+    ///
+    /// The elders here are stand-ins marked listed by hand, so none of them
+    /// announces it on [`Walks::listings`] the way a real walk does, and what
+    /// brings the walk back is its own fetches completing. That is the path
+    /// that still holds the list to its ceiling should a walk ever list
+    /// without saying so; the announcement has a test of its own, below.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_walk_trims_the_list_as_the_walks_above_it_wake_up() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -31646,6 +31757,149 @@ mod thumbnail_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         walking.abort();
+    }
+
+    /// A walk owed a trim is woken by the walks above it listing, not only by
+    /// its own fetches.
+    ///
+    /// Coming back after a completed fetch was the only way back, and against
+    /// a player that takes the request and then says nothing there is no
+    /// completed fetch for a whole `artwork::FETCH_TIMEOUT`. A burst of pages
+    /// the runtime reached newest first sat over the ceiling for all of that:
+    /// every walk in it had spent its one trim while the walks above it were
+    /// still unpolled, and not one of them had a fetch complete to bring it
+    /// back to the trim. Which order a burst is polled in is the runtime's
+    /// business, so the paging test above passed or failed on it, a few runs
+    /// in a hundred and more on a busy machine.
+    ///
+    /// Forced here rather than hoped for. The runtime is the current-thread
+    /// one, so nothing else runs until this test yields, and each walk waits
+    /// on a gate before it lists its rows. The gates are opened newest first,
+    /// each walk listed before the next is let go, so every walk's own trim
+    /// finds only unpolled elders — the case nobody could trim. And the player
+    /// answers nothing inside the test, so the fetches cannot be what brings
+    /// anybody back.
+    #[tokio::test]
+    async fn a_burst_listed_newest_first_is_trimmed_without_waiting_on_a_fetch() {
+        const WALKS: usize = WALKS_AT_ONCE + 3;
+        const EACH: u32 = 4;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let player = Player::start().await;
+        let artwork = Arc::new(Artwork::in_memory(reqwest::Client::new(), Arc::default()));
+        artwork.remember_player(player.address().ip());
+        player.delay("/Artwork", Duration::from_secs(30));
+
+        let list: Arc<Mutex<Walks>> = Arc::default();
+        let mut gates = Vec::new();
+        let mut lefts = Vec::new();
+        for walk in 0..WALKS {
+            let (open, gate) = tokio::sync::oneshot::channel::<()>();
+            let left: Rows = Arc::default();
+            let urls: Vec<(String, u32)> = (0..EACH)
+                .map(|row| {
+                    (
+                        format!("http://{}/Artwork?album={walk}-{row}", player.address()),
+                        THUMB_SIZE,
+                    )
+                })
+                .collect();
+            let (artwork, walks, mine) = (artwork.clone(), list.clone(), left.clone());
+            // Started the way a page is, through the slot and superseding
+            // nothing, so every walk stays registered in the order it was
+            // started.
+            start_walk(
+                &list,
+                Walk::From { done: 0, at: 0 },
+                left.clone(),
+                move || async move {
+                    let _ = gate.await;
+                    walk_covers(
+                        artwork,
+                        urls,
+                        mine,
+                        || true,
+                        || {},
+                        walks,
+                        Duration::from_millis(400),
+                    )
+                    .await;
+                },
+            );
+            gates.push(open);
+            lefts.push(left);
+        }
+
+        // Newest first, one at a time.
+        for (walk, open) in gates.into_iter().enumerate().rev() {
+            assert!(
+                lefts[..walk]
+                    .iter()
+                    .all(|elder| !elder.lock().unwrap().listed),
+                "a walk above {walk} listed first, so its own trim had something to stop \
+                 and this is not the order being tested"
+            );
+            let _ = open.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !lefts[walk].lock().unwrap().listed {
+                assert!(
+                    Instant::now() < deadline,
+                    "walk {walk} never listed its rows"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Every walk has listed now, and every trim each of them did on
+        // listing found nothing it was allowed to stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let kept = list.lock().unwrap().running.len();
+            if kept <= WALKS_AT_ONCE {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the list stayed at {kept} walks with every one of them listed: each \
+                 spent its one trim before the walks above it were polled, and \
+                 nothing but a fetch of its own would ever bring it back to the trim"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let walks = list.lock().unwrap();
+        assert_eq!(
+            walks.running.len(),
+            WALKS_AT_ONCE,
+            "and it stopped more than the ceiling asked for"
+        );
+        assert!(
+            walks
+                .running
+                .last()
+                .is_some_and(|newest| Arc::ptr_eq(&newest.left, &lefts[WALKS - 1])),
+            "the newest page, the one somebody has just scrolled to, was stopped"
+        );
+        // A row is struck off as its cover arrives, so a walk still owing
+        // every row it listed has had no fetch come back.
+        let owes_every_row = |left: &Rows| left.lock().unwrap().rows.iter().all(Option::is_some);
+        assert!(
+            walks.running.iter().all(|kept| owes_every_row(&kept.left)),
+            "a cover came back, so a fetch could have been what applied the ceiling"
+        );
+        assert_eq!(
+            lefts
+                .iter()
+                .filter(|left| left.lock().unwrap().stopped)
+                .count(),
+            WALKS - WALKS_AT_ONCE,
+            "the walks let go were dropped from the list without being told"
+        );
+        assert_eq!(
+            walks.carried.len(),
+            (WALKS - WALKS_AT_ONCE) * EACH as usize,
+            "and what they owed is the list's debt, not thrown away"
+        );
     }
 
     /// A walk that has been stopped does not become the holder of that debt.
