@@ -259,8 +259,11 @@ python3 packaging/cargo-sources.py > packaging/cargo-sources.json
 ```
 
 The sandbox takes no filesystem permissions. It does need `--share=network`,
-and not only for HTTP: discovery is a UDP broadcast, which needs the host's
-network namespace rather than a proxied socket.
+because the players are on the local network and nearly everything the app does
+is too: discovery is a UDP broadcast to port 11430, and every control is an HTTP
+request to the player. Only a streaming service's cover art comes from further
+away. Without that permission Flatpak leaves the sandbox nothing but loopback,
+so no player can be reached at all, not even one added by address.
 
 ## License
 

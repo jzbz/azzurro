@@ -25,10 +25,13 @@ finish-args:
   # without a GPU, but that is a fallback, not the plan.
   - --device=dri
 
-  # Not optional, and not only for HTTP. Discovery is a UDP broadcast to
-  # 255.255.255.255:11430 on every interface, which needs the host's network
-  # namespace rather than a proxied socket; without this the app cannot find a
-  # player at all, and can only reach ones added by address.
+  # Not optional. The players are on the local network, and so is nearly
+  # everything this app does: discovery is LSDP, a UDP broadcast to port 11430,
+  # and every control after that is an HTTP request to the player. The one
+  # thing fetched from further away is a streaming service's cover art, from
+  # that service's CDN. Without this permission Flatpak gives the sandbox a
+  # network namespace of its own with nothing in it but loopback, so no player
+  # can be reached at all, not even one added by address.
   - --share=network
 
   # Note what is *not* here: no --filesystem grants at all. The remembered
