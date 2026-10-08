@@ -9,6 +9,8 @@ Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 long poll and the transport verbs all run against a player rather than a
 fixture, and firmware upgrades have been driven end to end on a Bluesound Powernode.
 
+![Azzurro's Now Playing view, with large cover art, track details and the stream's audio format](packaging/screenshots/01-now-playing.png)
+
 The window lists the players it finds and drives them:
 
 - the selected player's queue, with cover art — play a row, remove one,
