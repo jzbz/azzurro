@@ -3689,6 +3689,39 @@ fn queue_buttons_fingerprint(buttons: &[QueueButtonData], hash: &mut impl std::h
 /// Distinguishes the several MPRIS bus names one process claims.
 static NEXT_MPRIS_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+/// Asks winit for an opaque window, so that macOS paints the title bar.
+///
+/// Slint 1.17 starts every window from winit's attributes with transparency
+/// turned on. winit carries that out on macOS by marking the `NSWindow` as not
+/// opaque and giving it a clear background color, and AppKit, at least on
+/// macOS 27 (slint-ui/slint#12893), then leaves the whole window frame
+/// unpainted, the title bar included. The close, minimize and zoom buttons and
+/// the title are views of their own and still draw, over a strip that shows
+/// whatever is behind the window.
+///
+/// Nothing in this window needs to show through. Its background, `Theme.bg`,
+/// is opaque in both color schemes, and the glass panels are translucent over
+/// the window's own backdrop, not over the desktop. It keeps its native frame,
+/// and its popups are drawn inside it rather than as windows of their own. The
+/// renderer reads the same attribute when it makes its surface: femtovg on
+/// wgpu keeps Metal's layer opaque to match, and the software renderer's
+/// pixels are opaque either way. A translucent window background or `no-frame`
+/// would want the transparency back.
+///
+/// Slint 1.18 makes this choice itself: `wants_transparent` in its winit
+/// backend (i-slint-backend-winit 1.18) asks for transparency on macOS only for
+/// a background that is not opaque or a window without a frame, and applies
+/// the answer after this hook has run. Once the app is on a Slint that has it,
+/// this function, the hook on the selection in [`run_app`], the retry there
+/// that asks for winit by name and the `unstable-winit-030` table in
+/// Cargo.toml can go. The selection itself stays: the application id needs it.
+#[cfg(target_os = "macos")]
+fn opaque_window(
+    attributes: slint::winit_030::winit::window::WindowAttributes,
+) -> slint::winit_030::winit::window::WindowAttributes {
+    attributes.with_transparent(false)
+}
+
 pub fn run_app() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -3703,8 +3736,33 @@ pub fn run_app() -> ExitCode {
     // called before anything else it fails with "No default Slint platform was
     // selected", silently leaving the window without an id. Then the id, which
     // has to be set before the window is built because that is when it is read.
-    if let Err(e) = slint::BackendSelector::new().select() {
+    //
+    // On macOS the selection also carries `opaque_window`, which keeps the
+    // title bar painted. SLINT_BACKEND is still honored, and the hook goes with
+    // whichever renderer it names.
+    let selector = slint::BackendSelector::new();
+    #[cfg(target_os = "macos")]
+    let selector = selector.with_winit_window_attributes_hook(opaque_window);
+    if let Err(e) = selector.select() {
         eprintln!("azzurro: could not select a rendering backend: {e}");
+        // Short of winit itself failing, which nothing here can mend, what
+        // fails is a SLINT_BACKEND naming a backend this build does not have.
+        // Left at that, Slint falls back to its default backend when the
+        // window is built, and on macOS that is winit, the only backend this
+        // build has there, but without the hook. Asking for winit by name keeps
+        // the hook. What follows the first dash in SLINT_BACKEND is still read
+        // as the renderer, where Slint's own fallback would have ignored it.
+        // Slint's own fallback announces itself, and this one, which takes its
+        // place, does too, so the error above does not read as the last word.
+        #[cfg(target_os = "macos")]
+        match slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_window_attributes_hook(opaque_window)
+            .select()
+        {
+            Ok(()) => eprintln!("azzurro: using the winit backend instead"),
+            Err(e) => eprintln!("azzurro: could not select the winit backend either: {e}"),
+        }
     }
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         eprintln!("azzurro: could not set the application id: {e}");

@@ -58,6 +58,23 @@ slint = { version = "1.17", default-features = false, features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = "0.10"
 
+# macOS only, for `BackendSelector::with_winit_window_attributes_hook`. Slint
+# 1.17 asks winit for a transparent window, which on macOS 27 leaves the title
+# bar unpainted, and the hook is how the app asks for an opaque one instead;
+# `opaque_window` in src/lib.rs has the details. The feature adds no crate: the
+# winit backend it exposes is already compiled for `backend-winit`, and slint
+# gaining a direct edge to it is the whole of the change to Cargo.lock. Linux
+# and Windows build slint exactly as before, since Cargo leaves one target's
+# features out of another's build. Unstable and tied to winit 0.30, which is no
+# burden on a hook meant to go once the app is on Slint 1.18, where the backend
+# makes the same choice itself. `default-features = false` again, because a
+# declaration without it turns slint's defaults back on for macOS, whatever
+# `[dependencies]` says.
+[target.'cfg(target_os = "macos")'.dependencies]
+slint = { version = "1.17", default-features = false, features = [
+    "unstable-winit-030",
+] }
+
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.31"
 
