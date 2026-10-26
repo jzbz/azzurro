@@ -30,40 +30,71 @@ use tokio::sync::Semaphore;
 /// Decoded art, ready for `slint::Image::from_rgba8`.
 pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 
-/// How many decoded images to keep. A screenful of queue thumbnails plus the
-/// covers of everything recently selected, with room to spare.
+/// How many decoded images to keep, of any size. [`MEMORY_BYTES`] is what
+/// they may come to between them.
 ///
-/// Counted in entries rather than bytes, so what it costs depends on which
-/// sizes are in it. Three tiers are asked for and no more: `THUMB_SIZE` 80,
-/// `TILE_SIZE` 232 and `COVER_SIZE` 720, and one LRU holds all of them. A
-/// fourth crept in for a while — the sidebar card fetched its own 80×80 beside
-/// the queue's 72, so the selected player's cover was decoded twice and held
-/// twice for a difference nothing can see. The two are one tier at 80 now,
-/// which is what both of them want at 2x: keeping this table true is what
-/// makes a fourth tier visible if one is ever added deliberately. At four
-/// bytes a pixel the worst case for a full cache of each is
+/// Rows are drawn from this and from nothing else: a list asks
+/// [`Artwork::cached`] what is decoded each time it is rebuilt, and a row whose
+/// cover has been pushed out is drawn with the placeholder until the list is
+/// walked again. So it has to hold a whole list. It held 256, and the music
+/// root of one household's share is 534 covers: replayed against a fake
+/// player, the folder's top rows had their covers three seconds after it
+/// opened and the placeholder at forty-five, every one of them decoded and
+/// then pushed out by the rows below. The same walk took every shelf tile and
+/// full-size cover with them, since all three sizes shared the one count.
+/// 2048 holds that folder and the queue beside it, 637 thumbnails, three times
+/// over.
 ///
-/// | tier | one entry | 256 entries |
-/// |------|-----------|-------------|
-/// | 80   | 25 KiB    | 6 MiB       |
-/// | 232  | 210 KiB   | 53 MiB      |
-/// | 720  | 2 MiB     | 506 MiB     |
+/// Three tiers are asked for and no more: `THUMB_SIZE` 80, `TILE_SIZE` 232 and
+/// `COVER_SIZE` 720, and one LRU holds all of them. A fourth crept in for a
+/// while — the sidebar card fetched its own 80×80 beside the queue's 72, so
+/// the selected player's cover was decoded twice and held twice for a
+/// difference nothing can see. The two are one tier at 80 now, which is what
+/// both of them want at 2x: keeping this table true is what makes a fourth
+/// tier visible if one is ever added deliberately. At four bytes a pixel, a
+/// count on its own allows
 ///
-/// so a realistic mix — mostly thumbnails and shelf tiles, a few covers — sits
-/// in the tens of megabytes. The 720 row needs 256 *different albums* opened
-/// at full size to be reached and is by far the least likely of the three; the
-/// 232 row is the one a few minutes of browsing actually approaches.
+/// | tier | one entry | 256 entries | 2048 entries |
+/// |------|-----------|-------------|--------------|
+/// | 80   | 25 KiB    | 6 MiB       | 50 MiB       |
+/// | 232  | 210 KiB   | 53 MiB      | 420 MiB      |
+/// | 720  | 2 MiB     | 506 MiB     | 4 GiB        |
 ///
-/// That top row grew fourfold when the now-playing sleeve went from 360 to
-/// 720, which is the honest cost of the hero being sharp rather than upscaled.
-/// If it ever bites, the fix is a small separate cache for the cover tier
-/// rather than shrinking the picture the app is arranged around.
+/// which is why the count could not simply be raised: the bottom row grows
+/// with it, and the bottom row is the one that never needed the room. The
+/// count is left keeping many small images — station logos, icons smaller
+/// than their box — from becoming any number of entries; the memory is bounded
+/// by [`MEMORY_BYTES`].
+pub(crate) const MEMORY_CACHE: usize = 2048;
+
+/// And what their pixels may come to between them, whatever the sizes.
 ///
-/// Nothing here is unbounded and no player can push past it: the entry count
-/// is fixed and each entry is capped by the size that was asked for. Whether
-/// tens of megabytes of decoded pixels is the right price for not re-decoding
-/// is a separate question from recording what the price is.
-pub(crate) const MEMORY_CACHE: usize = 256;
+/// The count used to be the only bound, which priced the whole cache by its
+/// largest tier: 256 covers at 720 is 506 MiB, grown fourfold when the
+/// now-playing sleeve went from 360 to 720 to be sharp rather than upscaled.
+/// Held to this as well, the worst case is this figure for any mix of sizes:
+///
+/// | tier | entries in 64 MiB                     |
+/// |------|---------------------------------------|
+/// | 80   | 2048, where the count binds: 50 MiB   |
+/// | 232  | 311                                   |
+/// | 720  | 32                                    |
+///
+/// So the cover tier's worst case falls from 506 MiB to 64 and the tile
+/// tier's rises from 53 to 64, while the thumbnails get the room a list needs:
+/// the folder and queue above are 16 MiB of it, and the app's resident size
+/// rose by 17 MiB across that walk in the replay. Thirty-two full-size covers
+/// is a header for each of thirty-two album pages; the now-playing sleeve is
+/// handed to the window once when it arrives, not redrawn from here.
+///
+/// Weighed by the pixels decoded rather than by the box they were asked for:
+/// a cover smaller than its box is kept at its own size — see [`decode`] — and
+/// costs what it holds.
+///
+/// Nothing here is unbounded and no player can push past it. An image bigger
+/// than all of this on its own, which only a size far past any tier could
+/// make, is handed to whoever asked for it and not kept.
+const MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fetches allowed at once. Enough to fill a list quickly, few enough that
 /// opening a long queue does not put thirty connections into a speaker that is
@@ -369,6 +400,63 @@ impl Drop for Fetching<'_> {
     }
 }
 
+/// Decoded images, held to [`MEMORY_CACHE`] entries and [`MEMORY_BYTES`] of
+/// pixels between them, the least recently used going first.
+///
+/// An unbounded LRU with both limits applied here on the way in, because the
+/// crate's own bound is a count and a count alone is what priced the cache by
+/// its largest tier.
+struct Decoded {
+    entries: LruCache<Key, Pixels>,
+    /// What the entries' pixels come to, kept as they arrive and leave rather
+    /// than added up when asked.
+    bytes: usize,
+}
+
+impl Decoded {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            bytes: 0,
+        }
+    }
+
+    /// Keep `image`, then let go of the oldest until both limits hold again.
+    ///
+    /// Replacing an entry gives back what the old one weighed, so a cover
+    /// decoded twice at the same size is counted once.
+    fn put(&mut self, key: Key, image: Pixels) {
+        // Bigger than the whole budget: kept, it would push out everything
+        // else and then itself.
+        if weight(&image) > MEMORY_BYTES {
+            return;
+        }
+        self.bytes += weight(&image);
+        if let Some(old) = self.entries.put(key, image) {
+            self.bytes -= weight(&old);
+        }
+        while self.entries.len() > MEMORY_CACHE || self.bytes > MEMORY_BYTES {
+            let Some((_, gone)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= weight(&gone);
+        }
+    }
+
+    fn peek(&self, key: &Key) -> Option<&Pixels> {
+        self.entries.peek(key)
+    }
+
+    fn contains(&self, key: &Key) -> bool {
+        self.entries.contains(key)
+    }
+}
+
+/// What one decoded image costs to keep.
+fn weight(image: &Pixels) -> usize {
+    image.as_bytes().len()
+}
+
 /// Where a decoded cover lands: the two caches it fills and the count that
 /// announces it.
 ///
@@ -387,8 +475,8 @@ impl Drop for Fetching<'_> {
 /// large enough for the permit limit to matter.
 struct Landing {
     /// Decoded images, by where they came from and the size they were scaled
-    /// to. See [`Key`].
-    memory: Mutex<LruCache<Key, Pixels>>,
+    /// to. See [`Key`] and [`Decoded`].
+    memory: Mutex<Decoded>,
     /// One color per image, computed once when it is decoded. Keyed by URL
     /// alone: the same cover gives the same color at any size.
     tints: Mutex<LruCache<String, [u8; 3]>>,
@@ -411,9 +499,7 @@ struct Landing {
 impl Landing {
     fn new() -> Self {
         Self {
-            memory: Mutex::new(LruCache::new(
-                NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
-            )),
+            memory: Mutex::new(Decoded::new()),
             tints: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MEMORY_CACHE).expect("MEMORY_CACHE is not zero"),
             )),
@@ -509,9 +595,9 @@ pub struct Artwork {
     /// of the outstanding set instead, and that walk is the cost it added. A
     /// test measuring only [`Self::peeks`] would be weighing what was removed
     /// without weighing what replaced it, and the replacement is the number
-    /// that grows with a queue nothing decodes for: the memory cache is
-    /// [`MEMORY_CACHE`] entries across all three sizes and a queue window is
-    /// longer than that, so the set a full queue is short of never empties.
+    /// that grows with a queue nothing decodes for: a player whose covers
+    /// cannot be had leaves the queue short of every one of them for as long
+    /// as it is open, and the walk is the length of the window each time.
     /// Counted by the length offered rather than by how far the walk got,
     /// because the bound is what is being watched.
     probes: std::sync::atomic::AtomicU64,
@@ -1810,6 +1896,136 @@ mod tests {
 
         assert!(!gone.exists(), "a file was made where none was");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An [`Artwork`] for a test of the memory cache alone.
+    fn decoding_only() -> Artwork {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Artwork::in_memory(reqwest::Client::new(), Players::default())
+    }
+
+    /// Rows are drawn from the memory cache and nothing else, so it has to
+    /// hold a whole list. Measured: a share's music root names 534 covers and
+    /// the queue beside it 104, one of them the same. Against 256 entries the
+    /// folder's top rows went to the placeholder once its walk had passed
+    /// them, and the album header and shelf tile the walk started from went
+    /// with them.
+    #[test]
+    fn a_walk_down_a_folder_keeps_the_rows_it_passed_and_the_page_it_left() {
+        const WORKING_SET: usize = 534 + 104 - 1;
+        let art = decoding_only();
+
+        // What was on screen before the folder: an album page's header and a
+        // shelf on Home.
+        let header = "http://192.168.1.155:11000/Artwork?album=Header";
+        let tile = "http://192.168.1.155:11000/Artwork?album=Tile";
+        art.decoded.keep(header, 720, &Pixels::new(720, 720));
+        art.decoded.keep(tile, 232, &Pixels::new(232, 232));
+
+        let row = |n: usize| format!("http://192.168.1.155:11000/Artwork?album={n}");
+        for n in 0..WORKING_SET {
+            art.decoded.keep(&row(n), 80, &Pixels::new(80, 80));
+        }
+
+        let lost = (0..WORKING_SET)
+            .filter(|&n| art.cached(&row(n), 80).is_none())
+            .count();
+        assert_eq!(
+            lost, 0,
+            "{lost} rows the walk had decoded are drawn with the placeholder"
+        );
+        assert!(
+            art.cached(header, 720).is_some(),
+            "a folder of thumbnails pushed out an album header"
+        );
+        assert!(
+            art.cached(tile, 232).is_some(),
+            "a folder of thumbnails pushed out a shelf tile"
+        );
+    }
+
+    /// The count alone priced the cache by its largest tier: 256 covers at 720
+    /// is 506 MiB, and raising the count for the thumbnails' sake would have
+    /// raised that with it. Held to a budget in bytes, a cache full of covers
+    /// is the budget and no more.
+    #[test]
+    fn a_cache_full_of_covers_comes_to_the_budget_and_no_more() {
+        const COVER: usize = 720 * 720 * 4;
+        const {
+            assert!(
+                MEMORY_BYTES <= 256 * COVER,
+                "the cover tier's worst case is above what it was"
+            )
+        };
+
+        let art = decoding_only();
+        let cover = |n: usize| format!("http://192.168.1.155:11000/Artwork?album={n}");
+        // Into the cache itself rather than through `keep`, whose tint is a
+        // pass over every pixel and not what is being weighed here.
+        let put = |n: usize| {
+            art.decoded.memory.lock().unwrap().put(
+                Key {
+                    url: cover(n),
+                    size: 720,
+                },
+                Pixels::new(720, 720),
+            )
+        };
+        let asked = MEMORY_BYTES / COVER + 8;
+        for n in 0..asked {
+            put(n);
+        }
+        // And one decoded twice, which is one entry and is counted once.
+        put(asked - 1);
+
+        let memory = art.decoded.memory.lock().unwrap();
+        let held: usize = memory.entries.iter().map(|(_, image)| weight(image)).sum();
+        assert_eq!(memory.bytes, held, "the running total has drifted");
+        assert!(
+            held <= MEMORY_BYTES,
+            "{held} bytes of covers held against a budget of {MEMORY_BYTES}"
+        );
+        assert_eq!(
+            memory.entries.len(),
+            MEMORY_BYTES / COVER,
+            "the budget should be full of covers, not short of it"
+        );
+        drop(memory);
+        assert!(
+            art.cached(&cover(asked - 1), 720).is_some(),
+            "and the newest is the one kept"
+        );
+        assert!(
+            art.cached(&cover(0), 720).is_none(),
+            "the oldest went first"
+        );
+    }
+
+    /// An image larger than the whole budget is handed back and not kept —
+    /// kept, it would push out everything else in the cache and then itself.
+    #[test]
+    fn an_image_too_big_to_keep_costs_the_rest_nothing() {
+        let art = decoding_only();
+        let row = "http://192.168.1.155:11000/Artwork?album=Row";
+        art.decoded.keep(row, 80, &Pixels::new(80, 80));
+
+        // Square, and one pixel a side past the budget. Put straight in, for
+        // the reason given above.
+        let side = ((MEMORY_BYTES / 4) as f64).sqrt() as u32 + 1;
+        let huge = "http://192.168.1.155:11000/Artwork?album=Huge";
+        art.decoded.memory.lock().unwrap().put(
+            Key {
+                url: huge.to_owned(),
+                size: side,
+            },
+            Pixels::new(side, side),
+        );
+
+        assert!(art.cached(huge, side).is_none(), "it was kept");
+        assert!(
+            art.cached(row, 80).is_some(),
+            "and it cost a row its cover on the way through"
+        );
     }
 
     /// A cover server on the loopback, so the paths below can be walked with
