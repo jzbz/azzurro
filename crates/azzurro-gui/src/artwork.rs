@@ -85,21 +85,43 @@ const CONCURRENT_FETCHES: usize = 4;
 const CONCURRENT_DECODES: usize = 3;
 
 /// Files kept on disk. Pruned to this on startup and every [`PRUNE_EVERY`]
-/// covers after that, oldest first.
+/// covers after that, least recently used first; see [`prune`].
 ///
 /// Startup alone was not enough: a session left open for a week fetches art
 /// the whole time and nothing between one launch and the next ever looks at
 /// the directory, so the limit held only for as long as the app had just
 /// started.
-const DISK_CACHE_FILES: usize = 512;
+///
+/// It was 512, which is less than one screen of a real library with the queue
+/// beside it. The music root of one household's share is 781 rows naming 534
+/// covers, and the queue playing at the time named 104 more, one of them the
+/// same: 637 between them. Replayed against a fake player serving those two
+/// documents with covers of real sizes, one session of opening the folder,
+/// the queue being read again, the folder again and the queue again fetched
+/// 1378 covers to show 637. Every cover past 512 pushed out one that was about
+/// to be wanted, so the second visit to the folder fetched all 534 again and
+/// each read of the queue after a visit fetched its 103 again — on a speaker
+/// that answers its queue only once it has stopped serving covers. It is the
+/// pattern a real session logged too: a hundred files pruned six times in 37
+/// seconds after a relaunch.
+///
+/// So the count is set where it stops being the limit that binds for covers,
+/// and [`DISK_CACHE_BYTES`] does the bounding. It is still worth having for
+/// files much smaller than a cover, since it is what prices the listing and
+/// sort a prune makes: about 5 ms for 4096 files, measured warm.
+const DISK_CACHE_FILES: usize = 4096;
 
 /// And how much they may come to, whatever the count.
 ///
 /// The file limit alone bounds the directory only if the files are the size a
-/// cover is. Each one may be up to [`MAX_BYTES`], so 512 of them is nearly
-/// five gigabytes — a ceiling set by what a player chose to serve rather than
-/// by anything this app decided. Real covers are tens of kilobytes, so this is
-/// far above a full cache of them and far below what the count alone allows.
+/// cover is. Each one may be up to [`MAX_BYTES`], so [`DISK_CACHE_FILES`] of
+/// them is thirty-two gigabytes — a ceiling set by what a player chose to
+/// serve rather than by anything this app decided.
+///
+/// Real covers from a player are 40–215 KB, so this holds between about 1200
+/// and 6500 of them: room for the 637 above at the largest of those sizes
+/// nearly twice over. The two limits meet at 64 KB a file, and this is the
+/// one that binds for anything bigger.
 const DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How many covers may be written before the directory is checked again.
@@ -1034,10 +1056,15 @@ impl Artwork {
         // runtime thread.
         if let Some(cache) = path.clone() {
             let reading = cache.clone();
-            let cached = tokio::task::spawn_blocking(move || std::fs::read(reading).ok())
-                .await
-                .ok()
-                .flatten();
+            let cached = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&reading).ok()?;
+                // A cover read back is a cover still wanted. See [`prune`].
+                touch(&reading);
+                Some(bytes)
+            })
+            .await
+            .ok()
+            .flatten();
             match cached.filter(|b| !b.is_empty()) {
                 Some(bytes) if looks_like_an_image(&bytes) => {
                     return Some((Arc::new(bytes), Source::Disk));
@@ -1326,12 +1353,47 @@ fn file_name(url: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Mark a cached cover as used just now, so [`prune`] drops it last.
+///
+/// The modification time, because it is the one time every platform keeps and
+/// lets this set: access times are not kept at all on a volume mounted
+/// `noatime`, and at most once a day under Linux's default `relatime`. Opened
+/// for writing and not written, which is what Windows asks before a time may
+/// be changed; without `create`, so a cover pruned since it was read stays
+/// gone.
+///
+/// Best effort. A cover that cannot be marked is pruned by when it was
+/// written, which is what every cover was before.
+fn touch(path: &std::path::Path) {
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+}
+
 /// Keep the cache directory from growing without end.
 ///
-/// Runs once at startup and drops the oldest files past the limit. Crude —
-/// modification time is not access time — but it bounds the directory without
-/// tracking anything, and re-fetching a cover that was wrongly dropped costs
-/// one request.
+/// Drops files past either limit, least recently used first. A file's
+/// modification time is set when the cover is written and again whenever it
+/// is read back — see [`touch`] — so the order is the order covers were last
+/// wanted rather than the order they were first fetched.
+///
+/// Which is the difference for a queue. Its covers are fetched once and read
+/// back from here at every launch after, while most of what a session browses
+/// is written once and not looked at again — so by write time, once the
+/// directory had filled, the queue's covers were the oldest files in it and
+/// the first ones dropped. Replayed as five launches on one cache, each
+/// opening a different folder of 534 covers and then a sixth launch, the byte
+/// budget filled on the fourth: by write time the next two launches fetched
+/// the queue's 104 covers again between them, and by last use neither fetched
+/// any.
+///
+/// What this does not change is a single list longer than the cache. A cover
+/// the memory cache answers for is not read from here and so is not marked,
+/// and a walk past either limit pushes out everything older than itself, used
+/// or not: with the old count of 512, the replay described at
+/// [`DISK_CACHE_FILES`] fetched 2013 covers over two sessions in this order
+/// against 2015 in the old one. Room for that is what the limits are for.
 fn prune(dir: &PathBuf) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1601,7 +1663,7 @@ mod tests {
 
     /// The file count alone bounds the directory only if the files are the
     /// size a cover is. Each may be up to MAX_BYTES, so the count that looks
-    /// generous for real covers allows nearly five gigabytes of whatever a
+    /// generous for real covers allows thirty-two gigabytes of whatever a
     /// player chose to serve.
     #[test]
     fn the_cache_is_bounded_by_bytes_as_well_as_by_count() {
@@ -1640,6 +1702,113 @@ mod tests {
         );
         assert!(count(&dir) > 0, "and it did not empty the directory");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache has to hold what one screen of a real library and the queue
+    /// beside it name, or each visit to one pushes out the other. Measured: a
+    /// share's music root of 781 rows naming 534 covers and a queue naming 104,
+    /// one of them the same. Against a count of 512 the second visit to the
+    /// folder fetched all 534 again, and each read of the queue after a visit
+    /// fetched its 103 again.
+    ///
+    /// At the largest size a cover from that player came in, so the byte
+    /// budget is held to it as well as the count.
+    #[test]
+    fn a_library_folder_and_the_queue_beside_it_fit_in_the_cache() {
+        const WORKING_SET: usize = 534 + 104 - 1;
+        const LARGEST_COVER: u64 = 215 * 1024;
+
+        let dir = scratch("art-working-set");
+        for n in 0..WORKING_SET {
+            // Sized rather than written: the length is all a prune reads, and
+            // 134 MB of zeros would be written for nothing.
+            std::fs::File::create(dir.join(format!("{n:016x}")))
+                .and_then(|file| file.set_len(LARGEST_COVER))
+                .expect("writes");
+        }
+
+        prune(&dir);
+
+        let kept = std::fs::read_dir(&dir).expect("reads").count();
+        assert_eq!(
+            kept,
+            WORKING_SET,
+            "{} covers the next screen wants were dropped",
+            WORKING_SET - kept
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning goes by when a cover was last wanted, not when it was first
+    /// fetched. A queue's covers are fetched once, at launch, and read back
+    /// from disk on every read of the queue after a longer list has turned the
+    /// memory cache over — so by write time they were the oldest files in the
+    /// directory and the first ones dropped, and the next read of the queue
+    /// fetched them all again.
+    #[tokio::test]
+    async fn a_cover_read_back_is_kept_over_one_that_was_only_written() {
+        let dir = scratch("art-last-used");
+        let art = art_in(&dir);
+        let server = serving(vec![png_of(32, 32)], Duration::ZERO).await;
+        let queued = format!("http://{}/Artwork?album=Queued", server.addr);
+        let browsed = format!("http://{}/Artwork?album=Browsed", server.addr);
+
+        // The queue's cover written two hours ago, at launch, and a browse
+        // page's an hour ago — big enough that the two are over the byte
+        // budget together, so one of them has to go.
+        let hours_ago =
+            |hours: u64| std::time::SystemTime::now() - Duration::from_secs(hours * 3600);
+        let queued_file = dir.join(file_name(&queued));
+        std::fs::write(&queued_file, png_of(32, 32)).expect("writes");
+        std::fs::File::options()
+            .write(true)
+            .open(&queued_file)
+            .and_then(|file| file.set_modified(hours_ago(2)))
+            .expect("dates");
+        let browsed_file = dir.join(file_name(&browsed));
+        let file = std::fs::File::create(&browsed_file).expect("writes");
+        file.set_len(DISK_CACHE_BYTES).expect("sizes");
+        file.set_modified(hours_ago(1)).expect("dates");
+        drop(file);
+
+        // The queue is read again, and its cover comes off the disk.
+        assert!(
+            art.get(&queued, 72).await.is_some(),
+            "the cached cover did not decode"
+        );
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fetched rather than read back, so this says nothing about the disk"
+        );
+
+        prune(&dir);
+
+        assert!(
+            queued_file.exists(),
+            "the cover just drawn was dropped for one nobody has looked at since"
+        );
+        assert!(
+            !browsed_file.exists(),
+            "and the budget was met by dropping the other"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prune can take a cover between its being read and its being marked,
+    /// and marking it must not put an empty file back in its place: the read
+    /// path refuses an empty file, but only after a turn of the disk.
+    #[test]
+    fn marking_a_pruned_cover_used_does_not_bring_it_back() {
+        let dir = scratch("art-touch-gone");
+        let gone = dir.join("00112233445566aa");
+
+        touch(&gone);
+
+        assert!(!gone.exists(), "a file was made where none was");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
