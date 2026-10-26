@@ -5794,17 +5794,44 @@ export component AppWindow inherits Window {
                                 // The number that moves is the brighter of the
                                 // two; the total it is measured against sits back.
                                 color: Theme.dim;
-                                // The total is fixed for the length of a track
-                                // and never shorter than the position, so it
-                                // sizes the box both numbers sit in. Geist's
-                                // figures are proportional and unusually so —
-                                // its "1" is 42% narrower than its "0" — so
-                                // without a fixed box this whole group slid
-                                // sideways on every tick, all through every
-                                // track, in the one bar that is always on
+                                // A box that holds still for the length of a
+                                // track. Geist's figures are proportional and
+                                // unusually so — its "1" is 42% narrower than
+                                // its "0" — so without one this whole group
+                                // slid sideways on every tick, all through
+                                // every track, in the one bar that is always on
                                 // screen. 0:59 to 1:00 alone moved it 1.8px.
-                                width: total.preferred-width;
+                                //
+                                // It was the total's width, on the grounds that
+                                // the position never runs past the total. It
+                                // never does, but it can still be wider, being
+                                // other figures: "0:07" is 2.7px wider than
+                                // "3:14", and that box cut the 7 in half.
+                                width: room.preferred-width;
                                 horizontal-alignment: right;
+
+                                // The total's shape with every figure a 0,
+                                // Geist's widest. No position in the track can
+                                // outgrow it: the transport clamps the position
+                                // to the total, so it never has more figures,
+                                // and no pair of figures kerns wide enough to
+                                // beat the zeros. The shape is `bluos::clock`'s
+                                // — m:ss, and h:mm:ss from an hour — so its
+                                // length alone says which one it is.
+                                room := Text {
+                                    property <int> characters: root.duration-text.character-count;
+                                    text: self.characters <= 4
+                                        ? "0:00"
+                                        : (self.characters <= 5
+                                            ? "00:00"
+                                            : (self.characters <= 7 ? "0:00:00" : "00:00:00"));
+                                    font-size: Theme.small-size;
+                                    // Measured, never drawn or read out. A
+                                    // child of the text rather than a sibling,
+                                    // so that it takes no room in the row.
+                                    visible: false;
+                                    accessible-role: none;
+                                }
                             }
 
                             Text {
@@ -5813,7 +5840,7 @@ export component AppWindow inherits Window {
                                 color: Theme.faint;
                             }
 
-                            total := Text {
+                            Text {
                                 text: root.duration > 0 ? root.duration-text : "";
                                 font-size: Theme.small-size;
                                 color: Theme.faint;
