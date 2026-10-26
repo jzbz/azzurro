@@ -12118,7 +12118,13 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
         return;
     };
 
-    match client.queue_range(0, QUEUE_WINDOW - 1).await {
+    // No covers asked of the player while this is out: it answers the queue
+    // only once it has stopped serving them. See `Artwork::make_way`.
+    let read = {
+        let _way = backend.artwork.make_way(id.host);
+        client.queue_range(0, QUEUE_WINDOW - 1).await
+    };
+    match read {
         Ok(queue) => {
             tracing::debug!(
                 %id,
@@ -12591,7 +12597,11 @@ async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option
         return;
     };
 
-    let read = client.queue_range(from, from + QUEUE_WINDOW - 1).await;
+    // As for the first window; see `fetch_queue`.
+    let read = {
+        let _way = backend.artwork.make_way(id.host);
+        client.queue_range(from, from + QUEUE_WINDOW - 1).await
+    };
     // Cleared before anything else can return, so a failure does not wedge the
     // list into never asking again.
     backend.browsing.lock().unwrap().fetching_queue = false;
@@ -30780,6 +30790,56 @@ mod thumbnail_tests {
             asked < COVERS as usize / 2,
             "the superseded loader walked on: {asked} of {COVERS} covers asked for"
         );
+    }
+
+    /// While the queue is being read, its player is asked for no covers.
+    ///
+    /// A player answers `/Playlist` only once it has stopped serving covers,
+    /// so a walk going on beside the read held it back for as long as the walk
+    /// had covers left — on a library folder of hundreds of rows, the several
+    /// seconds tracks added to the queue took to appear in it. See
+    /// `Artwork::make_way`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_cover_is_asked_of_a_player_while_its_queue_is_read() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // A queue with no covers of its own, so the only one asked for below
+        // is the one this test asks for.
+        player.hold_queue(3);
+        player.delay("/Playlist", Duration::from_millis(600));
+        let reading = tokio::spawn(fetch_queue(backend.clone(), player.id()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !player.asked_for("/Playlist") {
+            assert!(Instant::now() < deadline, "the queue was never asked for");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // A cover wanted while the read is out, as a browse row's would be.
+        let art = Arc::clone(&backend.artwork);
+        let url = cover_url(&backend, &player, 7);
+        let cover = tokio::spawn(async move { art.get(&url, THUMB_SIZE).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            covers_asked(&player),
+            0,
+            "a cover was asked of the player while its queue was being read"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("the queue read never landed")
+            .expect("joins");
+        tokio::time::timeout(Duration::from_secs(5), cover)
+            .await
+            .expect("the cover was still held back after the read landed")
+            .expect("joins");
+        assert_eq!(covers_asked(&player), 1, "and asked for once it had");
     }
 
     /// And it stops when it is superseded, not when its next fetch happens to

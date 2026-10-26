@@ -419,6 +419,31 @@ impl Landing {
     }
 }
 
+/// A read a player's covers are waiting on. See [`Artwork::make_way`].
+pub struct MadeWay<'a> {
+    art: &'a Artwork,
+    host: std::net::IpAddr,
+}
+
+impl Drop for MadeWay<'_> {
+    fn drop(&mut self) {
+        let clear = {
+            let mut making = self.art.making_way.lock().unwrap();
+            match making.get_mut(&self.host) {
+                Some(1) => making.remove(&self.host).is_some(),
+                Some(reads) => {
+                    *reads -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
+        if clear {
+            self.art.way_clear.notify_waiters();
+        }
+    }
+}
+
 pub struct Artwork {
     http: reqwest::Client,
     /// What a decode leaves behind, shared with the decode itself. See
@@ -486,6 +511,11 @@ pub struct Artwork {
     /// the same bytes and both wrote the same file. The sizes still decode
     /// separately, which is what they are for; only the bytes are shared.
     inflight: Mutex<HashMap<String, Running>>,
+    /// Players with a queue read out to them right now, and how many. A cover
+    /// from one of them waits until there are none; see [`Self::make_way`].
+    making_way: Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// Rung when a player's last such read lands, for the covers waiting on it.
+    way_clear: tokio::sync::Notify,
     /// The addresses of players this app has adopted.
     ///
     /// A player serves its own cover art from its own address, which is on the
@@ -525,6 +555,8 @@ impl Artwork {
             limit: Semaphore::new(CONCURRENT_FETCHES),
             decoding: Arc::new(Semaphore::new(CONCURRENT_DECODES)),
             inflight: Mutex::new(HashMap::new()),
+            making_way: Mutex::new(HashMap::new()),
+            way_clear: tokio::sync::Notify::new(),
         }
     }
 
@@ -549,6 +581,8 @@ impl Artwork {
             limit: Semaphore::new(CONCURRENT_FETCHES),
             decoding: Arc::new(Semaphore::new(CONCURRENT_DECODES)),
             inflight: Mutex::new(HashMap::new()),
+            making_way: Mutex::new(HashMap::new()),
+            way_clear: tokio::sync::Notify::new(),
         }
     }
 
@@ -705,6 +739,49 @@ impl Artwork {
     /// remains there, since one device can present two zones on one host.
     pub fn forget_player(&self, host: std::net::IpAddr) {
         self.players.lock().unwrap().remove(&host.to_canonical());
+    }
+
+    /// Ask nothing more of `host` for covers until what this returns is
+    /// dropped.
+    ///
+    /// A player puts off reading out its queue for as long as it is serving
+    /// covers. Measured on a Powernode with 134 tracks queued: `/Playlist` for
+    /// the whole window took 0.28s on its own and 4.1s with four covers at a
+    /// time going on beside it — answered only once the last of sixty-odd
+    /// covers had been, not once the four in flight when it was asked had.
+    /// With no new covers asked for while it was out, the same read took
+    /// 0.4–0.9s, with forty to fifty still waiting their turn. The queue is
+    /// held back behind every cover a list walk has left to fetch, which on a
+    /// library folder is hundreds; that wait was tracks added to the queue
+    /// taking several seconds to appear in it.
+    ///
+    /// Covers already asked for are left to finish. They are what the read is
+    /// waiting out, and there are at most [`CONCURRENT_FETCHES`] of them.
+    pub fn make_way(&self, host: std::net::IpAddr) -> MadeWay<'_> {
+        let host = host.to_canonical();
+        *self.making_way.lock().unwrap().entry(host).or_default() += 1;
+        MadeWay { art: self, host }
+    }
+
+    /// Wait while the player `url` is on has a read out. See
+    /// [`Self::make_way`].
+    async fn give_way(&self, url: &str) {
+        let Some(host) = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().and_then(literal_address))
+        else {
+            return;
+        };
+        loop {
+            // Listening before looking, so a read that lands between the two
+            // still wakes this.
+            let mut cleared = std::pin::pin!(self.way_clear.notified());
+            cleared.as_mut().enable();
+            if !self.making_way.lock().unwrap().contains_key(&host) {
+                return;
+            }
+            cleared.await;
+        }
     }
 
     /// The cover for `url` as the desktop should be told of it, if at all.
@@ -991,6 +1068,10 @@ impl Artwork {
         // Held across the request, not the decode: the point is to bound
         // connections, and a permit kept through decoding would idle it.
         let _permit = self.limit.acquire().await.ok()?;
+        // After the permit rather than before it, so a cover already queued
+        // for one when a read went out is not let straight through when it
+        // gets it.
+        self.give_way(url).await;
 
         let mut response = match self.http.get(url).timeout(FETCH_TIMEOUT).send().await {
             Ok(response) => response.error_for_status().ok()?,
@@ -1657,6 +1738,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temp dir");
         dir
+    }
+
+    /// A player answers its queue only once it has stopped serving covers, so
+    /// none is asked of it while a read of the queue is out — and a press
+    /// reads the queue twice at once, the menu's read and the status's, so it
+    /// is the last of them landing that lets the covers go.
+    #[tokio::test]
+    async fn a_cover_waits_out_every_read_of_its_players_queue() {
+        let dir = scratch("art-make-way");
+        let art = Arc::new(art_in(&dir));
+        let server = serving(vec![png_of(32, 32)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Waiting", server.addr);
+
+        let menu = art.make_way(server.addr.ip());
+        let status = art.make_way(server.addr.ip());
+        let mine = Arc::clone(&art);
+        let wanted = url.clone();
+        let task = tokio::spawn(async move { mine.get(&wanted, 72).await.is_some() });
+
+        // Long enough for an unimpeded fetch to have arrived several times
+        // over: the server answers at once.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(menu);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server.served.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a cover was asked of a player whose queue was still being read"
+        );
+
+        drop(status);
+        let fetched = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the cover was still held back after the last read landed")
+            .expect("joins");
+        assert!(fetched, "and fetched once it had");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only that player's. A read out to one speaker has nothing to do with the
+    /// art of another, or of a station's cover on somebody's CDN.
+    #[tokio::test]
+    async fn a_read_holds_back_only_its_own_players_covers() {
+        let dir = scratch("art-make-way-other");
+        let art = art_in(&dir);
+        let server = serving(vec![png_of(32, 32)], Duration::ZERO).await;
+        let url = format!("http://{}/Artwork?album=Elsewhere", server.addr);
+
+        let _elsewhere = art.make_way("192.0.2.10".parse().expect("an address"));
+        let fetched = tokio::time::timeout(Duration::from_secs(5), art.get(&url, 72))
+            .await
+            .expect("held back by a read out to another player");
+        assert!(fetched.is_some(), "the cover did not decode");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The queue wants a 72px thumbnail and the sleeve a 720px cover of the
