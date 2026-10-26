@@ -99,8 +99,9 @@ const COVER_SETTLE: Duration = Duration::from_millis(180);
 /// The cost is real and is worth stating: 720² × 4 = 2 MiB per entry against
 /// 506 KiB before, and the table on [`artwork::MEMORY_CACHE`] carries the
 /// arithmetic. Only the hero asks for this tier — the 232px shelf tiles and
-/// the small tier below are unchanged — so a cache full of them needs 256
-/// different albums opened at full size.
+/// the small tier below are unchanged — and the cache is held to a budget in
+/// bytes as well as a count of entries, so a cache full of them costs that
+/// budget rather than the count times 2 MiB.
 const COVER_SIZE: u32 = 720;
 
 /// The small tier: queue thumbnails and browse rows at 34px, and the sidebar
@@ -301,6 +302,9 @@ enum Command {
     ToggleNowPlaying,
     /// Fetch the next page of the list on show and add it to the end.
     BrowseMore,
+    /// The items of the browse list on screen, first and last, as places in
+    /// the list the window was last sent. See [`Viewing`].
+    BrowseViewing(usize, usize),
     /// A letter of the jump bar was pressed or typed.
     BrowseJump(String),
     /// Open the one screen the player puts a search box on.
@@ -1851,13 +1855,18 @@ struct Backend {
     /// disk so a window opened on a paused player has something to carry. See
     /// [`decoded`].
     decoded: Arc<Mutex<decoded::Heard>>,
-    /// The cover walks running over each list, so that starting one that
+    /// The cover walks running over the queue, so that starting one that
     /// replaces the list stops them at once rather than at their next
     /// completed fetch. More than one because a page starts a walk of its own
     /// and leaves the walk above it running: see [`Walk`] and [`start_walk`].
     /// The redraw clock lives here too, for the reason in [`Walks`].
     queue_walk: Arc<Mutex<Walks>>,
-    browse_walk: Arc<Mutex<Walks>>,
+    /// The one task fetching the browse screen's covers, and which screen it
+    /// is fetching them for. See [`Backend::walk_browse`].
+    browse_walk: Arc<Mutex<Option<Following>>>,
+    /// Which rows of the browse list are on screen, and what each row is
+    /// drawn with: what [`load_browse_thumbnails`] follows. See [`Viewing`].
+    browse_view: Arc<tokio::sync::watch::Sender<Viewing>>,
     /// How many sweeps are running, and what the window has been told.
     ///
     /// A count rather than a flag because there can be two: Rescan starts a
@@ -3298,6 +3307,30 @@ struct ItemData {
     rows: Vec<BrowseData>,
 }
 
+/// The size the pictures on an item of this kind are drawn at, and so fetched
+/// and held at: a shelf's tiles at [`TILE_SIZE`], since a cover on a shelf is
+/// drawn four times the size of one on a row, and everything else at
+/// [`THUMB_SIZE`]. The kinds are [`ItemData`]'s.
+///
+/// One place for both of the things that need it, the publisher building the
+/// rows and the record of what they are drawn with, so the cover fetched for
+/// a row is the one the row looks for.
+fn drawn_at(kind: i32) -> u32 {
+    if kind == 1 { TILE_SIZE } else { THUMB_SIZE }
+}
+
+/// What one item is drawn with: the address of each of its pictures, at the
+/// size it is drawn at. Nothing for a heading, and nothing for a row drawn as
+/// a glyph, whose `art` is `None`. See [`Viewing::art`].
+fn drawn_art(item: &ItemData) -> Vec<(String, u32)> {
+    let size = drawn_at(item.kind);
+    item.rows
+        .iter()
+        .filter_map(|row| row.art.clone())
+        .map(|url| (url, size))
+        .collect()
+}
+
 /// Lay a screen's sections out in the order the pane draws them.
 ///
 /// Here rather than in the event loop, where it used to sit, because this is
@@ -4131,6 +4164,13 @@ fn wire(ui: &AppWindow, commands: mpsc::UnboundedSender<Command>) {
     });
 
     let tx = commands.clone();
+    ui.on_browse_viewing(move |first, last| {
+        let first = usize::try_from(first).unwrap_or(0);
+        let last = usize::try_from(last).unwrap_or(0);
+        let _ = tx.send(Command::BrowseViewing(first, last.max(first)));
+    });
+
+    let tx = commands.clone();
     ui.on_browse_jump(move |key| {
         let _ = tx.send(Command::BrowseJump(key.to_string()));
     });
@@ -4309,6 +4349,7 @@ async fn run(
         known: Arc::new(Mutex::new(Vec::new())),
         queue_walk: Arc::default(),
         browse_walk: Arc::default(),
+        browse_view: Arc::new(tokio::sync::watch::Sender::new(Viewing::default())),
         sweeping: Arc::default(),
         vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
         searches: Arc::new(AtomicU64::new(0)),
@@ -6254,36 +6295,83 @@ impl Backend {
         });
     }
 
-    /// And the browse screen's.
-    fn walk_browse(&self, id: DeviceId, rows: Walk) {
-        let left: Rows = Arc::default();
-        let backend = self.clone();
-        start_walk(&self.browse_walk, rows, left.clone(), move || {
-            load_browse_thumbnails(backend, id, rows, left)
+    /// And the browse screen's: see that the covers of `id`'s screen on show
+    /// are being fetched, by the one task that follows the view over it. See
+    /// [`load_browse_thumbnails`].
+    ///
+    /// Called wherever the rows may have changed — a screen opened, a jump
+    /// landed, a page grafted on — and starts a task only for a screen that is
+    /// not the one already being followed. That one hears about its new rows
+    /// by itself, through [`Backend::browse_view`], as they are sent to the
+    /// window; starting it again would drop the fetches it has out, which are
+    /// for rows that are still on screen.
+    ///
+    /// A new screen opens at the top — see the end of
+    /// [`Backend::publish_browse`] — so the view is put there before the
+    /// window has said so, keeping its height. Left where it was, the first
+    /// covers asked of a new screen were the ones at the old screen's scroll
+    /// position, for the frame or two until the window measured the new one.
+    fn walk_browse(&self, id: DeviceId) {
+        // Read and let go: the slot below takes a lock of its own.
+        let era = self.browsing.lock().unwrap().era;
+        let mut walk = self.browse_walk.lock().unwrap();
+        let following = walk
+            .as_ref()
+            .is_some_and(|walk| walk.id == id && walk.era == era && !walk.stop.is_finished());
+        if following {
+            return;
+        }
+        let new_screen = walk.as_ref().is_none_or(|walk| walk.era != era);
+        if let Some(stood_down) = walk.take() {
+            stood_down.stop.abort();
+        }
+        if new_screen {
+            self.browse_view.send_if_modified(|view| {
+                let top = view.shown.map(|(first, last)| (0, last - first));
+                let moved = view.shown != top;
+                view.shown = top;
+                moved
+            });
+        }
+        let started = tokio::spawn(load_browse_thumbnails(self.clone(), id, era));
+        *walk = Some(Following {
+            id,
+            era,
+            stop: started.abort_handle(),
         });
     }
 
-    /// Stop every walk over the browse screen, for a screen that is being left
-    /// without another being opened in its place.
+    /// Stop fetching the browse screen's covers, for a screen that is being
+    /// left without another being opened in its place.
     ///
     /// Backing out of a screen and clearing the search box both bump `era`,
-    /// which is what the walks check — but only between fetches, so what they
-    /// actually do is hold their requests and their share of the four artwork
+    /// which is what the task checks — but only when it wakes, so what it
+    /// actually does is hold its requests and their share of the four artwork
     /// permits for up to an `artwork::FETCH_TIMEOUT` against a player that
-    /// accepts connections and then says nothing. That is the stretch
-    /// [`start_walk`] exists to cut short, and opening a screen gets it for
-    /// free because it starts a [`Walk::Whole`]; leaving one has to ask.
-    ///
-    /// It matters more than it did: a screen that was paged while it was open
-    /// leaves a walk per page behind rather than one.
+    /// accepts connections and then says nothing. Opening a screen stops it
+    /// for free, since [`Backend::walk_browse`] stands it down for the new
+    /// one; leaving one has to ask.
     fn stop_browse_walks(&self) {
-        let mut walks = self.browse_walk.lock().unwrap();
-        for walk in walks.running.drain(..) {
+        if let Some(walk) = self.browse_walk.lock().unwrap().take() {
             walk.stop.abort();
         }
-        // The rows any of them were carrying for a stopped walk belong to the
-        // screen being left, so they go with it.
-        walks.carried.clear();
+    }
+
+    /// Follow the screen now on show, for a screen left for the one under it:
+    /// Back, or a search's results taken away.
+    ///
+    /// The screen under it is drawn from the memory cache, which may have let
+    /// go of some of its covers while the screen above was up, and a row asks
+    /// for its cover again only while something follows the view over it.
+    /// Starting that stands down the task following the screen that was left,
+    /// which [`Self::stop_browse_walks`] would otherwise have to.
+    fn walk_browse_returned(&self) {
+        // Read and let go: the walk takes this lock itself.
+        let device = self.browsing.lock().unwrap().device;
+        match device {
+            Some(id) => self.walk_browse(id),
+            None => self.stop_browse_walks(),
+        }
     }
 
     /// Say that a sweep is running, until the answer is dropped.
@@ -8133,7 +8221,7 @@ impl Backend {
             }
         }
 
-        let (blocks, selector, recent, empty, header, title, can_go_back, search) = {
+        let (blocks, selector, recent, empty, header, title, can_go_back, search, era) = {
             let browsing = self.browsing.lock().unwrap();
 
             let Some(screen) = browsing.current() else {
@@ -8149,6 +8237,7 @@ impl Backend {
                     .map(|((_, why), (id, name, upgrading))| {
                         standing_in_notice(&name, id, upgrading, why)
                     });
+                let era = browsing.era;
                 drop(browsing);
                 self.send_browse(
                     Vec::new(),
@@ -8159,6 +8248,7 @@ impl Backend {
                     "Browse".into(),
                     false,
                     None,
+                    era,
                 );
                 // And no letters. The bar is built from the screen, so with no
                 // screen it went on offering the last list's, beside nothing.
@@ -8223,7 +8313,7 @@ impl Backend {
                     (0, Some(title)) if listed > 1 => american(title),
                     _ => String::new(),
                 };
-                let size = if kind == 1 { TILE_SIZE } else { THUMB_SIZE };
+                let size = drawn_at(kind);
 
                 let mut rows = Vec::new();
                 for item in &section.items {
@@ -8393,6 +8483,9 @@ impl Backend {
                 title,
                 browsing.trail.len() > 1,
                 search,
+                // The screen these rows are of, read under the guard they
+                // were read under. See [`Viewing::era`].
+                browsing.era,
             )
         };
 
@@ -8436,6 +8529,7 @@ impl Backend {
             title,
             can_go_back,
             search,
+            era,
         );
         self.send_browse_index();
 
@@ -8543,6 +8637,7 @@ impl Backend {
         title: String,
         can_go_back: bool,
         search: Option<String>,
+        era: u64,
     ) {
         // Everything drawn goes in, and the artwork as whether it has arrived
         // — the same rule the queue's memo follows, for the same reason: a
@@ -8573,6 +8668,16 @@ impl Backend {
             // What the memo is worth skipping is the model replacement, which
             // re-creates every row; two property writes are not worth being
             // clever about.
+            //
+            // The same rows can be another screen's: a screen opened again,
+            // or refreshed into what it already was. The record of what they
+            // are drawn with is still right, and only the screen it is of has
+            // moved. See [`Viewing::era`].
+            self.browse_view.send_if_modified(|view| {
+                let moved = view.era != era;
+                view.era = era;
+                moved
+            });
             let ui = self.ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = ui.upgrade() else { return };
@@ -8599,6 +8704,35 @@ impl Backend {
         // other.
         let mut sent = self.sent_items.lock().unwrap();
         let (patch, whole) = browse_patch(&mut sent, flatten_browse(blocks));
+
+        // And what the items are drawn with, at the places the window will
+        // hold them at, for the task fetching the covers of the ones on
+        // screen. Kept from the patch rather than worked out again from the
+        // screen: these places are the window's, and the patch is the one
+        // thing that says what they are. Under the same lock for the same
+        // reason the patch is. See [`Viewing`].
+        self.browse_view.send_if_modified(|view| {
+            let mut moved = view.era != era;
+            view.era = era;
+            if whole {
+                let art: Vec<_> = patch.iter().map(|(_, item)| drawn_art(item)).collect();
+                moved |= view.art != art;
+                view.art = art;
+                return moved;
+            }
+            if view.art.len() != sent.len() {
+                view.art.resize_with(sent.len(), Vec::new);
+                moved = true;
+            }
+            for (at, item) in &patch {
+                let art = drawn_art(item);
+                if view.art[*at] != art {
+                    view.art[*at] = art;
+                    moved = true;
+                }
+            }
+            moved
+        });
 
         let ui = self.ui.clone();
         let sent_browse = self.sent_browse.clone();
@@ -9669,7 +9803,7 @@ async fn open_screen(backend: Backend, id: DeviceId, uri: String, arrive: Arrive
             if arrive.home() {
                 backend.publish_sidebar();
             }
-            backend.walk_browse(id, Walk::Whole);
+            backend.walk_browse(id);
         }
         Err(e) => {
             tracing::warn!(%id, "could not read {uri}: {e}");
@@ -10403,8 +10537,8 @@ async fn run_search(backend: Backend, query: String, selection: Option<(DeviceId
                 browsing.moved_on();
             }
             // The results screen is gone, and nothing is opening another, so
-            // the walks over it have to be told rather than left to notice.
-            backend.stop_browse_walks();
+            // the task over it has to be told rather than left to notice.
+            backend.walk_browse_returned();
             backend.publish_browse();
         }
         None => {}
@@ -11101,13 +11235,25 @@ impl Drop for Refreshing {
     }
 }
 
+/// How many covers a list has out at once.
+///
+/// A few at a time. A library's Albums page is four hundred rows, and one
+/// request per row means four hundred at once against a player that is also
+/// being long-polled — which stalls the poll, the artwork and the window
+/// together. The list fills in slightly later and stays responsive while it
+/// does. The covers also arrive in the order they are drawn in, which is what
+/// makes the top of a queue fill first.
+const AT_ONCE: usize = 6;
+
 /// Fetch a list of covers, a few at a time, for as long as they are wanted.
 ///
-/// The one loop both cover walks are built from. They were the same twenty
-/// lines twice — the same `JoinSet`, the same six at once, the same refill on
-/// each completion, the same throttled republish — and the abandon check was
-/// missing from one of them for as long as they were separate. A third caller
-/// cannot now forget it.
+/// The loop the queue's cover walks are built from. The browse screen's were
+/// built from it too, until they stopped walking whole lists and began to
+/// follow the view — see [`load_browse_thumbnails`]. Before that the two were
+/// the same twenty lines twice — the same `JoinSet`, the same six at once,
+/// the same refill on each completion, the same throttled republish — and the
+/// abandon check was missing from one of them for as long as they were
+/// separate.
 ///
 /// `still_wanted` is asked between fetches and decides whether there is any
 /// point going on: the screen has been navigated away from, the player is no
@@ -11149,14 +11295,6 @@ async fn walk_covers(
     list: Arc<Mutex<Walks>>,
     every: Duration,
 ) {
-    // A few at a time. A library's Albums page is four hundred rows, and one
-    // request per row means four hundred at once against a player that is also
-    // being long-polled — which stalls the poll, the artwork and the window
-    // together. The list fills in slightly later and stays responsive while it
-    // does. The covers also arrive in the order they are drawn in, which is
-    // what makes the top of a queue fill first.
-    const AT_ONCE: usize = 6;
-
     // The rows go somewhere the list can read them rather than into a local
     // iterator, because a walk stopped for room is aborted from outside and
     // never gets a line of its own to hand them over in. Before the first
@@ -11355,29 +11493,32 @@ async fn walk_covers(
 /// would be easy to read that as "a newer walk has this list in hand" — but a
 /// page appended to rows that are still on screen supersedes nothing. The
 /// walk above it is fetching the covers for rows the user is looking at, and
-/// it is the only thing that will ever fetch them: `publish_queue` and
-/// `publish_browse` draw art out of the memory cache alone, and nothing walks
-/// a list a second time until the queue is re-read or the screen is left. Stop
-/// it where it stands and the rows between its position and the new page keep
-/// the placeholder for as long as the list is up.
+/// it is the only thing that will ever fetch them: `publish_queue` draws art
+/// out of the memory cache alone, and nothing walks the queue a second time
+/// until it is re-read. Stop it where it stands and the rows between its
+/// position and the new page keep the placeholder for as long as the list is
+/// up.
+///
+/// The queue's alone now. The browse screen follows the view instead, with
+/// one task that pages and jumps simply give new rows to; see
+/// [`Backend::walk_browse`].
 ///
 /// Keeping the two in one value is what stops them drifting apart. `done` is
 /// where the caller's rows end; it is not where the walk being replaced got to,
 /// and only [`Walk::Whole`] says anything about the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walk {
-    /// Every row is new — a screen opened, a jump landed, a queue re-read — so
-    /// whatever was walking the rows this list replaces has nothing left to
-    /// fetch for anybody.
+    /// Every row is new — the queue re-read — so whatever was walking the
+    /// rows this list replaces has nothing left to fetch for anybody.
     Whole,
     /// A page has been grafted onto rows that are still on screen, `done` of
     /// them, and the walks covering those rows run on.
     From {
         /// Where the caller's rows end, and so where this walk starts.
         done: usize,
-        /// The list's generation at the moment `done` was measured — the queue's
-        /// [`Backend::thumbnails`] or the screen's `browsing.era`, read under
-        /// the same guard that counted the rows.
+        /// The list's generation at the moment `done` was measured — the
+        /// queue's [`Backend::thumbnails`], read under the same guard that
+        /// counted the rows.
         ///
         /// It travels with the page because the two are only meaningful
         /// together. A page is registered after its own request has come back,
@@ -11527,7 +11668,7 @@ impl Default for Walks {
 /// they stood, they left a band of permanent placeholders — one flick of a
 /// wheel chained seventeen pages and left rows 106 to 799 on the glyph for as
 /// long as the screen was open, and scrolling back into them asked for
-/// nothing, because both publishes draw from the memory cache alone. So a walk
+/// nothing, because the list is drawn from the memory cache alone. So a walk
 /// stopped for room hands what it owes to the list and the next walk to run
 /// out of its own rows finishes it: see [`Walks::carried`] and [`trim_walks`].
 ///
@@ -11555,8 +11696,9 @@ const WALKS_AT_ONCE: usize = 3;
 /// each walk as it works out its rows: a list that pages forty times remembers
 /// neither forty handles nor forty walks.
 ///
-/// One slot per list: the queue's walks and the browse screen's replace their
-/// own kind and leave the other alone.
+/// One slot per list, and only the queue has one now: the browse screen's
+/// covers are fetched by a single task per screen that follows the view, and
+/// has no pages to run alongside. See [`Backend::walk_browse`].
 ///
 /// The walk arrives as something to build rather than as a future already
 /// made, and is built and spawned here, under the slot's lock, after the walks
@@ -11566,10 +11708,10 @@ const WALKS_AT_ONCE: usize = 3;
 /// runnable immediately, so on the multi-thread runtime another worker can
 /// poll the walk while this one is still waiting for the lock, and in that
 /// window there is a walk fetching that the slot does not hold. Three things
-/// follow, and every one of them was reported separately. [`stop_browse_walks`]
-/// and a superseding [`Walk::Whole`] both stop what is in `running`, so they
-/// miss it and it keeps its requests and its share of the four artwork permits
-/// for a whole `artwork::FETCH_TIMEOUT`. Its own [`trim_walks`] does not find
+/// follow, and every one of them was reported separately. A superseding
+/// [`Walk::Whole`] stops what is in `running`, so it misses the walk, which
+/// keeps its requests and its share of the four artwork permits for a whole
+/// `artwork::FETCH_TIMEOUT`. Its own [`trim_walks`] does not find
 /// it in `running` either, takes the exit written for a list that has been
 /// replaced, and quietly does not apply the ceiling. And the slot's order ends
 /// up being the order the callers reached the lock rather than the order they
@@ -11622,21 +11764,19 @@ where
 /// Takes a walk off its list if it ends without ever listing its rows.
 ///
 /// A walk can end that way. [`load_thumbnails`] returns before it lists
-/// anything when its player has left the registry or its queue has gone, and
-/// [`load_browse_thumbnails`] when its player has gone or there is no screen
-/// on the trail. [`start_walk`] has already counted it against the ceiling by
-/// then, and as one of the older walks on the list it can be one of the only
-/// walks a trim may stop — see [`trim_walks`] — so a walk below it that was
-/// owed a trim was waiting on it to list. It never would, and nothing it did
-/// woke anybody: a walk owed a trim comes back to it when another walk lists
-/// or a cover of its own arrives, and a finished walk is taken off only by the
-/// retain at the top of a later trim, by the same retain as another page
-/// starts, or by the list being drained. Against the player the ceiling is
-/// for, one that takes the request and says nothing, that is a whole
-/// `artwork::FETCH_TIMEOUT`, and the list stayed over its ceiling for all of
-/// it. In the count only — every walk that did list was still held to the
-/// ceiling — but the count is what each trim works from and what every test of
-/// the ceiling reads.
+/// anything when its player has left the registry or its queue has gone.
+/// [`start_walk`] has already counted it against the ceiling by then, and as
+/// one of the older walks on the list it can be one of the only walks a trim
+/// may stop — see [`trim_walks`] — so a walk below it that was owed a trim was
+/// waiting on it to list. It never would, and nothing it did woke anybody: a
+/// walk owed a trim comes back to it when another walk lists or a cover of its
+/// own arrives, and a finished walk is taken off only by the retain at the top
+/// of a later trim, by the same retain as another page starts, or by the list
+/// being drained. Against the player the ceiling is for, one that takes the
+/// request and says nothing, that is a whole `artwork::FETCH_TIMEOUT`, and the
+/// list stayed over its ceiling for all of it. In the count only — every walk
+/// that did list was still held to the ceiling — but the count is what each
+/// trim works from and what every test of the ceiling reads.
 ///
 /// So it takes itself off on the way out, under the list's lock. Not by
 /// announcing on [`Walks::listings`] and leaving the rest to that retain:
@@ -11842,134 +11982,231 @@ fn trim_walks(walks: &mut Walks, mine: &Rows) -> bool {
     false
 }
 
-/// Fetch the icons and cover art for the screen on show.
-/// Fetch the pictures the browse screen needs.
+/// Which items of the browse list the window has on screen, and what each
+/// item is drawn with: what [`load_browse_thumbnails`] follows.
 ///
-/// `rows` says whether the screen was replaced or grown, and how many items at
-/// its front a previous run already walked. Paging appends to the screen
-/// rather than replacing it, so without the skip the second page re-derived
-/// every URL on the first, the third re-derived the first two, and a library
-/// page fetched forty times over — each one a cache lookup rather than a
-/// request, but the memory cache is bounded, and on a list long enough to page
-/// the early entries have been evicted by the time the walk reaches them
-/// again. Skipping them is also what stops the header's cover being re-queued
-/// ahead of the rows that actually just arrived.
+/// Both halves are places in the flat list the window draws, a heading, a
+/// shelf and a row being one item each (see [`flatten_browse`]), because that
+/// is the one numbering the window and the backend share. The window can say
+/// which of its items are on screen and nothing about what is in them; the
+/// backend knows what is in them and nothing about the scroll.
 ///
-/// The count is [`Screen::window_end`] and not the whole screen, because
-/// `put_page` grafts a page into the section the window names rather than onto
-/// the end: the new rows begin exactly where the window does, and a shelf
-/// sitting under the list keeps its place behind them. Measured across the
-/// screen instead, the skip would run past the first rows that arrived by
-/// however long that shelf is and they would draw blank. The shelf is walked
-/// over again for a cache lookup apiece, which is the cheap side of the two to
-/// be wrong on.
-async fn load_browse_thumbnails(backend: Backend, id: DeviceId, rows: Walk, left: Rows) {
-    let done = rows.done();
+/// Held in a `watch` so the task fetching covers can sleep until either half
+/// moves: a scroll, a page landing, a jump replacing the rows.
+#[derive(Default)]
+struct Viewing {
+    /// The items on screen, first and last, as the window last said.
+    ///
+    /// `None` until it has said anything, which is read as every item: a list
+    /// nobody has measured is walked whole, the way every list was before the
+    /// window was asked, rather than not at all. In the app that lasts until
+    /// the browse list is first laid out; a test that never draws one gets
+    /// the whole walk.
+    shown: Option<(usize, usize)>,
+    /// The pictures on each item, at the size each is drawn at, by the item's
+    /// place in the list. Kept by [`Backend::send_browse`] as it sends the
+    /// window its rows, so a place here is the same item as the same place
+    /// there.
+    art: Vec<Vec<(String, u32)>>,
+    /// The screen `art` was drawn from, as `browsing.era`.
+    ///
+    /// A task is started for a screen before the window has been sent it
+    /// whenever the pane is under another one — a screen opened from the
+    /// sidebar while Settings is up is published when Settings goes — and
+    /// what it would find here meanwhile is the last screen's rows. So it
+    /// takes nothing from here until this says the rows are its own.
+    era: u64,
+}
 
+/// The task fetching the browse screen's covers, as [`Backend::browse_walk`]
+/// holds it.
+struct Following {
+    /// Whose screen it is following, and which of them: `browsing.era`.
+    id: DeviceId,
+    era: u64,
+    /// Stop it where it stands.
+    stop: tokio::task::AbortHandle,
+}
+
+/// The places worth fetching covers for in a list of `len` items, in the
+/// order to fetch them: the items on screen, then a screenful below them,
+/// then a screenful above, nearest the screen first.
+///
+/// A screenful either side because the window's idea of what is on screen is
+/// an estimate — it shares the list's height out evenly, where a heading is
+/// shorter than a row and a shelf taller — and because the rows just past an
+/// edge are the next to be scrolled into. Below before above: a list is read
+/// downwards.
+///
+/// `None` is every item, in order; see [`Viewing::shown`]. A view that runs
+/// past the end, which is the window measuring a list longer than the one
+/// sent since, is held to the items there are.
+fn reach(shown: Option<(usize, usize)>, len: usize) -> Vec<usize> {
+    let Some((first, last)) = shown else {
+        return (0..len).collect();
+    };
+    let Some(end) = len.checked_sub(1) else {
+        return Vec::new();
+    };
+    let last = last.min(end);
+    let first = first.min(last);
+    let span = last - first + 1;
+    let below = last + 1..len.min(last + 1 + span);
+    let above = (first.saturating_sub(span)..first).rev();
+    (first..=last).chain(below).chain(above).collect()
+}
+
+/// Fetch the pictures the browse screen needs, for the part of it on show,
+/// for as long as the screen is.
+///
+/// The part on show rather than the whole screen. A share's music root is 781
+/// rows naming 534 covers, and walking all of them when the folder opened was
+/// 533 requests to a speaker that is also playing music, for a pane that
+/// shows fifteen rows: twenty seconds of them at four at a time against a
+/// fake player answering in 150 ms, and about six hundred in 37 seconds on a
+/// real one. A player answers its queue only once it has stopped serving
+/// covers — see `Artwork::make_way` — so that was also twenty seconds of
+/// covers between an add and the queue showing it whenever a read went out
+/// with fetches still owed. Now a folder opened costs the rows on screen and
+/// a screenful either side, and the rest are asked for as they are scrolled
+/// to: see [`reach`].
+///
+/// One task for the screen, which sleeps when it has nothing to fetch and
+/// wakes when the view or the rows move. Not a walk per scroll: a fling
+/// crosses a row boundary dozens of times a second, and a walk started for
+/// each would either stop the last one's fetches as it went — requests the
+/// player had already begun to serve, thrown away — or pile up behind them.
+/// This keeps [`AT_ONCE`] out whatever the scroll does, and each one that
+/// comes back is replaced by whatever is on screen by then. A page landing or
+/// a jump replacing the rows reaches it the same way, through
+/// [`Backend::browse_view`], so neither needs a walk of its own either.
+///
+/// What it fetches is what the rows on screen are short of, judged by the
+/// memory cache, which is all the rows are drawn from. So a row scrolled back
+/// to after its cover was let go asks for it again, and it comes off the disk
+/// rather than from the player. Once for each place the view comes to rest at
+/// most: a cover that arrived since the view last moved is not asked for
+/// again until it moves, so a picture the cache will not keep costs a request
+/// per scroll rather than one per turn of this loop. One that did not arrive
+/// at all is not asked for again while the screen is up, as before.
+///
+/// The header's cover first, whatever the scroll: it is the largest thing on
+/// the screen and the one the eye lands on.
+async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
     // Registry first and released, then the browse state: never both at once.
     let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
         return;
     };
 
-    // The screen this was started for. Nothing here checked it was still on
-    // show, so walking away from a long list left its loader running: it kept
-    // its share of the four artwork permits and rebuilt the whole model every
-    // 400ms for a screen nobody could see. Its sibling `load_cover` has
-    // checked the equivalent from the start.
-    //
-    // A page brings the era its `done` was counted against rather than reading
-    // the one standing now, for the reason on [`Walk::From`]: a screen opened
-    // while the page was in flight replaces the list the count was made
-    // against, and a page that read the era here would adopt that new screen's
-    // and skip a `done` measured on the list that went. A whole screen is
-    // started where the era has just been bumped, so the one standing is its
-    // own — and if another screen opens first this walk is in `running` when
-    // that one drains the slot, which aborts it.
-    let era = match rows {
-        Walk::Whole => backend.browsing.lock().unwrap().era,
-        Walk::From { at, .. } => at,
-    };
-
-    let urls: Vec<(String, u32)> = {
-        let browsing = backend.browsing.lock().unwrap();
-        let Some(screen) = browsing.current() else {
-            return;
-        };
-
-        let mut seen = std::collections::BTreeSet::new();
-        // The header's cover first: it is the largest thing on the screen and
-        // the one the eye lands on, so it should not queue behind forty rows.
-        // Only on the first walk — it has not changed since.
-        let header = screen
-            .header
-            .as_ref()
-            .filter(|_| done == 0)
-            .and_then(|header| header.image.as_deref())
-            .filter(|src| !src.is_empty())
-            .map(|src| (client.image_url(src), COVER_SIZE))
-            .into_iter();
-
-        header
-            .chain(
-                screen
-                    .sections
-                    .iter()
-                    // A cover on a shelf is drawn four times the size of one on a row,
-                    // so the two want different fetches. Walking sections rather than
-                    // items is what makes that distinction available here.
-                    .flat_map(|section| {
-                        let kind = section.kind;
-                        let size = if kind == SectionKind::Row {
-                            TILE_SIZE
-                        } else {
-                            THUMB_SIZE
-                        };
-                        section.items.iter().map(move |item| (item, kind, size))
-                    })
-                    // Before the filter, so it counts items and not pictures:
-                    // the caller knows how many items it had, not how many of
-                    // them turned out to want one.
-                    .skip(done)
-                    .filter_map(|(item, kind, size)| {
-                        // Drawn as a glyph, so there is nothing to fetch: a
-                        // menu row is drawn as one whatever picture came with
-                        // it, and fetching TuneIn's logo for "Sports" would be
-                        // a request for something that never reaches the
-                        // screen. Asked of the call the publisher draws by, so
-                        // a row this skips is never one drawn as a picture.
-                        if glyphs::row_glyph(kind, item).is_some() {
-                            return None;
-                        }
-                        let source = item
-                            .image
-                            .as_deref()
-                            .or(item.icon.as_deref())
-                            .filter(|src| !src.is_empty())?;
-                        Some((source, size))
-                    })
-                    .map(|(src, size)| (client.image_url(src), size)),
-            )
-            .filter(|entry| seen.insert(entry.clone()))
-            .collect()
-    };
-
-    // A page of rows drawn as glyphs derives no URLs and is still not an early
-    // return: this is where a walk takes on what a walk stopped for room left
-    // owing, and those rows are on the same screen.
-    //
     // Redrawing rebuilds every row, so on a long list it costs more than the
     // fetch it is reporting. Often enough to look alive, rarely enough not to
     // be the reason the list stutters.
-    walk_covers(
-        backend.artwork.clone(),
-        urls,
-        left,
-        || backend.browsing.lock().unwrap().era == era,
-        || backend.publish_browse(),
-        backend.browse_walk.clone(),
-        Duration::from_millis(400),
-    )
-    .await;
+    const EVERY: Duration = Duration::from_millis(400);
+
+    let mut moves = backend.browse_view.subscribe();
+    let mut fetches = tokio::task::JoinSet::new();
+    // Out now, arrived since the view last moved, and not to be had at all.
+    let mut out = std::collections::HashSet::new();
+    let mut arrived = std::collections::HashSet::new();
+    let mut failed = std::collections::HashSet::new();
+    let mut shown = None;
+    let mut drawn = Instant::now();
+    let mut owed = false;
+
+    loop {
+        // Whether this is still the screen, and its header, under one guard.
+        let header = {
+            let browsing = backend.browsing.lock().unwrap();
+            if browsing.era != era {
+                break;
+            }
+            browsing
+                .current()
+                .and_then(|screen| screen.header.as_ref())
+                .and_then(|header| header.image.as_deref())
+                .filter(|src| !src.is_empty())
+                .map(|src| (client.image_url(src), COVER_SIZE))
+        };
+
+        let wanted: Vec<(String, u32)> = {
+            let view = moves.borrow_and_update();
+            if view.shown != shown {
+                shown = view.shown;
+                arrived.clear();
+            }
+            // Another screen's rows, until this one's are sent.
+            let rows = if view.era == era {
+                reach(view.shown, view.art.len())
+            } else {
+                Vec::new()
+            };
+            header
+                .into_iter()
+                .chain(rows.into_iter().flat_map(|at| view.art[at].iter().cloned()))
+                .collect()
+        };
+
+        for cover in wanted {
+            if fetches.len() >= AT_ONCE {
+                break;
+            }
+            if out.contains(&cover) || arrived.contains(&cover) || failed.contains(&cover) {
+                continue;
+            }
+            if backend
+                .artwork
+                .any_decoded(std::slice::from_ref(&cover.0), cover.1)
+            {
+                continue;
+            }
+            out.insert(cover.clone());
+            let artwork = backend.artwork.clone();
+            fetches.spawn(async move {
+                let got = artwork.get(&cover.0, cover.1).await.is_some();
+                (cover, got)
+            });
+        }
+
+        // Nothing out and nothing more on screen to ask for: draw what came,
+        // then sleep until the view or the rows move.
+        if fetches.is_empty() {
+            if owed {
+                owed = false;
+                drawn = Instant::now();
+                backend.publish_browse();
+            }
+            if moves.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        tokio::select! {
+            Some(done) = fetches.join_next() => {
+                if let Ok((cover, got)) = done {
+                    out.remove(&cover);
+                    if got {
+                        owed = true;
+                        arrived.insert(cover);
+                    } else {
+                        failed.insert(cover);
+                    }
+                }
+            }
+            // Only to look again at what is on screen; whatever is out stays
+            // out.
+            Ok(()) = moves.changed() => {}
+        }
+
+        if owed && drawn.elapsed() >= EVERY {
+            owed = false;
+            drawn = Instant::now();
+            backend.publish_browse();
+        }
+    }
+
+    // Another screen. What is still out is for rows nobody can see.
+    fetches.abort_all();
 }
 
 /// Fetch the art for whatever the selected player is playing.
@@ -12110,16 +12347,16 @@ async fn load_cover(backend: Backend, id: DeviceId) {
 /// image.
 ///
 /// `rows` says whether the queue was replaced or grown, and how many tracks at
-/// its front a previous walk was already given; it is the same parameter
-/// [`load_browse_thumbnails`] carries for the same reason. A page appends to
-/// the queue rather than replacing it, so without the skip each page
-/// re-derived every URL above it — and the claim that the ones already held
-/// cost nothing is not true past the first page: the memory cache is 256
-/// entries shared with the browse tiles and the sleeve, while a queue window is
-/// 500 tracks, so the early covers have been evicted by the time the walk
-/// reaches them again and are re-read, re-decoded, or re-fetched. Worse than
-/// the cost, the rows that just arrived sit at the end of that walk, so the
-/// rows somebody scrolled to were the last to fill.
+/// its front a previous walk was already given. A page appends to the queue
+/// rather than replacing it, so without the skip each page re-derived every URL
+/// above it — and the claim that the ones already held cost nothing was not
+/// true past the first page: the memory cache held 256 entries then, shared
+/// with the browse tiles and the sleeve, while a queue window is 500 tracks,
+/// so the early covers had been evicted by the time the walk reached them
+/// again and were re-read, re-decoded, or re-fetched. The cache is larger now,
+/// and the other reason stands on its own: the rows that just arrived sat at
+/// the end of that walk, so the rows somebody scrolled to were the last to
+/// fill.
 ///
 /// Counted in tracks and not in pictures, applied before the URL dedup and the
 /// empty-image filter, because tracks are what the caller knows it had.
@@ -12657,12 +12894,14 @@ async fn jump_to_letter(
     } else {
         backend.scroll_browse_to(0);
     }
-    // The rows are all new, so the artwork walk starts at the top of them.
-    // Which player, read and the lock let go: starting a walk takes a lock of
-    // its own, and nothing here needs to hold two.
+    // The rows are all new. The task following the view has them already,
+    // from the publish above, and follows the view onto them; this only
+    // starts one where none is following this screen. Which player, read and
+    // the lock let go: the walk takes a lock of its own, and nothing here
+    // needs to hold two.
     let device = backend.browsing.lock().unwrap().device;
     if let Some(id) = device {
-        backend.walk_browse(id, Walk::Whole);
+        backend.walk_browse(id);
     }
 }
 
@@ -13889,11 +14128,12 @@ async fn run_commands(
                     }
                 };
                 if left_screen {
-                    // The bump above is only read between fetches, and nothing
-                    // is opening a screen here to abort them: see
-                    // `stop_browse_walks`. After the `browsing` guard has
-                    // gone, so the two locks are never held together.
-                    backend.stop_browse_walks();
+                    // The bump above is only read when the task fetching
+                    // covers next wakes, and nothing is opening a screen here
+                    // to stand it down: see `walk_browse_returned`. After the
+                    // `browsing` guard has gone, so the two locks are never
+                    // held together.
+                    backend.walk_browse_returned();
                 }
                 if moved {
                     backend.publish_pane();
@@ -16557,6 +16797,20 @@ async fn run_commands(
                 continue;
             }
 
+            Command::BrowseViewing(first, last) => {
+                // Noted whoever's list it is: it asks nothing of anybody, and
+                // the task fetching covers decides what is worth asking for.
+                // Woken only when it moved, which a list being laid out again
+                // reports without moving.
+                backend.browse_view.send_if_modified(|view| {
+                    let shown = Some((first, last));
+                    let moved = view.shown != shown;
+                    view.shown = shown;
+                    moved
+                });
+                continue;
+            }
+
             Command::BrowseMore => {
                 // Only on a list of the selected player's, as every press on
                 // the pane is; see [`Backend::browsing_selected`]. Refused
@@ -16682,12 +16936,12 @@ async fn run_commands(
                                 crumb.screen.next = onward;
                             }
                             backend.publish_browse();
-                            // With the era the block above checked, which is
-                            // the era `had` was counted in: a screen opened
-                            // between here and the walk registering leaves this
-                            // page walking a list it was not measured against.
-                            // See [`Walk::From`].
-                            backend.walk_browse(id, Walk::From { done: had, at: era });
+                            // The page's rows reach the task following the
+                            // view through the publish above, and are fetched
+                            // if and when they are scrolled to. This only
+                            // starts a task where none is following the
+                            // screen; one opened since has its own.
+                            backend.walk_browse(id);
                         }
                         Err(e) => {
                             // Take the cursor away, or the list asks for the
@@ -22075,6 +22329,7 @@ mod selection_tests {
             known: Arc::new(Mutex::new(Vec::new())),
             queue_walk: Arc::default(),
             browse_walk: Arc::default(),
+            browse_view: Arc::new(tokio::sync::watch::Sender::new(Viewing::default())),
             sweeping: Arc::default(),
             vacated: Arc::new(Mutex::new(std::collections::HashMap::new())),
             searches: Arc::new(AtomicU64::new(0)),
@@ -22181,7 +22436,7 @@ mod selection_tests {
     }
 
     /// Wait for something the backend does off the loop, or fail saying what.
-    async fn until(what: &str, done: impl FnMut() -> bool) {
+    pub(super) async fn until(what: &str, done: impl FnMut() -> bool) {
         until_within(Duration::from_secs(5), what, done).await;
     }
 
@@ -30691,7 +30946,7 @@ mod selection_tests {
 /// list's worth of them costs between them.
 #[cfg(test)]
 mod thumbnail_tests {
-    use super::selection_tests::{add, backend};
+    use super::selection_tests::{add, backend, until};
     use super::*;
     use fake_player::Player;
 
@@ -30700,9 +30955,10 @@ mod thumbnail_tests {
 
     /// And one longer than the memory cache, for the memo's own test.
     ///
-    /// [`artwork::MEMORY_CACHE`] is shared across all three sizes while a
-    /// queue window is [`QUEUE_WINDOW`] tracks, so a full queue of distinct
-    /// albums is one whose covers cannot all be held: the set of covers it is
+    /// A queue is held a [`QUEUE_WINDOW`] of tracks at a time and every window
+    /// scrolled to stays held, so it can come to more distinct albums than
+    /// [`artwork::MEMORY_CACHE`] has entries for, all three sizes together.
+    /// Then its covers cannot all be held at once: the set of covers it is
     /// short of never empties, and the walk over that set is what the memo
     /// costs every status for as long as the screen is open. Measured at a
     /// length that fits in the cache, that walk is measured in the one case
@@ -31435,10 +31691,10 @@ mod thumbnail_tests {
     ///
     /// Spawning the walk and then taking the slot's lock left a window where
     /// the walk was running and the slot did not hold it: another worker polls
-    /// it the moment it is spawned. In that window `stop_browse_walks` and a
-    /// superseding re-read both miss it, its own `trim_walks` does not find
-    /// itself in the list, and the slot ends up ordered by which caller
-    /// reached the lock rather than by which walk started first.
+    /// it the moment it is spawned. In that window a superseding re-read misses
+    /// it, its own `trim_walks` does not find itself in the list, and the slot
+    /// ends up ordered by which caller reached the lock rather than by which
+    /// walk started first.
     ///
     /// Held here from outside, which is what the window is: while the slot is
     /// locked a walk is neither started nor registered, so the counter it
@@ -31589,81 +31845,102 @@ mod thumbnail_tests {
         walked_it_all(&player, (COVERS + PAGE) as usize).await;
     }
 
-    /// And a browse page carries the era its rows were counted in.
+    /// An album with a cover of its own, as a library list sends one. The
+    /// image is the player's own artwork endpoint, which keeps the glyph
+    /// reading off the row: a row the player sent a picture for is drawn with
+    /// it.
+    fn album(id: u32) -> bluos::screen::Item {
+        bluos::screen::Item {
+            title: Some(format!("Album {id}")),
+            image: Some(format!("/Artwork?album={id}")),
+            ..Default::default()
+        }
+    }
+
+    /// A list of `rows` of those open on `player`, and sent to the window.
     ///
-    /// The screen's half of the same thing: `grow_screen` measures `had` under
-    /// the guard that checks `era`, and a screen opened while the page is in
-    /// flight moves that era on. Read at the walk's first poll instead, the
-    /// page adopted the new screen's era, passed every check meant to stand it
-    /// down, and walked `done` into a list it was never measured against.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_browse_page_carries_the_era_its_rows_were_counted_in() {
-        use bluos::screen::Section;
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::new();
-        let player = Player::start().await;
-        let (backend, _commands) = backend(&http);
-        add(&backend, &player, &http);
-
-        *backend.selected.lock().unwrap() = Some(player.id());
-        backend.artwork.remember_player(player.address().ip());
-
-        let era = {
+    /// Sent, because what the task fetching covers follows is what the window
+    /// was sent: a screen nobody has published gives it nothing to follow.
+    fn open_albums(backend: &Backend, player: &Player, rows: u32) {
+        {
             let mut browsing = backend.browsing.lock().unwrap();
+            browsing.device = Some(player.id());
             browsing.trail.push(Crumb {
                 uri: "/ui/browseGrouped?type=Album".to_owned(),
                 screen: Screen {
-                    sections: vec![Section {
+                    sections: vec![bluos::screen::Section {
                         paged: true,
-                        items: (0..COVERS)
-                            .map(|id| bluos::screen::Item {
-                                title: Some(format!("Album {id}")),
-                                image: Some(format!("/Artwork?album={id}")),
-                                ..Default::default()
-                            })
-                            .collect(),
+                        items: (0..rows).map(album).collect(),
                         ..Default::default()
                     }],
                     ..Default::default()
                 },
                 query: None,
-                page: COVERS,
+                page: rows,
             });
-            browsing.era
-        };
-
-        // The screen the page was measured on being replaced under it, which
-        // is all a press or a staleness refresh amounts to here.
-        backend.browsing.lock().unwrap().moved_on();
-        backend.walk_browse(player.id(), Walk::From { done: 0, at: era });
-
-        // One batch goes out before the first reply can be checked; the other
-        // fifty-four must not.
-        const FIRST_BATCH: usize = 6;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let asked = covers_asked(&player);
-            assert!(
-                asked <= FIRST_BATCH,
-                "the page adopted the era of the screen that replaced it: \
-                 {asked} covers asked for"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        backend.publish_browse();
     }
 
-    /// The same for a browse page, which is the common path: a library list
-    /// whose first page does not fill the pane asks for the next one as soon
-    /// as its rows are laid out, so the walk that was started for page one is
-    /// only a few covers in when page two lands.
+    /// Which albums' covers the player has been asked for, by number, in the
+    /// order it was asked. Exact rather than by substring: `album=6` is the
+    /// front of `album=60`.
+    fn albums_asked(player: &Player) -> Vec<u32> {
+        player
+            .asked()
+            .iter()
+            .filter_map(|seen| seen.strip_prefix("/Artwork?album="))
+            .filter_map(|id| id.parse().ok())
+            .collect()
+    }
+
+    /// Have the window's report of what is on screen land.
+    fn viewing(backend: &Backend, first: usize, last: usize) {
+        backend
+            .browse_view
+            .send_modify(|view| view.shown = Some((first, last)));
+    }
+
+    /// The task following the browse screen, where one is.
+    fn following(backend: &Backend) -> Option<tokio::task::AbortHandle> {
+        backend
+            .browse_walk
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|walk| walk.stop.clone())
+    }
+
+    /// Long enough for a task that was going to ask for more to have asked.
+    /// The fake answers a cover it has no route for with a 404 at once, so
+    /// a task that did not stop would be hundreds of requests in by then.
+    const QUIET: Duration = Duration::from_millis(500);
+
+    /// The places worth fetching for: on screen, then a screenful below, then
+    /// a screenful above, nearest first.
+    #[test]
+    fn the_rows_on_screen_come_first_then_below_then_above() {
+        assert_eq!(reach(Some((0, 2)), 10), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(reach(Some((4, 5)), 10), [4, 5, 6, 7, 3, 2]);
+        assert_eq!(reach(Some((8, 9)), 10), [8, 9, 7, 6]);
+        // Nothing reported yet: the whole list, in order.
+        assert_eq!(reach(None, 4), [0, 1, 2, 3]);
+        // A view measured on a longer list than the one sent since is held
+        // to the items there are.
+        assert_eq!(reach(Some((30, 39)), 10), [9, 8]);
+        assert!(reach(Some((0, 5)), 0).is_empty());
+        assert!(reach(None, 0).is_empty());
+    }
+
+    /// What the task follows is what the window draws, place for place: a
+    /// heading is a place with no picture on it, a row is its cover at the
+    /// small size, and a shelf is every tile on it at the large one.
     ///
-    /// Nothing bumps `era` on a page — only leaving the screen does — so
-    /// before the abort existed the first walk ran on to the end of its own
-    /// page and the gap could not open.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_browse_page_leaves_the_walk_above_it_running() {
-        use bluos::screen::Section;
+    /// Kept from the rows as they are sent, so a row added in the middle moves
+    /// everything under it down a place, as it does in the window.
+    #[tokio::test]
+    async fn the_record_of_what_is_drawn_keeps_the_windows_places() {
+        use bluos::screen::{Section, SectionKind};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::new();
@@ -31671,76 +31948,324 @@ mod thumbnail_tests {
         let (backend, _commands) = backend(&http);
         add(&backend, &player, &http);
 
+        // Two lists, so each is given its heading, and a shelf, which always
+        // names itself.
+        let list = |title: &str, ids: std::ops::Range<u32>| Section {
+            title: Some(title.to_owned()),
+            items: ids.map(album).collect(),
+            ..Default::default()
+        };
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            browsing.device = Some(player.id());
+            browsing.trail.push(Crumb {
+                uri: "/ui/Browse?key=mixed".to_owned(),
+                screen: Screen {
+                    sections: vec![
+                        list("Albums", 0..2),
+                        list("Songs", 10..11),
+                        Section {
+                            kind: SectionKind::Row,
+                            ..list("Shelf", 20..22)
+                        },
+                    ],
+                    ..Default::default()
+                },
+                query: None,
+                page: 0,
+            });
+        }
+        backend.publish_browse();
+
+        let row = |id| vec![(cover_url(&backend, &player, id), THUMB_SIZE)];
+        let shelf = || {
+            (20..22)
+                .map(|id| (cover_url(&backend, &player, id), TILE_SIZE))
+                .collect::<Vec<_>>()
+        };
+        let drawn = || backend.browse_view.borrow().art.clone();
+        assert_eq!(
+            drawn(),
+            [vec![], row(0), row(1), vec![], row(10), vec![], shelf()]
+        );
+        assert_eq!(
+            backend.browse_view.borrow().era,
+            backend.browsing.lock().unwrap().era,
+            "the record does not say which screen it is of"
+        );
+
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            let crumb = browsing.trail.last_mut().expect("the crumb is still on");
+            crumb.screen.sections[1].items.push(album(11));
+        }
+        backend.publish_browse();
+        assert_eq!(
+            drawn(),
+            [
+                vec![],
+                row(0),
+                row(1),
+                vec![],
+                row(10),
+                row(11),
+                vec![],
+                shelf()
+            ],
+            "a row added to the middle list did not move the shelf down"
+        );
+    }
+
+    /// A long list asks for the covers on screen and a screenful either side
+    /// of them, and none of the rest.
+    ///
+    /// It asked for every row's as it opened. A share's music root is 781
+    /// rows naming 534 covers, which was 533 requests over twenty seconds to
+    /// put pictures on a pane showing fifteen rows, and on the speaker every
+    /// one of them stood between an add and the queue showing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_list_asks_for_the_covers_on_screen_and_no_further() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
         *backend.selected.lock().unwrap() = Some(player.id());
         backend.artwork.remember_player(player.address().ip());
 
-        // A cover on every row and no two the same, so a walk that stops early
-        // shows up as covers nobody asked for. The image source is the
-        // player's own artwork endpoint, which is what keeps the glyph reading
-        // off these rows: a row the player sent a picture for is drawn with
-        // it.
-        let tile = |id: u32| bluos::screen::Item {
-            title: Some(format!("Album {id}")),
-            image: Some(format!("/Artwork?album={id}")),
-            ..Default::default()
-        };
-        backend.browsing.lock().unwrap().trail.push(Crumb {
-            uri: "/ui/browseGrouped?type=Album".to_owned(),
-            screen: Screen {
-                sections: vec![Section {
-                    paged: true,
-                    items: (0..COVERS).map(tile).collect(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            query: None,
-            page: COVERS,
+        open_albums(&backend, &player, 200);
+        viewing(&backend, 0, 14);
+        backend.walk_browse(player.id());
+
+        until("the rows on screen and the screenful below", || {
+            albums_asked(&player).len() >= 30
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        let mut asked = albums_asked(&player);
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            (0..30).collect::<Vec<_>>(),
+            "not the fifteen on screen and the fifteen below them"
+        );
+    }
+
+    /// Scrolling asks for the covers of the rows that come into view and the
+    /// rows around them, and never for the ones scrolled past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scrolling_asks_for_the_rows_that_come_into_view() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        open_albums(&backend, &player, 200);
+        viewing(&backend, 0, 14);
+        backend.walk_browse(player.id());
+        until("the covers at the top", || {
+            albums_asked(&player).len() >= 30
+        })
+        .await;
+
+        viewing(&backend, 100, 114);
+        until("the covers scrolled to", || {
+            albums_asked(&player).len() >= 30 + 45
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        let mut asked = albums_asked(&player);
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            (0..30).chain(85..130).collect::<Vec<_>>(),
+            "not the rows on screen, the fifteen below and the fifteen above"
+        );
+    }
+
+    /// A row scrolled back to asks again for a cover the memory cache has let
+    /// go of, and not for one it still holds.
+    ///
+    /// Rows are drawn from that cache and from nothing else, and nothing asked
+    /// for a cover twice while its screen was up, so a row whose cover had
+    /// been pushed out kept the placeholder until the screen was opened again.
+    /// Asked of the player here, because a test's cache keeps nothing on disk;
+    /// the app's reads it back from the copy it wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_scrolled_back_to_asks_again_for_a_cover_the_cache_let_go() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // A real picture, so the covers arrive and are kept.
+        let mut png = Vec::new();
+        image::RgbaImage::new(4, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encodes");
+        player.handle_bytes("/Artwork", move |_| {
+            Some(("image/png".to_owned(), png.clone()))
         });
 
-        player.delay("/Artwork", Duration::from_millis(50));
+        open_albums(&backend, &player, 100);
+        viewing(&backend, 0, 4);
+        backend.walk_browse(player.id());
 
-        backend.walk_browse(player.id(), Walk::Whole);
+        let held = |id: u32| {
+            backend
+                .artwork
+                .any_decoded(&[cover_url(&backend, &player, id)], THUMB_SIZE)
+        };
+        let times = |id: u32| albums_asked(&player).iter().filter(|at| **at == id).count();
+        until("the covers on screen", || (0..10).all(held)).await;
+        assert_eq!(times(0), 1);
+
+        // Pushed out by covers decoded since, the way a long walk over
+        // another list pushes them out.
+        for n in 0..artwork::MEMORY_CACHE {
+            backend
+                .artwork
+                .note_arrival(&format!("http://192.0.2.1/Artwork?n={n}"), THUMB_SIZE);
+        }
+        assert!(
+            !held(0),
+            "the cache still holds the cover, so what follows proves nothing"
+        );
+
+        viewing(&backend, 50, 54);
+        until("the covers scrolled to", || (45..60).all(held)).await;
+        viewing(&backend, 0, 4);
+        until("the top row's cover, again", || held(0)).await;
+        assert_eq!(
+            times(0),
+            2,
+            "the top row's cover was not asked for once more"
+        );
+
+        // Away and back once more, with nothing let go of in between.
+        viewing(&backend, 50, 54);
+        viewing(&backend, 0, 4);
+        tokio::time::sleep(QUIET).await;
+        assert_eq!(
+            times(0),
+            2,
+            "a cover the cache still held was asked for again"
+        );
+    }
+
+    /// The task following a screen stops once the screen is not the one on
+    /// show, whether or not anything starts another in its place.
+    ///
+    /// What it checks is `browsing.era`, and it checks it whenever it wakes:
+    /// a cover coming back, or the view or the rows moving. Here the era moves
+    /// and the same rows are sent again, which is what a trail rebuilt under
+    /// the same screen looks like to it, and nothing stands it down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_task_for_a_screen_moved_on_from_asks_for_nothing_more() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        open_albums(&backend, &player, COVERS);
+        viewing(&backend, 0, 29);
+        player.delay("/Artwork", Duration::from_millis(200));
+        backend.walk_browse(player.id());
         walking(&player).await;
+        let task = following(&backend).expect("a task is following the screen");
 
-        // The page arriving, as `grow_screen` grafts it on: appended to the
-        // section already on screen, and walked from where those rows ended.
+        backend.browsing.lock().unwrap().moved_on();
+        backend.publish_browse();
+
+        until("the task to stand down", || task.is_finished()).await;
+        tokio::time::sleep(QUIET).await;
+        let asked = covers_asked(&player);
+        assert!(
+            asked <= AT_ONCE,
+            "the task went on fetching for a screen that had gone: {asked} covers asked for"
+        );
+    }
+
+    /// A page landing does not start the screen's task over.
+    ///
+    /// The rows it brings reach the task already following the screen, in the
+    /// publish that puts them on, and are fetched if and when they are
+    /// scrolled to. Starting the task again for them would throw away the
+    /// fetches it has out, which are for rows still on screen, and ask for
+    /// those covers a second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_reaches_the_task_already_following_the_screen() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        open_albums(&backend, &player, COVERS);
+        viewing(&backend, 0, 9);
+        player.delay("/Artwork", Duration::from_millis(100));
+        backend.walk_browse(player.id());
+        walking(&player).await;
+        let task = following(&backend).expect("a task is following the screen");
+
+        // The page, as `grow_screen` grafts it on, publishes it and asks for
+        // the walk.
         const PAGE: u32 = 10;
         {
             let mut browsing = backend.browsing.lock().unwrap();
-            let screen = browsing.trail.last_mut().expect("the crumb is still on");
-            let rows = &mut screen.screen.sections[0].items;
-            rows.extend((COVERS..COVERS + PAGE).map(tile));
+            let crumb = browsing.trail.last_mut().expect("the crumb is still on");
+            crumb.screen.sections[0]
+                .items
+                .extend((COVERS..COVERS + PAGE).map(album));
         }
-        backend.walk_browse(
-            player.id(),
-            Walk::From {
-                done: COVERS as usize,
-                at: backend.browsing.lock().unwrap().era,
-            },
+        backend.publish_browse();
+        backend.walk_browse(player.id());
+        assert_eq!(
+            following(&backend).map(|walk| walk.id()),
+            Some(task.id()),
+            "the page started the screen's task over"
         );
 
-        walked_it_all(&player, (COVERS + PAGE) as usize).await;
+        viewing(&backend, COVERS as usize, (COVERS + PAGE - 1) as usize);
+        until("the page's covers", || {
+            let asked = albums_asked(&player);
+            (COVERS..COVERS + PAGE).all(|id| asked.contains(&id))
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        let asked = albums_asked(&player);
+        let twice: Vec<u32> = (0..COVERS + PAGE)
+            .filter(|id| asked.iter().filter(|at| *at == id).count() > 1)
+            .collect();
+        assert!(twice.is_empty(), "covers asked for twice: {twice:?}");
+        assert!(!task.is_finished(), "the task stopped following the screen");
     }
 
-    /// The rows a page brought get the covers, on a screen with more than one
-    /// section.
+    /// The rows a page brings into the middle of a screen are fetched where
+    /// the window sees them.
     ///
-    /// The number a page hands its walk and the place the page's rows land are
-    /// worked out separately — `Screen::window_end` for the first, `put_page`
-    /// for the second — and they agree only because both stop at the window
-    /// rather than at the bottom of the screen. The test above it builds a
-    /// screen of exactly one section, which is the one shape where any number
-    /// works: a shelf under the list is where the two come apart. Measured
-    /// across the whole screen the skip would run five rows past the page and
-    /// leave the five that just arrived blank, while walking the shelf it had
-    /// already covered.
+    /// A page goes into the list it continues, and a shelf under that list
+    /// keeps its place behind it — so the page's rows are not at the end of
+    /// the screen, and a place the window reports names them only if the
+    /// record of what each place holds was kept from the rows the window was
+    /// sent. The walk this replaced worked out where a page began by counting
+    /// the screen instead, and the count and the graft were two sums that
+    /// agreed only while both stopped at the list.
     ///
-    /// Driven through `BrowseMore` rather than by calling the walk here, so
-    /// the number under test is the one `grow_screen` works out. Measuring it
-    /// in the test measures `Screen::window_end` twice and says nothing about
-    /// the call site: the prefix sum over the whole screen that this exists to
-    /// rule out would go back in and still pass.
+    /// Driven through `BrowseMore` and `BrowseViewing`, so the page lands
+    /// where `grow_screen` puts it and the view arrives the way the window
+    /// sends it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_page_into_the_middle_section_gets_the_covers_it_brought() {
         use bluos::screen::{Section, SectionKind};
@@ -31755,15 +32280,8 @@ mod thumbnail_tests {
         *backend.selected.lock().unwrap() = Some(player.id());
         backend.artwork.remember_player(player.address().ip());
 
-        let tile = |id: u32| bluos::screen::Item {
-            title: Some(format!("Album {id}")),
-            image: Some(format!("/Artwork?album={id}")),
-            ..Default::default()
-        };
-
         // The page the player will answer with, counted so that it is the last
-        // one: `offset` plus its rows reaches `total`, so nothing asks again
-        // and the covers below are this page's alone.
+        // one: `offset` plus its rows reaches `total`, so nothing asks again.
         const PAGE: u32 = 10;
         let rows: String = (COVERS..COVERS + PAGE)
             .map(|id| format!("\n    <item title=\"Album {id}\" image=\"/Artwork?album={id}\"/>"))
@@ -31794,12 +32312,12 @@ mod thumbnail_tests {
                     sections: vec![
                         Section {
                             paged: true,
-                            items: (0..COVERS).map(tile).collect(),
+                            items: (0..COVERS).map(album).collect(),
                             ..Default::default()
                         },
                         Section {
                             kind: SectionKind::Row,
-                            items: (SHELF..SHELF + ON_SHELF).map(tile).collect(),
+                            items: (SHELF..SHELF + ON_SHELF).map(album).collect(),
                             ..Default::default()
                         },
                     ],
@@ -31811,9 +32329,20 @@ mod thumbnail_tests {
                 page: COVERS,
             });
         }
+        backend.publish_browse();
+        let _ = backend.commands.send(Command::BrowseViewing(0, 9));
+        until("the view to land", || {
+            backend.browse_view.borrow().shown == Some((0, 9))
+        })
+        .await;
+        backend.walk_browse(player.id());
+        until("the covers at the top", || {
+            let asked = albums_asked(&player);
+            (0..20).all(|id| asked.contains(&id))
+        })
+        .await;
 
-        // The scroll, which is how a page is asked for in the app: the number
-        // the walk skips by is worked out inside the arm this sends to.
+        // The scroll, which is how a page is asked for in the app.
         let _ = backend.commands.send(Command::BrowseMore);
         let grafted = |backend: &Backend| {
             backend
@@ -31823,15 +32352,10 @@ mod thumbnail_tests {
                 .current()
                 .map(|screen| screen.sections[0].items.len())
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while grafted(&backend) != Some((COVERS + PAGE) as usize) {
-            assert!(
-                Instant::now() < deadline,
-                "the page never landed on the list: {:?} rows",
-                grafted(&backend)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        until("the page to land on the list", || {
+            grafted(&backend) == Some((COVERS + PAGE) as usize)
+        })
+        .await;
         assert_eq!(
             backend
                 .browsing
@@ -31843,36 +32367,32 @@ mod thumbnail_tests {
             "the page went into the list, leaving the shelf where it was"
         );
 
-        // Exact rather than by substring: `album=6` is the front of
-        // `album=60`, and getting that wrong would pass a test of the very
-        // rows it is meant to be counting.
-        let wanted = |player: &Player, id: u32| {
-            player
-                .asked()
-                .iter()
-                .any(|seen| seen.ends_with(&format!("album={id}")))
-        };
+        // Scrolled down onto the page: the end of the list, with the shelf
+        // the next place below it.
+        let _ = backend.commands.send(Command::BrowseViewing(
+            COVERS as usize,
+            (COVERS + PAGE - 1) as usize,
+        ));
+        until("the page's covers", || {
+            let asked = albums_asked(&player);
+            (COVERS..COVERS + PAGE).all(|id| asked.contains(&id))
+        })
+        .await;
+        until("the shelf's, under them", || {
+            let asked = albums_asked(&player);
+            (SHELF..SHELF + ON_SHELF).all(|id| asked.contains(&id))
+        })
+        .await;
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let missing: Vec<u32> = (COVERS..COVERS + PAGE)
-                .filter(|id| !wanted(&player, *id))
-                .collect();
-            if missing.is_empty() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the rows the page brought never got covers: {missing:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        // And it started at the page rather than at the top of the list: the
-        // rows above it are somebody else's to fetch.
+        // And nothing the view never came near.
+        tokio::time::sleep(QUIET).await;
+        let asked = albums_asked(&player);
+        let passed: Vec<u32> = (20..COVERS - PAGE)
+            .filter(|id| asked.contains(id))
+            .collect();
         assert!(
-            !wanted(&player, 0),
-            "the page walk went back over the rows that were already there"
+            passed.is_empty(),
+            "rows never on screen or beside it were fetched: {passed:?}"
         );
     }
 
@@ -32006,7 +32526,7 @@ mod thumbnail_tests {
     /// everything past its own start, which is not what a walk covers: `done`
     /// skips the rows the walk above it was given, so each one has its own
     /// page and no other. Stopping one therefore abandoned the rest of its
-    /// page, and nothing asks again while the list is up — both publishes draw
+    /// page, and nothing asks again while the list is up — the list is drawn
     /// from the memory cache alone. Measured in the rig, one flick of a wheel
     /// chained seventeen pages and left rows 106 to 799 on the placeholder
     /// glyph for as long as the screen stayed open, scrolling back into them
@@ -32588,14 +33108,13 @@ mod thumbnail_tests {
     ///
     /// A loader returns before it lists anything when what it was started for
     /// has gone: [`load_thumbnails`] when its player has left the registry or
-    /// its queue has, [`load_browse_thumbnails`] when its player has or there
-    /// is no screen on the trail. The walk was counted against the ceiling all
-    /// the same, and at the top of the list it is the one walk the three below
-    /// it may stop, so all three were owed a trim and waiting on it to list.
-    /// It never did, nothing it did woke them, and what would have dropped it
-    /// is the retain at the top of a trim, which only a cover of their own
-    /// coming back would have brought them to: against a player that takes the
-    /// request and says nothing, the list stayed a walk over for a whole
+    /// its queue has. The walk was counted against the ceiling all the same,
+    /// and at the top of the list it is the one walk the three below it may
+    /// stop, so all three were owed a trim and waiting on it to list. It never
+    /// did, nothing it did woke them, and what would have dropped it is the
+    /// retain at the top of a trim, which only a cover of their own coming back
+    /// would have brought them to: against a player that takes the request and
+    /// says nothing, the list stayed a walk over for a whole
     /// `artwork::FETCH_TIMEOUT`.
     ///
     /// Forced the way the burst above is: the current-thread runtime, gates
@@ -32864,18 +33383,18 @@ mod thumbnail_tests {
         assert!(drew > 1, "and it did redraw while the walks ran: {drew}");
     }
 
-    /// Backing out of a screen stops the walks over it where they stand.
+    /// Backing out of a screen stops the task fetching its covers where it
+    /// stands, and follows the screen backed out to instead.
     ///
-    /// Back bumps `era`, and a walk reads `era` between fetches — so what it
+    /// Back bumps `era`, and the task reads `era` when it wakes — so what it
     /// actually does on a player that accepts connections and then says
-    /// nothing is hold six requests and their share of the four artwork
+    /// nothing is hold its requests and their share of the four artwork
     /// permits for a whole fetch timeout, starving the screen that was backed
-    /// out to. Opening a screen gets the abort for free because it replaces
-    /// the list; leaving one has to ask for it.
+    /// out to. That screen is drawn from the memory cache, and a row on it
+    /// asks again for a cover the cache has let go of only while something
+    /// follows the view over it.
     #[tokio::test(flavor = "multi_thread")]
     async fn backing_out_of_a_screen_stops_its_cover_walks() {
-        use bluos::screen::Section;
-
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::new();
         let player = Player::start().await;
@@ -32888,70 +33407,39 @@ mod thumbnail_tests {
 
         // Two screens deep, so Back is the one level that leaves a screen
         // rather than a pane. The covers are on the screen being left.
-        let tile = |id: u32| bluos::screen::Item {
-            title: Some(format!("Album {id}")),
-            image: Some(format!("/Artwork?album={id}")),
-            ..Default::default()
-        };
-        {
-            let mut browsing = backend.browsing.lock().unwrap();
-            browsing.trail.push(Crumb {
-                uri: "/ui/Configuration".to_owned(),
-                screen: Screen::default(),
-                query: None,
-                page: 0,
-            });
-            browsing.trail.push(Crumb {
-                uri: "/ui/browseGrouped?type=Album".to_owned(),
-                screen: Screen {
-                    sections: vec![Section {
-                        paged: true,
-                        items: (0..COVERS).map(tile).collect(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                query: None,
-                page: COVERS,
-            });
-        }
+        backend.browsing.lock().unwrap().trail.push(Crumb {
+            uri: "/ui/Configuration".to_owned(),
+            screen: Screen::default(),
+            query: None,
+            page: 0,
+        });
+        open_albums(&backend, &player, COVERS);
         player.delay("/Artwork", Duration::from_secs(30));
-
-        // The screen, and a page of it, so there is more than one walk to
-        // leave behind — which is what makes this worth aborting.
-        backend.walk_browse(player.id(), Walk::Whole);
+        backend.walk_browse(player.id());
         walking(&player).await;
-        backend.walk_browse(
-            player.id(),
-            Walk::From {
-                done: 10,
-                at: backend.browsing.lock().unwrap().era,
-            },
-        );
-        let left: Vec<_> = backend
-            .browse_walk
-            .lock()
-            .unwrap()
-            .running
-            .iter()
-            .map(|walk| walk.stop.clone())
-            .collect();
-        assert_eq!(left.len(), 2, "both walks registered themselves");
+        let left = following(&backend).expect("a task is following the screen");
 
         let _ = backend.commands.send(Command::BrowseBack);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while left.iter().any(|walk| !walk.is_finished()) {
-            assert!(
-                Instant::now() < deadline,
-                "a walk over the screen that was left is still holding its fetches"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        until("the task over the screen that was left to let go", || {
+            left.is_finished()
+        })
+        .await;
         assert_eq!(
             backend.browsing.lock().unwrap().trail.len(),
             1,
             "and Back did leave the screen"
+        );
+        let era = backend.browsing.lock().unwrap().era;
+        assert_eq!(
+            backend
+                .browse_walk
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|walk| walk.era),
+            Some(era),
+            "nothing is following the screen backed out to"
         );
     }
 
@@ -32988,16 +33476,18 @@ mod thumbnail_tests {
         });
     }
 
-    /// The cover walk fetches the picture of a song whatever the song is
-    /// called, and never the icon of a row drawn as a glyph.
+    /// The covers fetched for a screen are the pictures its rows are drawn
+    /// with: a song's whatever the song is called, and never the icon of a row
+    /// drawn as a glyph.
     ///
-    /// It used to decide for itself, from the item's label alone. That
+    /// The walk used to decide for itself, from the item's label alone. That
     /// fetched the icon of a picker's chip that the publisher draws as a
     /// glyph, and it read a song's title for the player's words, so a song
     /// called "Shuffle" was skipped as a glyph. Once the publisher stopped
     /// reading a song's title, that song would have been drawn by a picture
-    /// nothing had fetched. The walk asks the publisher's own question now,
-    /// and this holds it to the answer.
+    /// nothing had fetched. What is fetched now is what the publisher recorded
+    /// each row as drawn with, so the two cannot disagree; this holds the
+    /// record to the publisher's answer and the fetching to the record.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_walk_fetches_a_things_picture_whatever_it_is_called() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -33009,25 +33499,36 @@ mod thumbnail_tests {
         *backend.selected.lock().unwrap() = Some(player.id());
         backend.artwork.remember_player(player.address().ip());
         open_named_like_a_button(&backend, &player);
+        backend.publish_browse();
 
-        // Waited out to the end rather than until the song's picture is asked
-        // for: the walk fetches several at once and they arrive in no
-        // particular order, so a fetch of the chip's icon could still be on
-        // its way when the song's has landed.
-        backend.walk_browse(player.id(), Walk::Whole);
-        let walk = backend.browse_walk.lock().unwrap().running[0].stop.clone();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !walk.is_finished() {
-            assert!(Instant::now() < deadline, "the walk never finished");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let asked = player.asked();
-        assert!(
-            player.asked_for("/images/x9271.png"),
-            "the song called Shuffle is drawn by its picture, and the picture \
-             was never fetched: {asked:?}"
+        let picture = backend
+            .with_entry(player.id(), |entry| {
+                entry.client.image_url("/images/x9271.png")
+            })
+            .expect("the player is in the registry");
+        let drawn: Vec<String> = backend
+            .browse_view
+            .borrow()
+            .art
+            .iter()
+            .flatten()
+            .map(|(url, _)| url.clone())
+            .collect();
+        assert_eq!(
+            drawn,
+            [picture],
+            "the rows are recorded as drawn with something other than the song's picture"
         );
+
+        // Then asked of the player: the song's picture, and once the 404s for
+        // anything else would have come back, nothing else.
+        backend.walk_browse(player.id());
+        until("the song's picture to be asked for", || {
+            player.asked_for("/images/x9271.png")
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        let asked = player.asked();
         assert!(
             !player.asked_for("QobuzIcon"),
             "the picker's chip is drawn as a glyph, and its icon was fetched \

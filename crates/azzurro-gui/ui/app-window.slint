@@ -2556,6 +2556,11 @@ export component AppWindow inherits Window {
     callback browse-header(int);
     callback toggle-now-playing();
     callback browse-more();
+    // Which items of `browse-items` are on screen, first and last. The covers
+    // are fetched for these and the rows beside them rather than for the whole
+    // list, and a row that comes back into view without one is asked for it
+    // again.
+    callback browse-viewing(int, int);
     callback queue-more();
     // The letters a long list can be jumped to — "#", "A", "B", and whatever
     // else a collection turns up. The player works out where each one starts;
@@ -3940,6 +3945,42 @@ export component AppWindow inherits Window {
                                 if (self.viewport-height + self.viewport-y - self.height < 900px) {
                                     root.browse-more();
                                 }
+                            }
+
+                            // The items on screen, first and last, for the
+                            // covers. Worked out the way `jump-y` is and for
+                            // the same reason: the list believes every item is
+                            // worth `viewport-height` over the number of items,
+                            // so that is what an offset is worth in items.
+                            // Approximate where headings and shelves sit
+                            // between the rows, which the backend allows for by
+                            // fetching a screenful either side.
+                            //
+                            // Whole items, so a scroll reports only as often as
+                            // an item crosses an edge and not on every frame.
+                            property <int> first-shown: self.viewport-height > 0
+                                && root.browse-items.length > 0
+                                ? Math.clamp(Math.floor(-self.viewport-y
+                                    * root.browse-items.length / self.viewport-height),
+                                    0, root.browse-items.length - 1)
+                                : 0;
+                            property <int> last-shown: self.viewport-height > 0
+                                && root.browse-items.length > 0
+                                ? Math.clamp(Math.ceil((self.height - self.viewport-y)
+                                    * root.browse-items.length / self.viewport-height) - 1,
+                                    0, root.browse-items.length - 1)
+                                : 0;
+                            // On creation as well: a change tracker never fires
+                            // for the first value, and a list made with the
+                            // view already where it will stay has no other.
+                            init => {
+                                root.browse-viewing(self.first-shown, self.last-shown);
+                            }
+                            changed first-shown => {
+                                root.browse-viewing(self.first-shown, self.last-shown);
+                            }
+                            changed last-shown => {
+                                root.browse-viewing(self.first-shown, self.last-shown);
                             }
 
                             // And on the list's own height, the same as the queue.
