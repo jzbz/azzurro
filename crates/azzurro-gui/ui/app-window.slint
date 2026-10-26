@@ -1,6 +1,6 @@
 import { ListView, ComboBox, LineEdit, Slider, Switch } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
-import { Icon, IconButton, PillButton, Segmented, Scrubber, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker, EmptyState, Modal } from "widgets.slint";
+import { Icon, IconButton, PillButton, Segmented, Scrubber, ClockRoom, Level, Panel, Artwork, Badge, WideButton, TimeField, DayPicker, EmptyState, Modal } from "widgets.slint";
 
 // A bare file import is how Slint registers a custom font: the family the
 // file declares becomes usable as a font-family anywhere, and the file is
@@ -1381,13 +1381,24 @@ component TrackRow inherits Rectangle {
             }
         }
 
+        // A column, so every row's length ends on the same edge and the dots
+        // beside it stand in one line down the queue. 36px holds any m:ss, but
+        // a track of an hour or more is h:mm:ss, and in 36px "1:02:03" lost its
+        // 3. Such a row takes the room its own length needs instead, and its
+        // dots and badge sit that much further left: on that row alone, since
+        // a row cannot see the others to widen them all.
         if !root.editing: Text {
             text: root.track.duration;
             font-size: Theme.small-size;
             color: Theme.faint;
             vertical-alignment: center;
             horizontal-alignment: right;
-            width: 36px;
+            width: Math.max(36px, room.preferred-width);
+
+            room := ClockRoom {
+                reading: root.track.duration;
+                font-size: Theme.small-size;
+            }
         }
 
         // In Edit mode the row trades what it says for what can be done to it,
@@ -5810,27 +5821,13 @@ export component AppWindow inherits Window {
                                 width: room.preferred-width;
                                 horizontal-alignment: right;
 
-                                // The total's shape with every figure a 0,
-                                // Geist's widest. No position in the track can
-                                // outgrow it: the transport clamps the position
-                                // to the total, so it never has more figures,
-                                // and no pair of figures kerns wide enough to
-                                // beat the zeros. The shape is `bluos::clock`'s
-                                // — m:ss, and h:mm:ss from an hour — so its
-                                // length alone says which one it is.
-                                room := Text {
-                                    property <int> characters: root.duration-text.character-count;
-                                    text: self.characters <= 4
-                                        ? "0:00"
-                                        : (self.characters <= 5
-                                            ? "00:00"
-                                            : (self.characters <= 7 ? "0:00:00" : "00:00:00"));
+                                // The total's room. No position in the track
+                                // can outgrow it: the transport clamps the
+                                // position to the total, so it never has more
+                                // figures.
+                                room := ClockRoom {
+                                    reading: root.duration-text;
                                     font-size: Theme.small-size;
-                                    // Measured, never drawn or read out. A
-                                    // child of the text rather than a sibling,
-                                    // so that it takes no room in the row.
-                                    visible: false;
-                                    accessible-role: none;
                                 }
                             }
 

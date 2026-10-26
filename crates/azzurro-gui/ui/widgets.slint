@@ -652,6 +652,31 @@ export component Scrubber inherits Rectangle {
     }
 }
 
+// The room a clock reading needs: its shape, with every figure a 0.
+//
+// Geist's figures are proportional, and unusually so — its "1" is 42%
+// narrower than its "0" — so "1:11" draws more than a third narrower than
+// "0:00", and a box sized from one reading can cut off another of the same
+// length. The 0 is the widest figure there is, and no pair of figures kerns
+// wide enough to make up the difference, so nothing of a shape draws wider
+// than this. The shapes are `bluos::clock`'s, m:ss and then h:mm:ss from an
+// hour, which is why the length alone tells them apart.
+//
+// Measured, never drawn or read out. It goes inside the text it measures for,
+// at that text's font-size, where it takes no room in the layout around it.
+export component ClockRoom inherits Text {
+    in property <string> reading;
+    property <int> characters: root.reading.character-count;
+
+    text: root.characters <= 4
+        ? "0:00"
+        : (root.characters <= 5
+            ? "00:00"
+            : (root.characters <= 7 ? "0:00:00" : "00:00:00"));
+    visible: false;
+    accessible-role: none;
+}
+
 // Volume: an icon that doubles as the mute button, and a level.
 export component Level inherits HorizontalLayout {
     in property <int> value;
