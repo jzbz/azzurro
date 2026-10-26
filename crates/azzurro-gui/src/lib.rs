@@ -64,6 +64,19 @@ const APP_ID: &str = "blue.azzurro.Azzurro";
 /// for the next window, the same way a long browse list does.
 const QUEUE_WINDOW: u32 = 500;
 
+/// How many more times a read of the queue that failed is made, and how long
+/// the first of them waits; each one after waits twice as long as the last.
+///
+/// A queue the player has replaced is read once, at the status that says so,
+/// and every status after that one names the same queue. So where that one
+/// read failed — a timeout, a blip — nothing asked again, and the pane said
+/// "Nothing queued" until the queue changed again or somebody pressed
+/// something. Four more over fifteen seconds outlast a blip without leaning
+/// for long on a player that has stopped answering. See [`read_queue_again`]
+/// for what stops them sooner.
+const QUEUE_RETRIES: u32 = 4;
+const QUEUE_RETRY: Duration = Duration::from_secs(1);
+
 /// How long the artwork has to stop changing before it is drawn.
 ///
 /// Short enough that a cover still appears to arrive with the track, long
@@ -1805,6 +1818,13 @@ struct Backend {
     /// walk: this number says which walks stand down for which, and that is
     /// only true if it is taken in the same order as the standing down.
     thumbnails: Arc<AtomicU64>,
+    /// Bumped by every read of the selected player's queue, as it starts.
+    ///
+    /// A read that failed is made again only while no newer one has started.
+    /// A card pressed twice over an empty pane reads the queue twice, and two
+    /// runs of retries against a player already slow to answer it is the very
+    /// load that makes it slow. See [`read_queue_again`].
+    queue_reads: Arc<AtomicU64>,
     /// Whether a stale-screen refresh is already in flight.
     ///
     /// Staleness is decided by comparing the screen's `refreshOnStatusChange`
@@ -4310,6 +4330,7 @@ async fn run(
         sent_era: Arc::new(AtomicU64::new(0)),
         sent_sidebar: Arc::new(AtomicU64::new(0)),
         thumbnails: Arc::new(AtomicU64::new(0)),
+        queue_reads: Arc::new(AtomicU64::new(0)),
         refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         orders: Arc::new(Mutex::new(order::load())),
         decoded: Arc::new(Mutex::new(decoded::load())),
@@ -5827,6 +5848,39 @@ impl Backend {
         self.selection()
             .filter(|(selected, _)| *selected == id)
             .map(|(_, n)| n)
+    }
+
+    /// What a read of `id`'s queue starting now is made under, counted as the
+    /// newest read of it. `None` where `id` is not the selected player: only
+    /// that queue is drawn, so only that one is worth reading again.
+    fn ask_queue(&self, id: DeviceId) -> Option<QueueAsk> {
+        let selection = self.selection_of(id)?;
+        let pid = self.with_entry(id, |e| e.status.as_ref().and_then(|s| s.pid))?;
+        let read = self.queue_reads.fetch_add(1, Ordering::Relaxed) + 1;
+        Some(QueueAsk {
+            selection,
+            read,
+            pid,
+        })
+    }
+
+    /// Whether the pane is still waiting on the read `asked` describes: the
+    /// same selection, no newer read begun, and no queue held, while the
+    /// player names the queue it named then.
+    ///
+    /// Any queue at all, where it had named none: the status a player is
+    /// adopted with comes after the read its adoption starts, and the first
+    /// status is not a replacement (see [`take_status`]), so nothing would
+    /// read the queue again on its account.
+    fn wants_queue(&self, id: DeviceId, asked: &QueueAsk) -> bool {
+        self.still_selected(asked.selection)
+            && self.queue_reads.load(Ordering::Relaxed) == asked.read
+            && self
+                .with_entry(id, |e| {
+                    let pid = e.status.as_ref().and_then(|s| s.pid);
+                    e.queue.is_none() && (asked.pid.is_none() || pid == asked.pid)
+                })
+                .unwrap_or(false)
     }
 
     /// Edit one player's row and push the result to the window.
@@ -12113,9 +12167,65 @@ async fn load_thumbnails(backend: Backend, id: DeviceId, rows: Walk, mine: u64, 
 }
 
 /// Read the selected player's queue and show it.
+///
+/// Once, for whoever awaits this: the queue's edits await it inside their
+/// player's write lane, where the next edit waits behind it. A read that fails
+/// and leaves the pane with nothing to draw is made again in a task of its
+/// own; see [`read_queue_again`].
 async fn fetch_queue(backend: Backend, id: DeviceId) {
-    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+    // Before the read: what a retry has to find unchanged is the selection
+    // and the queue this read was made for.
+    let asked = backend.ask_queue(id);
+    if read_queue(&backend, id).await {
         return;
+    }
+    if let Some(asked) = asked.filter(|asked| backend.wants_queue(id, asked)) {
+        tokio::spawn(read_queue_again(backend, id, asked));
+    }
+}
+
+/// What a read of the selected player's queue was made under. See
+/// [`Backend::wants_queue`].
+#[derive(Clone, Copy, Debug)]
+struct QueueAsk {
+    /// Which selection; see [`Backend::selection`].
+    selection: u64,
+    /// Which read; see `Backend::queue_reads`.
+    read: u64,
+    /// The queue the player named, if it had named one.
+    pid: Option<u32>,
+}
+
+/// Make a failed read of the queue again, waiting longer each time, for as
+/// long as the pane is waiting on it.
+///
+/// Every way out, since nothing else bounds this: a read that lands; the last
+/// of [`QUEUE_RETRIES`]; and, asked after every wait, another player chosen, a
+/// newer read begun, a queue held, or the player having replaced it — the
+/// status that says so starts a read of its own. A player that has left the
+/// registry holds no queue to want. A retry that fails goes round again here
+/// rather than spawning another, so one failed read is one of these at most.
+async fn read_queue_again(backend: Backend, id: DeviceId, asked: QueueAsk) {
+    let mut wait = QUEUE_RETRY;
+    for attempt in 1..=QUEUE_RETRIES {
+        tracing::debug!(%id, attempt, of = QUEUE_RETRIES, "reading the queue again in {wait:?}");
+        tokio::time::sleep(wait).await;
+        if !backend.wants_queue(id, &asked) {
+            tracing::debug!(%id, attempt, "the pane is not waiting on this read any more");
+            return;
+        }
+        if read_queue(&backend, id).await {
+            return;
+        }
+        wait *= 2;
+    }
+    tracing::debug!(%id, tries = QUEUE_RETRIES, "gave up reading the queue");
+}
+
+/// One read of `id`'s queue, shown if it lands. Whether it did.
+async fn read_queue(backend: &Backend, id: DeviceId) -> bool {
+    let Some(client) = backend.with_entry(id, |e| e.client.clone()) else {
+        return false;
     };
 
     // No covers asked of the player while this is out: it answers the queue
@@ -12138,8 +12248,12 @@ async fn fetch_queue(backend: Backend, id: DeviceId) {
             backend.publish_queue();
             tokio::spawn(fetch_queue_buttons(backend.clone(), id));
             backend.walk_queue(id, Walk::Whole);
+            true
         }
-        Err(e) => tracing::debug!(%id, "could not read the queue: {e}"),
+        Err(e) => {
+            tracing::debug!(%id, "could not read the queue: {e}");
+            false
+        }
     }
 }
 
@@ -12597,7 +12711,7 @@ async fn fetch_more_queue(backend: Backend, id: DeviceId, from: u32, pid: Option
         return;
     };
 
-    // As for the first window; see `fetch_queue`.
+    // As for the first window; see `read_queue`.
     let read = {
         let _way = backend.artwork.make_way(id.host);
         client.queue_range(from, from + QUEUE_WINDOW - 1).await
@@ -21982,6 +22096,7 @@ mod selection_tests {
             sent_era: Arc::new(AtomicU64::new(0)),
             sent_sidebar: Arc::new(AtomicU64::new(0)),
             thumbnails: Arc::new(AtomicU64::new(0)),
+            queue_reads: Arc::new(AtomicU64::new(0)),
             refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             orders: Arc::new(Mutex::new(order::Orders::new())),
             decoded: Arc::default(),
@@ -26380,6 +26495,189 @@ mod selection_tests {
             player.asked_for("/Playlist"),
             "and it was read from the player answering there now, not carried \
              over from the one that left"
+        );
+    }
+
+    /// A stopped player's status naming the queue it holds, under an etag of
+    /// its own so that the poll takes each one as news.
+    fn status_naming(pid: u32) -> String {
+        fixtures::status_stopped()
+            .replace("etag=\"1\"", &format!("etag=\"queue-{pid}\""))
+            .replace("</status>", &format!("  <pid>{pid}</pid>\n</status>"))
+    }
+
+    fn queue_length(backend: &Backend, id: DeviceId) -> Option<u32> {
+        backend
+            .with_entry(id, |e| e.queue.as_ref().map(|queue| queue.length))
+            .flatten()
+    }
+
+    /// A selected player that hangs up on every read of its queue, and the
+    /// read that has just failed against it.
+    async fn a_failed_queue_read() -> (Backend, Player, mpsc::UnboundedReceiver<Command>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, rx) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        player.hang_up("/Playlist");
+        fetch_queue(backend.clone(), player.id()).await;
+        assert_eq!(asked(&player, "/Playlist"), 1);
+        (backend, player, rx)
+    }
+
+    /// A replaced queue whose one read fails is read again.
+    ///
+    /// The status that names a new queue is the only one that reads it: every
+    /// status after names the same queue, and draws what is held, which is
+    /// nothing. So where that read timed out or was dropped, the pane said
+    /// "Nothing queued" until the queue changed again or somebody pressed
+    /// something. Driven through the poll, which is where that read starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_queue_whose_read_fails_is_read_again() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+        let id = player.id();
+        *backend.selected.lock().unwrap() = Some(id);
+
+        // A queue on screen, and the poll hearing the player name it.
+        player.hold_queue(3);
+        player.serve("/Status", status_naming(7));
+        fetch_queue(backend.clone(), id).await;
+        assert_eq!(queue_length(&backend, id), Some(3));
+        tokio::spawn(follow(
+            backend.clone(),
+            id,
+            NEXT_MPRIS_INDEX.fetch_add(1, Ordering::Relaxed),
+        ));
+        until("the first status", || {
+            backend.with_entry(id, |e| e.status.as_ref().and_then(|s| s.pid)) == Some(Some(7))
+        })
+        .await;
+
+        // Replaced, and the read of the new one dropped.
+        let reads = asked(&player, "/Playlist");
+        player.hang_up("/Playlist");
+        player.serve("/Status", status_naming(8));
+        until("the read of the new queue", || {
+            asked(&player, "/Playlist") > reads
+        })
+        .await;
+        assert_eq!(queue_length(&backend, id), None, "the old queue was let go");
+
+        // The player answering again, and nothing pressed.
+        player.hold_queue(5);
+        until("the new queue to be read again", || {
+            queue_length(&backend, id) == Some(5)
+        })
+        .await;
+    }
+
+    /// And a read that goes on failing is made again a set number of times,
+    /// and then left.
+    ///
+    /// Nothing outside the loop stops it while the pane waits, so the loop
+    /// has to stop itself: the player that fails every time is the case where
+    /// nothing else does. Run to its end rather than counted part-way, since
+    /// a loop that never ends would pass any count taken before its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_read_that_goes_on_failing_is_given_up() {
+        let (backend, player, _rx) = a_failed_queue_read().await;
+        let ask = backend.ask_queue(player.id()).expect("the player selected");
+        let schedule: Duration = (0..QUEUE_RETRIES).map(|n| QUEUE_RETRY * 2u32.pow(n)).sum();
+
+        tokio::time::timeout(
+            schedule + Duration::from_secs(5),
+            read_queue_again(backend.clone(), player.id(), ask),
+        )
+        .await
+        .expect("the retries never stopped");
+        assert_eq!(
+            asked(&player, "/Playlist"),
+            1 + QUEUE_RETRIES as usize,
+            "the read that failed, and each retry once"
+        );
+        assert_eq!(queue_length(&backend, player.id()), None);
+    }
+
+    /// A retry stands down once another player is chosen: only the queue of
+    /// the player selected is drawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_read_is_not_made_again_for_a_player_chosen_away_from() {
+        let (backend, player, _rx) = a_failed_queue_read().await;
+        let other = DeviceId::new(std::net::Ipv4Addr::new(127, 0, 0, 2), player.id().port);
+        {
+            let mut selected = backend.selected.lock().unwrap();
+            *selected = Some(other);
+            backend.selections.fetch_add(1, Ordering::SeqCst);
+        }
+        tokio::time::sleep(QUEUE_RETRY + SETTLED).await;
+        assert_eq!(asked(&player, "/Playlist"), 1);
+    }
+
+    /// Or once the player has replaced the queue it was for: the status that
+    /// says so reads the new one itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_read_is_not_made_again_for_a_queue_the_player_has_replaced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _rx) = backend(&http);
+        add(&backend, &player, &http);
+        let id = player.id();
+        *backend.selected.lock().unwrap() = Some(id);
+        let named = |pid| {
+            backend
+                .registry
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .status = Some(bluos::Status {
+                pid: Some(pid),
+                ..Default::default()
+            });
+        };
+        named(7);
+        player.hang_up("/Playlist");
+        fetch_queue(backend.clone(), id).await;
+        named(8);
+        tokio::time::sleep(QUEUE_RETRY + SETTLED).await;
+        assert_eq!(asked(&player, "/Playlist"), 1);
+    }
+
+    /// Or once a queue is held: another read has landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_read_is_not_made_again_once_another_has_landed() {
+        let (backend, player, _rx) = a_failed_queue_read().await;
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .unwrap()
+            .queue = Some(bluos::Queue::default());
+        tokio::time::sleep(QUEUE_RETRY + SETTLED).await;
+        assert_eq!(asked(&player, "/Playlist"), 1);
+    }
+
+    /// And two reads that fail are made again as one: a card pressed twice
+    /// over an empty pane is not two runs of retries against a player that is
+    /// already slow to answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_failed_queue_reads_are_made_again_as_one() {
+        let (backend, player, _rx) = a_failed_queue_read().await;
+        fetch_queue(backend.clone(), player.id()).await;
+        assert_eq!(asked(&player, "/Playlist"), 2);
+        tokio::time::sleep(QUEUE_RETRY + SETTLED).await;
+        assert_eq!(
+            asked(&player, "/Playlist"),
+            3,
+            "the newer read's first retry, and none for the one it replaced"
         );
     }
 
