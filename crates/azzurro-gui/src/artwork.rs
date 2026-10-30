@@ -33,10 +33,11 @@ pub type Pixels = SharedPixelBuffer<Rgba8Pixel>;
 /// How many decoded images to keep, of any size. [`MEMORY_BYTES`] is what
 /// they may come to between them.
 ///
-/// Rows are drawn from this and from nothing else: a list asks
-/// [`Artwork::cached`] what is decoded each time it is rebuilt, and a row whose
-/// cover has been pushed out is drawn with the placeholder until the list is
-/// walked again. So it has to hold a whole list. It held 256, and the music
+/// Rows are drawn from this and from nothing else: a list asks what is decoded
+/// each time it is rebuilt, and a row whose cover has been pushed out is drawn
+/// with the placeholder until somebody asks for it again — see
+/// [`Artwork::drawn`] for what keeps the covers on show from being the ones
+/// pushed out. So it has to hold a whole list. It held 256, and the music
 /// root of one household's share is 534 covers: replayed against a fake
 /// player, the folder's top rows had their covers three seconds after it
 /// opened and the placeholder at forty-five, every one of them decoded and
@@ -406,6 +407,12 @@ impl Drop for Fetching<'_> {
 /// An unbounded LRU with both limits applied here on the way in, because the
 /// crate's own bound is a count and a count alone is what priced the cache by
 /// its largest tier.
+///
+/// Used means [`Decoded::put`] or [`Decoded::touch`]; a peek is not a use. For
+/// a while nothing touched, so the order was the order covers were first
+/// decoded and the oldest went first however often they were wanted: the
+/// queue's thumbnails, decoded when it was read, were the first thing pushed
+/// out by the thirty-odd now-playing sleeves a long evening brings.
 struct Decoded {
     entries: LruCache<Key, Pixels>,
     /// What the entries' pixels come to, kept as they arrive and leave rather
@@ -445,6 +452,11 @@ impl Decoded {
 
     fn peek(&self, key: &Key) -> Option<&Pixels> {
         self.entries.peek(key)
+    }
+
+    /// The entry at `key`, moved to the back of the line for eviction.
+    fn touch(&mut self, key: &Key) -> Option<&Pixels> {
+        self.entries.get(key)
     }
 
     fn contains(&self, key: &Key) -> bool {
@@ -697,16 +709,22 @@ impl Artwork {
     /// What is already decoded, without touching the disk or the network — and
     /// without counting as a use.
     ///
-    /// This is what the queue view calls while building rows: it fills in the
-    /// covers it has and leaves the rest blank, and a later republish picks up
-    /// whatever arrived in the meantime.
+    /// For rows built but not on show: the rows of a browse list outside the
+    /// view, and the queue's rows past its window. It fills in the covers it
+    /// has and leaves the rest blank, and a later republish picks up whatever
+    /// arrived in the meantime.
     ///
-    /// `peek` and not `get`: this is called while drawing, and drawing every
-    /// row four hundred milliseconds apart would otherwise walk the whole
-    /// visible list to the front of the LRU on each pass. What is on screen
-    /// then looks more recently used than what was actually asked for, and the
-    /// eviction order stops meaning anything. Wanting a cover is `get`, in
-    /// [`Self::get`]; drawing one is this.
+    /// A peek, so that a list does not outrank what is actually on show. Cost
+    /// is not the reason: with this build's `lru`, promoting all 781 rows of a
+    /// share's music root measured 25 µs a publish against 24 µs for the peek.
+    /// Order is. A browse publish comes every 400 ms while covers walk in, and
+    /// the queue is touched once a track. A 2000-row paged list beside a
+    /// 500-row queue is past [`MEMORY_CACHE`]: in a replay of this cache's
+    /// eviction rule with the whole list touched at each publish, the queue
+    /// kept 48 of its 500 covers, and the fifteen rows actually on screen —
+    /// touched first, so oldest — were all gone ten sleeves later. Touching
+    /// only what is on show kept every one of both. That is done through
+    /// [`Self::drawn`] and [`Self::keep_drawn`].
     pub fn cached(&self, url: &str, size: u32) -> Option<Pixels> {
         self.peeks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -715,6 +733,77 @@ impl Artwork {
             size,
         };
         self.decoded.memory.lock().unwrap().peek(&key).cloned()
+    }
+
+    /// What is already decoded, for a cover on show or wanted: it counts as a
+    /// use, and goes to the back of the line for eviction.
+    ///
+    /// Drawing was a peek from 491afc5 on, when the cache held 256 entries and
+    /// the queue window alone was 500: touching the window at every redraw
+    /// turned the whole cache over and the order meant nothing. Neither holds
+    /// now. The cache holds [`MEMORY_CACHE`] and [`MEMORY_BYTES`], and what
+    /// comes through here is held to what fits: the queue's rows nearest the
+    /// cursor, 500 thumbnails or 12.2 MiB at most, the queue menu's cover, the
+    /// sleeve, and every cover [`Self::get`] already has. Touching a set that
+    /// fits evicts nothing, however often it is done. The peek had a price of
+    /// its own: the queue's thumbnails were decoded when it was read and never
+    /// touched again, and in a replay of this cache's eviction rule the first
+    /// of them was gone thirty-two now-playing sleeves later. Touched at every
+    /// track, all of them were still there two hundred sleeves later.
+    pub fn drawn(&self, url: &str, size: u32) -> Option<Pixels> {
+        self.peeks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = Key {
+            url: url.to_owned(),
+            size,
+        };
+        self.decoded.memory.lock().unwrap().touch(&key).cloned()
+    }
+
+    /// Count each of `covers` as drawn, in one turn of the lock, and say how
+    /// many of them are not held.
+    ///
+    /// For what a browse screen has in view: see [`Self::cached`] for why that
+    /// and not the whole list. Handed farthest first, so the rows on screen
+    /// are the last touched and the last let go of. One key, refilled, as in
+    /// [`Self::any_decoded`]: 45 rows measured 0.8 µs with this build's `lru`.
+    pub fn keep_drawn<'a>(&self, covers: impl IntoIterator<Item = (&'a str, u32)>) -> usize {
+        let mut key = Key {
+            url: String::new(),
+            size: 0,
+        };
+        let mut memory = self.decoded.memory.lock().unwrap();
+        let mut short = 0;
+        for (url, size) in covers {
+            key.url.clear();
+            key.url.push_str(url);
+            key.size = size;
+            if memory.touch(&key).is_none() {
+                short += 1;
+            }
+        }
+        short
+    }
+
+    /// Take the covers no longer held out of `covers`, and hand them back, in
+    /// one turn of the lock. A look and not a use, like [`Self::any_decoded`].
+    pub fn let_go(
+        &self,
+        covers: &mut std::collections::HashSet<(String, u32)>,
+    ) -> Vec<(String, u32)> {
+        let mut key = Key {
+            url: String::new(),
+            size: 0,
+        };
+        let memory = self.decoded.memory.lock().unwrap();
+        covers
+            .extract_if(|(url, size)| {
+                key.url.clear();
+                key.url.push_str(url);
+                key.size = *size;
+                !memory.contains(&key)
+            })
+            .collect()
     }
 
     /// Whether any of `urls` is decoded at `size`, in one turn of the lock.
@@ -729,8 +818,8 @@ impl Artwork {
     /// this is one turn of the lock for the whole list and clones nothing. It
     /// has a count of its own in [`Self::probes`] rather than none, so that
     /// what this added is weighed on the same scale as what it took away.
-    /// `peek` rather than `get`, for the reason given on [`Self::cached`] —
-    /// asking is not using.
+    /// A look and not a use: a memo asking what landed is not anybody drawing
+    /// or wanting a cover, so it leaves the eviction order alone.
     pub fn any_decoded(&self, urls: &[String], size: u32) -> bool {
         self.probes
             .fetch_add(urls.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -750,14 +839,21 @@ impl Artwork {
 
     /// Put a decoded image in as though one had been fetched and decoded.
     ///
-    /// For a test of a memo that watches the cache. Nothing in this build can
-    /// stage a real arrival: the fake player answers `/Artwork` with a 404,
-    /// and a picture it could answer with is bytes rather than the text its
-    /// routes are written in. The pixels are a single blank one, because what
-    /// is under test is which URLs moved and not what they look like.
+    /// For a test of a memo that watches the cache, or of what the cache lets
+    /// go of, without a fetch: quicker than a picture served from the fake
+    /// player, and placed exactly. The pixels are a single blank one, because
+    /// what is under test is which URLs moved and not what they look like.
     #[cfg(test)]
     pub fn note_arrival(&self, url: &str, size: u32) {
-        // The two fields rather than [`Landing::keep`]: a blank pixel has no
+        self.note_arrival_of(url, size, 1);
+    }
+
+    /// The same, `side` pixels square: what weighs on [`MEMORY_BYTES`] the
+    /// way a real cover at that size does, for a test of the byte budget
+    /// rather than the count. A 720 sleeve is 720.
+    #[cfg(test)]
+    pub fn note_arrival_of(&self, url: &str, size: u32, side: u32) {
+        // The two fields rather than [`Landing::keep`]: a blank image has no
         // dominant color worth remembering, and the tint is not what this
         // stages.
         self.decoded.memory.lock().unwrap().put(
@@ -765,7 +861,7 @@ impl Artwork {
                 url: url.to_owned(),
                 size,
             },
-            Pixels::new(1, 1),
+            Pixels::new(side, side),
         );
         // After the entry is in, exactly as in `get`: a memo that sees the new
         // number goes looking for the picture it is announcing.
@@ -968,7 +1064,10 @@ impl Artwork {
         if url.is_empty() {
             return None;
         }
-        if let Some(hit) = self.cached(url, size) {
+        // Wanted is used: a queue read asking for a cover it already has is
+        // the queue saying it still wants it. This went through the peek in
+        // [`Self::cached`] for a while, and nothing in the cache was ever used.
+        if let Some(hit) = self.drawn(url, size) {
             return Some(hit);
         }
         // Asked once and answered for a while. `get` is not the rare call it
@@ -2179,6 +2278,135 @@ mod tests {
         assert!(fetched.is_some(), "the cover did not decode");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full cache, with `first` decoded before everything else in it.
+    fn full_behind(first: &[&str]) -> Artwork {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let art = Artwork::in_memory(reqwest::Client::new(), Players::default());
+        for url in first {
+            art.note_arrival(url, THUMB);
+        }
+        for n in first.len()..MEMORY_CACHE {
+            art.note_arrival(&format!("http://192.0.2.1/Artwork?n={n}"), THUMB);
+        }
+        art
+    }
+
+    const THUMB: u32 = 80;
+
+    fn held(art: &Artwork, url: &str) -> bool {
+        art.any_decoded(&[url.to_owned()], THUMB)
+    }
+
+    /// Wanting a cover the cache holds is a use of it. A queue read asks for
+    /// every cover it names, and the ones already decoded were answered
+    /// through a peek, so nothing was ever moved up: the oldest went first
+    /// however often it had just been asked for.
+    #[tokio::test]
+    async fn wanting_a_cover_it_holds_counts_as_a_use() {
+        let wanted = "http://192.0.2.1/Artwork?album=Wanted";
+        let art = full_behind(&[wanted]);
+
+        assert!(
+            art.get(wanted, THUMB).await.is_some(),
+            "a cover it holds was not handed back"
+        );
+        art.note_arrival("http://192.0.2.1/Artwork?album=Next", THUMB);
+
+        assert!(
+            held(&art, wanted),
+            "the cover just asked for was let go first"
+        );
+        assert!(
+            !held(&art, "http://192.0.2.1/Artwork?n=1"),
+            "and something nobody asked for was kept in its place"
+        );
+    }
+
+    /// Drawing a cover that is on show is a use of it, and building a row
+    /// that is not on show is not. See [`Artwork::cached`] for why the two
+    /// differ.
+    #[test]
+    fn a_cover_drawn_is_kept_and_one_only_built_is_not() {
+        let drawn = "http://192.0.2.1/Artwork?album=Drawn";
+        let built = "http://192.0.2.1/Artwork?album=Built";
+        let art = full_behind(&[drawn, built]);
+
+        assert!(art.drawn(drawn, THUMB).is_some());
+        assert!(art.cached(built, THUMB).is_some());
+        art.note_arrival("http://192.0.2.1/Artwork?album=Next", THUMB);
+
+        assert!(
+            held(&art, drawn),
+            "a cover on show was let go of before one decoded after it"
+        );
+        assert!(
+            !held(&art, built),
+            "a row only built counted as drawn, so a long list outranks the screen"
+        );
+    }
+
+    /// What a browse screen has in view goes last, and the count of what it is
+    /// short of is the count of what the cache does not hold.
+    #[test]
+    fn what_is_kept_drawn_is_let_go_of_last() {
+        let rows: Vec<String> = (0..20)
+            .map(|n| format!("http://192.0.2.1/Artwork?row={n}"))
+            .collect();
+        let first: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let art = full_behind(&first);
+
+        let missing = "http://192.0.2.1/Artwork?row=gone";
+        let short = art.keep_drawn(
+            rows[..10]
+                .iter()
+                .map(|url| (url.as_str(), THUMB))
+                .chain([(missing, THUMB)]),
+        );
+        assert_eq!(short, 1, "the one cover it does not hold");
+
+        for n in 0..10 {
+            art.note_arrival(&format!("http://192.0.2.1/Artwork?pushed={n}"), THUMB);
+        }
+        assert!(
+            rows[..10].iter().all(|url| held(&art, url)),
+            "the rows in view were let go of"
+        );
+        assert!(
+            rows[10..].iter().all(|url| !held(&art, url)),
+            "and the rows out of view were kept instead"
+        );
+    }
+
+    /// The covers handed back are exactly the ones the cache dropped, and the
+    /// ones it still holds stay where they were.
+    #[test]
+    fn let_go_hands_back_exactly_what_the_cache_dropped() {
+        let urls: Vec<String> = (0..10)
+            .map(|n| format!("http://192.0.2.1/Artwork?brought={n}"))
+            .collect();
+        let first: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let art = full_behind(&first);
+        let mut brought: std::collections::HashSet<(String, u32)> =
+            urls.iter().map(|url| (url.clone(), THUMB)).collect();
+
+        for n in 0..4 {
+            art.note_arrival(&format!("http://192.0.2.1/Artwork?pushed={n}"), THUMB);
+        }
+        let mut gone = art.let_go(&mut brought);
+        gone.sort();
+
+        let mut expected: Vec<(String, u32)> =
+            urls[..4].iter().map(|url| (url.clone(), THUMB)).collect();
+        expected.sort();
+        assert_eq!(gone, expected);
+        assert_eq!(brought.len(), 6);
+        assert!(
+            urls[4..]
+                .iter()
+                .all(|url| brought.contains(&(url.clone(), THUMB)))
+        );
     }
 
     /// The queue wants a 72px thumbnail and the sleeve a 720px cover of the

@@ -1567,6 +1567,34 @@ struct QueueArt {
     /// built, so one decode is looked into once rather than at every status
     /// until the next one.
     seen: u64,
+    /// The covers the last build drew, of the rows that count as drawn (see
+    /// [`drawn_rows`]). One that a later build finds gone was let go of by the
+    /// cache, and is asked for again once, the next time the queue moves; see
+    /// [`Backend::walk_queue_again`].
+    ///
+    /// Only a cover that decoded and was kept gets in, so a 404, an
+    /// undecodable reply, a refused address or a picture too big to keep is
+    /// never asked for this way, however often the queue moves. One asked for
+    /// again is left out until a build finds it drawn again, so a cover that
+    /// cannot be had a second time costs one more request and no more.
+    had: std::collections::HashSet<String>,
+}
+
+/// Which of a queue's rows count as drawn: the [`QUEUE_WINDOW`] nearest the
+/// cursor, or the first that many where the pane marks no row — the status is
+/// about another queue, names no track, or names one not yet paged in.
+///
+/// Pages grow a queue without limit, and a set touched at every track change
+/// has to fit in the cache or it turns the cache over and the order means
+/// nothing; see [`artwork::Artwork::cached`]. 500 thumbnails are 12.2 MiB, a
+/// fifth of the cache's 64 MiB.
+fn drawn_rows(cursor: i32, len: usize) -> std::ops::Range<usize> {
+    let window = QUEUE_WINDOW as usize;
+    let centre = usize::try_from(cursor).unwrap_or(0);
+    let start = centre
+        .saturating_sub(window / 2)
+        .min(len.saturating_sub(window));
+    start..len.min(start + window)
 }
 
 /// Everything the background tasks share. Cheap to clone; all of it is behind
@@ -1710,7 +1738,9 @@ struct Backend {
     /// unrelated decodes are ignored outright.
     ///
     /// Taken only in [`Backend::publish_queue`] and outermost there, so it has
-    /// no order to get wrong with the locks above.
+    /// no order to get wrong with the locks above. It is let go before that
+    /// function asks for covers again, so it is never held over
+    /// [`Backend::queue_walk`] either.
     queue_art: Arc<Mutex<QueueArt>>,
     sent_players: Arc<AtomicU64>,
     /// And the settings rows, for the same reason as the three above: the
@@ -3259,6 +3289,10 @@ enum WebPage {
 /// What a screen about one thing says about it, on its way to the window.
 struct HeaderData {
     cover: Option<Pixels>,
+    /// Where `cover` comes from, at `COVER_SIZE`, so what is on show can be
+    /// counted as drawn and a cover let go of can be told from none; see
+    /// [`keep_on_screen`].
+    art: Option<String>,
     title: String,
     subtitle: String,
     detail: String,
@@ -3329,6 +3363,32 @@ fn drawn_art(item: &ItemData) -> Vec<(String, u32)> {
         .filter_map(|row| row.art.clone())
         .map(|url| (url, size))
         .collect()
+}
+
+/// Count what the browse pane has on show as drawn — the rows in [`reach`],
+/// farthest first, then the header — and say how many of their pictures the
+/// cache does not hold.
+///
+/// The reach and not every row a publish builds: a folder is 781 rows, and
+/// see [`artwork::Artwork::cached`] for what touching all of them at every
+/// publish did to the queue and to the rows actually on screen. Nothing for
+/// the rows before the window has said what is on screen, when [`reach`]
+/// would be the whole list.
+///
+/// Taken under `browse_view`'s lock, which is safe while the cache's lock
+/// takes nothing under it.
+fn keep_on_screen(artwork: &artwork::Artwork, view: &Viewing, header: Option<&str>) -> usize {
+    let rows = match view.shown {
+        Some(_) => reach(view.shown, view.art.len()),
+        None => Vec::new(),
+    };
+    artwork.keep_drawn(
+        rows.iter()
+            .rev()
+            .flat_map(|&at| view.art[at].iter().rev())
+            .map(|(url, size)| (url.as_str(), *size))
+            .chain(header.map(|url| (url, COVER_SIZE))),
+    )
 }
 
 /// Lay a screen's sections out in the order the pane draws them.
@@ -6295,6 +6355,23 @@ impl Backend {
         });
     }
 
+    /// Ask again for covers the queue drew and the cache has since let go of.
+    ///
+    /// Through the walks the queue already has, so the four permits, six at
+    /// once, `give_way` and the stand-down on a re-read all hold. The covers
+    /// go to [`Walks::carried`], and a walk with no rows of its own — a
+    /// [`Walk::From`] at the end of the rows the build counted, `done` of them
+    /// at run `at` — takes them on, as [`load_thumbnails`] says one does. A
+    /// re-read's [`Walk::Whole`] clears both, and walks every cover anyway.
+    ///
+    /// Not a walk of the whole queue: that would ask again for every cover
+    /// past the drawn window and every one that never decoded, on a queue
+    /// that can be pages long.
+    fn walk_queue_again(&self, id: DeviceId, lost: Vec<(String, u32)>, done: usize, at: u64) {
+        self.queue_walk.lock().unwrap().carried.extend(lost);
+        self.walk_queue(id, Walk::From { done, at });
+    }
+
     /// And the browse screen's: see that the covers of `id`'s screen on show
     /// are being fetched, by the one task that follows the view over it. See
     /// [`load_browse_thumbnails`].
@@ -6848,7 +6925,7 @@ impl Backend {
         let cover = cover
             .as_deref()
             .zip(client.as_ref())
-            .and_then(|(src, client)| art.cached(&client.image_url(src), THUMB_SIZE));
+            .and_then(|(src, client)| art.drawn(&client.image_url(src), THUMB_SIZE));
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -6995,7 +7072,7 @@ impl Backend {
         // answer, and what is behind it is the set of covers these rows are
         // actually waiting on. See [`Backend::queue_art`].
         let mut art = self.queue_art.lock().unwrap();
-        let (rows, line, cursor_row) = {
+        let (rows, line, cursor_row, again) = {
             let guard = self.registry.lock().unwrap();
             // Borrowed rather than cloned, and a shared default for the player
             // that has not answered yet.
@@ -7067,24 +7144,55 @@ impl Backend {
                     // they are being built is looked into at the next status
                     // rather than counted as already seen.
                     let arrivals = self.artwork.arrivals();
+                    // What asking again stands on, read under the guard the
+                    // rows are counted under. See [`Walk::From`].
+                    let run = self.thumbnails.load(Ordering::Relaxed);
+                    let tracks = queue.songs.len();
+                    let near = drawn_rows(cursor_row, tracks);
+                    // Asked again only when the queue itself moved — a track,
+                    // a pause, an edit, a page — and never for a build its own
+                    // covers landing caused: a walk's arrivals would otherwise
+                    // ask for whatever they had pushed out.
+                    let moved = !unchanged;
                     let client = &entry.client;
                     let mut wanted: Vec<String> = Vec::new();
+                    let mut had = std::collections::HashSet::new();
+                    let mut lost: Vec<(String, u32)> = Vec::new();
                     let rows: Vec<TrackData> = queue
                         .songs
                         .iter()
-                        .map(|song| {
+                        .enumerate()
+                        .map(|(at, song)| {
                             let at_cursor = Some(song.id) == cursor;
                             // Only what is already decoded. Anything missing
                             // is being fetched, and lands on a later republish
                             // — which is what the URL is written down for: it
                             // is the whole reason this pane has to be rebuilt
                             // for something the queue document cannot show.
+                            // What is missing that this pane drew last time was
+                            // let go of instead, and is asked for again.
                             let cover = match song
                                 .image
                                 .as_deref()
                                 .filter(|src| !src.is_empty())
                                 .map(|src| client.image_url(src))
                             {
+                                Some(url) if near.contains(&at) => {
+                                    let cover = self.artwork.drawn(&url, THUMB_SIZE);
+                                    if cover.is_some() {
+                                        had.insert(url);
+                                    } else {
+                                        if art.had.contains(&url) {
+                                            if moved {
+                                                lost.push((url.clone(), THUMB_SIZE));
+                                            } else {
+                                                had.insert(url.clone());
+                                            }
+                                        }
+                                        wanted.push(url);
+                                    }
+                                    cover
+                                }
                                 Some(url) => {
                                     let cover = self.artwork.cached(&url, THUMB_SIZE);
                                     if cover.is_none() {
@@ -7110,12 +7218,16 @@ impl Backend {
 
                     wanted.sort_unstable();
                     wanted.dedup();
+                    lost.sort_unstable();
+                    lost.dedup();
                     *art = QueueArt {
                         wanted,
                         seen: arrivals,
+                        had,
                     };
 
-                    (rows, line, cursor_row)
+                    let again = (!lost.is_empty()).then_some((lost, tracks, run));
+                    (rows, line, cursor_row, again)
                 }
                 None => {
                     // Nothing drawn is nothing waited on.
@@ -7130,12 +7242,12 @@ impl Backend {
                     }) {
                         return;
                     }
-                    (Vec::new(), line, -1)
+                    (Vec::new(), line, -1, None)
                 }
             }
         };
 
-        // `art` is held from here to the end of the function, across the post,
+        // `art` is held from here until the post has gone, across it,
         // for the reason `send_browse` gives for holding `sent_items` across
         // its own: the record of what the window has been given is only true
         // if the window is given things in the order the record was written.
@@ -7196,6 +7308,13 @@ impl Backend {
                 below.into_iter().map(dressed).collect::<Vec<_>>(),
             )));
         });
+
+        // Posted, so the record is true; let go before asking again, which
+        // takes the walks' lock.
+        drop(art);
+        if let (Some(id), Some((lost, done, at))) = (selected, again) {
+            self.walk_queue_again(id, lost, done, at);
+        }
     }
 
     /// Push the navigation sidebar to the window.
@@ -8259,28 +8378,32 @@ impl Backend {
             // The block at the top of an album's page. Its artwork is the one
             // picture on the screen worth showing large, so it is asked for at
             // the size a cover is drawn rather than a row's.
-            let header = screen.header.as_ref().map(|header| HeaderData {
-                cover: header
+            let header = screen.header.as_ref().map(|header| {
+                let art = header
                     .image
                     .as_deref()
                     .filter(|src| !src.is_empty())
                     .zip(client.as_ref())
-                    .and_then(|(src, client)| {
-                        self.artwork.cached(&client.image_url(src), COVER_SIZE)
-                    }),
-                title: header.title.clone().unwrap_or_default(),
-                subtitle: header.subtitle.clone().unwrap_or_default(),
-                detail: header.subsubtitle.clone().unwrap_or_default(),
-                buttons: header
-                    .buttons
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(at, button)| {
-                        let label = button.text.clone()?;
-                        let glyph = glyphs::glyph_for(&label, None);
-                        Some((at as i32, label, glyph))
-                    })
-                    .collect(),
+                    .map(|(src, client)| client.image_url(src));
+                HeaderData {
+                    cover: art
+                        .as_deref()
+                        .and_then(|url| self.artwork.cached(url, COVER_SIZE)),
+                    art,
+                    title: header.title.clone().unwrap_or_default(),
+                    subtitle: header.subtitle.clone().unwrap_or_default(),
+                    detail: header.subsubtitle.clone().unwrap_or_default(),
+                    buttons: header
+                        .buttons
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, button)| {
+                            let label = button.text.clone()?;
+                            let glyph = glyphs::glyph_for(&label, None);
+                            Some((at as i32, label, glyph))
+                        })
+                        .collect(),
+                }
             });
 
             let mut blocks: Vec<BlockData> = Vec::new();
@@ -8673,9 +8796,19 @@ impl Backend {
             // or refreshed into what it already was. The record of what they
             // are drawn with is still right, and only the screen it is of has
             // moved. See [`Viewing::era`].
+            //
+            // What is on show counts as drawn whichever path a publish takes.
+            // Nothing in view can have gone missing since the rows were last
+            // sent — whether a cover is there is in the memo — so there is
+            // nobody to wake.
             self.browse_view.send_if_modified(|view| {
                 let moved = view.era != era;
                 view.era = era;
+                keep_on_screen(
+                    &self.artwork,
+                    view,
+                    header.as_ref().and_then(|h| h.art.as_deref()),
+                );
                 moved
             });
             let ui = self.ui.clone();
@@ -8718,20 +8851,30 @@ impl Backend {
                 let art: Vec<_> = patch.iter().map(|(_, item)| drawn_art(item)).collect();
                 moved |= view.art != art;
                 view.art = art;
-                return moved;
-            }
-            if view.art.len() != sent.len() {
-                view.art.resize_with(sent.len(), Vec::new);
-                moved = true;
-            }
-            for (at, item) in &patch {
-                let art = drawn_art(item);
-                if view.art[*at] != art {
-                    view.art[*at] = art;
+            } else {
+                if view.art.len() != sent.len() {
+                    view.art.resize_with(sent.len(), Vec::new);
                     moved = true;
                 }
+                for (at, item) in &patch {
+                    let art = drawn_art(item);
+                    if view.art[*at] != art {
+                        view.art[*at] = art;
+                        moved = true;
+                    }
+                }
             }
-            moved
+            // Something on show without its picture wakes the task as well,
+            // to see whether it brought that cover and the cache let it go:
+            // while the pane was under Now Playing, say, which publishes
+            // nothing here. That is how a header let go of comes back once
+            // the pane is shown again, rather than when the list next moves.
+            let short = keep_on_screen(
+                &self.artwork,
+                view,
+                header.as_ref().and_then(|h| h.art.as_deref()),
+            );
+            moved || short > 0
         });
 
         let ui = self.ui.clone();
@@ -11447,7 +11590,8 @@ async fn walk_covers(
         }
 
         // Its own rows are done, so it takes on whatever the walks stopped for
-        // room left owing. Nothing else is coming back for those: each walk
+        // room left owing, and any covers the queue drew that the cache has
+        // since let go of. Nothing else is coming back for those: each walk
         // covers its own page, and the list is not walked again until it is
         // re-read or the screen is left. See [`Walks::carried`].
         if !still_wanted() {
@@ -11495,9 +11639,10 @@ async fn walk_covers(
 /// walk above it is fetching the covers for rows the user is looking at, and
 /// it is the only thing that will ever fetch them: `publish_queue` draws art
 /// out of the memory cache alone, and nothing walks the queue a second time
-/// until it is re-read. Stop it where it stands and the rows between its
-/// position and the new page keep the placeholder for as long as the list is
-/// up.
+/// until it is re-read — `publish_queue` asks again only for covers it drew
+/// and the cache then let go of, which a walk it never finished never drew.
+/// Stop it where it stands and the rows between its position and the new page
+/// keep the placeholder for as long as the list is up.
 ///
 /// The queue's alone now. The browse screen follows the view instead, with
 /// one task that pages and jumps simply give new rows to; see
@@ -11614,6 +11759,10 @@ struct Walks {
     /// instead, and the next walk to run out of its own rows takes them on:
     /// behind the rows somebody is looking at, which is the order the ceiling
     /// is for, but still fetched.
+    ///
+    /// And covers the queue drew that the cache has since let go of, which
+    /// [`Backend::walk_queue_again`] puts here for a walk with no rows of its
+    /// own to take on in the same way.
     carried: Vec<(String, u32)>,
     /// When any of them last redrew the list. The throttle in [`walk_covers`]
     /// reads and claims this, so the redraw rate is the list's and not each
@@ -11992,7 +12141,9 @@ fn trim_walks(walks: &mut Walks, mine: &Rows) -> bool {
 /// backend knows what is in them and nothing about the scroll.
 ///
 /// Held in a `watch` so the task fetching covers can sleep until either half
-/// moves: a scroll, a page landing, a jump replacing the rows.
+/// moves: a scroll, a page landing, a jump replacing the rows. A publish that
+/// finds something on show without its picture wakes it too, though nothing
+/// here moved; see [`keep_on_screen`].
 #[derive(Default)]
 struct Viewing {
     /// The items on screen, first and last, as the window last said.
@@ -12090,6 +12241,18 @@ fn reach(shown: Option<(usize, usize)>, len: usize) -> Vec<usize> {
 /// per scroll rather than one per turn of this loop. One that did not arrive
 /// at all is not asked for again while the screen is up, as before.
 ///
+/// With one exception, for a cover the cache let go of while this slept: an
+/// album page's header, say, behind a long Now Playing session, where nothing
+/// on this screen moves and nothing publishes it. That was the placeholder
+/// until the screen was left. A publish that finds something on show without
+/// its picture wakes this (see [`keep_on_screen`]), and a cover brought and
+/// since gone is asked for once more, as one held when this first looked and
+/// since gone always was. Either way it had to be kept and then pushed out by
+/// somebody else's decodes, so each further time needs the cache to turn over
+/// past it again. A cover this brought that was gone before this went quiet —
+/// its own walk pushed it out, or it was never kept — waits for the view to
+/// move as before.
+///
 /// The header's cover first, whatever the scroll: it is the largest thing on
 /// the screen and the one the eye lands on.
 async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
@@ -12105,9 +12268,11 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
 
     let mut moves = backend.browse_view.subscribe();
     let mut fetches = tokio::task::JoinSet::new();
-    // Out now, arrived since the view last moved, and not to be had at all.
+    // Out now, arrived since the view last moved, arrived and already gone
+    // again by the time this went quiet, and not to be had at all.
     let mut out = std::collections::HashSet::new();
     let mut arrived = std::collections::HashSet::new();
+    let mut spilled = std::collections::HashSet::new();
     let mut failed = std::collections::HashSet::new();
     let mut shown = None;
     let mut drawn = Instant::now();
@@ -12133,6 +12298,7 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
             if view.shown != shown {
                 shown = view.shown;
                 arrived.clear();
+                spilled.clear();
             }
             // Another screen's rows, until this one's are sent.
             let rows = if view.era == era {
@@ -12150,7 +12316,11 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
             if fetches.len() >= AT_ONCE {
                 break;
             }
-            if out.contains(&cover) || arrived.contains(&cover) || failed.contains(&cover) {
+            if out.contains(&cover)
+                || arrived.contains(&cover)
+                || spilled.contains(&cover)
+                || failed.contains(&cover)
+            {
                 continue;
             }
             if backend
@@ -12168,8 +12338,14 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
         }
 
         // Nothing out and nothing more on screen to ask for: draw what came,
-        // then sleep until the view or the rows move.
+        // then sleep until the view or the rows move, or a publish finds
+        // something on show without its picture.
         if fetches.is_empty() {
+            // Brought and already gone again: pushed out while this was
+            // still fetching, by this screen's own covers or by somebody
+            // else's, or never kept at all. Set aside until the view moves —
+            // a request per scroll, not one per turn.
+            spilled.extend(backend.artwork.let_go(&mut arrived));
             if owed {
                 owed = false;
                 drawn = Instant::now();
@@ -12178,6 +12354,12 @@ async fn load_browse_thumbnails(backend: Backend, id: DeviceId, era: u64) {
             if moves.changed().await.is_err() {
                 return;
             }
+            // Gone while this slept, which only somebody else's decodes do —
+            // a sleeve, the queue's walk, a card. Struck off, so the turn
+            // below asks for it once more. Asking again for it a second time
+            // needs the cache to turn over past it again: about thirty
+            // sleeves' worth of somebody else's covers, not anything this does.
+            backend.artwork.let_go(&mut arrived);
             continue;
         }
 
@@ -12304,7 +12486,7 @@ async fn load_cover(backend: Backend, id: DeviceId) {
     // gap at all.
     let ready = wanted
         .as_deref()
-        .and_then(|url| backend.artwork.cached(url, COVER_SIZE));
+        .and_then(|url| backend.artwork.drawn(url, COVER_SIZE));
 
     if ready.is_some() {
         if !backend.is_selected(id) {
@@ -31396,6 +31578,261 @@ mod thumbnail_tests {
         assert_eq!(covers_asked(&player), 1, "and asked for once it had");
     }
 
+    /// A queue playing track `song` of a queue whose id is 7, as a status
+    /// says it: what moves the cursor, and so redraws the rows.
+    fn playing(song: u32) -> bluos::Status {
+        bluos::Status {
+            pid: Some(7),
+            song: Some(song),
+            ..Default::default()
+        }
+    }
+
+    /// Hand the selected player a queue of `tracks` with id 7, on track 0.
+    fn hold_numbered_queue(backend: &Backend, player: &Player, tracks: u32) {
+        let mut registry = backend.registry.lock().unwrap();
+        let entry = registry
+            .get_mut(&player.id())
+            .expect("the player was just added");
+        entry.queue = Some(bluos::Queue {
+            id: Some(7),
+            ..queue_of(tracks)
+        });
+        entry.status = Some(playing(0));
+    }
+
+    fn move_to(backend: &Backend, player: &Player, song: u32) {
+        backend
+            .registry
+            .lock()
+            .unwrap()
+            .get_mut(&player.id())
+            .expect("the player is still there")
+            .status = Some(playing(song));
+    }
+
+    /// The queue's covers outlast an evening of now-playing sleeves.
+    ///
+    /// A sleeve is 720 pixels square, two megabytes decoded, so about thirty
+    /// of them come to the cache's 64 MiB. The queue's thumbnails were decoded
+    /// when it was read and never used again, so they were the first thing
+    /// pushed out, and a long evening of one queue drew its rows with the
+    /// placeholder. Each track redraws the rows nearest the cursor now, and
+    /// drawing them counts as a use.
+    #[tokio::test]
+    async fn the_queue_keeps_its_covers_through_an_evening_of_sleeves() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+
+        const TRACKS: u32 = 104;
+        hold_numbered_queue(&backend, &player, TRACKS);
+        let covers: Vec<String> = (0..TRACKS)
+            .map(|id| cover_url(&backend, &player, id))
+            .collect();
+        for url in &covers {
+            backend.artwork.note_arrival(url, THUMB_SIZE);
+        }
+        backend.publish_queue();
+
+        for track in 1..=40 {
+            move_to(&backend, &player, track);
+            backend.publish_queue();
+            backend.artwork.note_arrival_of(
+                &format!("http://192.0.2.1/Artwork?sleeve={track}"),
+                COVER_SIZE,
+                720,
+            );
+            let lost = covers
+                .iter()
+                .filter(|url| {
+                    !backend
+                        .artwork
+                        .any_decoded(std::slice::from_ref(url), THUMB_SIZE)
+                })
+                .count();
+            assert_eq!(
+                lost, 0,
+                "{lost} of the queue's covers were let go of {track} sleeves in"
+            );
+        }
+    }
+
+    /// A queue cover the cache let go of between tracks is asked for once
+    /// more, at the next track — and only one the pane drew. A cover that
+    /// never came, a 404 here, is not asked for again however often the queue
+    /// moves, and nothing is asked for again while nothing was let go of.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_cover_let_go_between_tracks_is_asked_for_once_more() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // A real picture for every album but 7, which the player has none for.
+        let mut png = Vec::new();
+        image::RgbaImage::new(4, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encodes");
+        player.handle_bytes("/Artwork", move |request| {
+            (request.param("album") != Some("7")).then(|| ("image/png".to_owned(), png.clone()))
+        });
+
+        const TRACKS: u32 = 20;
+        hold_numbered_queue(&backend, &player, TRACKS);
+        let held = |id: u32| {
+            backend
+                .artwork
+                .any_decoded(&[cover_url(&backend, &player, id)], THUMB_SIZE)
+        };
+        let times = |id: u32| albums_asked(&player).iter().filter(|at| **at == id).count();
+        let all_but_seven = || (0..TRACKS).filter(|id| *id != 7).all(held);
+        let asked_as = |expected: &dyn Fn(u32) -> usize| {
+            for id in 0..TRACKS {
+                assert_eq!(times(id), expected(id), "album {id} was asked for");
+            }
+        };
+
+        backend.walk_queue(player.id(), Walk::Whole);
+        until("the queue's covers", all_but_seven).await;
+        until("the pane to have drawn them", || {
+            backend.queue_art.lock().unwrap().had.len() == TRACKS as usize - 1
+        })
+        .await;
+        asked_as(&|_| 1);
+
+        // Pushed out, the way an evening of sleeves and album pages pushes
+        // them out.
+        for n in 0..artwork::MEMORY_CACHE {
+            backend
+                .artwork
+                .note_arrival(&format!("http://192.0.2.1/Artwork?n={n}"), THUMB_SIZE);
+        }
+        assert!(
+            !held(0),
+            "the cache still holds the covers, so what follows proves nothing"
+        );
+
+        move_to(&backend, &player, 1);
+        backend.publish_queue();
+        until("the covers let go of, again", all_but_seven).await;
+        tokio::time::sleep(QUIET).await;
+        asked_as(&|id| if id == 7 { 1 } else { 2 });
+
+        // A track on, with nothing let go of since: nothing more.
+        move_to(&backend, &player, 2);
+        backend.publish_queue();
+        tokio::time::sleep(QUIET).await;
+        asked_as(&|id| if id == 7 { 1 } else { 2 });
+    }
+
+    /// The selected player with a queue of `tracks` whose covers are served
+    /// while `serving` holds and refused once it does not, walked and drawn.
+    async fn drawn_queue(
+        tracks: u32,
+        serving: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Backend, Player) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        let picture = png();
+        player.handle_bytes("/Artwork", move |_| {
+            serving
+                .load(Ordering::SeqCst)
+                .then(|| ("image/png".to_owned(), picture.clone()))
+        });
+
+        hold_numbered_queue(&backend, &player, tracks);
+        backend.walk_queue(player.id(), Walk::Whole);
+        until("the pane to have drawn the queue's covers", || {
+            backend.queue_art.lock().unwrap().had.len() == tracks as usize
+        })
+        .await;
+        (backend, player)
+    }
+
+    /// Push every cover out, the way an evening of sleeves does.
+    fn push_out(backend: &Backend) {
+        for n in 0..artwork::MEMORY_CACHE {
+            backend
+                .artwork
+                .note_arrival(&format!("http://192.0.2.1/Artwork?n={n}"), THUMB_SIZE);
+        }
+    }
+
+    /// A cover landing is not the queue moving. A build its own covers'
+    /// arrival caused asks for nothing again, even with covers it drew gone:
+    /// otherwise a walk's arrivals would ask for whatever they had pushed out,
+    /// and the walk that asked would land and ask again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queue_cover_landing_asks_for_nothing_again() {
+        const TRACKS: u32 = 20;
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (backend, player) = drawn_queue(TRACKS, serving).await;
+        let asked = || albums_asked(&player).len();
+        assert_eq!(asked(), TRACKS as usize);
+
+        push_out(&backend);
+        // One cover the pane is waiting on lands, and redraws it with the
+        // rest missing, without the queue having moved.
+        backend.queue_art.lock().unwrap().wanted = vec![cover_url(&backend, &player, 0)];
+        backend
+            .artwork
+            .note_arrival(&cover_url(&backend, &player, 0), THUMB_SIZE);
+        backend.publish_queue();
+        tokio::time::sleep(QUIET).await;
+        assert_eq!(
+            asked(),
+            TRACKS as usize,
+            "a build its own covers' arrival caused asked for covers again"
+        );
+    }
+
+    /// A cover asked for again that cannot be had a second time is asked for
+    /// once more, and no more however often the queue moves: it stays out of
+    /// what the pane drew until a build finds it drawn again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_queue_cover_that_fails_is_asked_for_once_more_and_no_more() {
+        const TRACKS: u32 = 20;
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (backend, player) = drawn_queue(TRACKS, serving.clone()).await;
+        let times = |id: u32| albums_asked(&player).iter().filter(|at| **at == id).count();
+        let asked_each = |n: usize| {
+            for id in 0..TRACKS {
+                assert_eq!(times(id), n, "album {id} was asked for");
+            }
+        };
+        asked_each(1);
+
+        // The player has none of them any more, and the cache lets them go.
+        serving.store(false, Ordering::SeqCst);
+        push_out(&backend);
+
+        move_to(&backend, &player, 1);
+        backend.publish_queue();
+        until("the covers let go of to be asked for again", || {
+            (0..TRACKS).all(|id| times(id) == 2)
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        asked_each(2);
+
+        move_to(&backend, &player, 2);
+        backend.publish_queue();
+        tokio::time::sleep(QUIET).await;
+        asked_each(2);
+    }
+
     /// And it stops when it is superseded, not when its next fetch happens to
     /// return.
     ///
@@ -32124,6 +32561,10 @@ mod thumbnail_tests {
         };
         let times = |id: u32| albums_asked(&player).iter().filter(|at| **at == id).count();
         until("the covers on screen", || (0..10).all(held)).await;
+        // And the task gone quiet: its last publish counts what is on show as
+        // drawn, and landing among the pushes below it would keep the top
+        // row's cover through them.
+        tokio::time::sleep(QUIET).await;
         assert_eq!(times(0), 1);
 
         // Pushed out by covers decoded since, the way a long walk over
@@ -32157,6 +32598,227 @@ mod thumbnail_tests {
             2,
             "a cover the cache still held was asked for again"
         );
+    }
+
+    /// A small PNG, for a fake player whose covers have to arrive and be kept.
+    fn png() -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::new(4, 4)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encodes");
+        png
+    }
+
+    /// Give the album list on show a header, its cover at `src`.
+    fn head_with(backend: &Backend, src: &str) {
+        backend
+            .browsing
+            .lock()
+            .unwrap()
+            .trail
+            .last_mut()
+            .expect("a screen is open")
+            .screen
+            .header = Some(bluos::screen::Header {
+            image: Some(src.to_owned()),
+            title: Some("An album".to_owned()),
+            ..Default::default()
+        });
+        backend.publish_browse();
+    }
+
+    /// An album page's header let go of behind Now Playing is asked for
+    /// again when the pane comes back, and not only once the list is moved.
+    ///
+    /// Nothing on the page moves, and the pane publishes nothing while Now
+    /// Playing is over it, so the task had nothing to wake it: the header was
+    /// the placeholder until the page was left. The publish that puts the
+    /// pane back finds it gone, and that is what wakes the task now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_let_go_behind_now_playing_is_asked_for_when_it_closes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+        let picture = png();
+        player.handle_bytes("/Artwork", move |_| {
+            Some(("image/png".to_owned(), picture.clone()))
+        });
+
+        open_albums(&backend, &player, 10);
+        head_with(&backend, "/Artwork?album=900");
+        viewing(&backend, 0, 9);
+        backend.walk_browse(player.id());
+
+        let header = cover_url(&backend, &player, 900);
+        let held = || {
+            backend
+                .artwork
+                .any_decoded(std::slice::from_ref(&header), COVER_SIZE)
+        };
+        let times = || {
+            albums_asked(&player)
+                .iter()
+                .filter(|at| **at == 900)
+                .count()
+        };
+        until("the header's cover", held).await;
+        until("the rows' covers", || {
+            (0..10).all(|id| {
+                backend
+                    .artwork
+                    .any_decoded(&[cover_url(&backend, &player, id)], THUMB_SIZE)
+            })
+        })
+        .await;
+        tokio::time::sleep(QUIET).await;
+        assert_eq!(times(), 1);
+
+        // Now Playing over the page for an evening of sleeves.
+        backend.browsing.lock().unwrap().show(Pane::NowPlaying);
+        backend.publish_pane();
+        for n in 0..artwork::MEMORY_CACHE {
+            backend
+                .artwork
+                .note_arrival(&format!("http://192.0.2.1/Artwork?n={n}"), THUMB_SIZE);
+        }
+        assert!(
+            !held(),
+            "the cache still holds the header, so what follows proves nothing"
+        );
+        tokio::time::sleep(QUIET).await;
+        assert_eq!(times(), 1, "asked for again while nobody could see it");
+
+        // And closed.
+        backend.browsing.lock().unwrap().show(Pane::Browse);
+        backend.publish_pane();
+        until("the header's cover, again", held).await;
+        tokio::time::sleep(QUIET).await;
+        assert_eq!(times(), 2, "the header was not asked for exactly once more");
+    }
+
+    /// A screen too big for the cache asks for each cover once for each place
+    /// the view comes to rest, and not again whenever a publish finds some of
+    /// them gone.
+    ///
+    /// A shelf of 400 tiles at their drawn size is 86 MB decoded against the
+    /// cache's 64 MiB, so the walk down it pushes out its own first tiles.
+    /// Those come back to the task already gone, and are set aside until the
+    /// view moves. Asked for again whenever a publish found them missing, each
+    /// would push out another and the next publish would find that one gone:
+    /// a request per publish for as long as the screen was up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_screen_too_big_for_the_cache_asks_for_each_cover_once_per_rest() {
+        use bluos::screen::{Section, SectionKind};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::new();
+        let player = Player::start().await;
+        let (backend, _commands) = backend(&http);
+        add(&backend, &player, &http);
+        *backend.selected.lock().unwrap() = Some(player.id());
+        backend.artwork.remember_player(player.address().ip());
+
+        // Bigger than a tile is drawn, so each decodes to a full 232 square.
+        let mut big = Vec::new();
+        image::RgbaImage::new(240, 240)
+            .write_to(&mut std::io::Cursor::new(&mut big), image::ImageFormat::Png)
+            .expect("encodes");
+        player.handle_bytes("/Artwork", move |_| {
+            Some(("image/png".to_owned(), big.clone()))
+        });
+
+        const TILES: u32 = 400;
+        {
+            let mut browsing = backend.browsing.lock().unwrap();
+            browsing.device = Some(player.id());
+            browsing.trail.push(Crumb {
+                uri: "/ui/Browse?key=shelf".to_owned(),
+                screen: Screen {
+                    sections: vec![Section {
+                        kind: SectionKind::Row,
+                        title: Some("Shelf".to_owned()),
+                        items: (0..TILES).map(album).collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                query: None,
+                page: 0,
+            });
+        }
+        backend.publish_browse();
+        // The heading, then the shelf with every tile on it.
+        viewing(&backend, 0, 1);
+        backend.walk_browse(player.id());
+
+        let asked = || albums_asked(&player).len();
+        let settled = || async {
+            let mut last = usize::MAX;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while asked() != last {
+                assert!(
+                    Instant::now() < deadline,
+                    "the tiles were still being asked for"
+                );
+                last = asked();
+                tokio::time::sleep(QUIET).await;
+            }
+        };
+        let most = || {
+            let mut times = std::collections::HashMap::new();
+            for id in albums_asked(&player) {
+                *times.entry(id).or_insert(0usize) += 1;
+            }
+            times.into_values().max().unwrap_or(0)
+        };
+
+        settled().await;
+        let kept = (0..TILES)
+            .filter(|id| {
+                backend
+                    .artwork
+                    .any_decoded(&[cover_url(&backend, &player, *id)], TILE_SIZE)
+            })
+            .count();
+        assert!(
+            kept < TILES as usize,
+            "every tile fits, so the screen is not too big for the cache and this proves nothing"
+        );
+        assert_eq!(asked(), TILES as usize, "every tile asked for once");
+        assert_eq!(
+            most(),
+            1,
+            "a tile was asked for again before the view moved"
+        );
+
+        // A publish that finds tiles gone and wakes the task: one that changes
+        // something drawn, as a header arriving does, rather than one the memo
+        // answers. Its cover is a request of its own, from a path of its own.
+        let picture = png();
+        player.handle_bytes("/Cover", move |_| {
+            Some(("image/png".to_owned(), picture.clone()))
+        });
+        head_with(&backend, "/Cover?album=900");
+        until("the header's cover", || {
+            player.asked().iter().any(|seen| seen.starts_with("/Cover"))
+        })
+        .await;
+        settled().await;
+        assert_eq!(
+            most(),
+            1,
+            "a publish asked again for tiles the screen pushed out"
+        );
+
+        // The view moving is what asks for them again: once more each, and
+        // then it rests.
+        viewing(&backend, 0, 0);
+        settled().await;
+        assert!(most() <= 2, "a tile was asked for {} times", most());
     }
 
     /// The task following a screen stops once the screen is not the one on
