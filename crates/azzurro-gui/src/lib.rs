@@ -19427,6 +19427,9 @@ mod tests {
         the_picker_list_is_as_tall_as_the_cards_in_it(&ui);
         // And the pane in a window the size Flathub asks screenshots to be.
         the_browse_pane_fits_a_1000px_window(&ui);
+        // And what the browse list says is on screen, which is what its
+        // covers follow.
+        the_browse_list_reports_the_rows_on_screen(&ui, &mut rx);
         // And the one button in the player list that only a dead row has.
         // Last, because it opens the list, and an open popup takes every
         // press made anywhere until it is closed.
@@ -19802,6 +19805,288 @@ mod tests {
         ui.set_queue_shown(queue_was);
         ui.window().set_size(was);
         settle(0);
+    }
+
+    /// The browse list says which of its items are on screen.
+    ///
+    /// The covers follow what it says. `load_browse_thumbnails` fetches for
+    /// the items the window reports through `browse-viewing`, plus a screenful
+    /// either side, and every test of that sets the view by hand. The sums on
+    /// the list and the `init` and `changed` handlers that report them were
+    /// reached by nothing, so a sum turned upside down or a handler lost would
+    /// have fetched the wrong covers, or none, and passed.
+    ///
+    /// Judged against the rows the window drew rather than against figures
+    /// worked out here: the items whose rows overlap the list's own box, read
+    /// off the element tree. The sums share `viewport-height` out evenly among
+    /// the items, and every row here is the same height, so on this list the
+    /// two have to agree exactly.
+    ///
+    /// Two reports are wrong for one frame and put right on the next, and are
+    /// pinned below as they are. Both come from the sums running before the
+    /// list has measured its rows: a list built with its rows already in it
+    /// claims every row, and a count that changes is shared out over the old
+    /// height. Neither costs much: the task fetching covers wakes for the
+    /// stale view and starts at most `AT_ONCE` fetches from its near end
+    /// before the next frame moves it on. For a list built again that end is
+    /// the top row, which is on screen. For a list a page has just grown it
+    /// is further down than the top of the screen, by no more than the page
+    /// is long.
+    ///
+    /// Called from the window test above, for the reason given there.
+    fn the_browse_list_reports_the_rows_on_screen(
+        ui: &AppWindow,
+        rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) {
+        let settle = |ms: u64| {
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+        };
+        // Something done to the window, then the frames it takes to come to
+        // rest: past the wheel's glide and the half second End holds the list
+        // at the bottom for. What comes back is what the window said meanwhile,
+        // as the backend hears it. `send_if_modified` drops a view it already
+        // has, so a repeat is folded into the report before it: a scroll that
+        // moves both edges at once is reported twice in the same frame, once
+        // from each `changed`.
+        let mut step = |act: &dyn Fn()| {
+            act();
+            for ms in [0, 0, 600, 0, 0] {
+                settle(ms);
+            }
+            let mut said = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                if let Command::BrowseViewing(first, last) = command {
+                    said.push((first, last));
+                }
+            }
+            said.dedup();
+            said
+        };
+        let list = || {
+            i_slint_backend_testing::ElementQuery::from_root(ui)
+                .match_descendants()
+                .match_id("AppWindow::browse-list")
+                .find_first()
+        };
+        let rows_in = |list: &i_slint_backend_testing::ElementHandle| {
+            list.query_descendants()
+                .match_descendants()
+                .match_accessible_role(i_slint_backend_testing::AccessibleRole::ListItem)
+                .find_all()
+        };
+        // The list's box, top and bottom, and the rows with any of their
+        // height inside it, as item, top and bottom. A row that only touches
+        // an edge is not on screen. The list builds rows past both edges, so
+        // being built is not the test.
+        let on_screen = || {
+            let list = list()?;
+            let top = list.absolute_position().y;
+            let bottom = top + list.size().height;
+            let rows: Vec<(usize, f32, f32)> = rows_in(&list)
+                .into_iter()
+                .filter_map(|row| {
+                    let item = row.accessible_item_index()?;
+                    let y = row.absolute_position().y;
+                    let end = y + row.size().height;
+                    (y < bottom && end > top).then_some((item, y, end))
+                })
+                .collect();
+            Some((top, bottom, rows))
+        };
+        // The first and last of them.
+        let drawn = || {
+            let (_, _, rows) = on_screen()?;
+            let items = || rows.iter().map(|row| row.0);
+            Some((items().min()?, items().max()?))
+        };
+        // Down the list is a negative delta: it is the content that moves.
+        let wheel = |pixels: f32| list().expect("the browse list").scroll(0.0, -pixels);
+        let item_of = |at: i32| BrowseItem {
+            kind: 0,
+            row: BrowseRow {
+                index: at,
+                title: format!("Track {at}").into(),
+                actionable: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows =
+            |count: i32| ModelRc::new(VecModel::from((0..count).map(item_of).collect::<Vec<_>>()));
+
+        let was = ui.window().size().to_logical(ui.window().scale_factor());
+        let items_was = ui.get_browse_items();
+        // The size the app opens at, so a screenful is a good many rows and a
+        // short list is plainly short.
+        ui.window().set_size(slint::LogicalSize::new(1440.0, 920.0));
+        ui.set_in_settings(false);
+        ui.set_in_stations(false);
+        ui.set_now_playing(false);
+        ui.set_browse_empty("".into());
+        ui.set_browse_items(rows(0));
+        step(&|| ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new()))));
+        assert!(list().is_none(), "no players, no list");
+
+        // A player arriving builds the list before any screen has reached it.
+        // There is nothing to see and it says so, from `init`: a change
+        // tracker never fires for the first value.
+        let said = step(&|| {
+            ui.set_devices(ModelRc::new(VecModel::from(vec![Device {
+                id: "192.0.2.7:11000".into(),
+                name: "Kitchen".into(),
+                reachable: true,
+                ..Default::default()
+            }])));
+            ui.set_selected(0);
+        });
+        assert!(list().is_some(), "a player selected puts the list up");
+        assert_eq!(said, [(0, 0)], "an empty list reports from `init`");
+
+        // A screen landing in it. Reported once laid out, as the screenful at
+        // the top and not the whole list.
+        let said = step(&|| ui.set_browse_items(rows(200)));
+        let top = drawn().expect("the rows of a screen just landed");
+        assert_eq!(top.0, 0, "a screen lands at its top");
+        assert!(
+            (6..100).contains(&top.1),
+            "a screenful of a 200-row list fills the pane and stops well short \
+             of the end: {top:?}"
+        );
+        assert_eq!(said, [top], "a screen landing reports the rows drawn");
+
+        // The wheel, by three rows. The third row then ends exactly on the
+        // top edge, which is not on screen.
+        let row = list()
+            .and_then(|list| rows_in(&list).into_iter().next())
+            .expect("a row to measure")
+            .size()
+            .height;
+        let said = step(&|| wheel(3.0 * row));
+        let three = drawn().expect("rows after three rows of wheel");
+        assert_eq!(three.0, 3, "three rows of wheel put the fourth at the top");
+        assert_eq!(said, [three], "a scroll reports the rows drawn");
+
+        // And by a pixel more. Whole items are what is reported, so a scroll
+        // that takes no row across an edge reports nothing, rather than a
+        // report on every frame of a scroll.
+        let said = step(&|| wheel(1.0));
+        let nudged = drawn().expect("rows after a pixel of wheel");
+        if nudged == three {
+            assert!(said.is_empty(), "a pixel crossed no edge: {said:?}");
+        } else {
+            assert_eq!(said, [nudged], "a row crossed an edge");
+        }
+
+        // The top edge on its own. Every scroll above moves both edges or
+        // neither, so a list that had lost `changed first-shown` would have
+        // passed them all on the report the other handler makes. Sized off
+        // the rows drawn: how far the first reaches above the top edge and
+        // the last below the bottom one says which way to scroll so that a
+        // row crosses the top before any crosses the bottom, and by how much.
+        let (top_edge, bottom_edge, on) = on_screen().expect("rows to measure the edges by");
+        let above = top_edge - on.iter().map(|row| row.1).fold(f32::MAX, f32::min);
+        let below = on.iter().map(|row| row.2).fold(f32::MIN, f32::max) - bottom_edge;
+        let by = if above + below < row {
+            // Up: the row above enters before the last one leaves.
+            -(above + row - below) / 2.0
+        } else {
+            // Down: the first row leaves before the next one enters.
+            (row - above + below) / 2.0
+        };
+        let said = step(&|| wheel(by));
+        let moved = drawn().expect("rows after the top edge moved");
+        assert!(
+            moved.0 != nudged.0 && moved.1 == nudged.1,
+            "a scroll of {by}px moves the top edge alone: {nudged:?} to {moved:?}"
+        );
+        assert_eq!(said, [moved], "the top edge alone reports the rows drawn");
+
+        // A fling to the end and back, far past both: the list stops at each,
+        // and says so.
+        let said = step(&|| wheel(1000.0 * row));
+        let end = drawn().expect("rows at the end");
+        assert_eq!(end.1, 199, "a fling past the end stops at the last row");
+        assert_eq!(said, [end], "and reports the screenful there");
+        let said = step(&|| wheel(-1000.0 * row));
+        assert_eq!(drawn(), Some(top), "a fling past the top stops at the top");
+        assert_eq!(said, [top], "and reports the screenful there");
+
+        // End and Home, which set the list's offset themselves rather than
+        // scrolling it.
+        let said = step(&|| ui.set_browse_to_end(ui.get_browse_to_end() + 1));
+        assert_eq!(drawn(), Some(end), "End shows the last screenful");
+        assert_eq!(said, [end], "End reports it");
+        let said = step(&|| ui.set_browse_to_top(ui.get_browse_to_top() + 1));
+        assert_eq!(drawn(), Some(top), "Home shows the first");
+        assert_eq!(said, [top], "Home reports it");
+
+        // A page landing while the list is scrolled. The app pushes the new
+        // rows onto the model on screen, as here. For one frame the thirty
+        // more items are shared out over the height of the 200 already
+        // measured, so every item is taken to be shorter than it is and the
+        // view is reported further down the list than it is.
+        let said = step(&|| ui.set_browse_page(ui.get_browse_page() + 1));
+        let paged = drawn().expect("rows a screenful down");
+        assert_eq!(said, [paged], "a page down reports the rows drawn");
+        let said = step(&|| {
+            let on_screen = ui.get_browse_items();
+            let model = on_screen
+                .as_any()
+                .downcast_ref::<VecModel<BrowseItem>>()
+                .expect("the rows put up above");
+            for at in 200..230 {
+                model.push(item_of(at));
+            }
+        });
+        let grown = drawn().expect("rows after a page landed");
+        let [stale, settled] = said[..] else {
+            panic!("a page landing reports twice, stale then right: {said:?}")
+        };
+        assert_eq!(settled, grown, "and is right once the list is measured");
+        assert!(
+            stale.0 > grown.0 && stale.1 > grown.1,
+            "the stale report is the view shared out over the old height, \
+             further down the list than the rows drawn: {stale:?} against \
+             {grown:?}"
+        );
+
+        // A list shorter than the pane, which replaces the long one as a
+        // shorter screen does. The same stale frame, shared out over the long
+        // list's height: five items in 200 rows' worth claim the top row
+        // alone.
+        let said = step(&|| ui.set_browse_items(rows(5)));
+        assert_eq!(drawn(), Some((0, 4)), "five rows fit in the pane");
+        assert_eq!(said, [(0, 0), (0, 4)], "the stale frame, then every row");
+
+        // No items at all. Nothing is drawn, and the report is the same
+        // (0, 0) as the empty list built above, which `reach` turns into
+        // nothing to fetch when there are no items.
+        let said = step(&|| ui.set_browse_items(rows(0)));
+        assert!(list().is_some(), "an empty list is still the list");
+        assert_eq!(drawn(), None, "and draws no rows");
+        assert_eq!(said, [(0, 0)], "it reports the same as an empty one built");
+
+        // The list built again with a screen already in it, which is what
+        // closing Settings over a scrolled list does. The new list starts at
+        // the top, and `init` reports before it has measured a row: its
+        // viewport is as tall as itself, so it claims every item, until the
+        // next frame says otherwise.
+        step(&|| ui.set_browse_items(rows(200)));
+        step(&|| ui.set_browse_page(ui.get_browse_page() + 1));
+        let said = step(&|| ui.set_in_settings(true));
+        assert!(list().is_none(), "Settings takes the list down");
+        assert!(said.is_empty(), "and a list taken down says nothing");
+        let said = step(&|| ui.set_in_settings(false));
+        assert_eq!(drawn(), Some(top), "a list built again starts at the top");
+        assert_eq!(said, [(0, 199), top], "every item, then the rows drawn");
+
+        // Left as it was found.
+        ui.set_browse_items(items_was);
+        ui.set_devices(ModelRc::new(VecModel::<Device>::from(Vec::new())));
+        ui.set_selected(0);
+        ui.window().set_size(was);
+        settle(0);
+        while rx.try_recv().is_ok() {}
     }
 
     /// Rows whose shape has not moved are seated into the model on screen.

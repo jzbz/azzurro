@@ -3958,6 +3958,15 @@ export component AppWindow inherits Window {
                             //
                             // Whole items, so a scroll reports only as often as
                             // an item crosses an edge and not on every frame.
+                            //
+                            // Wrong for one frame in two places, which the next
+                            // frame puts right. A list built with rows already
+                            // in it has measured none of them at `init`, and
+                            // its viewport is as tall as itself, so it claims
+                            // every item. And a count that changes is shared
+                            // out over the height measured for the old count.
+                            // Both are pinned by
+                            // `the_browse_list_reports_the_rows_on_screen`.
                             property <int> first-shown: self.viewport-height > 0
                                 && root.browse-items.length > 0
                                 ? Math.clamp(Math.floor(-self.viewport-y
