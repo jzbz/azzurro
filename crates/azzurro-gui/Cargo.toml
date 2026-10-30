@@ -33,7 +33,7 @@ tracing-subscriber.workspace = true
 # renderer-femtovg-wgpu draws through wgpu — Vulkan on Linux — instead of
 # femtovg's OpenGL path. renderer-software stays enabled as a fallback for
 # machines without a usable GPU: SLINT_BACKEND=winit-software.
-slint = { version = "1.17", default-features = false, features = [
+slint = { version = "1.18.1", default-features = false, features = [
     "std",
     "compat-1-2",
     "accessibility",
@@ -58,28 +58,11 @@ slint = { version = "1.17", default-features = false, features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = "0.10"
 
-# macOS only, for `BackendSelector::with_winit_window_attributes_hook`. Slint
-# 1.17 asks winit for a transparent window, which on macOS 27 leaves the title
-# bar unpainted, and the hook is how the app asks for an opaque one instead;
-# `opaque_window` in src/lib.rs has the details. The feature adds no crate: the
-# winit backend it exposes is already compiled for `backend-winit`, and slint
-# gaining a direct edge to it is the whole of the change to Cargo.lock. Linux
-# and Windows build slint exactly as before, since Cargo leaves one target's
-# features out of another's build. Unstable and tied to winit 0.30, which is no
-# burden on a hook meant to go once the app is on Slint 1.18, where the backend
-# makes the same choice itself. `default-features = false` again, because a
-# declaration without it turns slint's defaults back on for macOS, whatever
-# `[dependencies]` says.
-[target.'cfg(target_os = "macos")'.dependencies]
-slint = { version = "1.17", default-features = false, features = [
-    "unstable-winit-030",
-] }
-
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.31"
 
 [build-dependencies]
-slint-build = "1.17"
+slint-build = "1.18.1"
 
 [dev-dependencies]
 # The paused clock, and nothing else. The upgrade watch measures twenty
@@ -95,7 +78,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # Its clicks are real: `single_click` dispatches a PointerPressed at the
 # element's own center and the window hit-tests it like any other, so a
 # control covered by something else fails here the way it would on screen.
-i-slint-backend-testing = "1.17"
+i-slint-backend-testing = "1.18.1"
 # The player on the loopback, for the backend tests that need a reply to come
 # back from somewhere — late, or not at all. A path dependency inside the
 # workspace, so nothing is downloaded for it.

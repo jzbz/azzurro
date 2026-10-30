@@ -2269,8 +2269,8 @@ component BrowseItemView inherits VerticalLayout {
         // no subtitles and so wants less than one of records; asking the tiles
         // is how the two stay right without the number being written twice.
         height: tiles.preferred-height;
-        viewport-width: root.item.tiles.length * 128px + 2 * Theme.pad;
-        viewport-height: self.height;
+        content-width: root.item.tiles.length * 128px + 2 * Theme.pad;
+        content-height: self.height;
 
         tiles := HorizontalLayout {
             accessible-role: list;
@@ -2811,6 +2811,13 @@ export component AppWindow inherits Window {
     // again the next time something joins that row. Height still needs saying,
     // since nothing in the window is tall enough to insist on one.
     min-height: 560px;
+    // Opaque in both schemes, which on macOS is what keeps the title bar
+    // painted. Slint makes the window transparent there when its background
+    // is translucent or it has no frame, and AppKit, at least on macOS 27
+    // (slint-ui/slint#12893), leaves a transparent window's frame unpainted:
+    // the buttons and the title over a strip of whatever is behind it.
+    // Nothing needs to show through — the glass panels are translucent over
+    // this, not over the desktop.
     background: Theme.bg;
 
     property <bool> has-selection: root.devices.length > 0
@@ -3875,7 +3882,7 @@ export component AppWindow inherits Window {
                             // the rest of the pane empty. Invisible while the
                             // window opened at 1100 and the pane was narrower than
                             // that preference; plain at 1440.
-                            viewport-width: self.width;
+                            content-width: self.width;
 
                             // A library's Artists page answers thirty of four
                             // hundred and hands over the request for the next
@@ -3920,7 +3927,7 @@ export component AppWindow inherits Window {
                             // every item is worth the same — the average of
                             // the ones it has built. So the offset that
                             // reaches a given item is that average times the
-                            // item, and the average is `viewport-height` over
+                            // item, and the average is `content-height` over
                             // the number of items, which is how the list
                             // arrived at the height in the first place. Adding
                             // the heights up here instead landed a jump a few
@@ -3936,13 +3943,13 @@ export component AppWindow inherits Window {
                             // snaps the offset to the item it settles on.
                             function jump-y() -> length {
                                 root.browse-items.length > 0 && root.browse-jump-at > 0
-                                    ? -(self.viewport-height * root.browse-jump-at
+                                    ? -(self.content-height * root.browse-jump-at
                                         / root.browse-items.length) - 0.5px
                                     : 0px
                             }
 
-                            changed viewport-y => {
-                                if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                            changed content-y => {
+                                if (self.content-height + self.content-y - self.height < 900px) {
                                     root.browse-more();
                                 }
                             }
@@ -3950,7 +3957,7 @@ export component AppWindow inherits Window {
                             // The items on screen, first and last, for the
                             // covers. Worked out the way `jump-y` is and for
                             // the same reason: the list believes every item is
-                            // worth `viewport-height` over the number of items,
+                            // worth `content-height` over the number of items,
                             // so that is what an offset is worth in items.
                             // Approximate where headings and shelves sit
                             // between the rows, which the backend allows for by
@@ -3967,16 +3974,16 @@ export component AppWindow inherits Window {
                             // out over the height measured for the old count.
                             // Both are pinned by
                             // `the_browse_list_reports_the_rows_on_screen`.
-                            property <int> first-shown: self.viewport-height > 0
+                            property <int> first-shown: self.content-height > 0
                                 && root.browse-items.length > 0
-                                ? Math.clamp(Math.floor(-self.viewport-y
-                                    * root.browse-items.length / self.viewport-height),
+                                ? Math.clamp(Math.floor(-self.content-y
+                                    * root.browse-items.length / self.content-height),
                                     0, root.browse-items.length - 1)
                                 : 0;
-                            property <int> last-shown: self.viewport-height > 0
+                            property <int> last-shown: self.content-height > 0
                                 && root.browse-items.length > 0
-                                ? Math.clamp(Math.ceil((self.height - self.viewport-y)
-                                    * root.browse-items.length / self.viewport-height) - 1,
+                                ? Math.clamp(Math.ceil((self.height - self.content-y)
+                                    * root.browse-items.length / self.content-height) - 1,
                                     0, root.browse-items.length - 1)
                                 : 0;
                             // On creation as well: a change tracker never fires
@@ -4004,14 +4011,14 @@ export component AppWindow inherits Window {
                             // stops on a page that brought nothing and on a cursor
                             // that repeats itself. Scrolling hid both, a person
                             // being the thing that gets bored and stops.
-                            changed viewport-height => {
+                            changed content-height => {
                                 if (self.settling) {
-                                    self.viewport-y = self.jump-y();
+                                    self.content-y = self.jump-y();
                                 }
                                 if (self.settling-end) {
-                                    self.viewport-y = min(0px, self.height - self.viewport-height);
+                                    self.content-y = min(0px, self.height - self.content-height);
                                 }
-                                if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                                if (self.content-height + self.content-y - self.height < 900px) {
                                     root.browse-more();
                                 }
                             }
@@ -4054,14 +4061,14 @@ export component AppWindow inherits Window {
                             changed to-top => {
                                 browse-list.settling = false;
                                 browse-list.settling-end = false;
-                                browse-list.viewport-y = 0;
+                                browse-list.content-y = 0;
                             }
 
                             property <int> to-end: root.browse-to-end;
                             changed to-end => {
                                 browse-list.settling = false;
-                                browse-list.viewport-y = min(0px,
-                                    browse-list.height - browse-list.viewport-height);
+                                browse-list.content-y = min(0px,
+                                    browse-list.height - browse-list.content-height);
                                 // Right when the rows are already measured, and
                                 // put right on the next measure when they are
                                 // not. See `settling-end` on the list.
@@ -4075,20 +4082,20 @@ export component AppWindow inherits Window {
                             changed paged => {
                                 browse-list.settling = false;
                                 browse-list.settling-end = false;
-                                browse-list.viewport-y = clamp(
-                                    browse-list.viewport-y
+                                browse-list.content-y = clamp(
+                                    browse-list.content-y
                                         + (root.browse-page-down
                                             ? -browse-list.height
                                             : browse-list.height),
                                     min(0px, browse-list.height
-                                        - browse-list.viewport-height),
+                                        - browse-list.content-height),
                                     0px);
                             }
 
                             property <int> at: root.browse-jumped;
                             changed at => {
                                 browse-list.settling-end = false;
-                                browse-list.viewport-y = browse-list.jump-y();
+                                browse-list.content-y = browse-list.jump-y();
                                 // Held there until the rows stop changing size
                                 // under it. See `settling` on the list.
                                 browse-list.settling = true;
@@ -4099,7 +4106,7 @@ export component AppWindow inherits Window {
                                 // a window too short to scroll would then never ask
                                 // for the page after it. The backend ignores the ask
                                 // when there is nothing further or one is out.
-                                if (browse-list.viewport-height + browse-list.viewport-y
+                                if (browse-list.content-height + browse-list.content-y
                                         - browse-list.height < 900px) {
                                     root.browse-more();
                                 }
@@ -4112,7 +4119,7 @@ export component AppWindow inherits Window {
                             //
                             // A timer rather than the scroll itself: a ListView
                             // exposes no `flicked`, and telling a reader's
-                            // scroll from a re-layout by watching `viewport-y`
+                            // scroll from a re-layout by watching `content-y`
                             // means knowing which of two `changed` handlers ran
                             // first. The second publish lands well inside this.
                             //
@@ -4475,7 +4482,7 @@ export component AppWindow inherits Window {
                         // As above: without this the settings, Help and
                         // technical-info rows are as wide as they would like
                         // rather than as wide as the pane.
-                        viewport-width: self.width;
+                        content-width: self.width;
                         accessible-item-count: root.settings.length;
 
                         for item[i] in root.settings: SettingRow {
@@ -5304,8 +5311,8 @@ export component AppWindow inherits Window {
                         // dead at it. The backend drops a second ask while one
                         // is already out, and a page that arrives for a queue
                         // that has since been replaced.
-                        changed viewport-y => {
-                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                        changed content-y => {
+                            if (self.content-height + self.content-y - self.height < 900px) {
                                 root.queue-more();
                             }
                         }
@@ -5319,8 +5326,8 @@ export component AppWindow inherits Window {
                         // Growing the viewport re-asks, so the pages chain
                         // until there is either something to scroll or
                         // nothing left to fetch.
-                        changed viewport-height => {
-                            if (self.viewport-height + self.viewport-y - self.height < 900px) {
+                        changed content-height => {
+                            if (self.content-height + self.content-y - self.height < 900px) {
                                 root.queue-more();
                             }
                         }
