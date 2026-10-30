@@ -259,6 +259,14 @@ Neither is announced. The queue's `id` does not change for a reorder or a
 delete, so `/Status` looks identical and a client has to re-read the queue
 itself.
 
+An add is. **Observed** on a Powernode, 2026-10-26, adding folders of 101 and
+134 tracks with Add last to an emptied queue: the long poll came back with a
+new `pid`, and `/Playlist`, asked at once, already held every track under that
+id. No status in between showed a partly filled queue. A clear is announced
+the same way, as a new `pid` with `length="0"`. A client can re-read on the
+`pid` change alone — and should expect that read to be slow while it is
+fetching covers; see below.
+
 Note that the queue keeps its position while a player is on an input: `pid` and
 `song` both stay put. The right reading is "where playback would resume", not
 "what you are hearing".
@@ -396,6 +404,33 @@ Covers are per *album*, not per track: every track from one album shares an
 artwork URL. A 42-track queue on the test player needed 22 fetches, so
 deduplicating by URL before fetching roughly halves the work on a queue built
 from albums and does far better on one built from a single record.
+
+### A queue read waits for the covers
+
+**Observed, and timed**, on a Powernode, 2026-10-26: the player answers
+`/Playlist` only once it has stopped serving cover art.
+
+* On its own, `/Playlist?start=0&end=499` for a 134-track queue took 0.28 s.
+* With four `/Artwork` requests at a time going on beside it, the same read
+  took 4.1–4.2 s, twice. It came back once the covers had run dry — after the
+  last of the 65 or so still to fetch when it was asked, not after the four
+  then in flight.
+* With no new cover asked for while it was out, it took 0.4–0.9 s, with forty
+  to fifty covers still waiting their turn.
+* A 30-track window was held back the same way (2 s and more against 0.06 s),
+  so it is not the size of the reply.
+* Browse screens and `/Status` were not held back: the music folder's
+  `/ui/BrowseObjects` took 0.57 s beside the same stream against 0.46 s alone,
+  and `/Status` 5 ms.
+
+For a controller that fetches covers for the lists it shows, that means every
+queue read waits behind whatever covers are still to come. A share's music root
+of 781 rows names 534 covers, and while they were being walked, tracks added to
+the queue took up to 5.4 s to appear in it. Azzurro asks a player for no new
+cover while a queue read is out to it (`Artwork::make_way` in
+`crates/azzurro-gui`). The covers come from the library service on port 11004
+(see above), which the queue is presumably read through as well; why the
+player orders the two this way is not known.
 
 ### Settings — a third service, on port 11001
 
