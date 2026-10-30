@@ -196,7 +196,7 @@ winget avoids that warning.
 ```bash
 brew install --cask jzbz/tap/azzurro               # macOS, from the tap
 flatpak install ./azzurro-*.flatpak                # Linux, from the bundle
-winget install Azzurro.Azzurro                     # Windows, once the manifest lands
+winget install Azzurro.Azzurro                     # Windows, from winget's repository
 ```
 
 The installer, `azzurro-vX.Y.Z-x86_64-setup.exe` from the release after 0.1.0
@@ -207,10 +207,8 @@ with Azzurro closed, takes all of that away again without touching the players,
 stations and everything else Azzurro remembers. The bare `.exe` keeps those in
 the same places, so moving from one to the other loses nothing.
 
-It is also what winget will install. The winget manifest is submitted rather
-than merged: the submission still open carries 0.1.0's bare `.exe`, and is to be
-switched to the first release with an installer before it merges. Until a
-moderator takes it, the Windows route is a file from the release;
+It is also what winget installs: Azzurro.Azzurro has been in winget's
+community repository since 2026-10-07, starting with 0.2.0's installer.
 `packaging/winget/README.md` has the detail.
 
 Every release ships a `SHA256SUMS` signed with the maintainer's PGP key. It is

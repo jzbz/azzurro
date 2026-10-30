@@ -55,20 +55,18 @@ and its `SHA256SUMS` signed, the pull request's branch
 (`jzbz:Azzurro.Azzurro-0.1.0`) got one commit that removes
 `manifests/a/Azzurro/Azzurro/0.1.0/` and adds 0.2.0's installer-only manifests
 in `manifests/a/Azzurro/Azzurro/0.2.0/`, written by hand as below, and the pull
-request was retitled for 0.2.0. Validation runs again on the new commit. The
-pull request keeps its history, and the first Azzurro anyone installs through
-winget is the installer, so nobody has a portable install to move off.
+request was retitled for 0.2.0. It was merged on 2026-10-07, so the first
+Azzurro anyone installs through winget is the installer, and nobody has a
+portable install to move off.
 
 ## The identifier
 
-`Azzurro.Azzurro`, as submitted, naming the project twice. rPGP's first
-submission named its project the same way, `rPGP.rPGP`, and winget's moderators
-asked for `jzbz.rPGP` instead: the publisher segment is the account that
-publishes. They may ask the same of this one, for `jzbz.Azzurro`. The identifier
-is effectively permanent once a version is merged, since changing it later means
-a new package and an orphaned old one that silently stops updating, so if it is
-going to change, the swap above is the moment. The manifests would then live at
-`manifests/j/jzbz/Azzurro/<version>/` instead.
+`Azzurro.Azzurro`, naming the project twice, and merged that way: winget's
+moderators asked for no change. (rPGP's first submission was named the same
+way, `rPGP.rPGP`, and there they asked for `jzbz.rPGP`.) The identifier is now
+permanent, since changing it would mean a new package and an orphaned old one
+that silently stops updating. The manifests live at
+`manifests/a/Azzurro/Azzurro/<version>/`.
 
 The installer does not care either way. Its `AppId`, `jzbz.Azzurro`, names the
 uninstall entry, `jzbz.Azzurro_is1`, which the manifest gives as its
@@ -86,13 +84,13 @@ over SHA256SUMS, not before.
 
 By hand, per release, and deliberately so — see below.
 
-Komac cannot write the first installer manifest. The setup exe is built by Inno
-Setup 7, and Komac 2.16.0, the latest release as of 2026-10-02, reads Inno
+Komac could not write the first installer manifest. The setup exe is built by
+Inno Setup 7, and Komac 2.16.0, the latest release as of 2026-10-02, read Inno
 installers through the `inno` crate 0.4.2, which refuses anything newer than
-Inno Setup 6.7; support for 7 came in `inno` 0.6.0, which Komac's main branch
-already uses. `komac update` also starts from the version winget-pkgs already
-has, which for Azzurro is none yet, and Komac opens pull requests rather than
-adding to one that is open. So the swap's manifests are written by hand,
+Inno Setup 6.7; 2.17.0 (2026-10-14) reads Inno Setup up to 7.1.0. `komac
+update` also starts from the version winget-pkgs already has, which for
+Azzurro was none then, and Komac opens pull requests rather than adding to one
+that is open. So the swap's manifests were written by hand,
 starting from `manifest/`, and pushed to the pull request's branch the way
 0.1.0 was submitted, with `gh api`. They have to read as follows:
 
@@ -117,29 +115,34 @@ publisher `Jonathan Zeppettini`, the version being submitted and the same
 ProductCode, and `InstallationMetadata`, if written, has
 `DefaultInstallLocation: '%LocalAppData%\Programs\Azzurro'`.
 
-Once an installer version is merged, later ones go through Komac as before,
-with one URL, the setup exe's, and a dry run first:
+Later versions go through Komac, with one URL, the setup exe's, writing the
+manifests to a folder:
 
-    komac update Azzurro.Azzurro --version 0.1.2 \
-      --urls https://github.com/jzbz/azzurro/releases/download/v0.1.2/azzurro-v0.1.2-x86_64-setup.exe \
-      --dry-run
+    komac update Azzurro.Azzurro --version 0.2.1 \
+      --urls https://github.com/jzbz/azzurro/releases/download/v0.2.1/azzurro-v0.2.1-x86_64-setup.exe \
+      --output <dir>
 
 Komac downloads the installer, reads what it needs from it, computes the hash
-and fills the schema; with `--submit` in place of `--dry-run` it then forks
-`microsoft/winget-pkgs` and opens the pull request. The Microsoft CLA is a
-one-time checkbox on that PR. That needs a Komac newer than 2.16.0, or one built
-from its main branch: `inno` 0.6.0 reads this installer's privileges as lowest,
+and fills the schema, then stops at a Submit / Edit / Exit menu with Submit
+chosen: **choose Exit**. The manifests are in `<dir>` by then. That needs
+Komac 2.17.0 or newer (its `inno` 0.7.0), for Inno Setup 7; on Komac's main
+branch before that, `inno` 0.6.0 read this installer's privileges as lowest,
 which Komac turns into `Scope: user`, and its ProductCode as
-`jzbz.Azzurro_is1`. The dry run should show the list above. If it shows anything
-else, run it again with `--output <dir>` in place of `--dry-run`, correct the
-manifests there by hand, and send that directory with `komac submit <dir>`,
-which submits manifests as they stand and analyzes no installer.
+`jzbz.Azzurro_is1`. Check what it wrote against the list above, and its
+`InstallerSha256` against the setup exe's line in the verified `SHA256SUMS`
+(below); correct anything by hand, then send them with `komac submit <dir>`,
+which analyzes no installer and keeps every value, InstallerSha256 included,
+though it writes the files out again in its own layout, without comments, and
+asks once more before sending. Not Submit in `komac update`, nor its
+`--submit`: that sends the hash Komac computed from its own download, which
+nobody has compared with the signed one. The Microsoft CLA is a one-time
+checkbox on the pull request.
 
 The hash comes from the signed file, not from Komac. In a directory holding the
 release's `SHA256SUMS` and `SHA256SUMS.asc`:
 
     gpg --verify SHA256SUMS.asc SHA256SUMS
-    awk '$2 == "azzurro-v0.1.1-x86_64-setup.exe" { print toupper($1) }' SHA256SUMS
+    awk '$2 == "azzurro-v0.2.1-x86_64-setup.exe" { print toupper($1) }' SHA256SUMS
 
 The first has to report a good signature from
 `252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; the second prints the value

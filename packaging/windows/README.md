@@ -88,8 +88,8 @@ Or install it, on a machine where losing nothing matters, and hash
 line.
 
 From Linux, innoextract is no help, since its newest code knows Inno Setup only
-up to 6.4, but the Rust `inno` crate reads Inno Setup 7 from 0.6.0, the version
-Komac's main branch uses. With its `extract` feature, `inno::Inno::new` on the
+up to 6.4, but the Rust `inno` crate reads Inno Setup 7 from 0.6.0 (Komac 2.17
+uses 0.7.0). With its `extract` feature, `inno::Inno::new` on the
 setup exe opened as a plain `std::fs::File` (a `BufReader` around it trips a
 bug in 0.6.0), then `files()`, yields `{app}\azzurro.exe` and its bytes, whose
 SHA-256 should equal the bare exe's line. That shows the payload is the signed

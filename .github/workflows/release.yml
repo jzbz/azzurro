@@ -31,9 +31,37 @@ on:
         description: "Tag or commit to build"
         required: true
 
-# Read by default; only the job that publishes gets write. The three build
-# jobs compile the build scripts of 800-odd crates, which run as ordinary code
-# on the runner beside the credential the checkout persists to disk.
+# One run per tag at a time. A tag moved and pushed again while its first run
+# is still building starts a second run under the same name, and both would
+# otherwise reach `release` and --clobber the same draft, whichever finished
+# last deciding file by file what it holds. The older run is cancelled
+# instead: what it was building is no longer what the tag names. checksums.yml
+# queues in the same group, so it never hashes a draft while an upload for
+# that tag is under way.
+#
+# The group is named for whatever the ref is, so a second dispatch of the
+# same commit or branch cancels the first as well, and the newer run is the
+# one to wait for. A re-run of an older run joins the group like a new run
+# and cancels a newer one in progress; if the tag has moved, the re-run's
+# Upload then refuses, and the newer run has to be started again.
+concurrency:
+  group: release-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Read by default; only the job that publishes gets write. The build jobs
+# compile the build scripts of 800-odd crates, which run as ordinary code on
+# the runner, so no checkout here leaves its credential on disk for them to
+# find: nothing after a checkout needs git credentials. flatpak-builder clones
+# the public URL, and gh is handed its token explicitly.
+#
+# For the same reason no job here restores a cache, unlike ci.yml. A manual
+# run is dispatched on master whatever commit it builds, so it saves into
+# master's cache scope, which every later run can restore, a tag build
+# included. Cargo trusts what it finds there: it links a cached rlib whose
+# fingerprint looks fresh, and unpacks a cached .crate without checking it
+# against Cargo.lock, whose checksums it verifies only on download. A cache
+# would let whatever one manual run compiled decide what a release links.
+# What ships is compiled here, from nothing.
 permissions:
   contents: read
 
@@ -46,6 +74,49 @@ env:
   TAG: ${{ inputs.ref || github.ref_name }}
 
 jobs:
+  # The commit every job below builds, resolved once. The build jobs start on
+  # separate runners, sometimes minutes apart, and if each checked out the ref
+  # by name, a tag moved during the run could put Flatpaks from one commit and
+  # an exe from another into the same release. Each checks out this SHA
+  # instead, and the Upload step refuses if the tag has since moved off it.
+  #
+  # actions/checkout still does the resolving, so a branch, a tag and a full
+  # SHA mean here what they meant when every job checked out inputs.ref. A tag
+  # push gives it no ref at all: it then fetches the pushed tag and fails
+  # unless that still names the commit the push event carried. Whether this is
+  # a tag build is read from the checkout rather than from the name:
+  # actions/checkout fetches the tag's ref when it was given a tag, and only
+  # then.
+  resolve:
+    name: Resolve the commit to build
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Resolve
+        id: resolve
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          tag=
+          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            if [ "$tagged" != "$head" ]; then
+              echo "::error::$TAG names $tagged, but the checkout is $head"
+              exit 1
+            fi
+            tag=$TAG
+          fi
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $head${tag:+ as $tag}"
+
   # Before any of the long builds, because nothing after them would notice. A
   # tag that disagrees with the version it builds publishes a release whose
   # name, `azzurro --version` and software-centre entry each say something
@@ -53,12 +124,14 @@ jobs:
   # changelog.
   version:
     name: Tag matches the version
+    needs: resolve
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Compare the tag with Cargo.toml and the metainfo
         run: |
@@ -97,7 +170,7 @@ jobs:
 
   bundle:
     name: Flatpak (${{ matrix.arch }})
-    needs: version
+    needs: [resolve, version]
     timeout-minutes: 90
     strategy:
       # One architecture failing must not hide the other's result: they are
@@ -111,7 +184,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Install flatpak-builder
         timeout-minutes: 20
@@ -165,9 +239,9 @@ jobs:
           for attempt in $(seq 1 $attempts); do
             rc=0
             flatpak install --user --noninteractive --arch=${{ matrix.arch }} flathub \
-              org.freedesktop.Platform//$RUNTIME_VERSION \
-              org.freedesktop.Sdk//$RUNTIME_VERSION \
-              org.freedesktop.Sdk.Extension.rust-stable//$RUNTIME_VERSION || rc=$?
+              org.freedesktop.Platform//"$RUNTIME_VERSION" \
+              org.freedesktop.Sdk//"$RUNTIME_VERSION" \
+              org.freedesktop.Sdk.Extension.rust-stable//"$RUNTIME_VERSION" || rc=$?
             if [ "$rc" -eq 0 ]; then
               exit 0
             fi
@@ -192,11 +266,9 @@ jobs:
       # commit that was checked out keeps the artifact honest even when the two
       # disagree — a tag moved after the fact cannot change what shipped.
       #
-      # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
-      # tip of the ref the workflow was *dispatched on* — master — while the
-      # checkout above honors inputs.ref and sits on the tag. HEAD is the
-      # commit being built by construction, on a tag push and a manual run
-      # alike.
+      # The commit `resolve` found, not GITHUB_SHA. On a manual run
+      # GITHUB_SHA is the tip of the ref the workflow was *dispatched on* —
+      # master — while the checkout above sits on the commit being built.
       #
       # `tag:` is rewritten with it, because flatpak-builder checks the two
       # against each other and refuses a source where they disagree ("Git
@@ -204,24 +276,20 @@ jobs:
       # build it becomes the tag being built. On anything else — a dispatch
       # naming a commit or a branch, which is how this workflow is tested — the
       # line is removed, since no tag names that commit and leaving the
-      # manifest's old one would contradict it.
-      #
-      # Whether this is a tag build is read from the checkout rather than from
-      # the name: actions/checkout fetches the tag's ref when it was given a
-      # tag, and only then.
+      # manifest's old one would contradict it. Whether it is a tag build,
+      # `resolve` decided.
       - name: Point the manifest at this commit
+        env:
+          BUILD_SHA: ${{ needs.resolve.outputs.sha }}
+          BUILD_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           head=$(git rev-parse HEAD)
-          tag=
-          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
-            if [ "$tagged" != "$head" ]; then
-              echo "::error::$TAG names $tagged, but the checkout is $head"
-              exit 1
-            fi
-            tag=$TAG
+          if [ "$head" != "$BUILD_SHA" ]; then
+            echo "::error::the checkout is $head, but resolve named $BUILD_SHA"
+            exit 1
           fi
-          python3 - "$head" "$tag" <<'PY'
+          python3 - "$head" "$BUILD_TAG" <<'PY'
           import pathlib, re, sys
           sha, tag = sys.argv[1], sys.argv[2]
           p = pathlib.Path("packaging/blue.azzurro.Azzurro.yml")
@@ -287,27 +355,14 @@ jobs:
   # without cutting a release.
   windows:
     name: Windows (x86_64)
-    needs: version
+    needs: [resolve, version]
     timeout-minutes: 60
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      # The registry only, never target/. A tag run can restore only caches
-      # saved by its own ref or by master, so a target/ cache from the previous
-      # tag never hits — and on a run where one did, another build's objects
-      # would be linked into the binary that ships. What ships is compiled here,
-      # from nothing.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       # The statically linked CRT is not set here. `.cargo/config.toml` already
       # asks for it per Windows target, and RUSTFLAGS in the environment
@@ -629,23 +684,14 @@ jobs:
   # need one per arch.
   macos:
     name: macOS (universal, signed by hand)
-    needs: version
+    needs: [resolve, version]
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      # The registry only, for the reason the Windows job gives.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Add the Intel target
         run: rustup target add x86_64-apple-darwin
@@ -708,7 +754,7 @@ jobs:
 
   release:
     name: Attach to the release
-    needs: [bundle, windows]
+    needs: [resolve, bundle, windows]
     # Windows has to have built, and at least one Flatpak architecture: they
     # are separate downloads, so a release missing one of them is still worth
     # attaching. `bundle` is a matrix, and its one result speaks for both legs:
@@ -806,6 +852,7 @@ jobs:
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -831,16 +878,77 @@ jobs:
           done
           ls -lh "${files[@]}"
 
-          # A tag push creates no release on its own, so make one if it is not
-          # already there. --verify-tag refuses to invent a tag that does not
-          # exist, which would otherwise turn a typo into a published release.
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # The tag has to name the commit these files were built from. Every
+          # build job checked out the one commit `resolve` found, so they agree
+          # with each other; this ties them to the tag. It matters most on a
+          # re-run: "Re-run failed jobs" keeps the first attempt's builds and
+          # the commit it resolved, and the tag may have moved since. Asked
+          # for the bare SHA, which peels an annotated tag to its commit
+          # without GitHub also computing that commit's diff.
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" \
+            -H 'Accept: application/vnd.github.sha') || {
+            echo "::error::could not find the commit the tag $TAG names"
+            exit 1
+          }
+          if [ "$tagged" != "$BUILD_SHA" ]; then
+            echo "::error::$TAG names $tagged, but these files were built from $BUILD_SHA."
+            echo "::error::Run the workflow again for the tag as it now stands."
+            exit 1
+          fi
+
+          # Whether there is a release for the tag, whether it is a draft and
+          # what it carries, read so that any gh failure stops the step: taken
+          # for "no release" it would create a second draft beside the first,
+          # and taken for "no signature" it would --clobber assets under one.
+          # From the REST listing, which shows drafts to a token that can push,
+          # rather than from `gh release view`. That looks a release up two
+          # ways at once and answers "release not found" when one lookup says
+          # so and the other fails; for a draft the published-release lookup
+          # always says so, so a passing error in the draft lookup reads
+          # exactly like no release at all.
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | .id') || {
+            echo "::error::could not list the releases of $GITHUB_REPOSITORY"
+            exit 1
+          }
+          # The commit the draft's files were built from rides in its notes as
+          # an HTML comment, which the release page doesn't show, so that a
+          # later run can tell when it is attaching builds of another commit.
+          marker="<!-- built from $BUILD_SHA -->"
+          count=$(grep -c . <<<"$ids" || true)
+          case $count in
+          0)
+            # A tag push creates no release on its own, so make one.
+            # --verify-tag refuses to invent a tag that does not exist, which
+            # would otherwise turn a typo into a published release.
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag --draft \
               --title "Azzurro $TAG" \
+              --notes "$marker" \
               --generate-notes
-          fi
+            # Just made, so a draft with nothing attached, from this commit.
+            state=$(printf 'true\n%s' "$BUILD_SHA")
+            ;;
+          1)
+            state=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ids" \
+              --jq '(.draft | tostring),
+                ((.body // "" | capture("<!-- built from (?<sha>[0-9a-f]{40}) -->") | .sha) // ""),
+                .assets[].name') || {
+              echo "::error::could not read the release for $TAG"
+              exit 1
+            }
+            ;;
+          *)
+            echo "::error::$TAG has $count releases. Which one these files belong"
+            echo "::error::to is not for this workflow to guess; delete the extra"
+            echo "::error::drafts and run it again."
+            exit 1
+            ;;
+          esac
+          draft=$(sed -n 1p <<<"$state")
+          built=$(sed -n 2p <<<"$state")
+          assets=$(tail -n +3 <<<"$state")
 
           # Only ever onto a draft, and never under a signature. A re-run, or a
           # dispatch naming a tag released long ago, would otherwise --clobber
@@ -849,20 +957,16 @@ jobs:
           # against the file beside it, which reads as tampering rather than as
           # a rebuild. The same refusal checksums.yml makes, for the same
           # reason: the operator decides, not the workflow.
-          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq .isDraft)
           if [ "$draft" != true ]; then
             echo "::error::$TAG is already published. Its assets are not replaced"
             echo "::error::after the fact; a changed build needs a new tag."
             exit 1
           fi
-          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name')
           if grep -qx 'SHA256SUMS.asc' <<<"$assets"; then
             echo "::error::$TAG already has SHA256SUMS.asc. Replacing assets would"
             echo "::error::invalidate it. Delete the signature first if the"
             echo "::error::artifacts genuinely need rebuilding:"
-            echo "::error::  gh release delete-asset $TAG SHA256SUMS.asc"
+            echo "::error::  gh release delete-asset $TAG SHA256SUMS.asc --repo $GITHUB_REPOSITORY"
             exit 1
           fi
           # An unsigned SHA256SUMS from an earlier run describes the builds
@@ -879,7 +983,50 @@ jobs:
             echo "::warning::which would not have matched these builds, so it was"
             echo "::warning::deleted. Run checksums.yml again once every asset is attached."
           fi
+          # A signed macOS zip comes from one run's macos-universal artifact.
+          # Builds of another commit (the tag was moved) would otherwise sit
+          # beside it, and the SHA256SUMS signed next would vouch for the two
+          # commits mixed. A rebuild of the same commit keeps it.
+          macos="azzurro-$TAG-macos-universal.zip"
+          if grep -qx "$macos" <<<"$assets" && [ "$built" != "$BUILD_SHA" ]; then
+            gh release delete-asset "$TAG" "$macos" \
+              --repo "$GITHUB_REPOSITORY" --yes
+            echo "::warning::$TAG carried $macos built from ${built:-an unrecorded commit},"
+            echo "::warning::not $BUILD_SHA, so it was deleted. Sign this run's macos-universal"
+            echo "::warning::artifact with packaging/macos-sign.sh and upload that instead."
+          fi
+          # Likewise a Flatpak of another commit that this run is not
+          # replacing, which happens when the tag moved and one architecture's
+          # build failed this time: it would stay beside this commit's files.
+          if [ "$built" != "$BUILD_SHA" ]; then
+            for arch in x86_64 aarch64; do
+              name="azzurro-$TAG-$arch.flatpak"
+              if grep -qx "$name" <<<"$assets" && [ ! -e "$name" ]; then
+                gh release delete-asset "$TAG" "$name" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+                echo "::warning::$TAG carried $name built from ${built:-an unrecorded commit},"
+                echo "::warning::not $BUILD_SHA, and this run built no $arch Flatpak, so it was deleted."
+              fi
+            done
+          fi
 
+          # --clobber, so a re-run replaces its own earlier uploads. It only
+          # ever touches a draft with no signature, which the checks above
+          # have just established.
           gh release upload "$TAG" \
             "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+          # Now that its files are this commit's, the draft says so.
+          if [ "$built" != "$BUILD_SHA" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/$ids" --jq '.body // ""' > notes.md || {
+              echo "::error::could not read the notes of $TAG to record $BUILD_SHA"
+              exit 1
+            }
+            if grep -q '<!-- built from [0-9a-f]\{40\} -->' notes.md; then
+              sed -i "s/<!-- built from [0-9a-f]\{40\} -->/$marker/" notes.md
+            else
+              printf '%s\n\n%s\n' "$marker" "$(cat notes.md)" > notes.new && mv notes.new notes.md
+            fi
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          fi
