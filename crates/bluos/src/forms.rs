@@ -221,7 +221,7 @@ pub fn parse(html: &str) -> Vec<Form> {
                         if let Some((target, words)) = label.take()
                             && !target.is_empty()
                         {
-                            labels.insert(target, tidy(&words));
+                            labels.insert(target, label_of(&words));
                         }
                     }
 
@@ -437,6 +437,22 @@ fn is_hidden(attrs: &BTreeMap<String, String>) -> bool {
         || attrs
             .get("style")
             .is_some_and(|style| style.replace(' ', "").contains("display:none"))
+}
+
+/// The longest a label is kept.
+///
+/// A label is copied into every input that names it, so one long label and
+/// many inputs pointing at it made the memory a form costs the product of the
+/// two. Real labels are a word or a short phrase.
+const MAX_LABEL: usize = 256;
+
+/// A label's words, tidied and cut to [`MAX_LABEL`] characters.
+fn label_of(words: &str) -> String {
+    let mut label = tidy(words);
+    if let Some((cut, _)) = label.char_indices().nth(MAX_LABEL) {
+        label.truncate(cut);
+    }
+    label
 }
 
 /// Trailing colons and collapsed whitespace: the pages write "Password:".

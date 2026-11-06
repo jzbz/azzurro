@@ -100,7 +100,7 @@ const MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// Fetches allowed at once. Enough to fill a list quickly, few enough that
 /// opening a long queue does not put thirty connections into a speaker that is
 /// also trying to play music.
-const CONCURRENT_FETCHES: usize = 4;
+pub(crate) const CONCURRENT_FETCHES: usize = 4;
 
 /// Decodes allowed at once.
 ///
@@ -206,18 +206,73 @@ pub type Players = std::sync::Arc<Mutex<std::collections::HashSet<std::net::IpAd
 /// the only thing this can turn away is a flood.
 const MAX_ART_HOSTS: usize = 256;
 
+/// The longest cover URL fetched or kept.
+///
+/// The decoded cache is bounded by pixels, and each entry is keyed by its URL
+/// in two maps, so a URL is memory the bound does not count. Real cover URLs
+/// are a few hundred bytes; a player naming megabyte-long ones, one per row,
+/// would otherwise hold that much again per cover kept.
+const MAX_URL: usize = 4096;
+
 /// Whether art may be fetched from `url`, given the players adopted so far.
 ///
 /// [`permitted`] alone is the rule for somewhere this app has never spoken to;
 /// this adds the players themselves, whose own addresses are exactly the
 /// private space that rule refuses.
 pub fn allowed_by(players: &Players, url: &reqwest::Url) -> bool {
+    if url.as_str().len() > MAX_URL {
+        return false;
+    }
     if permitted(url) {
         return true;
     }
     match url.host_str().and_then(literal_address) {
         Some(addr) => players.lock().unwrap().contains(&addr),
         None => false,
+    }
+}
+
+/// Whether art may be fetched from this address, given the players adopted
+/// so far: the address rule in [`permitted`], with the players let through.
+pub fn address_allowed(players: &Players, addr: std::net::IpAddr) -> bool {
+    let addr = addr.to_canonical();
+    !(addr.is_loopback() || addr.is_unspecified() || is_private(addr))
+        || players.lock().unwrap().contains(&addr)
+}
+
+/// The artwork client's resolver: the system's, with what a name resolves to
+/// held to the same rule an address written into the URL is.
+///
+/// [`permitted`] can only judge a host written as an address, and a player
+/// chooses its cover URLs outright — so without this, any name that resolves
+/// into loopback or private space (there are public wildcard domains that do
+/// exactly that for any address spelled into the name) reached what the
+/// address rule refuses, with no redirect needed. Judged here, at resolution,
+/// the address checked is the address dialled: there is no second lookup for
+/// the answer to change between.
+///
+/// Only names come through here; a URL that writes an address is never
+/// resolved, and is judged by [`allowed_by`].
+pub struct Guarded {
+    pub players: Players,
+}
+
+impl reqwest::dns::Resolve for Guarded {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let players = self.players.clone();
+        Box::pin(async move {
+            let host = name.as_str();
+            let kept: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+                .await?
+                .filter(|found| address_allowed(&players, found.ip()))
+                .collect();
+            if kept.is_empty() {
+                return Err(
+                    format!("{host} resolves only to addresses art is not fetched from").into(),
+                );
+            }
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -231,11 +286,9 @@ pub fn allowed_by(players: &Players, url: &reqwest::Url) -> bool {
 ///
 /// So: the player's own art is fine, a CDN's is fine, and an address in
 /// private, loopback or link-local space that is *not* a player is not. The
-/// host is only inspected when it is written as an address; a name is left to
-/// the resolver, which is the gap in this — a name that resolves into private
-/// space still passes. Closing that needs a connect-time hook rather than a
-/// check here, and the hop limit above bounds how far a redirect can walk
-/// toward one.
+/// host is only inspected here when it is written as an address. A name is
+/// passed, and judged where it is resolved, by [`Guarded`] — which is where
+/// the address it stands for is known.
 pub fn permitted(url: &reqwest::Url) -> bool {
     if !matches!(url.scheme(), "http" | "https") {
         return false;
@@ -1044,6 +1097,9 @@ impl Artwork {
 
     /// Whether art may be fetched from here, given the players adopted so far.
     fn may_fetch(&self, url: &str) -> bool {
+        if url.len() > MAX_URL {
+            return false;
+        }
         match reqwest::Url::parse(url) {
             Ok(url) => allowed_by(&self.players, &url),
             Err(_) => false,
@@ -1061,7 +1117,7 @@ impl Artwork {
     /// `size` bounds both dimensions; the aspect ratio is kept, so art that is
     /// not square comes back smaller in one axis rather than distorted.
     pub async fn get(&self, url: &str, size: u32) -> Option<Pixels> {
-        if url.is_empty() {
+        if url.is_empty() || url.len() > MAX_URL {
             return None;
         }
         // Wanted is used: a queue read asking for a cover it already has is
@@ -1623,6 +1679,62 @@ fn prune(dir: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name is judged by what it resolves to. `localhost` resolves to the
+    /// loopback on every machine, with no network, which makes it the stand-in
+    /// for any name a player could point into this machine or the LAN.
+    #[tokio::test]
+    async fn a_name_that_resolves_into_private_space_is_not_dialled() {
+        use reqwest::dns::Resolve;
+        let players = Players::default();
+        let guarded = Guarded {
+            players: players.clone(),
+        };
+        let name = |host: &str| host.parse::<reqwest::dns::Name>().unwrap();
+
+        assert!(
+            guarded.resolve(name("localhost")).await.is_err(),
+            "the loopback, reached by name"
+        );
+
+        // Unless it is a player, as an address written out would be.
+        players.lock().unwrap().extend([
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+            "::1".parse().unwrap(),
+        ]);
+        let found: Vec<_> = guarded
+            .resolve(name("localhost"))
+            .await
+            .expect("a player's own address")
+            .collect();
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|a| a.ip().is_loopback()));
+    }
+
+    #[test]
+    fn the_address_rule_lets_players_through_and_nothing_else_private() {
+        let players = Players::default();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(address_allowed(&players, ip("151.101.1.1")), "a CDN");
+        assert!(!address_allowed(&players, ip("127.0.0.1")));
+        assert!(!address_allowed(&players, ip("::ffff:127.0.0.1")), "mapped");
+        assert!(!address_allowed(&players, ip("192.168.1.1")));
+        players.lock().unwrap().insert(ip("192.168.1.155"));
+        assert!(address_allowed(&players, ip("192.168.1.155")));
+        assert!(!address_allowed(&players, ip("192.168.1.1")));
+    }
+
+    /// The decoded cache is bounded by pixels and keyed by URL, so a URL past
+    /// the ceiling is neither fetched nor offered.
+    #[test]
+    fn an_overlong_url_is_not_fetched() {
+        let players = Players::default();
+        let long = format!("https://cdn.example/{}", "a".repeat(MAX_URL));
+        assert!(!allowed_by(&players, &reqwest::Url::parse(&long).unwrap()));
+        let art = Artwork::in_memory(reqwest::Client::new(), players);
+        assert!(!art.may_fetch(&long));
+        assert!(art.may_fetch("https://cdn.example/cover.jpg"));
+    }
 
     /// A valid 24-bit BMP header declaring `w` by `h`, with almost no pixel
     /// data behind it — the shape a header bomb takes.

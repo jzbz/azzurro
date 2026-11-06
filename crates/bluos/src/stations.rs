@@ -21,6 +21,8 @@
 //! The `service` on the root is inherited by rows that do not carry their own,
 //! which is how the Capture list can name two inputs without repeating itself.
 
+use std::sync::Arc;
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -33,8 +35,9 @@ pub struct Station {
     /// What it is called. The alarm stores this as its `source`.
     pub text: String,
     /// Which service it belongs to, inherited from the document where the row
-    /// does not say.
-    pub service: Option<String>,
+    /// does not say. Shared with the document for the same reason as
+    /// [`Self::group`].
+    pub service: Option<Arc<str>>,
     /// Percent-encoded on the wire. Held decoded, because that is the form the
     /// alarm routes want it in.
     pub url: Option<String>,
@@ -53,7 +56,7 @@ pub struct Station {
     /// inside the 4 MiB reply cap could name a heading of a couple of megabytes
     /// and then a hundred thousand rows to hang under it. An `Arc` makes each
     /// row cost a pointer.
-    pub group: Option<std::sync::Arc<str>>,
+    pub group: Option<Arc<str>>,
 }
 
 impl Station {
@@ -96,7 +99,7 @@ const QUERY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stations {
     /// The service this level belongs to, where the document says.
-    pub service: Option<String>,
+    pub service: Option<Arc<str>>,
     pub rows: Vec<Station>,
 }
 
@@ -130,7 +133,7 @@ pub fn parse(xml: &str) -> Result<Stations> {
 
         match name {
             "radiotime" => {
-                out.service = a.remove("service");
+                out.service = a.remove("service").map(Arc::from);
                 seen_root = true;
             }
             _ if !seen_root => {
@@ -155,7 +158,10 @@ pub fn parse(xml: &str) -> Result<Stations> {
                 out.rows.push(Station {
                     text: a.remove("text").unwrap_or_default(),
                     // The row's own service wins; the document's stands in.
-                    service: a.remove("service").or_else(|| out.service.clone()),
+                    service: a
+                        .remove("service")
+                        .map(Arc::from)
+                        .or_else(|| out.service.clone()),
                     url,
                     image: a.remove("image"),
                     key: a.remove("key"),

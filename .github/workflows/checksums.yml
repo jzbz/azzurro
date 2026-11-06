@@ -92,7 +92,10 @@ jobs:
             --pattern '*' --clobber
           rm -f SHA256SUMS SHA256SUMS.asc
 
-          shopt -s nullglob
+          # dotglob too: an asset whose name starts with a dot is on the
+          # release like any other, and leaving it out of SHA256SUMS would
+          # sign for a release that is not all there.
+          shopt -s nullglob dotglob
           files=(*)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::$TAG has no assets to hash"
@@ -102,7 +105,8 @@ jobs:
           # Bare filenames, not paths, so `sha256sum -c SHA256SUMS` works in
           # whatever directory someone downloaded them to.
           ls -lh
-          sha256sum "${files[@]}" > SHA256SUMS
+          # `--` so an asset named like an option is hashed, not obeyed.
+          sha256sum -- "${files[@]}" > SHA256SUMS
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 

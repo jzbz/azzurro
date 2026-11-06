@@ -171,9 +171,11 @@ pub fn outcome(screen: &str, rows: &[String], sealed: bool) -> &'static str {
 
 /// Whether an id survives the round trip through the file above.
 ///
-/// The separators the format uses, plus anything that would split a line.
+/// The separators the format uses, plus anything that would split a line, and
+/// space at either end, which [`parse`] trims off and so would read back as a
+/// different id.
 fn writable(id: &str) -> bool {
-    !id.is_empty() && !id.contains(['\n', '\r', ':', ',', '#'])
+    !id.is_empty() && id.trim() == id && !id.contains(['\n', '\r', ':', ',', '#'])
 }
 
 /// Sections that are never drawn.
@@ -321,6 +323,12 @@ mod tests {
             outcome("screen-home", &partly, false),
             "Home rearranged, but not all of it can be saved"
         );
+        let padded = vec!["recent".to_owned(), " presets ".to_owned()];
+        assert_eq!(
+            outcome("screen-home", &padded, false),
+            "Home rearranged, but not all of it can be saved",
+            "an id parse would trim does not read back as itself"
+        );
         assert_eq!(
             outcome("screen:home", &rows, false),
             "Home rearranged, but it cannot be saved"
@@ -350,11 +358,8 @@ mod tests {
     fn what_was_written_reads_back() {
         let mut orders = Orders::new();
         orders.insert("screen-home".into(), vec!["b".into(), "a".into()]);
-        let mut text = String::new();
-        for (screen, rows) in &orders {
-            text.push_str(&format!("{screen}: {}\n", rows.join(", ")));
-        }
-        assert_eq!(parse(&text), orders);
+        orders.insert("screen-other".into(), vec!["c".into()]);
+        assert_eq!(parse(&body(&orders)), orders);
     }
 
     #[test]

@@ -51,6 +51,15 @@ pub type Heard = Vec<(DeviceId, Status)>;
 /// end.
 const MAX_REMEMBERED: usize = crate::known::MAX_REMEMBERED;
 
+/// The longest field written down.
+///
+/// Every field is the player's to fill and is written again on every track
+/// change, so without a ceiling one long title — or a player sending one —
+/// sets the size of a file the app rewrites as it plays. Real titles, paths
+/// and stream URLs are a fraction of this; a track past it just goes without
+/// its tier after a restart, as one with a tab in it does.
+const MAX_FIELD: usize = 4096;
+
 /// What was last heard from the player at `id`.
 pub fn about(heard: &Heard, id: DeviceId) -> Option<&Status> {
     heard
@@ -92,7 +101,7 @@ fn keepable(status: &Status) -> Option<Status> {
     let writable = [&kept.quality, &kept.stream_url, &kept.title1, &kept.file]
         .into_iter()
         .flatten()
-        .all(|value| !value.contains(['\t', '\n', '\r']));
+        .all(|value| value.len() <= MAX_FIELD && !value.contains(['\t', '\n', '\r']));
     // A status that names no track is the same as nothing to `same_track`, so
     // one written down would never be carried anywhere.
     (writable && kept.same_track(&kept)).then_some(kept)
@@ -359,6 +368,12 @@ mod tests {
             ..playing_mqa()
         };
         assert!(!remember(&mut heard, player(11000), &tabbed));
+
+        let long = Status {
+            title1: Some("a".repeat(MAX_FIELD + 1)),
+            ..playing_mqa()
+        };
+        assert!(!remember(&mut heard, player(11000), &long), "too long");
 
         let untitled = Status {
             quality: Some("cd".to_owned()),

@@ -10,6 +10,8 @@
 //! id. Modeling that as `Option` rather than empty strings keeps "the player
 //! did not say" distinct from "the player said nothing".
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
 use crate::device::DeviceId;
@@ -491,17 +493,25 @@ impl Status {
     /// The player names the field and the value it should hold, leaving the
     /// client to compare them; this is the lookup half of that. Unknown keys
     /// return `None`, which reads as "does not match" rather than as an error.
-    pub fn field(&self, key: &str) -> Option<String> {
+    ///
+    /// Borrowed where the field is text: this is asked once per matching row
+    /// on every publish, and a copy of a long stream URL per row was the
+    /// whole of its cost.
+    pub fn field(&self, key: &str) -> Option<Cow<'_, str>> {
+        fn text(field: &Option<String>) -> Option<Cow<'_, str>> {
+            field.as_deref().map(Cow::Borrowed)
+        }
+        let number = |field: Option<u32>| field.map(|v| Cow::Owned(v.to_string()));
         match key {
-            "service" => self.service.clone(),
-            "serviceType" => self.service_type.clone(),
-            "inputId" => self.input_id.clone(),
-            "state" => self.state.clone(),
-            "streamUrl" => self.stream_url.clone(),
-            "song" => self.song.map(|v| v.to_string()),
-            "sid" => self.sid.map(|v| v.to_string()),
-            "pid" => self.pid.map(|v| v.to_string()),
-            "prid" => self.prid.map(|v| v.to_string()),
+            "service" => text(&self.service),
+            "serviceType" => text(&self.service_type),
+            "inputId" => text(&self.input_id),
+            "state" => text(&self.state),
+            "streamUrl" => text(&self.stream_url),
+            "song" => number(self.song),
+            "sid" => number(self.sid),
+            "pid" => number(self.pid),
+            "prid" => number(self.prid),
             _ => None,
         }
     }

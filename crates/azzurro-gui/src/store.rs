@@ -91,7 +91,16 @@ pub struct Store {
     /// whether what they are about to promise will survive the next start —
     /// rather than only the one about reading.
     failed: AtomicBool,
+    /// Run by the next [`Self::flush`] once it has carried the body out and
+    /// before it touches the disk: the one moment a writer is truly in
+    /// flight, which holding the lock on writing does not reach.
+    #[cfg(test)]
+    between: Mutex<Option<Between>>,
 }
+
+/// See `Store::between`.
+#[cfg(test)]
+type Between = Box<dyn FnOnce(&Store) + Send>;
 
 impl Store {
     /// A file of this name under `~/.config/azzurro`.
@@ -112,6 +121,8 @@ impl Store {
             writing: Mutex::new(()),
             sealed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            #[cfg(test)]
+            between: Mutex::new(None),
         }
     }
 
@@ -264,6 +275,10 @@ impl Store {
             // is always the whole file, so there is nothing left over.
             return;
         };
+        #[cfg(test)]
+        if let Some(between) = self.between.lock().unwrap().take() {
+            between(self);
+        }
 
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -508,6 +523,41 @@ mod tests {
         store.flush();
         assert_eq!(std::fs::read_to_string(dir.file()).unwrap(), "second\n");
         assert_eq!(store.read().as_deref(), Some("second\n"));
+    }
+
+    /// The two tests above hold the writer at the lock, before it has the
+    /// body. This one stops it after: the body carried out, the disk still
+    /// holding the old one. A read there has to answer with what is being
+    /// written — a writer that took the body rather than cloning it would
+    /// leave nothing to answer with — and a body staged there has to outlive
+    /// the write, which only the stamp check at the end of `flush` decides.
+    #[test]
+    fn a_write_in_flight_neither_hides_its_body_nor_clears_a_newer_one() {
+        let dir = Dir::new("in-flight");
+        std::fs::write(dir.file(), "old\n").expect("the file to be there");
+        let store = dir.store(Durability::Rename);
+
+        store.stage("first\n".to_owned());
+        *store.between.lock().unwrap() = Some(Box::new(|store: &Store| {
+            assert_eq!(
+                std::fs::read_to_string(store.path.as_deref().unwrap()).unwrap(),
+                "old\n",
+                "the write is not on the disk yet"
+            );
+            assert_eq!(store.read().as_deref(), Some("first\n"));
+            store.stage("second\n".to_owned());
+        }));
+        store.flush();
+        assert!(store.between.lock().unwrap().is_none(), "the hook ran");
+        assert_eq!(std::fs::read_to_string(dir.file()).unwrap(), "first\n");
+        assert_eq!(
+            store.read().as_deref(),
+            Some("second\n"),
+            "staged while the write was out, so still staged"
+        );
+
+        store.flush();
+        assert_eq!(std::fs::read_to_string(dir.file()).unwrap(), "second\n");
     }
 
     #[test]

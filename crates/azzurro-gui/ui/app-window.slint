@@ -480,6 +480,9 @@ component SettingRow inherits Rectangle {
                 enabled: root.item.available;
                 minimum: root.item.minimum;
                 maximum: root.item.maximum;
+                // The player's step, for the arrow keys. A drag does not snap
+                // to it; the write rounds onto it instead.
+                step: root.item.step > 0 ? root.item.step : 1;
                 value: root.item.number;
                 // On release: a drag writes to the player, and every
                 // intermediate value would be a POST.

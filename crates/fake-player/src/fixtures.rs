@@ -164,8 +164,10 @@ pub fn no_alarms() -> &'static str {
 <alarms supportsEndTime="true"></alarms>"#
 }
 
-/// One alarm, carrying every attribute the official controller reads —
-/// including the player's two spellings of a boolean.
+/// One alarm, carrying the attributes the official controller reads —
+/// including the player's two spellings of a boolean — except `shuffle` and
+/// `canShuffle`, which are left off: this is also an alarm from firmware that
+/// does not write them, and nothing here asserts on them yet.
 pub fn one_alarm() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <alarms supportsEndTime="true">

@@ -28,6 +28,12 @@ pub const QUERY_SCHEDULE: [u64; 7] = [0, 1, 2, 3, 5, 7, 10];
 /// Long enough to cover the whole schedule with room for the last replies.
 pub const DEFAULT_SWEEP: Duration = Duration::from_secs(12);
 
+/// The most node ids one sweep keeps track of. A home has a handful of
+/// players; this is far past any network of them, and small enough that a
+/// flood of invented ids costs a bounded table rather than whatever the
+/// sender can send in a sweep.
+const MAX_SEEN: usize = 4096;
+
 /// The receive buffer, big enough that no datagram can be cut short by it: a
 /// UDP payload cannot exceed 65507 bytes.
 ///
@@ -297,9 +303,19 @@ impl Discovery {
 /// announcement settles an id now. An unusable one is still handed over once,
 /// since deciding for the caller what is worth seeing is not this function's
 /// job, but a usable one after it is handed over too.
+///
+/// The table is bounded: every new id is a new entry, and a node id is
+/// whatever bytes the sender chose, so a segment flooding announcements with
+/// fresh ids would otherwise grow it for the whole of the sweep. Past
+/// [`MAX_SEEN`] a new id is not handed over; one already seen still settles.
 fn worth_handing_over(seen: &mut BTreeMap<Vec<u8>, bool>, announce: &Announce) -> bool {
     let usable = announce.player().is_some();
+    let full = seen.len() >= MAX_SEEN;
     match seen.entry(announce.node_id.clone()) {
+        Entry::Vacant(_) if full => {
+            tracing::debug!("not handing over another node id: {MAX_SEEN} seen this sweep");
+            false
+        }
         Entry::Vacant(slot) => {
             slot.insert(usable);
             true
@@ -367,6 +383,16 @@ pub fn is_local(address: IpAddr) -> bool {
     let IpAddr::V4(address) = address else {
         return false;
     };
+    // Never a player, whatever the interfaces say: these are this machine, or
+    // everyone, and a forged announcement naming one is the case this check
+    // is the last word on.
+    if address.is_loopback()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast()
+    {
+        return false;
+    }
     let address = u32::from(address);
 
     if_addrs::get_if_addrs()
@@ -374,14 +400,19 @@ pub fn is_local(address: IpAddr) -> bool {
         .flatten()
         .filter(|iface| !iface.is_loopback())
         .any(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) => {
-                let mask = u32::from(v4.netmask);
-                // A /32 — a point-to-point or VPN interface — matches only
-                // itself, which is the right answer rather than a special case.
-                (u32::from(v4.ip) & mask) == (address & mask)
-            }
+            if_addrs::IfAddr::V4(v4) => on_subnet(u32::from(v4.ip), u32::from(v4.netmask), address),
             if_addrs::IfAddr::V6(_) => false,
         })
+}
+
+/// Whether `candidate` is on the subnet of an interface at `ip` with `mask`.
+///
+/// A /32 — a point-to-point or VPN interface — matches only itself, which is
+/// the right answer rather than a special case. A /0 is the special case: it
+/// would match every address there is, which is not what "attached" means, so
+/// an interface reporting one counts for nothing.
+fn on_subnet(ip: u32, mask: u32, candidate: u32) -> bool {
+    mask != 0 && (ip & mask) == (candidate & mask)
 }
 
 /// The broadcast address of every usable IPv4 interface.
@@ -518,6 +549,60 @@ mod tests {
         // And having got in, it settles the id.
         assert!(!worth_handing_over(&mut seen, &real));
         assert!(!worth_handing_over(&mut seen, &forged));
+    }
+
+    /// A flood of invented node ids stops growing the table at its ceiling,
+    /// and an id already in it still settles past that.
+    #[test]
+    fn a_flood_of_node_ids_is_bounded() {
+        let mut seen = BTreeMap::new();
+        let forged = announce(b"node", &[(0, 4)]);
+        assert!(worth_handing_over(&mut seen, &forged));
+        for i in 1..MAX_SEEN as u32 {
+            assert!(worth_handing_over(
+                &mut seen,
+                &announce(&i.to_be_bytes(), &[(0, 1)])
+            ));
+        }
+        assert_eq!(seen.len(), MAX_SEEN);
+
+        let newcomer = announce(b"one more", &[(0, 1)]);
+        assert!(!worth_handing_over(&mut seen, &newcomer));
+        assert_eq!(seen.len(), MAX_SEEN);
+
+        let real = announce(b"node", &[(0, 1)]);
+        assert!(
+            worth_handing_over(&mut seen, &real),
+            "already seen, so it settles"
+        );
+    }
+
+    #[test]
+    fn a_zero_netmask_is_attached_to_nothing() {
+        let ip = u32::from(Ipv4Addr::new(192, 168, 1, 5));
+        let at = |a: [u8; 4]| u32::from(Ipv4Addr::from(a));
+        let class_c = u32::from(Ipv4Addr::new(255, 255, 255, 0));
+        assert!(on_subnet(ip, class_c, at([192, 168, 1, 155])));
+        assert!(!on_subnet(ip, class_c, at([192, 168, 2, 155])));
+        assert!(on_subnet(ip, u32::MAX, ip), "a /32 matches itself");
+        assert!(!on_subnet(ip, u32::MAX, at([192, 168, 1, 155])));
+        assert!(
+            !on_subnet(ip, 0, at([169, 254, 169, 254])),
+            "a /0 matches nothing"
+        );
+        assert!(!on_subnet(ip, 0, ip));
+    }
+
+    #[test]
+    fn this_machine_and_everyone_are_never_local() {
+        for address in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 251),
+        ] {
+            assert!(!is_local(IpAddr::V4(address)), "{address}");
+        }
     }
 
     #[test]

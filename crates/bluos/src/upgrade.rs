@@ -148,9 +148,14 @@ impl Stage {
 
 /// Read the answer to `?upgrade=…`.
 ///
-/// Absent attributes read as false, which is the safe direction for both: an
-/// upgrade that cannot be confirmed available is not started, and one that
-/// cannot be confirmed finished is not treated as finished.
+/// Absent attributes read as false. For `available` that is the safe
+/// direction: an upgrade that cannot be confirmed available is not started.
+/// For `inProgress` it is not — an answer that leaves it out reads as nothing
+/// running, and the check before starting one passes — but it is how the
+/// official controller reads it too (`inProgress === 'true'`), every capture
+/// carries the attribute, and reading its absence as "running" would leave a
+/// player whose firmware omits it with no way to upgrade from here. The
+/// player itself is the last word on whether a second upgrade can start.
 pub fn availability(xml: &str) -> Result<Availability> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);

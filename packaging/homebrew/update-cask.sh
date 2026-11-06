@@ -31,6 +31,11 @@ OUT="${2:-}"
 }
 case "$TAG" in v*) ;; *) echo "error: tag should start with v, got '$TAG'" >&2; exit 1 ;; esac
 VERSION="${TAG#v}"
+# Numbers and dots only: the version goes into a sed expression and then into
+# Ruby, where a slash, an ampersand, a quote or #{} would mean something.
+case "$VERSION" in
+    ''|*[!0-9.]*|.*|*.|*..*) echo "error: version should be X.Y.Z, got '$VERSION'" >&2; exit 1 ;;
+esac
 OUT_DIR=$(dirname "$OUT")
 [ -d "$OUT_DIR" ] || { echo "error: no directory $OUT_DIR to write the cask into" >&2; exit 1; }
 command -v gpg >/dev/null 2>&1 || { echo "error: gpg is needed to check the signature on SHA256SUMS" >&2; exit 1; }

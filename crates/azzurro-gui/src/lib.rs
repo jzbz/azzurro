@@ -1737,12 +1737,28 @@ struct Backend {
     /// Empty means the pane has every cover its rows name, or names none, and
     /// unrelated decodes are ignored outright.
     ///
-    /// Taken only in [`Backend::publish_queue`] and outermost there, so it has
-    /// no order to get wrong with the locks above. It is let go before that
+    /// Taken only in [`Backend::publish_queue`] and outermost there — before
+    /// the selection is read, which is what makes publishes post in the order
+    /// they read it — so it has no order to get wrong with the locks above.
+    /// It is let go before that
     /// function asks for covers again, so it is never held over
     /// [`Backend::queue_walk`] either.
     queue_art: Arc<Mutex<QueueArt>>,
     sent_players: Arc<AtomicU64>,
+    /// Held by [`Backend::publish`] and [`Backend::publish_selection`] from
+    /// reading the selection to posting to the window, so the window gets
+    /// their posts in the order the selection was read. Without it a publish
+    /// that read the old selection could post after the move and put the
+    /// highlight back, and the memo it set could then refuse the repair.
+    /// Taken before the selection, and by nothing else.
+    player_publication: Arc<Mutex<()>>,
+    /// Held by [`Backend::publish_transport`] from its memo to its post, for
+    /// the same reason: two publishes that swap the memo in one order and post
+    /// in the other leave the window on the older one under a memo that says
+    /// it has the newer. A leaf: nothing else is taken while it is held.
+    transport_publication: Arc<Mutex<()>>,
+    /// The same for [`Backend::send_settings`].
+    settings_publication: Arc<Mutex<()>>,
     /// And the settings rows, for the same reason as the three above: the
     /// status ticks every second and rebuilding a settings model replaces
     /// every row instance, which throws away whatever was being typed into
@@ -1879,6 +1895,12 @@ struct Backend {
     told_about_update: Arc<Mutex<std::collections::HashSet<DeviceId>>>,
     /// Which player the offer on screen is about.
     update_offer: Arc<Mutex<Option<DeviceId>>>,
+    /// Players whose offer arrived while another's was up, oldest first. Each
+    /// is put up when the one before it is answered: the check is made once a
+    /// run, so an offer turned away for being second was never made at all,
+    /// and several players of one model are offered the same firmware on the
+    /// same day.
+    update_waiting: Arc<Mutex<std::collections::VecDeque<DeviceId>>>,
     /// Section order per screen, as set by Customize Home and kept on disk.
     orders: Arc<Mutex<order::Orders>>,
     /// The last tier each player's decoder named, and for which track, kept on
@@ -3580,6 +3602,10 @@ fn browse_fingerprint(
         header.subtitle.hash(&mut hash);
         header.detail.hash(&mut hash);
         header.cover.is_some().hash(&mut hash);
+        // Which cover, not only whether one is there: two screens alike but
+        // for the header's record, both covers already decoded, kept the
+        // first one's. The rows hash theirs the same way.
+        header.art.hash(&mut hash);
         header.buttons.hash(&mut hash);
     }
     hash.finish()
@@ -4297,6 +4323,11 @@ async fn run(
         // swallows the SYN would otherwise hold a fetch permit until the whole
         // fetch timed out.
         .connect_timeout(bluos::client::CONNECT_TIMEOUT)
+        // A host written as a name is judged by what it resolves to, which the
+        // redirect policy and `permitted` cannot see. See `artwork::Guarded`.
+        .dns_resolver(artwork::Guarded {
+            players: players.clone(),
+        })
         .redirect(reqwest::redirect::Policy::custom({
             let players = players.clone();
             move |attempt| {
@@ -4362,11 +4393,15 @@ async fn run(
         sent_queue: Arc::new(AtomicU64::new(0)),
         queue_art: Arc::default(),
         sent_players: Arc::new(AtomicU64::new(0)),
+        player_publication: Arc::default(),
+        transport_publication: Arc::default(),
+        settings_publication: Arc::default(),
         sent_settings: Arc::new(AtomicU64::new(0)),
         settings_redraws: Arc::new(AtomicU64::new(0)),
         seated_redraws: Arc::new(AtomicU64::new(0)),
         told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
         update_offer: Arc::new(Mutex::new(None)),
+        update_waiting: Arc::default(),
         sent_browse: Arc::new(AtomicU64::new(0)),
         sent_items: Arc::default(),
         sent_index: Arc::new(AtomicU64::new(0)),
@@ -5297,6 +5332,7 @@ impl Backend {
                     ui.set_update_notice("".into());
                 }
             });
+            self.offer_next_update();
         }
 
         if stranded {
@@ -5680,6 +5716,15 @@ impl Backend {
             .unwrap_or_default()
     }
 
+    /// Put up the offer that has waited longest, now the one on screen is
+    /// gone. A player forgotten while it waited is dropped by
+    /// `Command::UpdateNotice` itself, which asks whether it is tracked.
+    fn offer_next_update(&self) {
+        if let Some(next) = self.update_waiting.lock().unwrap().pop_front() {
+            let _ = self.commands.send(Command::UpdateNotice(next));
+        }
+    }
+
     /// Start tracking a player, unless it is already tracked.
     ///
     /// The name and model are only hints — from an announcement, or absent
@@ -6027,6 +6072,7 @@ impl Backend {
     /// `VecModel` held across calls with `row_changed` on the one row that
     /// moved, so that a volume nudge does not re-upload every cover on screen.
     fn publish(&self) {
+        let _publishing = self.player_publication.lock().unwrap();
         // Selection first, then the registry: two locks, always in that order,
         // everywhere.
         let selected = *self.selected.lock().unwrap();
@@ -6119,25 +6165,27 @@ impl Backend {
     /// [`Backend::publish`] builds the model in. Nothing to push where the
     /// player is not tracked: the publish that adds it carries the highlight
     /// itself, by the same [`highlighted_row`] rule.
+    ///
+    /// Found in the window's rows by id when the post runs rather than by an
+    /// index worked out here: a publish of a different set of rows can land
+    /// between the two, and an index into the old set names the wrong card.
     fn publish_selection(&self) {
+        let _publishing = self.player_publication.lock().unwrap();
         // Selection first, then the registry: two locks, always in that order,
         // everywhere.
         let selected = *self.selected.lock().unwrap();
         let Some(id) = selected else { return };
-        let Some(at) = self
-            .registry
-            .lock()
-            .unwrap()
-            .keys()
-            .position(|tracked| *tracked == id)
-        else {
+        if !self.registry.lock().unwrap().contains_key(&id) {
             return;
-        };
+        }
+        let id = id.to_string();
 
         let ui = self.ui.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui.upgrade() else { return };
-            ui.set_selected(at as i32);
+            if let Some(at) = ui.get_devices().iter().position(|d| d.id.as_str() == id) {
+                ui.set_selected(at as i32);
+            }
         });
     }
 
@@ -6914,6 +6962,12 @@ impl Backend {
     }
 
     fn publish_queue(&self) {
+        // Taken first, before the selection is read, so that publishes post in
+        // the order they read it. Taken further down, a publish that read the
+        // old selection could get it after one that read the new and post the
+        // old player's rows last — under which a remove or a reorder sends
+        // that player's positions to this one. See [`Backend::queue_art`].
+        let mut art = self.queue_art.lock().unwrap();
         // Read the selection out before taking the registry lock, so the two
         // are never held at once and there is no order to get wrong.
         let selected = *self.selected.lock().unwrap();
@@ -7012,8 +7066,7 @@ impl Backend {
         // which is worse than what this replaced — for covers belonging to
         // something else entirely. So the count is the gate and not the
         // answer, and what is behind it is the set of covers these rows are
-        // actually waiting on. See [`Backend::queue_art`].
-        let mut art = self.queue_art.lock().unwrap();
+        // actually waiting on. See [`Backend::queue_art`], taken at the top.
         let (rows, line, cursor_row, again) = {
             let guard = self.registry.lock().unwrap();
             // Borrowed rather than cloned, and a shared default for the player
@@ -8089,6 +8142,7 @@ impl Backend {
         // fingerprinting the settings document instead of the rows, which is
         // a larger change than it looks — the rows also carry state from
         // outside the document, the sleep timer among it.
+        let _publishing = self.settings_publication.lock().unwrap();
         let unchanged = already_sent(&self.sent_settings, {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -8113,6 +8167,14 @@ impl Backend {
                 row.as_typed.hash(&mut hash);
                 // The numbers a slider carries, which change as it is dragged.
                 row.number.to_bits().hash(&mut hash);
+                // And the rest of what a row draws: a page whose bounds or
+                // units changed under an unchanged value kept the old ones.
+                row.opens.hash(&mut hash);
+                row.glyph.hash(&mut hash);
+                row.minimum.to_bits().hash(&mut hash);
+                row.maximum.to_bits().hash(&mut hash);
+                row.step.to_bits().hash(&mut hash);
+                row.units.hash(&mut hash);
             }
             hash.finish()
         });
@@ -8708,6 +8770,13 @@ impl Backend {
         // — the same rule the queue's memo follows, for the same reason: a
         // decoded cover is more expensive to compare than the redraw it would
         // save, and its arrival is the only thing about it that changes.
+        //
+        // The record of the items is taken before the memo rather than after
+        // it, and held over the post on both paths: a publish that swapped
+        // the memo and then lost the race to post would otherwise leave the
+        // window on the older rows under a memo that says it has the newer,
+        // and nothing would ever send them again.
+        let mut sent = self.sent_items.lock().unwrap();
         if already_sent(
             &self.sent_browse,
             browse_fingerprint(
@@ -8777,7 +8846,6 @@ impl Backend {
         // here would otherwise each diff against the other's record and post
         // in the other order, which is a screen half of one and half of the
         // other.
-        let mut sent = self.sent_items.lock().unwrap();
         let (patch, whole) = browse_patch(&mut sent, flatten_browse(blocks));
 
         // And what the items are drawn with, at the places the window will
@@ -9134,6 +9202,7 @@ impl Backend {
         // else here, yet this ran once a second regardless — and each run
         // repainted the progress line, which spans the whole window. Nothing to
         // say means nothing to draw.
+        let _publishing = self.transport_publication.lock().unwrap();
         if already_sent(&self.sent_transport, view.fingerprint()) {
             return;
         }
@@ -11019,6 +11088,14 @@ async fn run_action(backend: Backend, id: DeviceId, action: bluos::Action, arriv
                 // app already renders — sending it to a browser would be
                 // handing back a page it can draw itself.
                 if let Some(page) = settings_page(&uri) {
+                    // A fresh settings pane is the selected player's, which is
+                    // only this one while the choice the press was made under
+                    // stands. Otherwise it would open the page of the player
+                    // chosen since, under a press made on this one.
+                    if selection.is_none() {
+                        tracing::debug!(%id, "not opening settings for a player no longer chosen");
+                        return;
+                    }
                     let _ = backend
                         .commands
                         .send(Command::OpenSettings(page, Step::Root));
@@ -11084,7 +11161,17 @@ async fn read_sync(backend: &Backend, id: DeviceId, client: &Client) -> Option<S
         // there. Everything below is for a tracked player, so all of it is
         // skipped.
         let entry = registry.get_mut(&id)?;
-        entry.sync = Some(sync.clone());
+        // Nothing orders the replies of two reads that were out at once, and
+        // the next status, which would repair an older one landing last, can
+        // be a long poll away. So a reply is not kept over a held document
+        // that already matches what the latest status says the grouping is,
+        // when the reply itself does not.
+        let latest = entry.status.as_ref().and_then(|s| s.sync_stat.as_deref());
+        let held_is_latest =
+            latest.is_some() && entry.sync.as_ref().map(|s| s.etag.as_str()) == latest;
+        if !(held_is_latest && Some(sync.etag.as_str()) != latest) {
+            entry.sync = Some(sync.clone());
+        }
         // What the player calls itself, where nothing has said yet: an address
         // typed in by hand arrives with no announcement behind it, and without
         // this one could never be recognized when it moves. Filled in rather
@@ -12603,7 +12690,20 @@ async fn read_queue(backend: &Backend, id: DeviceId) -> bool {
                 total = queue.length,
                 "read the queue"
             );
-            if let Some(entry) = backend.registry.lock().unwrap().get_mut(&id) {
+            {
+                let mut registry = backend.registry.lock().unwrap();
+                let Some(entry) = registry.get_mut(&id) else {
+                    return false;
+                };
+                if !queue_fits(entry.status.as_ref(), &queue) {
+                    tracing::debug!(
+                        %id,
+                        read = ?queue.id,
+                        now = ?entry.status.as_ref().and_then(|s| s.pid),
+                        "not showing a queue the player has replaced since"
+                    );
+                    return false;
+                }
                 entry.queue = Some(queue);
             }
             backend.publish_queue();
@@ -12615,6 +12715,43 @@ async fn read_queue(backend: &Backend, id: DeviceId) -> bool {
             tracing::debug!(%id, "could not read the queue: {e}");
             false
         }
+    }
+}
+
+/// A slider's value put on the player's own grid, inside its bounds.
+///
+/// A drag lands anywhere between the ends, and the player was left to round
+/// what it was sent — a step of five written as 37 — after which the page was
+/// read again and the handle jumped. Written on the step, it stays where it is
+/// let go, give or take the step.
+fn on_step(v: f32, bounds: &bluos::settings::Bounds) -> f32 {
+    let v = match bounds.step {
+        Some(step) if step > 0.0 => bounds.min + ((v - bounds.min) / step).round() * step,
+        _ => v,
+    };
+    if bounds.min <= bounds.max {
+        v.clamp(bounds.min, bounds.max)
+    } else {
+        v
+    }
+}
+
+/// Whether a queue just read is still the one the player says it holds.
+///
+/// A replaced queue clears what is held and starts a read of its own, so two
+/// reads can be out at once, and nothing orders their replies: the older one
+/// landing last put the replaced queue back for good, since the statuses after
+/// it all name the same new queue and none of them asks again. Then the
+/// cursor matched nothing and a remove by position removed from a list the
+/// player no longer had.
+///
+/// A queue or a status that names no queue fits: reads made before the first
+/// status are how a player is adopted, and a player that names neither has
+/// nothing to compare.
+fn queue_fits(status: Option<&Status>, queue: &bluos::Queue) -> bool {
+    match (queue.id, status.and_then(|s| s.pid)) {
+        (Some(read), Some(now)) => read == now,
+        _ => true,
     }
 }
 
@@ -13506,7 +13643,7 @@ async fn follow(backend: Backend, id: DeviceId, mpris_index: usize) {
                         )
                         .await
                         {
-                            mpris::Attach::Exported(bridge) => mpris = Some(bridge),
+                            mpris::Attach::Exported(bridge) => mpris = Some(*bridge),
                             mpris::Attach::NoBus => no_bus = true,
                             mpris::Attach::Failed => {}
                         }
@@ -13605,7 +13742,12 @@ async fn run_commands(
             Command::UpdateNotice(id) => {
                 // One at a time: a second offer while one is up would replace
                 // it, and the person would answer a question they never saw.
-                if backend.update_offer.lock().unwrap().is_some() {
+                // So it waits its turn instead. See `update_waiting`.
+                if let Some(up) = *backend.update_offer.lock().unwrap() {
+                    let mut waiting = backend.update_waiting.lock().unwrap();
+                    if up != id && !waiting.contains(&id) {
+                        waiting.push_back(id);
+                    }
                     continue;
                 }
                 // Nor for a player that is no longer tracked. The check is
@@ -13633,7 +13775,12 @@ async fn run_commands(
                 let Some(id) = backend.update_offer.lock().unwrap().take() else {
                     continue;
                 };
+                // The next player's turn, whichever way this one was
+                // answered: turning one player's offer away says nothing about
+                // another's. Sent after what Show sends below, so the page it
+                // opens is under the next offer rather than over it.
                 if !show {
+                    backend.offer_next_update();
                     continue;
                 }
                 // Select it first: the page reads the selection, and the offer
@@ -13650,6 +13797,7 @@ async fn run_commands(
                 {
                     let _ = backend.commands.send(Command::HelpAction(row));
                 }
+                backend.offer_next_update();
                 continue;
             }
 
@@ -14721,10 +14869,17 @@ async fn run_commands(
                 let Some(path) = row.into_path() else {
                     {
                         let mut browsing = backend.browsing.lock().unwrap();
-                        if let Pane::Alarms(page) = &mut browsing.pane {
+                        // Still the page the row was pressed on, as
+                        // `open_picker` asks for the levels below: the lock
+                        // was let go above, and another player's editor in its
+                        // place is not where this choice belongs.
+                        if let Pane::Alarms(page) = &mut browsing.pane
+                            && page.device == id
+                            && page.top() == top
+                        {
                             if let Some(alarm) = page.editing.as_mut() {
                                 alarm.source = Some(row.text.clone());
-                                alarm.service = row.service.clone();
+                                alarm.service = row.service.as_deref().map(str::to_owned);
                                 alarm.url = row.url.clone();
                                 alarm.image = row.image.clone();
                                 // The player decides what can be shuffled, and
@@ -14783,9 +14938,21 @@ async fn run_commands(
                     //
                     // A new alarm is exempt: it is created armed, and its id
                     // is not known until the save has answered.
+                    //
+                    // Two writes, so the second can fail after the first has
+                    // landed. That is a saved alarm left switched on, not a
+                    // failed save: the first reply's list is the player's and
+                    // is seated, and the toast says what is still wrong.
+                    let mut left_on = None;
                     let saved = match client.save_alarm(&alarm).await {
                         Ok(list) if alarm.enabled || alarm.id == 0 => Ok(list),
-                        Ok(_) => client.arm_alarm(alarm.id, false).await,
+                        Ok(list) => match client.arm_alarm(alarm.id, false).await {
+                            Ok(list) => Ok(list),
+                            Err(e) => {
+                                left_on = Some(e);
+                                Ok(list)
+                            }
+                        },
                         Err(e) => Err(e),
                     };
                     match saved {
@@ -14825,7 +14992,16 @@ async fn run_commands(
                                     _ => None,
                                 }
                             };
-                            say(&backend.ui, "Alarm saved");
+                            match left_on {
+                                None => say(&backend.ui, "Alarm saved"),
+                                Some(e) => say(
+                                    &backend.ui,
+                                    format!(
+                                        "Alarm saved, but it is still switched on — \
+                                         could not switch it off: {e}"
+                                    ),
+                                ),
+                            }
                             // After it: what became of the editor still open
                             // is the more urgent of the two.
                             if let Some(note) = note {
@@ -14946,22 +15122,30 @@ async fn run_commands(
 
             Command::QueueMenuAction(at) => {
                 // The player the menu came from, not whichever is selected
-                // now: the lines on it carry that player's own paths.
-                let Some(id) = backend.browsing.lock().unwrap().queue_menu_owner else {
+                // now: the lines on it carry that player's own paths. Read
+                // with the line under one lock, as `put_up_menu` writes them,
+                // so the two are always of the same menu.
+                let (owner, action) = {
+                    let browsing = backend.browsing.lock().unwrap();
+                    let action = browsing
+                        .queue_menu
+                        .as_ref()
+                        .and_then(|menu| menu.items().nth(at))
+                        .and_then(|item| item.action.clone());
+                    (browsing.queue_menu_owner, action)
+                };
+                let Some(id) = owner else {
                     continue;
                 };
-                let action = backend
-                    .browsing
-                    .lock()
-                    .unwrap()
-                    .queue_menu
-                    .as_ref()
-                    .and_then(|menu| menu.items().nth(at))
-                    .and_then(|item| item.action.clone());
 
                 if let Some(action) = action {
+                    // In the player's line of writes: "Remove from queue" is a
+                    // delete by position, as `QueueRemove` is, and overtaking
+                    // one of those removes the wrong track. See `lane`.
+                    let mut ticket = backend.write_lane(id).enter();
                     let backend = backend.clone();
                     tokio::spawn(async move {
+                        ticket.wait().await;
                         run_action(backend.clone(), id, action, Arrive::Deeper).await;
                         // Favoriting and deleting both change the queue, and
                         // the player announces neither.
@@ -16081,9 +16265,12 @@ async fn run_commands(
                     Edit::Choose(n) => setting.options.get(n).map(|o| o.name.clone()),
                     // The player wants the number as it writes it: a whole one
                     // where the step is whole, and one decimal where it is not.
-                    Edit::Number(v) => Some(match setting.range.as_ref().and_then(|r| r.step) {
-                        Some(step) if step.fract() != 0.0 => format!("{v:.1}"),
-                        _ => format!("{}", v.round() as i64),
+                    Edit::Number(v) => Some({
+                        let v = setting.range.as_ref().map_or(v, |r| on_step(v, r));
+                        match setting.range.as_ref().and_then(|r| r.step) {
+                            Some(step) if step.fract() != 0.0 => format!("{v:.1}"),
+                            _ => format!("{}", v.round() as i64),
+                        }
                     }),
                     Edit::Text(text) => Some(text),
                 };
@@ -16406,8 +16593,13 @@ async fn run_commands(
                     backend.publish_queue();
                 }
                 if let Some(action) = action {
+                    // In line with the edits: Clear overtaking a remove, or a
+                    // remove overtaking Clear, is a different queue from the
+                    // one the presses were made in. See `lane`.
+                    let mut ticket = backend.write_lane(id).enter();
                     let backend = backend.clone();
                     tokio::spawn(async move {
+                        ticket.wait().await;
                         run_action(backend.clone(), id, action, Arrive::Deeper).await;
                         // Every one of these changes the queue, and the player
                         // reports none of them: clearing keeps the same queue
@@ -17355,9 +17547,13 @@ async fn run_commands(
                         .then(|| backend.with_entry(owner, |e| e.client.clone()))
                         .flatten();
                     let Some(client) = addressed else {
-                        // Refusing rather than sending part of it: every slot
-                        // has to be in the permutation or the ones left out
-                        // are deleted.
+                        // Refused where a row's id did not read as a slot, or
+                        // the player has gone. Not because a slot left out
+                        // would be lost — `reordering` permutes exactly the
+                        // slots it is given, so one left out is never a
+                        // destination and is left alone — but because a
+                        // subset would be reordered among itself only, which
+                        // is not the order on screen.
                         say(&backend.ui, "Could not work out the new order");
                         continue;
                     };
@@ -17831,6 +18027,55 @@ mod queue_paging_tests {
 }
 
 #[cfg(test)]
+mod reply_and_write_tests {
+    use super::*;
+
+    /// A read of a queue the player has since replaced is not shown over the
+    /// replacement. One that names no queue, or arrives before any status, is.
+    #[test]
+    fn a_queue_read_for_a_replaced_queue_does_not_fit() {
+        let queue = |id| bluos::Queue {
+            id,
+            ..Default::default()
+        };
+        let status = |pid| Status {
+            pid,
+            ..Default::default()
+        };
+        assert!(queue_fits(Some(&status(Some(7))), &queue(Some(7))));
+        assert!(!queue_fits(Some(&status(Some(8))), &queue(Some(7))));
+        assert!(queue_fits(None, &queue(Some(7))), "before the first status");
+        assert!(queue_fits(Some(&status(None)), &queue(Some(7))));
+        assert!(queue_fits(Some(&status(Some(8))), &queue(None)));
+    }
+
+    #[test]
+    fn a_slider_writes_on_the_players_step_and_inside_its_bounds() {
+        let bounds = |min, max, step| bluos::settings::Bounds {
+            min,
+            max,
+            step,
+            min_range: None,
+            units: None,
+        };
+        let fives = bounds(0.0, 100.0, Some(5.0));
+        assert_eq!(on_step(37.0, &fives), 35.0);
+        assert_eq!(on_step(38.0, &fives), 40.0);
+        assert_eq!(on_step(101.0, &fives), 100.0);
+        assert_eq!(on_step(-3.0, &fives), 0.0);
+
+        // Counted from the bottom of the range, not from zero.
+        let offset = bounds(-12.0, 12.0, Some(4.0));
+        assert_eq!(on_step(-9.0, &offset), -8.0);
+
+        // A half step, and no step at all, which is left as it is.
+        assert_eq!(on_step(1.3, &bounds(0.0, 10.0, Some(0.5))), 1.5);
+        assert_eq!(on_step(1.3, &bounds(0.0, 10.0, None)), 1.3);
+        assert_eq!(on_step(1.3, &bounds(0.0, 10.0, Some(0.0))), 1.3);
+    }
+}
+
+#[cfg(test)]
 mod index_tests {
     use super::*;
 
@@ -17934,21 +18179,33 @@ mod index_tests {
 
     #[test]
     fn a_short_list_and_a_shelf_are_left_alone() {
-        let short: Vec<String> = ["zebra", "apple", "mango"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
+        // Short, and with a single straggler — which a list long enough to
+        // index would have filed under C. Only its length keeps it put; a
+        // list as jumbled as three random words is left alone for being
+        // jumbled, whatever its length, and would show nothing about this.
+        let mut short = genres()[..20].to_vec();
+        short.push("classical".to_owned());
+        assert!(short.len() < WORTH_INDEXING);
         let mut blocks = one_block(&short);
         collate(&mut blocks);
-        assert_eq!(blocks[0].rows[0].title, "zebra");
+        assert_eq!(
+            blocks[0].rows.last().expect("a last row").title,
+            "classical",
+            "a list too short for a bar is not filed"
+        );
 
-        // A shelf of tiles has no single column to file rows into.
-        let names = genres();
+        // A shelf of tiles has no single column to file rows into: the same
+        // straggler, on a shelf long enough for a list to be filed, stays.
+        let mut names = genres();
+        names.push("classical".to_owned());
         let mut shelf = one_block(&names);
         shelf[0].kind = 1;
-        let first = shelf[0].rows[0].title.clone();
         collate(&mut shelf);
-        assert_eq!(shelf[0].rows[0].title, first);
+        assert_eq!(
+            shelf[0].rows.last().expect("a last row").title,
+            "classical",
+            "a shelf is not filed"
+        );
     }
 
     #[test]
@@ -18630,38 +18887,22 @@ mod tests {
                         .find_first()
                 });
 
-        match row {
-            Some(row) => {
-                // A settings row presses through `setting-open`, whatever pane
-                // is drawn with settings rows — the alarms list is one — so
-                // the command is the row's own action and not a browse
-                // activation. What is under test is the number it carries.
-                row.invoke_accessible_default_action();
-                let sent = rx.try_recv();
-                assert!(
-                    matches!(sent, Ok(Command::SettingAction(at)) if at == NEW_ALARM),
-                    "a press on the last row must carry its own index, got {sent:?}"
-                );
-            }
-            // The rows are drawn by a component that does not publish an
-            // accessible label. Rather than assert nothing, drive the callback
-            // the window itself would: this still crosses the boundary that
-            // clamped the index, which is the thing under test.
-            None => {
-                ui.invoke_browse_activate(NEW_ALARM as i32);
-                let sent = rx.try_recv();
-                assert!(
-                    matches!(sent, Ok(Command::BrowseActivate(at)) if at == NEW_ALARM),
-                    "the callback must not clamp a high row index, got {sent:?}"
-                );
-
-                ui.invoke_browse_activate(ALARM_SAVE as i32);
-                assert!(matches!(
-                    rx.try_recv(),
-                    Ok(Command::BrowseActivate(at)) if at == ALARM_SAVE
-                ));
-            }
-        }
+        // Found or failed: the rows publish their label, so a row that cannot
+        // be found is a test that would otherwise go on to check a different
+        // callback from the one this is about.
+        let row = row.expect(
+            "the New alarm row was not found; element queries need the debug info build.rs turns on",
+        );
+        // A settings row presses through `setting-open`, whatever pane is
+        // drawn with settings rows — the alarms list is one — so the command
+        // is the row's own action and not a browse activation. What is under
+        // test is the number it carries.
+        row.invoke_accessible_default_action();
+        let sent = rx.try_recv();
+        assert!(
+            matches!(sent, Ok(Command::SettingAction(at)) if at == NEW_ALARM),
+            "a press on the last row must carry its own index, got {sent:?}"
+        );
 
         // And a negative one — which is what the window sends to dismiss a
         // dialog — must not become row zero either.
@@ -21053,7 +21294,10 @@ mod tests {
         let Ok(discovery) = Discovery::bind() else {
             // The LSDP port is the machine's, not this test's. Somewhere that
             // will not give it up has nothing to say about whether `sweep`
-            // speaks, and failing here would only report the network.
+            // speaks, and failing here would only report the network. Said
+            // out loud, though, so a run that checked nothing does not read
+            // as one that passed.
+            eprintln!("skipped: the LSDP port could not be bound here");
             return;
         };
 
@@ -22749,11 +22993,15 @@ mod selection_tests {
             sent_queue: Arc::new(AtomicU64::new(0)),
             queue_art: Arc::default(),
             sent_players: Arc::new(AtomicU64::new(0)),
+            player_publication: Arc::default(),
+            transport_publication: Arc::default(),
+            settings_publication: Arc::default(),
             sent_settings: Arc::new(AtomicU64::new(0)),
             settings_redraws: Arc::new(AtomicU64::new(0)),
             seated_redraws: Arc::new(AtomicU64::new(0)),
             told_about_update: Arc::new(Mutex::new(std::collections::HashSet::new())),
             update_offer: Arc::new(Mutex::new(None)),
+            update_waiting: Arc::default(),
             sent_browse: Arc::new(AtomicU64::new(0)),
             sent_items: Arc::default(),
             sent_index: Arc::new(AtomicU64::new(0)),
@@ -32092,11 +32340,19 @@ mod thumbnail_tests {
         player.delay("/Artwork", Duration::from_secs(30));
 
         backend.walk_queue(player.id(), Walk::Whole);
+        // Every permit taken, so that the walk after this can only fetch
+        // anything once these are given back.
+        let permits = artwork::CONCURRENT_FETCHES;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while covers_asked(&player) == 0 {
-            assert!(Instant::now() < deadline, "no cover was ever asked for");
+        while covers_asked(&player) < permits {
+            assert!(
+                Instant::now() < deadline,
+                "the walk never held every permit: {} asked for",
+                covers_asked(&player)
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(covers_asked(&player), permits, "no more than the permits");
         let first = {
             let slot = backend.queue_walk.lock().unwrap();
             assert_eq!(slot.running.len(), 1, "the walk registered itself");
@@ -32112,6 +32368,19 @@ mod thumbnail_tests {
             assert!(
                 Instant::now() < deadline,
                 "the replaced walk was still holding its fetches"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // And the permits came back with it: the walk that replaced it gets
+        // requests out. A walk whose fetches outlived it — spawned loose
+        // rather than owned — would finish here just the same, and leave the
+        // new one waiting the thirty seconds for a permit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while covers_asked(&player) <= permits {
+            assert!(
+                Instant::now() < deadline,
+                "the walk that replaced it never got a permit"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -32164,7 +32433,22 @@ mod thumbnail_tests {
             "the walk went back over the covers a previous one had: \
              {asked} asked for where ten arrived"
         );
-        assert!(asked > 0, "and it did fetch the rows that arrived");
+        // And exactly the ten that arrived, not merely some of them: a walk
+        // that started one row late or stopped one early would pass a count.
+        let albums: std::collections::BTreeSet<u32> = player
+            .asked()
+            .iter()
+            .filter(|seen| seen.starts_with("/Artwork"))
+            .filter_map(|seen| {
+                let (_, rest) = seen.split_once("album=")?;
+                rest.split(['&', ' ']).next()?.parse().ok()
+            })
+            .collect();
+        assert_eq!(
+            albums,
+            (had as u32..COVERS).collect(),
+            "the walk fetched the rows that arrived"
+        );
     }
 
     /// A queue walk takes its number where it is started, not where it runs.
@@ -33042,10 +33326,13 @@ mod thumbnail_tests {
         );
 
         // The view moving is what asks for them again: once more each, and
-        // then it rests.
+        // then it rests. Waited for, rather than only bounded: a bound alone
+        // passes when nothing is asked again at all, which is the failure the
+        // reset on a moved view exists to prevent.
         viewing(&backend, 0, 0);
+        until("the pushed-out tiles asked for again", || most() == 2).await;
         settled().await;
-        assert!(most() <= 2, "a tile was asked for {} times", most());
+        assert_eq!(most(), 2, "a tile was asked for {} times", most());
     }
 
     /// The task following a screen stops once the screen is not the one on

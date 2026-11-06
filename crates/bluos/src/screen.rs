@@ -189,7 +189,7 @@ impl Screen {
         // the cautious reading; this now matches it.
         self.refresh_on
             .iter()
-            .any(|(key, value)| status.field(key).is_some_and(|actual| actual != *value))
+            .any(|(key, value)| status.field(key).is_some_and(|actual| *actual != **value))
     }
 }
 
@@ -386,7 +386,7 @@ impl Item {
         let Some((key, value)) = &self.now_playing_match else {
             return false;
         };
-        status.field(key).is_some_and(|actual| &actual == value)
+        status.field(key).is_some_and(|actual| *actual == **value)
     }
 }
 
@@ -594,6 +594,8 @@ pub fn parse(xml: &str) -> Result<Screen> {
     let mut menu_action: Option<MenuAction> = None;
     let mut button: Option<Button> = None;
     let mut seen_screen = false;
+    // How many of `screen.sections` are known to have `paged` clear.
+    let mut unpaged = 0;
 
     loop {
         match reader.read_event() {
@@ -611,6 +613,7 @@ pub fn parse(xml: &str) -> Result<Screen> {
                     &mut menu_action,
                     &mut button,
                     &mut seen_screen,
+                    &mut unpaged,
                 )?;
             }
             Ok(Event::Empty(e)) => {
@@ -626,6 +629,7 @@ pub fn parse(xml: &str) -> Result<Screen> {
                     &mut menu_action,
                     &mut button,
                     &mut seen_screen,
+                    &mut unpaged,
                 )?;
                 end(
                     name,
@@ -694,6 +698,11 @@ pub fn parse(xml: &str) -> Result<Screen> {
     Ok(screen)
 }
 
+/// The deepest a screen may nest. The players write about six levels; this is
+/// far past that, and refusing past it keeps a hostile document from making
+/// the stack, which several tags search, as long as the document.
+const MAX_DEPTH: usize = 64;
+
 const ITEM_ELEMENTS: &[(&str, ItemKind)] = &[
     ("item", ItemKind::Item),
     ("source", ItemKind::Source),
@@ -719,7 +728,16 @@ fn start(
     menu_action: &mut Option<MenuAction>,
     button: &mut Option<Button>,
     seen_screen: &mut bool,
+    unpaged: &mut usize,
 ) -> Result<()> {
+    // Real screens nest half a dozen deep. Without a ceiling a document can
+    // open hundreds of thousands of elements the parser does not model, and
+    // every row after them asks the whole stack whether a section is open.
+    if stack.len() >= MAX_DEPTH {
+        return Err(Error::Screen(format!(
+            "screen nested more than {MAX_DEPTH} deep"
+        )));
+    }
     let mut a = attributes(e);
 
     match name {
@@ -862,9 +880,14 @@ fn start(
             if (offset.is_some() || total.is_some())
                 && let Some(open) = section.as_mut()
             {
-                for earlier in &mut screen.sections {
+                // Only the sections filed since the last counted list: every
+                // one before them was cleared then, and nothing sets the flag
+                // on a section already filed. Clearing them all each time was
+                // quadratic in a screen of many short lists.
+                for earlier in &mut screen.sections[*unpaged..] {
                     earlier.paged = false;
                 }
+                *unpaged = screen.sections.len();
                 open.paged = true;
             }
         }
@@ -1187,12 +1210,6 @@ pub fn appending(uri: &str) -> Option<String> {
     Some(format!("{path}?{}", parts.join("&")))
 }
 
-/// Strip `playnow=1` from a query, however many times it is encoded.
-///
-/// The wrapper's `u` is encoded once, so its separators read as `%3D` and
-/// `%26`; the same query unwrapped uses `=` and `&`. Both spellings are
-/// handled rather than decoding and re-encoding, which would rewrite every
-/// other parameter on the way through and risk changing a file name.
 /// Whether pressing this action makes the player start making sound.
 ///
 /// Not the same question as [`appending`], which asks whether an action can be
@@ -1239,32 +1256,45 @@ fn is_play_command(command: &str) -> bool {
     }
 }
 
+/// Strip `playnow=1` from a query, however many times it is encoded.
+///
+/// The wrapper's `u` is encoded once, so its separators read as `%3D` and
+/// `%26`; the same query unwrapped uses `=` and `&`. Both spellings are
+/// handled rather than decoding and re-encoding, which would rewrite every
+/// other parameter on the way through and risk changing a file name.
+///
+/// `%3D` is matched in either case, since [`starts_playing`] decodes either
+/// and a lowercase one left behind would play the track Queue Builder Mode
+/// was meant to append. `%26` has no letter in it to differ by.
 fn without_playnow(query: &str) -> (String, bool) {
     let mut out = query.to_owned();
     let mut dropped = false;
 
     for pattern in [
         "playnow%3D1%26",
+        "playnow%3d1%26",
         "%26playnow%3D1",
+        "%26playnow%3d1",
         "playnow=1&",
         "&playnow=1",
     ] {
-        // `replace` builds the result in one pass; the loop that was here
-        // removed one occurrence at a time with `replace_range`, and each
-        // removal shifted the whole remaining tail down — quadratic in the
-        // length of a URI the player chose.
+        // Removing one occurrence can join its neighbors into another:
+        // "playn" + "playnow=1&" + "ow=1&" becomes a match that a single
+        // `replace` would leave behind. Replacing until it settled caught that
+        // but took a pass over the whole query per level of nesting, which is
+        // quadratic in a URI the player chose.
         //
-        // Repeated until it settles rather than replaced once, because
-        // removing one occurrence can join its neighbors into another:
-        // "playn" + "playnow=1&" + "ow=1&" becomes a match that a single pass
-        // would leave behind. The string shrinks every round, so this ends.
-        loop {
-            let next = out.replace(pattern, "");
-            if next == out {
-                break;
+        // So the query is copied across once and a match is taken off the end
+        // of what has been copied the moment it completes, which catches a
+        // join as it forms. None of these patterns overlaps itself, so this
+        // settles on exactly what the repeated replace did.
+        let source = std::mem::take(&mut out);
+        for c in source.chars() {
+            out.push(c);
+            if out.ends_with(pattern) {
+                out.truncate(out.len() - pattern.len());
+                dropped = true;
             }
-            out = next;
-            dropped = true;
         }
     }
     (out, dropped)
@@ -2105,6 +2135,36 @@ mod tests {
             strip("a&playnow=1&playnow=1b"),
             ("ab".to_owned(), true),
             "repeated occurrences all come out"
+        );
+
+        // `starts_playing` decodes `%3d` as readily as `%3D`, so a lowercase
+        // one left in would still play.
+        assert_eq!(
+            strip("cmd%3Dx%26playnow%3d1%26id%3D3"),
+            ("cmd%3Dx%26id%3D3".to_owned(), true)
+        );
+        assert_eq!(strip("cmd%3Dx%26playnow%3d1"), ("cmd%3Dx".to_owned(), true));
+    }
+
+    /// Nested so that every removal makes the next match: settling by
+    /// repeated whole-string replaces took a pass per level, which at the
+    /// size of a document the client accepts was hundreds of thousands of
+    /// passes over megabytes.
+    #[test]
+    fn deeply_nested_playnow_comes_out_in_one_pass() {
+        let levels = 200_000;
+        let mut query = String::from("a");
+        query.push_str(&"playn".repeat(levels));
+        query.push_str("playnow=1&");
+        query.push_str(&"ow=1&".repeat(levels));
+        query.push('b');
+
+        let started = std::time::Instant::now();
+        assert_eq!(without_playnow(&query), ("ab".to_owned(), true));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
         );
     }
 
@@ -3037,6 +3097,60 @@ mod tests {
         )
         .expect("parses");
         assert!(grouped.sections[0].paged);
+
+        // Three counted lists with an uncounted one between: only the last
+        // counted one is, however many were filed before it.
+        let many = parse(
+            r#"<screen>
+                 <list offset="0" total="5"><item title="a"/></list>
+                 <list offset="0" total="6"><item title="b"/></list>
+                 <list><item title="c"/></list>
+                 <list offset="0" total="7"><item title="d"/></list>
+                 <list><item title="e"/></list>
+               </screen>"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            many.sections.iter().map(|s| s.paged).collect::<Vec<_>>(),
+            vec![false, false, false, true, false]
+        );
+    }
+
+    /// Each counted list cleared the flag on every list before it, so a screen
+    /// of many short counted lists cost the square of their number.
+    #[test]
+    fn many_counted_lists_parse_in_linear_time() {
+        let mut doc = String::from("<screen>");
+        for _ in 0..100_000 {
+            doc.push_str(r#"<list offset="0" total="1"><item title="a"/></list>"#);
+        }
+        doc.push_str("</screen>");
+
+        let started = std::time::Instant::now();
+        let screen = parse(&doc).expect("parses");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(screen.sections.iter().filter(|s| s.paged).count(), 1);
+        assert!(screen.sections.last().unwrap().paged);
+    }
+
+    /// Real screens nest a few levels. A document that nests far past that is
+    /// refused rather than parsed with a stack every row has to search.
+    #[test]
+    fn a_screen_nested_past_the_ceiling_is_refused() {
+        let nested = |depth: usize| {
+            let mut doc = String::from("<screen>");
+            doc.push_str(&"<x>".repeat(depth));
+            doc.push_str(r#"<row title="r"><item title="a"/></row>"#);
+            doc.push_str(&"</x>".repeat(depth));
+            doc.push_str("</screen>");
+            doc
+        };
+        assert!(parse(&nested(10)).is_ok());
+        assert!(parse(&nested(100_000)).is_err());
     }
 
     /// The same two elements inside a real `<row>` still belong to it.

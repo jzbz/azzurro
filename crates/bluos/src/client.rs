@@ -130,8 +130,17 @@ const POLL_SLACK: Duration = Duration::from_secs(15);
 ///
 /// Only the unchanged ones. A reply that carries a change is the player
 /// answering the question that was asked, and the next poll after one has to
-/// go straight back out or a burst of changes arrives a second apart.
+/// go straight back out or a burst of changes arrives a second apart — almost
+/// straight back: see [`MIN_CHANGED_POLL`].
 const MIN_POLL: Duration = Duration::from_secs(1);
+
+/// The shortest one turn of the poll may be when something did change.
+///
+/// Short enough that a burst of real changes still arrives as it happens, and
+/// long enough that a player — or anything in between — that hands back a new
+/// etag on every reply costs ten requests a second rather than as many as the
+/// loop can make, each of them a full redraw of the window.
+const MIN_CHANGED_POLL: Duration = Duration::from_millis(100);
 
 /// What `<repeat>` means. Note that off is 2, not 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +350,12 @@ impl Client {
     ///
     /// Worth doing in an app: the connection pool and the resolver are per
     /// client, and a controller holds a long-poll open to every player at once.
+    ///
+    /// The client given is used as it is, so build it with [`http_client`]:
+    /// that is where the redirect policy lives which keeps a player from
+    /// sending this client to any other host. One built without it follows
+    /// reqwest's default policy instead, and the check on the paths a player
+    /// names does nothing about where a redirect goes.
     pub fn with_http(id: DeviceId, http: reqwest::Client) -> Self {
         Self {
             id,
@@ -1572,14 +1587,18 @@ impl StatusWatch {
 
         let status: Status = self
             .client
-            .get_xml("/Status", &query, self.poll + POLL_SLACK)
+            .get_xml("/Status", &query, self.poll.saturating_add(POLL_SLACK))
             .await?;
         // The same etag back is the player saying nothing has changed, which
         // is the answer a poll that came back early has no business asking
         // again straight away. See [`MIN_POLL`].
-        if asked_with.as_deref() == Some(status.etag.as_str()) {
-            self.earliest = Some(asked_at + MIN_POLL);
-        }
+        let unchanged = asked_with.as_deref() == Some(status.etag.as_str());
+        let floor = if unchanged {
+            MIN_POLL
+        } else {
+            MIN_CHANGED_POLL
+        };
+        self.earliest = Some(asked_at + floor);
         self.etag = Some(status.etag.clone());
         Ok(status)
     }

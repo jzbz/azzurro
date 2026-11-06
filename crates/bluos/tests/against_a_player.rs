@@ -93,6 +93,15 @@ async fn saving_an_alarm_sends_every_field_the_player_wants() {
         "the player has to know whose wall clock"
     );
     assert!(!sent.contains("id="), "a new alarm has no id to send");
+    assert!(sent.contains("volume=20"), "the alarm's own volume: {sent}");
+    assert!(sent.contains("service=TestRadio"), "what plays: {sent}");
+    assert!(
+        sent.contains("source=A"),
+        "named as the user saw it: {sent}"
+    );
+    assert!(sent.contains("url=TestRadio"), "and where it is: {sent}");
+    assert!(sent.contains("shuffle=false"));
+    assert!(sent.contains("useBackup=false"));
 }
 
 /// A schedule is the same call with the other half of the pair.
@@ -134,15 +143,23 @@ async fn deleting_and_arming_name_the_alarm() {
     let client = client_for(&player).await;
 
     let after = client.delete_alarm(4).await.expect("deletes");
-    assert!(player.asked_for("delete=1"));
-    assert!(player.asked_for("id=4"));
+    let delete = player.asked().last().cloned().expect("a request went out");
+    assert!(delete.contains("delete=1"), "{delete}");
+    assert!(
+        delete.contains("id=4"),
+        "the delete names the alarm: {delete}"
+    );
     assert!(
         after.alarms.is_empty(),
         "the reply is the list after the delete"
     );
 
     let after = client.arm_alarm(4, false).await.expect("disarms");
-    assert!(player.asked_for("enable=0"));
+    // The same request, not one each: an id left over from the delete above
+    // would satisfy a check of the whole history.
+    let arm = player.asked().last().cloned().expect("a request went out");
+    assert!(arm.contains("enable=0"), "{arm}");
+    assert!(arm.contains("id=4"), "arming names the alarm too: {arm}");
     assert_eq!(after.alarms.len(), 1, "arming is not a delete");
 }
 
@@ -412,7 +429,7 @@ async fn writing_a_setting_posts_its_name_and_value() {
     let setting = bluos::settings::Setting {
         id: "eq-bass".to_owned(),
         name: Some("eq-bass".to_owned()),
-        url: Some("/alsa_setting".to_owned()),
+        url: Some("/alsa_setting".into()),
         ..Default::default()
     };
     client.write_setting(&setting, "3").await.expect("writes");
@@ -507,11 +524,22 @@ async fn a_member_is_upgraded_through_its_leader() {
         .await
         .expect("starts");
 
+    // Of the trigger itself: the check before it names the member too, so a
+    // trigger sent to the leader alone would pass a look over the history.
+    let trigger = player
+        .asked()
+        .into_iter()
+        .rev()
+        .find(|seen| seen.contains("upgrade=this"))
+        .expect("the trigger went out");
     assert!(
-        player.asked_for("slave=192.168.1.156"),
-        "the request names the member"
+        trigger.contains("slave=192.168.1.156"),
+        "the trigger names the member: {trigger}"
     );
-    assert!(player.asked_for("port=11000"), "and the port it answers on");
+    assert!(
+        trigger.contains("port=11000"),
+        "and the port it answers on: {trigger}"
+    );
     assert!(
         player.asked_for("upgrade=this"),
         "the scope is still this and never all"

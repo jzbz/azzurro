@@ -52,6 +52,11 @@ struct Announced {
 /// The parts of a track that, taken together, mean "this is a different track".
 #[derive(PartialEq)]
 struct TrackKey {
+    /// The id the Metadata carries. It is part of what is announced, so a
+    /// change to it alone has to be announced too: a client holds the id it
+    /// was last given and hands it back with `SetPosition`, which refuses one
+    /// that no longer names the track.
+    id: TrackId,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
@@ -62,7 +67,9 @@ struct TrackKey {
 /// What came of trying to export one player.
 pub enum Attach {
     /// Exported, and here is the object serving it.
-    Exported(Bridge),
+    /// Boxed: the bridge carries the whole of what was last announced, and
+    /// the other two carry nothing.
+    Exported(Box<Bridge>),
     /// There is no session bus to export onto: the app is running outside a
     /// desktop session, or in a container without one. Nothing a player does
     /// will conjure a bus, so the caller stops asking — this used to be tried
@@ -107,10 +114,10 @@ impl Bridge {
         match Server::new(&suffix, exported).await {
             Ok(server) => {
                 tracing::info!(%id, bus = %server.bus_name(), "exported over MPRIS");
-                Attach::Exported(Self {
+                Attach::Exported(Box::new(Self {
                     server,
                     announced: Mutex::new(None),
-                })
+                }))
             }
             Err(e) if no_session_bus(&e) => {
                 // Said once, and quietly: a machine without a session bus is
@@ -381,6 +388,7 @@ fn album_of(status: &Status) -> Option<String> {
 
 fn track_key(status: &Status, art: Option<String>) -> TrackKey {
     TrackKey {
+        id: track_id(status),
         title: status.title1.clone().filter(|s| !s.is_empty()),
         artist: artist_of(status),
         album: album_of(status),
@@ -416,6 +424,25 @@ fn track_id(status: &Status) -> TrackId {
     };
 
     TrackId::try_from(format!("/app/azzurro/track/{key}")).unwrap_or(TrackId::NO_TRACK)
+}
+
+/// Where `SetPosition` should seek to, or nothing when the spec says the call
+/// is to be ignored: an id that is not the current track's, a negative
+/// position, or one past the end of a track whose length is known.
+fn set_position_target(status: &Status, id: &TrackId, position: Time) -> Option<u32> {
+    if *id != track_id(status) || position.is_negative() {
+        return None;
+    }
+    if length_micros(status).is_some_and(|length| position.as_micros() > length) {
+        return None;
+    }
+    Some(seconds(position.as_secs()))
+}
+
+/// Seconds as BluOS takes them, held inside the range rather than wrapped
+/// round it: a cast would turn 2^32 s into a seek to the start.
+fn seconds(secs: i64) -> u32 {
+    secs.clamp(0, i64::from(u32::MAX)) as u32
 }
 
 /// FNV-1a, inlined to keep a hashing crate out of the graph for something whose
@@ -643,12 +670,21 @@ impl PlayerInterface for Exported {
     /// the current one. A negative offset past the start clamps to zero, which
     /// is what the spec asks for.
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
-        let target = (self.position_secs() + offset.as_secs()).max(0);
-        self.send(Action::Seek(target as u32))
+        let target = self.position_secs().saturating_add(offset.as_secs());
+        self.send(Action::Seek(seconds(target)))
     }
 
-    async fn set_position(&self, _track_id: TrackId, position: Time) -> fdo::Result<()> {
-        self.send(Action::Seek(position.as_secs().max(0) as u32))
+    /// The spec has this do nothing when the id is not the current track's —
+    /// the call raced a track change, and seeking the track that replaced it
+    /// is not what was asked — or when the position is outside the track.
+    async fn set_position(&self, track_id: TrackId, position: Time) -> fdo::Result<()> {
+        let Some((status, _)) = self.snapshot() else {
+            return Ok(());
+        };
+        match set_position_target(&status, &track_id, position) {
+            Some(secs) => self.send(Action::Seek(secs)),
+            None => Ok(()),
+        }
     }
 
     async fn open_uri(&self, _uri: String) -> fdo::Result<()> {
@@ -824,6 +860,52 @@ mod tests {
         assert_eq!(volume(100), 1.0);
         assert_eq!(volume(140), 1.0);
         assert_eq!(volume(-5), 0.0);
+    }
+
+    /// `SetPosition` names the track it means. One that raced a track change
+    /// must not seek the track that replaced it, and a position outside the
+    /// track is ignored rather than clamped, as the spec asks.
+    #[test]
+    fn set_position_seeks_only_the_track_it_names() {
+        let playing = Status {
+            pid: Some(692),
+            song: Some(3),
+            service: Some("Qobuz".into()),
+            title1: Some("Anything".into()),
+            totlen: Some(240.0),
+            ..Default::default()
+        };
+        let current = track_id(&playing);
+        let at = |secs| Time::from_secs(secs);
+
+        assert_eq!(set_position_target(&playing, &current, at(30)), Some(30));
+        assert_eq!(set_position_target(&playing, &current, at(240)), Some(240));
+        assert_eq!(set_position_target(&playing, &current, at(241)), None);
+        assert_eq!(set_position_target(&playing, &current, at(-1)), None);
+
+        let moved_on = Status {
+            song: Some(4),
+            ..playing.clone()
+        };
+        assert_eq!(set_position_target(&moved_on, &current, at(30)), None);
+
+        // With no length to check against, only the id and the sign decide,
+        // and a position past what BluOS can take is held at its ceiling.
+        let unknown = Status {
+            totlen: None,
+            ..playing
+        };
+        assert_eq!(
+            set_position_target(&unknown, &current, at(1 << 40)),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn seconds_are_held_in_range_rather_than_wrapped() {
+        assert_eq!(seconds(-5), 0);
+        assert_eq!(seconds(90), 90);
+        assert_eq!(seconds(1 << 32), u32::MAX);
     }
 
     #[test]

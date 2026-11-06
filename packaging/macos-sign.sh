@@ -10,11 +10,12 @@
 # revocation is not. So the key stays on this machine, next to the PGP key
 # that signs the release's SHA256SUMS, and never goes near a runner.
 #
-#   ./packaging/macos-sign.sh azzurro-v0.1.2-macos-universal.zip
+#   ./packaging/macos-sign.sh azzurro-v0.1.2-macos-universal-unsigned.zip
 #
 # Takes the unsigned zip CI produced (or an unpacked Azzurro.app) and leaves a
-# signed, notarized, stapled zip beside it, verified the way a stranger's Mac
-# will verify it.
+# signed, notarized, stapled zip beside it — azzurro-v0.1.2-macos-universal.zip
+# here, the name without -unsigned — verified the way a stranger's Mac will
+# verify it.
 #
 # One-time setup on this machine — see the block printed by --setup.
 set -eu
@@ -161,6 +162,13 @@ case "$INPUT" in
         [ -n "$APP" ] || die "no .app inside $INPUT"
         OUTDIR=$(cd "$(dirname "$INPUT")" && pwd)
         BASE=$(basename "$INPUT" .zip)
+        # The signed zip is written under this name without -unsigned, and the
+        # old one at that name removed first: without the suffix, that is the
+        # input.
+        case "$BASE" in
+            *-unsigned) ;;
+            *) die "$INPUT has no -unsigned suffix, so the signed zip would replace it" ;;
+        esac
         ;;
     *.app)
         APP="$WORK/$(basename "$INPUT")"
@@ -208,11 +216,12 @@ run codesign --sign "$IDENTITY" \
     1. Run this from Terminal ON the Mac, once. macOS asks whether codesign may
        use the key; choose 'Always Allow'. Afterwards SSH runs work too.
 
-    2. Or authorize it without the prompt, which needs your login password on
-       the command line:
+    2. Or authorize it without the dialog. This asks for your login password
+       at the terminal; leave it off the command line, where it would land in
+       the shell's history:
 
            security set-key-partition-list -S apple-tool:,apple:,codesign: \\
-             -s -k '<login password>' ~/Library/Keychains/login.keychain-db"
+             -s ~/Library/Keychains/login.keychain-db"
 
 run codesign --verify --deep --strict --verbose=2 "$APP" \
     || die "the signature did not verify immediately after signing"
@@ -254,25 +263,34 @@ run xcrun stapler staple "$APP" || die "stapling failed"
 
 # The order matters and is the step most often missed: the zip that ships has
 # to be made AFTER stapling. Re-using the submission zip ships an unstapled app.
+#
+# Packed in the work directory and moved into place only once every check
+# below has passed, so a bundle Gatekeeper rejects never sits under the name
+# that ships.
 step "Re-packing"
 FINAL="$OUTDIR/${BASE%-unsigned}.zip"
-rm -f "$FINAL"
-ditto -c -k --keepParent "$APP" "$FINAL"
+PACKED="$WORK/final.zip"
+ditto -c -k --keepParent "$APP" "$PACKED"
 
 # ------------------------------------------------------------------- verify
 # The checks a stranger's Mac will make, run here so a bad bundle is caught now
 # rather than by the first person to download it.
 step "Verifying"
+# Each one gates: piped into sed, as these were, only the last command of the
+# pipe decided, and a ticket that was not there printed its failure and went on.
 echo "  --- stapler validate (is the ticket actually in the bundle?) ---"
-xcrun stapler validate "$APP" 2>&1 | sed 's/^/    /'
+run xcrun stapler validate "$APP" || die "the ticket is not in the bundle — do not ship this"
 echo "  --- codesign (is the seal intact, including nested content?) ---"
-codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
+run codesign --verify --deep --strict --verbose=2 "$APP" \
+    || die "the seal does not verify — do not ship this"
 echo "  --- spctl (what Gatekeeper decides) ---"
 spctl -a -vvv -t exec "$APP" 2>&1 | sed 's/^/    /'
 
 if ! spctl -a -t exec "$APP" >/dev/null 2>&1; then
     die "Gatekeeper still rejects the bundle — do not ship this"
 fi
+
+mv -f "$PACKED" "$FINAL"
 
 printf '\n'
 printf 'done: %s\n' "$FINAL"

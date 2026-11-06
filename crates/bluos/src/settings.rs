@@ -24,6 +24,7 @@
 //! carefully.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -127,7 +128,11 @@ pub struct Group {
     pub description: Option<String>,
     pub icon: Option<String>,
     /// Where writes for the settings inside go, unless one names its own.
-    pub url: Option<String>,
+    ///
+    /// Shared rather than copied, because it is copied into every setting
+    /// inside that names none: one long url and many settings under it made
+    /// the memory a page costs the product of the two.
+    pub url: Option<Arc<str>>,
     /// Whether the group offers a "reset to defaults".
     pub defaults: bool,
     pub entries: Vec<Entry>,
@@ -199,7 +204,10 @@ pub struct Setting {
     /// [`Settings::base`], which is where the page was read from. The two are
     /// different services on different ports; see
     /// [`crate::client::Client::write_setting`], which resolves this.
-    pub url: Option<String>,
+    ///
+    /// Shared with the group it was inherited from, where it was: see
+    /// [`Group::url`].
+    pub url: Option<Arc<str>>,
     pub help_url: Option<String>,
     pub kind: Kind,
     pub value: Option<String>,
@@ -398,7 +406,7 @@ fn open(
             display_name: a.remove("displayName"),
             description: a.remove("description"),
             icon: a.remove("icon"),
-            url: a.remove("url"),
+            url: a.remove("url").map(Arc::from),
             defaults: flag(a.remove("defaults")),
             entries: Vec::new(),
         }),
@@ -411,7 +419,7 @@ fn open(
                 description: a.remove("description"),
                 explanation: a.remove("explanation"),
                 icon: a.remove("icon"),
-                url: a.remove("url"),
+                url: a.remove("url").map(Arc::from),
                 help_url: a.remove("helpUrl"),
                 value: a.remove("value"),
                 count: a.remove("count").and_then(|v| v.parse().ok()),
@@ -819,5 +827,21 @@ mod tests {
             urls,
             vec![("a", Some("/outer")), ("b", Some("/own")), ("c", None)]
         );
+        // Inherited by sharing, not copying: a long url under many settings
+        // costs one copy of it, not one per setting.
+        let shared = parse(
+            r#"<settings><menuGroup id="g" url="/long">
+                <setting id="a" name="a" class="boolean"/>
+                <setting id="b" name="b" class="boolean"/>
+            </menuGroup></settings>"#,
+            "http://x",
+        )
+        .unwrap();
+        let inherited: Vec<_> = shared
+            .settings()
+            .into_iter()
+            .map(|s| s.url.clone().unwrap())
+            .collect();
+        assert!(Arc::ptr_eq(&inherited[0], &inherited[1]));
     }
 }
