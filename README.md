@@ -5,6 +5,8 @@ Linux, macOS and Windows.
 
 Rust throughout, Slint for the GUI. No webview, no Electron, no Qt, no C++.
 
+<a href="https://slint.dev"><img src="docs/made-with-slint.png" alt="Made with Slint" width="160"></a>
+
 **Status: young, and exercised against real hardware.** Discovery, status, the
 long poll and the transport verbs all run against a player rather than a
 fixture, and firmware upgrades have been driven end to end on a Bluesound Powernode.
