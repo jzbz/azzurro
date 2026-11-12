@@ -75,7 +75,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/jzbz/azzurro.git
-        tag: v0.2.0
+        tag: v0.3.0
         # Pinned alongside the tag so a tag that is later moved cannot change
         # what Flathub builds. Both have to be updated together on a release.
         #
@@ -85,5 +85,5 @@ modules:
         # builds, so what CI ships is the tagged tree regardless; what is
         # written here is what a Flathub submission would use, and it is
         # corrected to the tag's own commit immediately after tagging.
-        commit: 523ccfc3aab2447c47c9a343cd9a25acc8706c63
+        commit: 1cfac366abf7a547c285f09ae786cb84a5d12f5e
       - cargo-sources.json

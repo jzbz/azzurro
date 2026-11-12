@@ -125,6 +125,21 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.3.0" date="2026-11-12">
+      <description>
+        <p>Large folders open quickly, tracks added to the queue show up at once, and covers stay on screen far longer.</p>
+        <ul>
+          <li>Browse screens fetch covers only for the rows on screen and those just around them, so large folders open in a moment. Covers already seen are kept far longer, and one that is let go comes back on its own.</li>
+          <li>Tracks added to the queue appear in about a second even while covers are loading, and a queue that fails to load is read again instead of being left empty.</li>
+          <li>A track whose title contains one of the player's own words, such as Shuffle or Home, no longer takes the icon of the button of that name.</li>
+          <li>The elapsed time, the length of hour-long tracks in the queue, the album header and the empty-state messages are no longer cut short.</li>
+          <li>Replies that arrive late no longer show one player's queue, settings or alarm sources under another, presses on the queue's controls reach the player in the order they were made, and settings sliders move in the player's own steps.</li>
+          <li>A player that sends very large pages, or replies to every check with something new, no longer ties the app up.</li>
+          <li>On Linux, the desktop's media controls follow every change of track and stop a seek at the ends of the track. The players are now named under the app's id, so a playerctl filter needs -p blue.azzurro.Azzurro instead of -p azzurro.</li>
+          <li>Two copies of the Flatpak can run side by side without damaging each other's saved files, the icon is redrawn to sit evenly beside other apps' icons, and taskbars on X11 show it for the window.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-05">
       <description>
         <p>Players that move, stop answering or come back are handled as they should be.</p>
