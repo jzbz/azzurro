@@ -152,8 +152,8 @@ bare exe's bytes exactly, which release.yml checks by installing the setup on
 its runner, so the bare exe's line vouches for what ends up on disk as well.
 
 `manifest/` here holds what was actually submitted, for review before it is
-sent and as the starting point for the next version. Since the swap that is
-0.2.0's installer manifest, the one the pull request carries. Keep
+sent and as the starting point for the next version. That is now 0.3.0's
+installer manifest, the one submitted for that release. Keep
 `InstallerSha256` in step with the release's signed `SHA256SUMS` rather than
 recomputing it: pinning the hash that signature covers is the only thread
 connecting a winget install back to the key.
